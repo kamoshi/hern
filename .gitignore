@@ -3,6 +3,7 @@
 *
 
 !.gitignore
+!.gitattributes
 
 !Cargo.toml
 !Cargo.lock
