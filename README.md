@@ -49,11 +49,15 @@ let point = #{ x: 1, y: 2, label: "origin" };
 get_x(point)
 ```
 
-That style gives `get_x` a record-polymorphic shape: it only cares that `x` exists, not what other fields are present.
+That style gives `get_x` a record-polymorphic shape: it only cares that `x`
+exists, not what other fields are present.
 
-Traits are resolved through dictionaries during lowering, then emitted as Lua. The generated Lua is intended to be readable enough for debugging while keeping Hern's type information in the compiler.
+Traits are resolved through dictionaries during lowering, then emitted as Lua.
+The generated Lua is intended to be readable enough for debugging while keeping
+Hern's type information in the compiler.
 
-The language server currently supports diagnostics, hover type hints, go-to-definition, references, rename, and completion from scope.
+The language server currently supports diagnostics, hover type hints,
+go-to-definition, references, rename, and completion from scope.
 
 ## Build
 
@@ -72,13 +76,16 @@ cargo run -p hern -- bundle path/to/file.hern
 cargo run -p hern -- lsp
 ```
 
-The `lua` command prints generated Lua. The `run` command executes generated Lua through a local Lua runtime.
+The `lua` command prints generated Lua. The `run` command executes generated Lua
+through a local Lua runtime.
 
 ## Workspace
 
-- `hern-core`: lexer, parser, type inference, module loading, source indexing, and Lua code generation.
+- `hern-core`: lexer, parser, type inference, module loading, source indexing,
+  and Lua code generation.
 - `hern`: CLI.
-- `hern-lsp`: language server support for diagnostics, hover, definitions, references, rename, and completions.
+- `hern-lsp`: language server support for diagnostics, hover, definitions,
+  references, rename, and completions.
 - `std/prelude.hern`: built-in prelude loaded by the compiler.
 - `tests/hern`: integration fixtures.
 
