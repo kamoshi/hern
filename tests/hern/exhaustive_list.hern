@@ -1,0 +1,3 @@
+fn bad(xs: [f64]) -> f64 {
+    match xs { [h, ..rest] -> h }
+}

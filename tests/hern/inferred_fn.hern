@@ -1,0 +1,13 @@
+fn double(x) {
+    x + x
+}
+
+fn add(x, y) {
+    x + y
+}
+
+let a = double(21);
+let b = add(20, 22);
+
+print(a);
+print(b);

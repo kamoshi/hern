@@ -1,0 +1,10 @@
+fn double['a: Add](x: 'a) -> 'a {
+    x + x
+}
+
+fn quadruple['a: Add](x: 'a) -> 'a {
+    double(x) + double(x)
+}
+
+print(double(21.0));
+print(quadruple(10.5));

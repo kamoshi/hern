@@ -1,0 +1,25 @@
+fn tuple_item(xs) -> f64 {
+    match xs {
+        [(x, y)] -> x + y,
+        _ -> 0,
+    }
+}
+
+fn record_item(xs) -> f64 {
+    match xs {
+        [#{ a }] -> a,
+        _ -> 0,
+    }
+}
+
+fn array_item(xs) -> f64 {
+    match xs {
+        [[x]] -> x,
+        _ -> 0,
+    }
+}
+
+print(tuple_item([(1, 2)]));
+print(tuple_item([]));
+print(record_item([#{ a: 4 }]));
+print(array_item([[5]]));

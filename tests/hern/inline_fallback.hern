@@ -1,0 +1,17 @@
+trait Pick 'a {
+  fn infixl 6 <>(lhs: 'a, rhs: 'a) -> 'a
+}
+
+impl Pick for f64 {
+  #[inline]
+  fn <>(lhs, rhs) {
+    if lhs > rhs {
+      lhs
+    } else {
+      rhs
+    }
+  }
+}
+
+print(2 <> 4)
+print(5 <> 3)

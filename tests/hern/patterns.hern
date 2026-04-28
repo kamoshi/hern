@@ -1,0 +1,67 @@
+// ── Sum types ─────────────────────────────────────────────────────────────────
+
+fn unwrap_or(opt: Option('a), default: 'a) -> 'a {
+    match opt {
+        Some(v) -> v,
+        None -> default,
+    }
+}
+
+print(unwrap_or(Some(42), 0));
+print(unwrap_or(None, 99));
+
+// ── Record patterns ───────────────────────────────────────────────────────────
+
+fn get_x(p: #{ x: f64, y: f64 }) -> f64 {
+    match p {
+        #{ x, .. } -> x,
+    }
+}
+
+fn swap_label(p: #{ x: f64, y: f64 }) -> f64 {
+    match p {
+        #{ x: a, y: b } -> a + b,
+    }
+}
+
+let point = #{ x: 3, y: 4 };
+print(get_x(point));
+print(swap_label(point));
+
+fn first_field(r: #{ x: f64, y: f64 }) -> f64 {
+    match r {
+        #{ x, ..rest } -> x,
+    }
+}
+
+print(first_field(#{ x: 10, y: 20 }));
+
+// ── List patterns ─────────────────────────────────────────────────────────────
+
+fn list_head(xs: [f64]) -> f64 {
+    match xs {
+        [] -> 0,
+        [h, ..] -> h,
+    }
+}
+
+fn list_sum(xs: [f64]) -> f64 {
+    match xs {
+        [] -> 0,
+        [h, ..rest] -> h + list_sum(rest),
+    }
+}
+
+print(list_head([]));
+print(list_head([5, 6, 7]));
+print(list_sum([1, 2, 3, 4, 5]));
+
+fn is_pair(xs: [f64]) -> f64 {
+    match xs {
+        [_, _] -> 1,
+        _ -> 0,
+    }
+}
+
+print(is_pair([1, 2]));
+print(is_pair([1, 2, 3]));

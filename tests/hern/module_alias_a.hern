@@ -1,0 +1,4 @@
+type LocalAlias = f64
+
+#{ value: 1 }
+

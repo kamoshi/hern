@@ -1,0 +1,20 @@
+fn double(x: f64) -> f64 {
+    x + x
+}
+
+fn unwrap_or(opt: Option('a), default: 'a) -> 'a {
+    match opt {
+        Some(v) -> v,
+        None -> default,
+    }
+}
+
+let a = Some(21);
+let b = None;
+
+// map through the impl dict
+let mapped_a = Functor.map(a, double);
+let mapped_b = Functor.map(b, double);
+
+print(unwrap_or(mapped_a, 0));
+print(unwrap_or(mapped_b, 0));

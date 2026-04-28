@@ -1,0 +1,5 @@
+let s = "hello
+\"world\"
+this is multiline";
+
+print(s);

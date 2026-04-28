@@ -1,0 +1,14 @@
+let mut rec = #{ i: 0 };
+
+let x = loop {
+    rec.i = rec.i + 1;
+    if rec.i == 3 {
+        continue;
+    };
+    if rec.i == 5 {
+        break rec.i + 10;
+    };
+};
+
+print(x);
+print(rec.i);

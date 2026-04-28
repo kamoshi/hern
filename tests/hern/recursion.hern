@@ -1,0 +1,22 @@
+fn sum_up_to(n: f64) -> f64 {
+  if n == 0 {
+    0
+  } else {
+    n + sum_up_to(n - 1)
+  }
+}
+
+let res = sum_up_to(5);
+print(res);
+
+// Test new type notation
+fn first_element(list: [f64]) -> f64 {
+  1.0
+}
+
+fn generic_id(x: 'a) -> 'a {
+  x
+}
+
+print(generic_id(res));
+print(generic_id(#{ x: 1 }));

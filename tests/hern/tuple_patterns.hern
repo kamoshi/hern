@@ -1,0 +1,8 @@
+// Tuple patterns in let bindings
+let (a, b) = (1.0, 2.0);
+let (x, y, z) = (10.0, 20.0, 30.0);
+
+// Nested tuple destructuring
+let (p, (q, r)) = (1.0, (2.0, 3.0));
+
+print(a + b + x + y + z + p + q + r);

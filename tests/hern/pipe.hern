@@ -1,0 +1,5 @@
+let add_one = fn(x: f64) -> x + 1.0;
+let double = fn(x: f64) -> x * 2.0;
+
+let result = 5.0 |> add_one |> double;
+print(result); // 12

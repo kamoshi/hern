@@ -1,0 +1,15 @@
+type MathModule = #{
+  floor: fn(f64) -> f64,
+  abs: fn(f64) -> f64,
+  max: fn(f64, f64) -> f64
+}
+
+extern math: MathModule = "math";
+
+fn apply_floor(m, x) {
+  m.floor(x)
+}
+
+print(apply_floor(math, 3.7))
+print(math.abs(0.0 - 42.0))
+print(math.max(3.0, 7.0))

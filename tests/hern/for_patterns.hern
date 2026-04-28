@@ -1,0 +1,17 @@
+let pairs = [(1, 2), (3, 4)];
+let mut total = 0;
+
+for (x, y) in pairs {
+  total = total + x + y;
+}
+
+print(total);
+
+let rows = [#{ a: 5, b: 6 }];
+let mut field_sum = 0;
+
+for #{ a, .. } in rows {
+  field_sum = field_sum + a;
+}
+
+print(field_sum);

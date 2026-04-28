@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "hern",
+    "hern-core",
+    "hern-lsp",
+]
+resolver = "2"

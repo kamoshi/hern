@@ -1,0 +1,12 @@
+fn get_x(obj) {
+  obj.x
+}
+
+let r1 = #{ x: "1", y: 2 };
+let r2 = #{ x: 10, z: 20 };
+
+let x1 = get_x(r1);
+let x2 = get_x(r2);
+
+print(x1);
+print(x2);

@@ -1,0 +1,38 @@
+# This repository uses a whitelist ignore file so local scratch files do not
+# end up in the repository.
+*
+
+!.gitignore
+
+!Cargo.toml
+!Cargo.lock
+
+!README.md
+
+# Rust crates
+!hern/
+!hern/**/
+!hern/Cargo.toml
+!hern/**/*.rs
+
+!hern-core/
+!hern-core/**/
+!hern-core/Cargo.toml
+!hern-core/**/*.rs
+
+!hern-lsp/
+!hern-lsp/**/
+!hern-lsp/Cargo.toml
+!hern-lsp/**/*.rs
+
+# Standard library
+!std/
+!std/**/
+!std/**/*.hern
+
+# Integration harness and fixtures
+!tests/
+!tests/**/
+!tests/run.py
+!tests/test.toml
+!tests/**/*.hern

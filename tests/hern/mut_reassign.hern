@@ -1,0 +1,6 @@
+let mut x = 5;
+let mut y = None;
+x = x + 1;
+print(x);
+
+y = Some(x);

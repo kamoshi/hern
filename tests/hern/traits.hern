@@ -1,0 +1,8 @@
+impl Functor for Array {
+    fn map(fa: Array('a), f: fn('a) -> 'b) -> Array('b) {
+        // placeholder — codegen not wired yet, just type-check
+        fa
+    }
+}
+
+print(1)

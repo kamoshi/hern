@@ -1,0 +1,345 @@
+extern _unpack: fn(['a], f64) -> ['a] = "table.unpack or unpack";
+extern print: fn('a) -> () = "(function(x)
+  if type(x) == \"table\" then
+    local s = \"{\"
+    for k, v in pairs(x) do s = s .. tostring(k) .. \"=\" .. tostring(v) .. \", \" end
+    _G.print(s .. \"}\")
+  else
+    _G.print(x)
+  end
+  return {}
+end)";
+
+extern assert: fn(bool, string) -> () = "(function(c, m) if c == 0 then _G.error(m or \"assertion failed!\") end end)";
+extern error: fn(string) -> () = "error";
+extern tostring: fn('a) -> string = "tostring";
+extern type_of: fn('a) -> string = "type";
+extern collectgarbage: fn(string) -> f64 = "collectgarbage";
+
+extern _VERSION: string = "_VERSION";
+
+extern pcall: fn(fn() -> 'a) -> Result('a, string) = "(function(f)
+  local ok, res = _G.pcall(f)
+  if ok then return { _tag = \"Ok\", _0 = res } else return { _tag = \"Err\", _0 = _G.tostring(res) } end
+end)";
+
+extern rawequal: fn('a, 'a) -> bool = "(function(a, b) return _G.rawequal(a, b) and 1 or 0 end)";
+extern rawget: fn(Map('k, 'v), 'k) -> 'v = "rawget";
+extern rawset: fn(Map('k, 'v), 'k, 'v) -> () = "rawset";
+
+// --- Standard Data Types ---
+
+type Option('a) = Some('a) | None
+
+type Result('a, 'e) = Ok('a) | Err('e)
+
+type Map('k, 'v) = *
+
+trait Functor 'f {
+    fn map(fa: 'f('a), f: fn('a) -> 'b) -> 'f('b)
+}
+
+impl Functor for Option {
+    fn map(fa: Option('a), f: fn('a) -> 'b) -> Option('b) {
+        match fa {
+            Some(v) -> Some(f(v)),
+            None -> None,
+        }
+    }
+}
+
+// Result(*, 'e) maps over the Ok side, leaving the error type fixed.
+impl Functor for Result(*, 'e) {
+    fn map(fa: Result('a, 'e), f: fn('a) -> 'b) -> Result('b, 'e) {
+        match fa {
+            Ok(v) -> Ok(f(v)),
+            Err(e) -> Err(e),
+        }
+    }
+}
+
+// --- Primitives ---
+
+extern __add: fn(f64, f64) -> f64 = #[template] "(($1) + ($2))";
+extern __sub: fn(f64, f64) -> f64 = #[template] "(($1) - ($2))";
+extern __mul: fn(f64, f64) -> f64 = #[template] "(($1) * ($2))";
+extern __div: fn(f64, f64) -> f64 = #[template] "(($1) / ($2))";
+extern __mod: fn(f64, f64) -> f64 = #[template] "(($1) % ($2))";
+
+extern __lt:  fn(f64, f64) -> bool = #[template] "((($1) < ($2)) and 1 or 0)";
+extern __gt:  fn(f64, f64) -> bool = #[template] "((($1) > ($2)) and 1 or 0)";
+extern __lte: fn(f64, f64) -> bool = #[template] "((($1) <= ($2)) and 1 or 0)";
+extern __gte: fn(f64, f64) -> bool = #[template] "((($1) >= ($2)) and 1 or 0)";
+extern __eq_f64:  fn(f64, f64) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
+extern __eq_string: fn(string, string) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
+extern __eq_bool: fn(bool, bool) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
+extern __neq_f64: fn(f64, f64) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
+extern __neq_string: fn(string, string) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
+extern __neq_bool: fn(bool, bool) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
+
+extern __and: fn(bool, bool) -> bool = #[template] "((($1) ~= 0 and ($2) ~= 0) and 1 or 0)";
+extern __or:  fn(bool, bool) -> bool = #[template] "((($1) ~= 0 or ($2) ~= 0) and 1 or 0)";
+
+extern __concat: fn(string, string) -> string = #[template] "(($1) .. ($2))";
+
+// --- Map ---
+
+extern map_new: fn() -> Map('k, 'v) = "(function() return {} end)";
+extern map_set: fn(Map('k, 'v), 'k, 'v) -> Map('k, 'v) = "(function(m, k, v) m[k] = v; return m end)";
+extern map_get: fn(Map('k, 'v), 'k) -> Option('v) = "(function(m, k) local v = m[k]; if v ~= nil then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end end)";
+extern map_delete: fn(Map('k, 'v), 'k) -> Map('k, 'v) = "(function(m, k) m[k] = nil; return m end)";
+extern map_has: fn(Map('k, 'v), 'k) -> bool = "(function(m, k) return m[k] ~= nil and 1 or 0 end)";
+extern map_keys: fn(Map('k, 'v)) -> ['k] = "(function(m) local ks = {}; for k in pairs(m) do ks[#ks + 1] = k end; return ks end)";
+extern map_size: fn(Map('k, 'v)) -> f64 = "(function(m) local n = 0; for _ in pairs(m) do n = n + 1 end; return n end)";
+
+// --- Standard Operator Traits ---
+
+trait Add 'a {
+    fn infixl 6 +(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Sub 'a {
+    fn infixl 6 -(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Mul 'a {
+    fn infixl 7 *(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Div 'a {
+    fn infixl 7 /(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Mod 'a {
+    fn infixl 7 %(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Ord 'a {
+    fn infix 4 <(lhs: 'a, rhs: 'a) -> bool
+    fn infix 4 >(lhs: 'a, rhs: 'a) -> bool
+    fn infix 4 <=(lhs: 'a, rhs: 'a) -> bool
+    fn infix 4 >=(lhs: 'a, rhs: 'a) -> bool
+}
+
+trait Eq 'a {
+    fn infix 4 ==(lhs: 'a, rhs: 'a) -> bool
+    fn infix 4 !=(lhs: 'a, rhs: 'a) -> bool
+}
+
+trait Concat 'a {
+    fn infixr 5 ..(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait And 'a {
+    fn infixl 3 &&(lhs: 'a, rhs: 'a) -> bool
+}
+
+trait Or 'a {
+    fn infixl 2 ||(lhs: 'a, rhs: 'a) -> bool
+}
+
+// --- Implementations ---
+
+impl Add for f64 {
+    #[inline]
+    fn +(lhs, rhs) { __add(lhs, rhs) }
+}
+
+impl Sub for f64 {
+    #[inline]
+    fn -(lhs, rhs) { __sub(lhs, rhs) }
+}
+
+impl Mul for f64 {
+    #[inline]
+    fn *(lhs, rhs) { __mul(lhs, rhs) }
+}
+
+impl Div for f64 {
+    #[inline]
+    fn /(lhs, rhs) { __div(lhs, rhs) }
+}
+
+impl Mod for f64 {
+    #[inline]
+    fn %(lhs, rhs) { __mod(lhs, rhs) }
+}
+
+impl Ord for f64 {
+    #[inline]
+    fn <(lhs, rhs) { __lt(lhs, rhs) }
+    #[inline]
+    fn >(lhs, rhs) { __gt(lhs, rhs) }
+    #[inline]
+    fn <=(lhs, rhs) { __lte(lhs, rhs) }
+    #[inline]
+    fn >=(lhs, rhs) { __gte(lhs, rhs) }
+}
+
+impl Eq for f64 {
+    #[inline]
+    fn ==(lhs, rhs) { __eq_f64(lhs, rhs) }
+    #[inline]
+    fn !=(lhs, rhs) { __neq_f64(lhs, rhs) }
+}
+
+impl Eq for string {
+    #[inline]
+    fn ==(lhs, rhs) { __eq_string(lhs, rhs) }
+    #[inline]
+    fn !=(lhs, rhs) { __neq_string(lhs, rhs) }
+}
+
+impl Eq for bool {
+    #[inline]
+    fn ==(lhs, rhs) { __eq_bool(lhs, rhs) }
+    #[inline]
+    fn !=(lhs, rhs) { __neq_bool(lhs, rhs) }
+}
+
+impl Concat for string {
+    #[inline]
+    fn ..(lhs, rhs) { __concat(lhs, rhs) }
+}
+
+impl And for bool {
+    #[inline]
+    fn &&(lhs, rhs) { __and(lhs, rhs) }
+}
+
+impl Or for bool {
+    #[inline]
+    fn ||(lhs, rhs) { __or(lhs, rhs) }
+}
+
+// --- Iterable ---
+
+trait Iterable 'f {
+    fn iter(self: 'f('a)) -> Iter('a)
+}
+
+extern __array_iter: fn(['a]) -> Iter('a) = "(function(arr)
+  local i = 0
+  local n = #arr
+  return function()
+    i = i + 1
+    if i <= n then return arr[i] else return nil end
+  end
+end)";
+
+impl Iterable for Array {
+    fn iter(self) { __array_iter(self) }
+}
+
+// --- Lua Builtin Modules ---
+
+type Math = #{
+    abs: fn(f64) -> f64,
+    acos: fn(f64) -> f64,
+    asin: fn(f64) -> f64,
+    atan: fn(f64) -> f64,
+    atan2: fn(f64, f64) -> f64,
+    ceil: fn(f64) -> f64,
+    cos: fn(f64) -> f64,
+    cosh: fn(f64) -> f64,
+    deg: fn(f64) -> f64,
+    exp: fn(f64) -> f64,
+    floor: fn(f64) -> f64,
+    fmod: fn(f64, f64) -> f64,
+    ldexp: fn(f64, f64) -> f64,
+    log: fn(f64) -> f64,
+    log10: fn(f64) -> f64,
+    max: fn(f64, f64) -> f64,
+    min: fn(f64, f64) -> f64,
+    pow: fn(f64, f64) -> f64,
+    rad: fn(f64) -> f64,
+    random: fn() -> f64,
+    randomseed: fn(f64) -> (),
+    sin: fn(f64) -> f64,
+    sinh: fn(f64) -> f64,
+    sqrt: fn(f64) -> f64,
+    tan: fn(f64) -> f64,
+    tanh: fn(f64) -> f64,
+    pi: f64,
+    huge: f64
+}
+
+extern math: Math = "math";
+
+type StringModule = #{
+    byte: fn(string, f64) -> f64,
+    char: fn(f64) -> string,
+    len: fn(string) -> f64,
+    lower: fn(string) -> string,
+    rep: fn(string, f64) -> string,
+    reverse: fn(string) -> string,
+    sub: fn(string, f64, f64) -> string,
+    upper: fn(string) -> string
+}
+
+extern string: StringModule = "string";
+
+type TableModule = #{
+    concat: fn(['a], string) -> string,
+    insert: fn(['a], 'a) -> (),
+    maxn: fn(['a]) -> f64,
+    remove: fn(['a], f64) -> 'a,
+    sort: fn(['a], fn('a, 'a) -> bool) -> ()
+}
+
+extern table: TableModule = "table";
+
+type OSModule = #{
+    clock: fn() -> f64,
+    date: fn(string) -> string,
+    difftime: fn(f64, f64) -> f64,
+    execute: fn(string) -> f64,
+    exit: fn(f64) -> (),
+    time: fn() -> f64
+}
+
+extern os: OSModule = "os";
+
+type BitModule = #{
+    tobit: fn(f64) -> f64,
+    tohex: fn(f64) -> string,
+    bnot: fn(f64) -> f64,
+    band: fn(f64, f64) -> f64,
+    bor: fn(f64, f64) -> f64,
+    bxor: fn(f64, f64) -> f64,
+    lshift: fn(f64, f64) -> f64,
+    rshift: fn(f64, f64) -> f64,
+    arshift: fn(f64, f64) -> f64,
+    rol: fn(f64, f64) -> f64,
+    ror: fn(f64, f64) -> f64,
+    bswap: fn(f64) -> f64
+}
+
+extern bit: BitModule = "bit or {}";
+
+type JitModule = #{
+    on: fn() -> (),
+    off: fn() -> (),
+    flush: fn() -> (),
+    version: string,
+    version_num: f64,
+    arch: string,
+    os: string
+}
+
+extern jit: JitModule = "jit or {}";
+
+// --- Wrapped Lua Functions ---
+
+extern getenv: fn(string) -> Option(string) = "(function(k)
+  local v = os.getenv(k)
+  if v then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end
+end)";
+
+extern modf: fn(f64) -> (f64, f64) = "(function(x) return {math.modf(x)} end)";
+extern frexp: fn(f64) -> (f64, f64) = "(function(x) return {math.frexp(x)} end)";
+
+extern tonumber: fn(string) -> Option(f64) = "(function(s)
+  local n = _G.tonumber(s)
+  if n then return { _tag = \"Some\", _0 = n } else return { _tag = \"None\" } end
+end)";

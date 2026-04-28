@@ -1,0 +1,5 @@
+let a = import "module_alias_a";
+let b = import "module_alias_b";
+
+print(a.value);
+print(b.takes_alias(1));

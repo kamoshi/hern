@@ -1,0 +1,9 @@
+trait LocalAdd 'a {
+  fn bump(x: 'a) -> 'a
+}
+
+impl LocalAdd for f64 {
+  fn bump(x) {
+    x + 1
+  }
+}

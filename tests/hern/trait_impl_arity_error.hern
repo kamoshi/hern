@@ -1,0 +1,8 @@
+trait Pair 'a {
+    fn combine(lhs: 'a, rhs: 'a) -> 'a
+}
+
+impl Pair for f64 {
+    fn combine(lhs) { lhs }
+}
+

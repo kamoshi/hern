@@ -1,0 +1,38 @@
+fn block_returns_early() {
+  let a = {
+    let x = 7;
+    return 10;
+    x
+  };
+
+  a
+}
+
+fn block_branch_continues(flag) {
+  let a = {
+    if flag {
+      return 11;
+    } else {
+      2
+    };
+    3
+  };
+
+  a
+}
+
+fn let_initializer_returns() {
+  let a = return 20;
+  a
+}
+
+fn call_arg_returns() {
+  print(return 30);
+  0
+}
+
+print(block_returns_early())
+print(block_branch_continues(false))
+print(block_branch_continues(true))
+print(let_initializer_returns())
+print(call_arg_returns())

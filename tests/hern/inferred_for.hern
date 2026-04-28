@@ -1,0 +1,9 @@
+fn sum_items(xs) {
+    let mut total = 0;
+    for x in xs {
+        total = total + x;
+    }
+    total
+}
+
+print(sum_items([1, 2, 3, 4]));

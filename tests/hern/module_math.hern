@@ -1,0 +1,9 @@
+fn add(x, y) {
+  x + y
+}
+
+fn mul(x, y) {
+  x * y
+}
+
+#{ add: add, mul: mul }

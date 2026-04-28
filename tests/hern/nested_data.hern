@@ -1,0 +1,7 @@
+let nested = #{
+  data: [1, 2, 3],
+  info: #{ id: 42, name: 100 }
+};
+
+print(nested.data);
+print(nested.info.id);

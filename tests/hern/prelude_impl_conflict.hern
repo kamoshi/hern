@@ -1,0 +1,6 @@
+impl Add for f64 {
+    fn +(lhs, rhs) { lhs }
+}
+
+print(1 + 2)
+

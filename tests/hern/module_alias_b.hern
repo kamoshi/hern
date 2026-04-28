@@ -1,0 +1,6 @@
+fn takes_alias(x: LocalAlias) {
+    x
+}
+
+#{ takes_alias: takes_alias }
+

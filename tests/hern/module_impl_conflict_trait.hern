@@ -1,0 +1,3 @@
+trait SharedBump 'a {
+  fn bump(x: 'a) -> 'a
+}

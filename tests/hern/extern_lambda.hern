@@ -1,0 +1,4 @@
+extern my_print: fn('a) -> () = "(function(x) _G.print('EXTERN: ' .. tostring(x)) end)";
+
+my_print(42);
+my_print("hello");

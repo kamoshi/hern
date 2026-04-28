@@ -1,0 +1,8 @@
+// #{ x } is a closed pattern — rejects records with extra fields
+fn get_x(p: #{ x: f64, y: f64 }) -> f64 {
+    match p {
+        #{ x } -> x,
+    }
+}
+
+print(get_x(#{ x: 1, y: 2 }))

@@ -1,0 +1,7 @@
+let shared = import "module_impl_conflict_trait";
+
+impl SharedBump for f64 {
+  fn bump(x) {
+    x + 2
+  }
+}

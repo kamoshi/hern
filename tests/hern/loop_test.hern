@@ -1,0 +1,12 @@
+let mut i = 0;
+let x = loop {
+    i = i + 1;
+    if i == 3 {
+        continue;
+    };
+    if i == 5 {
+        break i + 10;
+    };
+};
+print(x);
+print(i);

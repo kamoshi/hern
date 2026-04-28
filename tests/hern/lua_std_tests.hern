@@ -1,0 +1,80 @@
+// Math
+print(math.abs(0.0 - 5.0));
+print(math.floor(3.7));
+print(math.ceil(3.2));
+print(math.sqrt(16.0));
+print(math.max(10.0, 20.0));
+print(math.min(10.0, 20.0));
+print(math.pi > 3.0);
+
+// String
+print(string.len("hello"));
+print(string.lower("HELLO"));
+print(string.upper("hello"));
+print(string.sub("hello", 2.0, 4.0));
+print(string.byte("A", 1.0));
+print(string.char(65.0));
+
+// Table
+let t = [3.0, 1.0, 2.0];
+table.sort(t, fn(a, b) { a < b });
+print(table.concat(t, ", "));
+print(table.remove(t, 1.0));
+print(table.concat(t, ", "));
+print(table.maxn(t));
+
+// OS
+print(os.clock() >= 0.0);
+print(os.time() > 0.0);
+print(os.difftime(2.0, 1.0));
+
+// Bit
+print(bit.band(3.0, 1.0));
+print(bit.bor(1.0, 2.0));
+print(bit.bxor(3.0, 1.0));
+
+// Jit
+print(jit.version_num >= 20000.0);
+print(string.len(jit.arch) > 0.0);
+
+// Wrapped
+match getenv("NON_EXISTENT_VAR") {
+  Some(v) -> print("Error: found unexpected env var"),
+  None -> print("OK: env var not found"),
+};
+
+let (i, f) = modf(3.5);
+print(i);
+print(f);
+
+// Globals
+print(tostring(42.0) == "42");
+print(type_of(42.0));
+print(type_of("hello"));
+
+match tonumber("123") {
+  Some(n) -> print(n),
+  None -> print("Error: tonumber failed"),
+};
+
+match tonumber("abc") {
+  Some(n) -> print("Error: tonumber should have failed"),
+  None -> print("OK: tonumber failed as expected"),
+};
+
+assert(1 == 1, "Should pass");
+print("OK: assert passed");
+
+print(string.sub(_VERSION, 1.0, 3.0) == "Lua");
+
+match pcall(fn() { 42.0 }) {
+  Ok(v) -> print(v),
+  Err(e) -> print("Error: pcall failed"),
+};
+
+// 2.0 is needed here because error() currently doesn't infer as a bottom type,
+// so we explicitly return an f64 to unify the Result with the previous test.
+match pcall(fn() { error("forced error"); 2.0 }) {
+  Ok(v) -> print("Error: pcall should have failed"),
+  Err(e) -> print("OK: pcall caught error"),
+};

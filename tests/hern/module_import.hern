@@ -1,0 +1,4 @@
+let math = import "module_math";
+
+print(math.add(2, 3));
+print(math.mul(4, 5));

@@ -1,0 +1,410 @@
+[tests.basic_math]
+path = "tests/hern/basic_math.hern"
+expect = "typecheck"
+output = """
+12
+"""
+
+[tests.mut_reassign]
+path = "tests/hern/mut_reassign.hern"
+expect = "typecheck"
+output = """
+6
+"""
+
+[tests.mut_error]
+path = "tests/hern/mut_error.hern"
+expect = "error"
+error_contains = "cannot assign to immutable variable"
+
+[tests.row_poly]
+path = "tests/hern/row_poly.hern"
+expect = "typecheck"
+output = """
+1
+10
+"""
+
+[tests.nested_data]
+path = "tests/hern/nested_data.hern"
+expect = "typecheck"
+output = """
+{1=1, 2=2, 3=3, }
+42
+"""
+
+[tests.recursion]
+path = "tests/hern/recursion.hern"
+expect = "typecheck"
+output = """
+15
+15
+{x=1, }
+"""
+
+[tests.sum_types]
+path = "tests/hern/sum_types.hern"
+expect = "typecheck"
+output = """
+42
+0
+"""
+
+[tests.annotated_let]
+path = "tests/hern/annotated_let.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
+[tests.inferred_fn]
+path = "tests/hern/inferred_fn.hern"
+expect = "typecheck"
+output = """
+42
+42
+"""
+
+[tests.patterns]
+path = "tests/hern/patterns.hern"
+expect = "typecheck"
+output = """
+42
+99
+3
+7
+10
+0
+5
+15
+1
+0
+"""
+
+[tests.record_pattern_closed]
+path = "tests/hern/record_pattern_closed.hern"
+expect = "error"
+error_contains = "type mismatch"
+
+[tests.exhaustive_sum]
+path = "tests/hern/exhaustive_sum.hern"
+expect = "error"
+error_contains = "non-exhaustive match"
+
+[tests.exhaustive_list]
+path = "tests/hern/exhaustive_list.hern"
+expect = "error"
+error_contains = "non-exhaustive match"
+
+[tests.strings_and_bools]
+path = "tests/hern/strings_and_bools.hern"
+expect = "typecheck"
+output = """
+hello
+1
+0
+1
+0
+0
+1
+1
+0
+1
+1
+0
+1
+"""
+
+[tests.loop_test]
+path = "tests/hern/loop_test.hern"
+expect = "typecheck"
+output = """
+15
+5
+"""
+
+[tests.field_assign_loop]
+path = "tests/hern/field_assign_loop.hern"
+expect = "typecheck"
+output = """
+15
+5
+"""
+
+[tests.multiline_string]
+path = "tests/hern/multiline_string.hern"
+expect = "typecheck"
+output = """
+hello
+"world"
+this is multiline
+"""
+
+[tests.extern_test]
+path = "tests/hern/extern_test.hern"
+expect = "typecheck"
+output = """
+3
+42
+7
+"""
+
+[tests.extern_lambda]
+path = "tests/hern/extern_lambda.hern"
+expect = "typecheck"
+output = """
+EXTERN: 42
+EXTERN: hello
+"""
+
+[tests.return_in_expr]
+path = "tests/hern/return_in_expr.hern"
+expect = "typecheck"
+output = """
+7
+7
+"""
+
+[tests.return_in_block_expr]
+path = "tests/hern/return_in_block_expr.hern"
+expect = "typecheck"
+output = """
+10
+3
+11
+20
+30
+"""
+
+[tests.custom_op]
+path = "tests/hern/custom_op.hern"
+expect = "typecheck"
+output = """
+3
+17
+"""
+
+[tests.fixity]
+path = "tests/hern/fixity.hern"
+expect = "typecheck"
+output = """
+8
+6
+11
+"""
+
+[tests.lambda]
+path = "tests/hern/lambda.hern"
+expect = "typecheck"
+output = """
+7
+15
+15
+42
+"""
+
+[tests.pipe]
+path = "tests/hern/pipe.hern"
+expect = "typecheck"
+output = """
+12
+"""
+
+[tests.pipe_constraints]
+path = "tests/hern/pipe_constraints.hern"
+expect = "typecheck"
+output = """
+10
+"""
+
+[tests.for_loop]
+path = "tests/hern/for_loop.hern"
+expect = "typecheck"
+output = """
+1
+2
+3
+60
+"""
+
+[tests.for_patterns]
+path = "tests/hern/for_patterns.hern"
+expect = "typecheck"
+output = """
+10
+5
+"""
+
+[tests.inferred_for]
+path = "tests/hern/inferred_for.hern"
+expect = "typecheck"
+output = """
+10
+"""
+
+[tests.propagate_constraints]
+path = "tests/hern/propagate_constraints.hern"
+expect = "typecheck"
+output = """
+10
+"""
+
+[tests.explicit_constraints]
+path = "tests/hern/explicit_constraints.hern"
+expect = "typecheck"
+output = """
+42
+42
+"""
+
+[tests.multi_trait_ops]
+path = "tests/hern/multi_trait_ops.hern"
+expect = "typecheck"
+output = """
+10
+"""
+
+[tests.inline_fallback]
+path = "tests/hern/inline_fallback.hern"
+expect = "typecheck"
+output = """
+4
+5
+"""
+
+[tests.trait_impl_arity_error]
+path = "tests/hern/trait_impl_arity_error.hern"
+expect = "error"
+error_contains = "wrong number of arguments"
+
+[tests.prelude_impl_conflict]
+path = "tests/hern/prelude_impl_conflict.hern"
+expect = "error"
+error_contains = "impl Add for f64 is defined in multiple modules"
+
+[tests.module_import]
+path = "tests/hern/module_import.hern"
+expect = "typecheck"
+output = """
+5
+20
+"""
+
+[tests.module_trait_import]
+path = "tests/hern/module_trait_import.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
+[tests.module_trait_conflict]
+path = "tests/hern/module_trait_conflict.hern"
+expect = "error"
+error_contains = "trait `LocalAdd` is defined in multiple modules"
+
+[tests.module_impl_conflict]
+path = "tests/hern/module_impl_conflict.hern"
+expect = "error"
+error_contains = "impl SharedBump for f64 is defined in multiple modules"
+
+[tests.module_alias_leak]
+path = "tests/hern/module_alias_leak.hern"
+expect = "error"
+error_contains = "unknown type: `LocalAlias`"
+
+[tests.unknown_type_error]
+path = "tests/hern/unknown_type_error.hern"
+expect = "error"
+error_contains = "unknown type: `MissingType`"
+
+[tests.traits]
+path = "tests/hern/traits.hern"
+expect = "typecheck"
+output = """
+1
+"""
+
+[tests.functor_result_left]
+path = "tests/hern/functor_result_left.hern"
+expect = "typecheck"
+output = ""
+
+[tests.option_functor]
+path = "tests/hern/option_functor.hern"
+expect = "typecheck"
+output = """
+42
+0
+"""
+
+[tests.let_destructure]
+path = "tests/hern/let_destructure.hern"
+expect = "typecheck"
+output = """
+34
+"""
+
+[tests.tuple_patterns]
+path = "tests/hern/tuple_patterns.hern"
+expect = "typecheck"
+output = """
+69
+"""
+
+[tests.nested_list_patterns]
+path = "tests/hern/nested_list_patterns.hern"
+expect = "typecheck"
+output = """
+3
+0
+4
+5
+"""
+
+[tests.refutable_let_error]
+path = "tests/hern/refutable_let_error.hern"
+expect = "error"
+error_contains = "refutable pattern in let binding"
+
+[tests.lua_std_tests]
+path = "tests/hern/lua_std_tests.hern"
+expect = "typecheck"
+output = """
+5
+3
+4
+4
+20
+10
+1
+5
+hello
+HELLO
+ell
+65
+A
+1, 2, 3
+1
+2, 3
+2
+1
+1
+1
+1
+3
+2
+1
+1
+OK: env var not found
+3
+0.5
+1
+number
+string
+123
+OK: tonumber failed as expected
+OK: assert passed
+1
+42
+OK: pcall caught error
+"""

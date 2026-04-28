@@ -1,0 +1,6 @@
+fn takes_missing(x: MissingType) {
+    x
+}
+
+print(takes_missing(1))
+

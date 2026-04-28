@@ -1,0 +1,9 @@
+trait Bump 'a {
+  fn bump(x: 'a) -> 'a
+}
+
+impl Bump for f64 {
+  fn bump(x) {
+    x + 1
+  }
+}

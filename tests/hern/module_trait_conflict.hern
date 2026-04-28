@@ -1,0 +1,4 @@
+let a = import "module_trait_conflict_a";
+let b = import "module_trait_conflict_b";
+
+print(1);

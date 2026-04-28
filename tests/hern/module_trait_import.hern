@@ -1,0 +1,3 @@
+let traits = import "module_trait";
+
+print(Bump.bump(41));

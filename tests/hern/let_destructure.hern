@@ -1,0 +1,8 @@
+// Record destructuring in let bindings
+let #{ x, y } = #{ x: 1.0, y: 2.0 };
+let #{ x: a, y: b } = #{ x: 10.0, y: 20.0 };
+
+// Open record destructuring (with rest)
+let #{ x: first, ..rest } = #{ x: 1.0, y: 2.0, z: 3.0 };
+
+print(x + y + a + b + first);

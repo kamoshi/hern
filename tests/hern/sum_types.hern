@@ -1,0 +1,11 @@
+fn unwrap_or(opt: Option('a), default: 'a) -> 'a {
+  match opt {
+    Some(v) -> v,
+    None -> default,
+  }
+}
+
+let x = Some(42);
+let y = None;
+print(unwrap_or(x, 0));
+print(unwrap_or(y, 0));

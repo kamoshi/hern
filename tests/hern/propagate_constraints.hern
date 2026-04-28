@@ -1,0 +1,13 @@
+fn add(x, y) {
+    x + y
+}
+
+fn mul(x, y) {
+    x * y
+}
+
+fn math_stuff(a, b, c) {
+    add(mul(a, b), c)
+}
+
+print(math_stuff(2.0, 3.0, 4.0));

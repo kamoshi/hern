@@ -1,0 +1,31 @@
+let greeting = "hello";
+print(greeting);
+
+let t = true;
+let f = false;
+
+let both = t && t;
+let neither = f || f;
+let one_or = t || f;
+let one_and = t && f;
+
+print(both);
+print(neither);
+print(one_or);
+print(one_and);
+
+let not_true = !t;
+let not_false = !f;
+print(not_true);
+print(not_false);
+
+fn is_same(a: string, b: string) -> bool {
+    a == b
+}
+
+print(is_same("hello", "hello"));
+print(is_same("hello", "world"));
+print("hello" != "world");
+print(t != f);
+print(1 != 1);
+print(1 != 2);

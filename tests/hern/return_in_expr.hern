@@ -1,0 +1,11 @@
+fn test_match_ret(x) {
+  let n = match x {
+    [] -> return 7.0,
+    [..] -> 2.0
+  };
+
+  n + 5.0
+}
+
+print(test_match_ret([]))
+print(test_match_ret([1.0]))

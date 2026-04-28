@@ -1,0 +1,3 @@
+fn bad(x: Option(f64)) -> f64 {
+    match x { Some(v) -> v }
+}

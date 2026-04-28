@@ -1,0 +1,5 @@
+fn scale_then_shift['a: Add + Mul](x: 'a, y: 'a, z: 'a) -> 'a {
+    x * y + z
+}
+
+print(scale_then_shift(2.0, 3.0, 4.0));

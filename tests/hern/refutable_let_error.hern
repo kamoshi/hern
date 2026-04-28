@@ -1,0 +1,4 @@
+// Constructor patterns are refutable and must not appear in let bindings.
+type Option('a) = None | Some('a)
+let Some(x) = Some(1.0);
+x
