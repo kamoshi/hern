@@ -1,28 +1,48 @@
+// Uri's Hash/Eq is stable for a given value; the clippy warning about mutable key
+// types is a false positive here. The allow is crate-wide because Uri keys appear
+// in both this file and the analysis submodules.
 #![allow(clippy::mutable_key_type)]
 mod analysis;
 
 use analysis::{
     DiagnosticsByUri, ServerState, combined_diagnostics_for_uri, completion, definition,
-    diagnostics_for_document, hover, references, rename,
+    diagnostics_for_document, document_highlights, hover, prepare_rename, references, rename,
+    semantic_tokens, semantic_tokens_legend,
 };
-use lsp_server::{Connection, Message, Notification, Response};
+use lsp_server::{Connection, Message, Notification, RequestId, Response};
 use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
-    PublishDiagnostics,
+    DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
+    Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, GotoDefinition, HoverRequest, References, Rename, Request as _,
+    Completion, DocumentHighlightRequest, GotoDefinition, HoverRequest, PrepareRenameRequest,
+    References, Rename, Request as _, SemanticTokensFullRequest,
 };
 use lsp_types::{
-    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverParams, HoverProviderCapability, InitializeParams, MarkupKind,
-    OneOf, PublishDiagnosticsParams, ReferenceParams, RenameParams, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, DocumentHighlightParams,
+    GotoDefinitionParams, GotoDefinitionResponse, HoverParams, HoverProviderCapability,
+    InitializeParams, MarkupKind, OneOf, PublishDiagnosticsParams,
+    ReferenceParams, RenameOptions, RenameParams, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Uri,
 };
+use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::time::Duration;
 
 const VALIDATION_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Decode request params or immediately send an `InvalidParams` response and return.
+/// Requires `conn` and `req` to be in scope.
+macro_rules! decode_params {
+    ($conn:expr, $req:expr, $T:ty) => {
+        match decode_request_params::<$T>(&$req.id, &$req.method, $req.params) {
+            Ok(p) => p,
+            Err(resp) => return send_response($conn, resp),
+        }
+    };
+}
 
 pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let (connection, io_threads) = Connection::stdio();
@@ -32,12 +52,24 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
-        rename_provider: Some(OneOf::Left(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
         completion_provider: Some(CompletionOptions {
             resolve_provider: Some(false),
-            trigger_characters: None,
+            trigger_characters: Some(vec![".".to_string(), "\"".to_string(), "/".to_string()]),
             ..Default::default()
         }),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: semantic_tokens_legend(),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                range: None,
+                ..Default::default()
+            },
+        )),
         ..Default::default()
     })?;
     let init_params: InitializeParams =
@@ -93,28 +125,28 @@ fn handle_request(
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     match req.method.as_str() {
         HoverRequest::METHOD => {
-            let params: HoverParams = serde_json::from_value(req.params)?;
-            let hover = hover(
+            let params: HoverParams = decode_params!(conn, req, HoverParams);
+            let result = hover(
                 state,
                 params.text_document_position_params.text_document.uri,
                 params.text_document_position_params.position,
             );
             conn.sender
-                .send(Message::Response(Response::new_ok(req.id, hover)))?;
+                .send(Message::Response(Response::new_ok(req.id, result)))?;
         }
         GotoDefinition::METHOD => {
-            let params: GotoDefinitionParams = serde_json::from_value(req.params)?;
-            let definition = definition(
+            let params: GotoDefinitionParams = decode_params!(conn, req, GotoDefinitionParams);
+            let result = definition(
                 state,
                 params.text_document_position_params.text_document.uri,
                 params.text_document_position_params.position,
             )
             .map(GotoDefinitionResponse::Scalar);
             conn.sender
-                .send(Message::Response(Response::new_ok(req.id, definition)))?;
+                .send(Message::Response(Response::new_ok(req.id, result)))?;
         }
         References::METHOD => {
-            let params: ReferenceParams = serde_json::from_value(req.params)?;
+            let params: ReferenceParams = decode_params!(conn, req, ReferenceParams);
             let locations = references(
                 state,
                 params.text_document_position.text_document.uri,
@@ -124,8 +156,21 @@ fn handle_request(
             conn.sender
                 .send(Message::Response(Response::new_ok(req.id, locations)))?;
         }
+        DocumentHighlightRequest::METHOD => {
+            let params: DocumentHighlightParams =
+                decode_params!(conn, req, DocumentHighlightParams);
+            let highlights = document_highlights(
+                state,
+                params.text_document_position_params.text_document.uri,
+                params.text_document_position_params.position,
+            );
+            conn.sender.send(Message::Response(Response::new_ok(
+                req.id,
+                Some(highlights),
+            )))?;
+        }
         Rename::METHOD => {
-            let params: RenameParams = serde_json::from_value(req.params)?;
+            let params: RenameParams = decode_params!(conn, req, RenameParams);
             match rename(
                 state,
                 params.text_document_position.text_document.uri,
@@ -137,21 +182,43 @@ fn handle_request(
                     .send(Message::Response(Response::new_ok(req.id, edit)))?,
                 Err(msg) => conn.sender.send(Message::Response(Response::new_err(
                     req.id,
-                    lsp_server::ErrorCode::InvalidParams as i32,
+                    lsp_server::ErrorCode::RequestFailed as i32,
+                    msg,
+                )))?,
+            }
+        }
+        PrepareRenameRequest::METHOD => {
+            let params: TextDocumentPositionParams =
+                decode_params!(conn, req, TextDocumentPositionParams);
+            match prepare_rename(state, params.text_document.uri, params.position) {
+                Ok(response) => conn
+                    .sender
+                    .send(Message::Response(Response::new_ok(req.id, response)))?,
+                Err(msg) => conn.sender.send(Message::Response(Response::new_err(
+                    req.id,
+                    lsp_server::ErrorCode::RequestFailed as i32,
                     msg,
                 )))?,
             }
         }
         Completion::METHOD => {
-            let params: CompletionParams = serde_json::from_value(req.params)?;
+            let params: CompletionParams = decode_params!(conn, req, CompletionParams);
             let items = completion(
                 state,
                 params.text_document_position.text_document.uri,
                 params.text_document_position.position,
             );
-            let response = CompletionResponse::Array(items);
+            conn.sender.send(Message::Response(Response::new_ok(
+                req.id,
+                Some(CompletionResponse::Array(items)),
+            )))?;
+        }
+        SemanticTokensFullRequest::METHOD => {
+            let params: SemanticTokensParams = decode_params!(conn, req, SemanticTokensParams);
+            let result: Option<SemanticTokensResult> =
+                semantic_tokens(state, params.text_document.uri);
             conn.sender
-                .send(Message::Response(Response::new_ok(req.id, Some(response))))?;
+                .send(Message::Response(Response::new_ok(req.id, result)))?;
         }
         _ => {
             let resp = Response::new_err(
@@ -165,6 +232,44 @@ fn handle_request(
     Ok(())
 }
 
+fn send_response(
+    conn: &Connection,
+    response: Response,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    conn.sender.send(Message::Response(response))?;
+    Ok(())
+}
+
+fn decode_request_params<T>(
+    id: &RequestId,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<T, Response>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(params).map_err(|err| {
+        Response::new_err(
+            id.clone(),
+            lsp_server::ErrorCode::InvalidParams as i32,
+            format!("invalid params for {method}: {err}"),
+        )
+    })
+}
+
+fn decode_notification_params<T>(method: &str, params: serde_json::Value) -> Option<T>
+where
+    T: DeserializeOwned,
+{
+    match serde_json::from_value(params) {
+        Ok(params) => Some(params),
+        Err(err) => {
+            eprintln!("invalid params for notification {method}: {err}");
+            None
+        }
+    }
+}
+
 fn handle_notification(
     conn: &Connection,
     state: &mut ServerState,
@@ -174,7 +279,10 @@ fn handle_notification(
     match notif.method.as_str() {
         DidOpenTextDocument::METHOD => {
             let params: lsp_types::DidOpenTextDocumentParams =
-                serde_json::from_value(notif.params)?;
+                match decode_notification_params(&notif.method, notif.params) {
+                    Some(params) => params,
+                    None => return Ok(()),
+                };
             let uri = params.text_document.uri;
             let affected_entries = state.entries_affected_by_document(&uri);
             state.set_document(
@@ -190,7 +298,10 @@ fn handle_notification(
         }
         DidChangeTextDocument::METHOD => {
             let params: lsp_types::DidChangeTextDocumentParams =
-                serde_json::from_value(notif.params)?;
+                match decode_notification_params(&notif.method, notif.params) {
+                    Some(params) => params,
+                    None => return Ok(()),
+                };
             if let Some(change) = params.content_changes.into_iter().last() {
                 let uri = params.text_document.uri;
                 let affected_entries = state.entries_affected_by_document(&uri);
@@ -200,7 +311,10 @@ fn handle_notification(
         }
         DidCloseTextDocument::METHOD => {
             let params: lsp_types::DidCloseTextDocumentParams =
-                serde_json::from_value(notif.params)?;
+                match decode_notification_params(&notif.method, notif.params) {
+                    Some(params) => params,
+                    None => return Ok(()),
+                };
             let uri = params.text_document.uri;
             // Capture dependent entries and entry status before mutating state.
             // Use is_open_entry (client-opened status) rather than is_known_entry
@@ -225,6 +339,16 @@ fn handle_notification(
                     publish_diagnostics(conn, state, entry_uri)?;
                 }
             }
+        }
+        DidChangeWatchedFiles::METHOD => {
+            let params: lsp_types::DidChangeWatchedFilesParams =
+                match decode_notification_params(&notif.method, notif.params) {
+                    Some(params) => params,
+                    None => return Ok(()),
+                };
+            let changed_uris = params.changes.into_iter().map(|change| change.uri);
+            let affected_entries = state.invalidate_cached_analyses_for_documents(changed_uris);
+            pending_validations.extend(affected_entries);
         }
         _ => {}
     }
@@ -328,6 +452,33 @@ mod tests {
 
     fn uri(value: &str) -> Uri {
         Uri::from_str(value).expect("test URI should parse")
+    }
+
+    #[test]
+    fn malformed_request_params_become_invalid_params_response() {
+        let id = RequestId::from(1);
+        let response = decode_request_params::<HoverParams>(
+            &id,
+            HoverRequest::METHOD,
+            serde_json::json!({ "unexpected": true }),
+        )
+        .expect_err("malformed params should produce an error response");
+
+        assert_eq!(response.id, id);
+        assert!(response.result.is_none());
+        let error = response.error.expect("response should contain an error");
+        assert_eq!(error.code, lsp_server::ErrorCode::InvalidParams as i32);
+        assert!(error.message.contains(HoverRequest::METHOD));
+    }
+
+    #[test]
+    fn malformed_notification_params_are_dropped() {
+        let decoded = decode_notification_params::<lsp_types::DidOpenTextDocumentParams>(
+            DidOpenTextDocument::METHOD,
+            serde_json::json!({ "unexpected": true }),
+        );
+
+        assert!(decoded.is_none());
     }
 
     #[test]

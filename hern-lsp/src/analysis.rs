@@ -1,2228 +1,60 @@
-#![allow(clippy::mutable_key_type)]
-use hern_core::analysis::{
-    CompilerDiagnostic, DiagnosticSeverity as CoreDiagnosticSeverity, DiagnosticSource,
-    PreludeAnalysis, analyze_prelude, hover_at,
-};
-use hern_core::ast::{
-    Expr, ExprKind, ImplMethod, Pattern, Program, SourcePosition, SourceSpan, Stmt,
-};
-use hern_core::module::{GraphInference, ModuleGraph, infer_graph};
-use hern_core::pipeline::parse_source_recovering;
-use hern_core::source_index::{
-    CompletionCandidateKind, Definition, DefinitionKind, ImportMemberReference, index_program,
-};
-use hern_core::types::infer::{TypeEnv, VariantEnv};
-use hern_core::types::{
-    Scheme, TraitConstraint, Ty, TyVar, display_ty_with_var_names, free_type_vars_in_display_order,
-    type_var_name,
-};
-use hern_core::workspace::{WorkspaceInputs, analyze_workspace};
-use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit, Diagnostic,
-    DiagnosticSeverity, Hover, HoverContents, Location, MarkupContent, MarkupKind, Position, Range,
-    TextEdit, Uri, WorkspaceEdit,
-};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+mod completion;
+mod diagnostics;
+mod hover;
+mod navigation;
+mod rename;
+mod semantic_tokens;
+mod state;
+mod uri;
+mod workspace;
 
-pub(crate) type DiagnosticsByUri = HashMap<Uri, Vec<Diagnostic>>;
+pub(crate) use diagnostics::DiagnosticsByUri;
+pub(crate) use semantic_tokens::legend as semantic_tokens_legend;
+pub(crate) use state::{ServerState, combined_diagnostics_for_uri, diagnostics_for_document};
+pub(crate) use hover::hover;
+pub(crate) use navigation::{definition, document_highlights, references};
+pub(crate) use rename::{prepare_rename, rename};
+pub(crate) use completion::completion;
 
-pub(crate) struct ServerState {
-    pub(crate) documents: HashMap<Uri, String>,
-    pub(crate) document_versions: HashMap<Uri, i32>,
-    pub(crate) diagnostics_by_entry: HashMap<Uri, DiagnosticsByUri>,
-    entry_dependencies: HashMap<Uri, HashSet<Uri>>,
-    cached_analyses: HashMap<Uri, CachedAnalysis>,
-    /// URIs that were explicitly opened by the client (via didOpen) and are treated as
-    /// entry-point documents. A document absent from this set but present in another
-    /// entry's `entry_dependencies` is dependency-only and should not get its own
-    /// entry-level diagnostic lifecycle.
-    open_entry_uris: HashSet<Uri>,
-    prelude: PreludeAnalysis,
-    /// Whether the client advertised `markdown` in its hover `contentFormat` capability.
-    /// When false, plain text is used instead of Markdown fenced blocks.
-    pub(crate) supports_markdown_hover: bool,
-}
+use uri::uri_to_path;
 
-#[derive(Clone)]
-struct CachedAnalysis {
-    document_versions: HashMap<Uri, i32>,
-    graph: ModuleGraph,
-    inference: GraphInference,
-}
-
-impl ServerState {
-    pub(crate) fn new() -> Result<Self, CompilerDiagnostic> {
-        Ok(Self {
-            documents: HashMap::new(),
-            document_versions: HashMap::new(),
-            diagnostics_by_entry: HashMap::new(),
-            entry_dependencies: HashMap::new(),
-            cached_analyses: HashMap::new(),
-            open_entry_uris: HashSet::new(),
-            prelude: analyze_prelude()?,
-            supports_markdown_hover: true,
-        })
-    }
-
-    /// Marks `uri` as a client-opened entry document. Call this when a didOpen notification
-    /// arrives. Does nothing if the URI is already marked.
-    pub(crate) fn mark_open_entry(&mut self, uri: Uri) {
-        self.open_entry_uris.insert(uri);
-    }
-
-    /// Unmarks `uri` as a client-opened entry. Call this when a didClose notification
-    /// arrives before removing the document overlay.
-    pub(crate) fn unmark_open_entry(&mut self, uri: &Uri) {
-        self.open_entry_uris.remove(uri);
-    }
-
-    /// Returns `true` if `uri` was explicitly opened by the client and is being tracked
-    /// as an entry-point document.
-    pub(crate) fn is_open_entry(&self, uri: &Uri) -> bool {
-        self.open_entry_uris.contains(uri)
-    }
-
-    pub(crate) fn set_document(&mut self, uri: Uri, text: String, version: i32) {
-        self.documents.insert(uri.clone(), text);
-        self.document_versions.insert(uri.clone(), version);
-        self.invalidate_cached_analyses_for_document(&uri);
-    }
-
-    pub(crate) fn remove_document(&mut self, uri: &Uri) {
-        self.documents.remove(uri);
-        self.document_versions.remove(uri);
-        self.invalidate_cached_analyses_for_document(uri);
-    }
-
-    pub(crate) fn entries_affected_by_document(&self, uri: &Uri) -> HashSet<Uri> {
-        // Only treat `uri` itself as an affected entry if the client opened it as one.
-        // A document that appears only as a dependency of another entry should not be
-        // re-analysed independently when it changes — the owning entries handle that.
-        let mut entries = if self.open_entry_uris.contains(uri) {
-            HashSet::from([uri.clone()])
-        } else {
-            HashSet::new()
-        };
-        entries.extend(
-            self.entry_dependencies
-                .iter()
-                .filter(|(_, dependencies)| dependencies.contains(uri))
-                .map(|(entry, _)| entry.clone()),
-        );
-        entries
-    }
-
-    fn invalidate_cached_analyses_for_document(&mut self, uri: &Uri) {
-        for entry in self.entries_affected_by_document(uri) {
-            self.cached_analyses.remove(&entry);
-        }
-    }
-
-    fn update_entry_dependencies(
-        &mut self,
-        entry_uri: &Uri,
-        graph: Option<&ModuleGraph>,
-    ) -> HashSet<Uri> {
-        let dependencies = graph
-            .map(graph_module_uris)
-            .unwrap_or_else(|| HashSet::from([entry_uri.clone()]));
-        self.entry_dependencies
-            .insert(entry_uri.clone(), dependencies.clone());
-        dependencies
-    }
-
-    pub(crate) fn remove_entry_tracking(&mut self, entry_uri: &Uri) {
-        self.entry_dependencies.remove(entry_uri);
-        self.cached_analyses.remove(entry_uri);
-    }
-}
-
-pub(crate) fn diagnostics_for_document(
-    state: &mut ServerState,
-    entry_uri: &Uri,
-) -> DiagnosticsByUri {
-    if let Some(source) = state.documents.get(entry_uri) {
-        match parse_source_recovering(source) {
-            Ok(parsed) if !parsed.diagnostics.is_empty() => {
-                state.update_entry_dependencies(entry_uri, None);
-                return diagnostics_from_compiler_diagnostics(entry_uri, parsed.diagnostics);
-            }
-            Ok(_) => {}
-            Err(diagnostic) => {
-                state.update_entry_dependencies(entry_uri, None);
-                return diagnostics_from_compiler_diagnostics(entry_uri, vec![diagnostic]);
-            }
-        }
-    }
-
-    let path = match uri_to_path(entry_uri) {
-        Some(path) => path,
-        None => {
-            return diagnostics_from_compiler_diagnostics(
-                entry_uri,
-                vec![CompilerDiagnostic::error(
-                    None,
-                    format!("unsupported document URI: {}", entry_uri.as_str()),
-                )],
-            );
-        }
-    };
-    let analysis = analyze_workspace(WorkspaceInputs {
-        entry: path,
-        overlays: document_overlays(state),
-        prelude: Some(state.prelude.program.clone()),
-    });
-    let dependencies = state.update_entry_dependencies(entry_uri, analysis.graph.as_ref());
-    if analysis.diagnostics.is_empty()
-        && let (Some(graph), Some(inference)) = (analysis.graph, analysis.inference)
-    {
-        state.cached_analyses.insert(
-            entry_uri.clone(),
-            CachedAnalysis {
-                document_versions: document_versions_for_uris(state, &dependencies),
-                graph,
-                inference,
-            },
-        );
-    }
-    diagnostics_from_compiler_diagnostics(entry_uri, analysis.diagnostics)
-}
-
-pub(crate) fn combined_diagnostics_for_uri(state: &ServerState, uri: &Uri) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-    let mut seen = HashSet::new();
-    for by_uri in state.diagnostics_by_entry.values() {
-        if let Some(items) = by_uri.get(uri) {
-            for diagnostic in items {
-                if seen.insert(diagnostic_identity(diagnostic)) {
-                    diagnostics.push(diagnostic.clone());
-                }
-            }
-        }
-    }
-    diagnostics
-}
-
-pub(crate) fn hover(state: &ServerState, uri: Uri, position: Position) -> Option<Hover> {
+pub(crate) fn semantic_tokens(
+    state: &ServerState,
+    uri: lsp_types::Uri,
+) -> Option<lsp_types::SemanticTokensResult> {
+    let source = workspace::document_source(state, &uri)?;
     let path = uri_to_path(&uri)?;
     let fallback;
-    let (graph, inference) = if let Some(analysis) = cached_analysis(state, &uri) {
-        (&analysis.graph, &analysis.inference)
+    let program = if let Some(analysis) = state::cached_analysis(state, &uri) {
+        analysis
+            .graph
+            .module_for_path(&path)
+            .map(|(_, program)| program)
     } else {
-        let analysis = analyze_workspace(WorkspaceInputs {
-            entry: path.clone(),
-            overlays: document_overlays(state),
-            prelude: Some(state.prelude.program.clone()),
-        });
-        fallback = WorkspaceAnalysis {
-            graph: analysis.graph?,
-            inference: analysis.inference?,
-        };
-        (&fallback.graph, &fallback.inference)
+        let analysis = workspace::load_document_graph_recovering(state, &uri)?;
+        fallback = analysis;
+        fallback.module_for_path(&path).map(|(_, program)| program)
     };
-    let (module_name, program) = graph.module_for_path(&path)?;
-    let expr_types = inference.expr_types_for_module(module_name)?;
-    let symbol_types = inference.symbol_types_for_module(module_name)?;
-    let position = SourcePosition {
-        line: position.line as usize + 1,
-        col: position.character as usize + 1,
-    };
-    let markdown = state.supports_markdown_hover;
-    if let Some(contents) = symbol_hover(graph, inference, module_name, program, position) {
-        return Some(type_hover(contents, markdown));
-    }
-    let info = hover_at(program, expr_types, symbol_types, position)?;
-    Some(type_hover(ty_to_display_string(&info.ty), markdown))
-}
-
-/// Wrap a type string for display in a hover response.
-///
-/// When `markdown` is true (client advertised markdown hover support), the type is
-/// wrapped in a fenced `hern` code block so editors can syntax-highlight it.
-/// When false, a plain-text response is returned for compatibility with older clients.
-fn type_hover(ty: String, markdown: bool) -> Hover {
-    let contents = if markdown {
-        HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: format!("```hern\n{ty}\n```"),
-        })
-    } else {
-        HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::PlainText,
-            value: ty,
-        })
-    };
-    Hover {
-        contents,
-        range: None,
-    }
-}
-
-fn symbol_hover(
-    graph: &ModuleGraph,
-    inference: &GraphInference,
-    module_name: &str,
-    program: &Program,
-    position: SourcePosition,
-) -> Option<String> {
-    let index = index_program(program);
-    if let Some(reference) = index.import_member_reference_at(position) {
-        return imported_member_hover_text(graph, inference, reference);
-    }
-
-    let definition = index.definition_at(position)?;
-    definition_hover_text(
-        definition,
-        inference.env_for_module(module_name),
-        inference.expr_types_for_module(module_name),
-        inference.binding_types_for_module(module_name),
-        inference.definition_schemes_for_module(module_name),
-        inference.variant_env_for_module(module_name),
-        program,
-    )
-}
-
-/// Display a bare `Ty` with normalized type variable names.
-///
-/// Unlike `ty.to_string()`, this wraps the type in a `Scheme` so that internal
-/// type variable IDs (e.g. `'70`) are renamed to human-readable names (`'a`, `'b`, …).
-fn ty_to_display_string(ty: &Ty) -> String {
-    let vars = free_type_vars_in_display_order(ty);
-    let constraints = match ty {
-        Ty::Qualified(constraints, _) => constraints.clone(),
-        _ => vec![],
-    };
-    scheme_to_display_string(
-        &Scheme {
-            vars,
-            constraints,
-            ty: ty.clone(),
-        },
-        true,
-    )
-}
-
-fn completion_ty_to_display_string(ty: &Ty) -> String {
-    let vars = free_type_vars_in_display_order(ty);
-    let constraints = match ty {
-        Ty::Qualified(constraints, _) => constraints.clone(),
-        _ => vec![],
-    };
-    scheme_to_display_string(
-        &Scheme {
-            vars,
-            constraints,
-            ty: ty.clone(),
-        },
-        false,
-    )
-}
-
-fn hover_scheme_to_string(scheme: &Scheme) -> String {
-    scheme_to_display_string(scheme, true)
-}
-
-fn completion_scheme_to_string(scheme: &Scheme) -> String {
-    scheme_to_display_string(scheme, false)
-}
-
-fn scheme_to_display_string(scheme: &Scheme, include_constraints: bool) -> String {
-    let names = type_var_names(scheme);
-    let mut out = display_ty_body_for_lsp(&scheme.ty, &names);
-    if include_constraints {
-        let constraints = constraints_by_var(scheme, &names);
-        if !constraints.is_empty() {
-            out.push_str("\n\nConstraints:");
-            for (name, traits) in constraints {
-                out.push_str(&format!("\n- '{}: {}", name, traits.join(" + ")));
-            }
-        }
-    }
-    out
-}
-
-fn display_ty_body_for_lsp(ty: &Ty, names: &HashMap<TyVar, String>) -> String {
-    match ty {
-        Ty::Qualified(_, inner) => display_ty_body_for_lsp(inner, names),
-        _ => display_ty_with_var_names(ty, names),
-    }
-}
-
-fn type_var_names(scheme: &Scheme) -> HashMap<TyVar, String> {
-    let mut vars = scheme.vars.clone();
-    for var in free_type_vars_in_display_order(&scheme.ty) {
-        if !vars.contains(&var) {
-            vars.push(var);
-        }
-    }
-    for constraint in &scheme.constraints {
-        if !vars.contains(&constraint.var) {
-            vars.push(constraint.var);
-        }
-    }
-
-    vars.into_iter()
-        .enumerate()
-        .map(|(idx, var)| (var, type_var_name(idx)))
-        .collect()
-}
-
-fn constraints_by_var(
-    scheme: &Scheme,
-    names: &HashMap<TyVar, String>,
-) -> Vec<(String, Vec<String>)> {
-    let mut grouped: Vec<(TyVar, Vec<String>)> = Vec::new();
-    for constraint in &scheme.constraints {
-        let resolved_var = constraint_var_for_hover(constraint, &scheme.ty);
-        if let Some((_, traits)) = grouped.iter_mut().find(|(var, _)| *var == resolved_var) {
-            if !traits.contains(&constraint.trait_name) {
-                traits.push(constraint.trait_name.clone());
-            }
-        } else {
-            grouped.push((resolved_var, vec![constraint.trait_name.clone()]));
-        }
-    }
-    grouped.sort_by_key(|(var, _)| names.get(var).cloned().unwrap_or_else(|| var.to_string()));
-    grouped
-        .into_iter()
-        .map(|(var, traits)| {
-            (
-                names.get(&var).cloned().unwrap_or_else(|| var.to_string()),
-                traits,
-            )
-        })
-        .collect()
-}
-
-fn constraint_var_for_hover(constraint: &TraitConstraint, ty: &Ty) -> TyVar {
-    match ty {
-        Ty::Qualified(_, inner) => match inner.as_ref() {
-            Ty::Var(var) => *var,
-            _ => constraint.var,
-        },
-        _ => constraint.var,
-    }
-}
-
-fn type_declaration_hover_text(program: &Program, definition: &Definition) -> Option<String> {
-    match definition.kind {
-        DefinitionKind::Type => program.stmts.iter().find_map(|stmt| match stmt {
-            Stmt::Type(type_def) if type_def.name_span == definition.location.span => {
-                let params = type_params_suffix(&type_def.params);
-                let variants = type_def
-                    .variants
-                    .iter()
-                    .map(|variant| match &variant.payload {
-                        Some(payload) => {
-                            format!("{}({})", variant.name, ast_type_to_string(payload))
-                        }
-                        None => variant.name.clone(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                Some(format!("type {}{} = {}", type_def.name, params, variants))
-            }
-            _ => None,
-        }),
-        DefinitionKind::TypeAlias => program.stmts.iter().find_map(|stmt| match stmt {
-            Stmt::TypeAlias {
-                name,
-                name_span,
-                params,
-                ty,
-                ..
-            } if *name_span == definition.location.span => Some(format!(
-                "type {}{} = {}",
-                name,
-                type_params_suffix(params),
-                ast_type_to_string(ty)
-            )),
-            _ => None,
-        }),
-        DefinitionKind::Trait => program.stmts.iter().find_map(|stmt| match stmt {
-            Stmt::Trait(trait_def) if trait_def.name_span == definition.location.span => {
-                Some(format!("trait {} {}", trait_def.name, trait_def.param))
-            }
-            _ => None,
-        }),
-        DefinitionKind::TraitMethod => program.stmts.iter().find_map(|stmt| match stmt {
-            Stmt::Trait(trait_def) => trait_def
-                .methods
-                .iter()
-                .find(|method| method.name_span == definition.location.span)
-                .map(trait_method_signature),
-            _ => None,
-        }),
-        DefinitionKind::ImplMethod => program.stmts.iter().find_map(|stmt| match stmt {
-            Stmt::Impl(impl_def) => impl_def
-                .methods
-                .iter()
-                .find(|method| method.name_span == definition.location.span)
-                .map(impl_method_signature),
-            _ => None,
-        }),
-        _ => None,
-    }
-}
-
-fn trait_method_signature(method: &hern_core::ast::TraitMethod) -> String {
-    let params = method
-        .params
-        .iter()
-        .map(|(name, ty)| format!("{name}: {}", ast_type_to_string(ty)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "fn {}({}) -> {}",
-        method.name,
-        params,
-        ast_type_to_string(&method.ret_type)
-    )
-}
-
-fn impl_method_signature(method: &ImplMethod) -> String {
-    let params = method
-        .params
-        .iter()
-        .map(|(pat, ty)| {
-            let pat = pattern_to_string(pat);
-            match ty {
-                Some(ty) => format!("{pat}: {}", ast_type_to_string(ty)),
-                None => pat,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    match &method.ret_type {
-        Some(ret) => format!(
-            "fn {}({}) -> {}",
-            method.name,
-            params,
-            ast_type_to_string(ret)
-        ),
-        None => format!("fn {}({})", method.name, params),
-    }
-}
-
-fn type_params_suffix(params: &[String]) -> String {
-    if params.is_empty() {
-        String::new()
-    } else {
-        format!("({})", params.join(", "))
-    }
-}
-
-fn ast_type_to_string(ty: &hern_core::ast::Type) -> String {
-    use hern_core::ast::Type;
-    match ty {
-        Type::Ident(name) | Type::Var(name) => name.clone(),
-        Type::App(con, args) => format!(
-            "{}({})",
-            ast_type_to_string(con),
-            args.iter()
-                .map(ast_type_to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Type::Func(params, ret) => format!(
-            "fn({}) -> {}",
-            params
-                .iter()
-                .map(ast_type_to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-            ast_type_to_string(ret)
-        ),
-        Type::Tuple(items) => format!(
-            "({})",
-            items
-                .iter()
-                .map(ast_type_to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Type::Record(fields, is_open) => {
-            let mut parts = fields
-                .iter()
-                .map(|(name, ty)| format!("{name}: {}", ast_type_to_string(ty)))
-                .collect::<Vec<_>>();
-            if *is_open {
-                parts.push("..".to_string());
-            }
-            format!("#{{ {} }}", parts.join(", "))
-        }
-        Type::Unit => "()".to_string(),
-        Type::Hole => "*".to_string(),
-    }
-}
-
-fn pattern_to_string(pat: &Pattern) -> String {
-    match pat {
-        Pattern::Wildcard => "_".to_string(),
-        Pattern::StringLit(value) => format!("{value:?}"),
-        Pattern::Variable(name, _) => name.clone(),
-        Pattern::Constructor { name, binding } => match binding {
-            Some((binding, _)) => format!("{name}({binding})"),
-            None => name.clone(),
-        },
-        Pattern::Record { fields, rest } => {
-            let mut parts = fields
-                .iter()
-                .map(|(field, binding, _)| {
-                    if field == binding {
-                        field.clone()
-                    } else {
-                        format!("{field}: {binding}")
-                    }
-                })
-                .collect::<Vec<_>>();
-            match rest {
-                Some(Some((name, _))) => parts.push(format!("..{name}")),
-                Some(None) => parts.push("..".to_string()),
-                None => {}
-            }
-            format!("#{{ {} }}", parts.join(", "))
-        }
-        Pattern::List { elements, rest } => {
-            let mut parts = elements.iter().map(pattern_to_string).collect::<Vec<_>>();
-            match rest {
-                Some(Some((name, _))) => parts.push(format!("..{name}")),
-                Some(None) => parts.push("..".to_string()),
-                None => {}
-            }
-            format!("[{}]", parts.join(", "))
-        }
-        Pattern::Tuple(items) => format!(
-            "({})",
-            items
-                .iter()
-                .map(pattern_to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
-}
-
-/// Resolve the hover type for an imported module member.
-///
-/// Uses the module's export record type (`import_types`) rather than searching
-/// by definition name, so it correctly handles aliased exports (`#{ public: private }`),
-/// exported literals, and computed export expressions.
-fn imported_member_hover_text(
-    graph: &ModuleGraph,
-    inference: &GraphInference,
-    reference: &ImportMemberReference,
-) -> Option<String> {
-    // Primary path: look up the field from the module's concrete export type.
-    // This is correct for all export shapes, including aliased names.
-    if let Some(Ty::Record(row)) = inference.import_types.get(&reference.module_name) {
-        if let Some((_, field_ty)) = row.fields.iter().find(|(f, _)| f == &reference.member_name) {
-            return Some(ty_to_display_string(field_ty));
-        }
-    }
-
-    // Fallback: definition-based lookup for non-record or unavailable export shapes.
-    let target_program = graph.module(&reference.module_name)?;
-    let target_index = index_program(target_program);
-    let target_definition = target_index.definition_named(&reference.member_name)?;
-    definition_hover_text(
-        target_definition,
-        inference.env_for_module(&reference.module_name),
-        inference.expr_types_for_module(&reference.module_name),
-        inference.binding_types_for_module(&reference.module_name),
-        inference.definition_schemes_for_module(&reference.module_name),
-        inference.variant_env_for_module(&reference.module_name),
-        target_program,
-    )
-}
-
-fn definition_hover_text(
-    definition: &Definition,
-    env: Option<&TypeEnv>,
-    expr_types: Option<&HashMap<hern_core::ast::NodeId, Ty>>,
-    binding_types: Option<&HashMap<SourceSpan, Ty>>,
-    definition_schemes: Option<&HashMap<SourceSpan, Scheme>>,
-    variant_env: Option<&VariantEnv>,
-    program: &Program,
-) -> Option<String> {
-    if let Some(scheme) =
-        definition_schemes.and_then(|schemes| schemes.get(&definition.location.span))
-    {
-        return Some(hover_scheme_to_string(scheme));
-    }
-
-    if matches!(
-        definition.kind,
-        DefinitionKind::Let | DefinitionKind::Parameter
-    ) && let Some(ty) = binding_types.and_then(|types| types.get(&definition.location.span))
-    {
-        return Some(ty_to_display_string(ty));
-    }
-
-    // For parameter definitions, use ONLY the pattern-based type lookup.
-    // Do NOT fall through to env.get(name): a same-named top-level binding would
-    // produce a misleading type (lambda params, shadowed names, etc.).
-    if definition.kind == DefinitionKind::Parameter {
-        return param_hover_text(definition, program, env, expr_types, variant_env);
-    }
-
-    if let Some(info) = env.and_then(|env| env.get(&definition.name)) {
-        return Some(hover_scheme_to_string(&info.scheme));
-    }
-
-    // For destructured local let/for/match bindings,
-    // extract the specific binding type from the RHS via the pattern structure.
-    if definition.kind == DefinitionKind::Let {
-        if let Some(types) = expr_types {
-            if let Some(ty) = local_pattern_binding_type(
-                program,
-                &definition.name,
-                definition.location.span,
-                types,
-                binding_types,
-                variant_env,
-            ) {
-                return Some(ty);
-            }
-        }
-    }
-
-    expr_types
-        .and_then(|types| declaration_value_type(program, definition.location.span, types))
-        .map(|ty| ty_to_display_string(ty))
-        .or_else(|| type_declaration_hover_text(program, definition))
-}
-
-/// Given a Parameter definition, find the enclosing callable and return the
-/// parameter's type as a string.
-fn param_hover_text(
-    definition: &Definition,
-    program: &Program,
-    env: Option<&TypeEnv>,
-    expr_types: Option<&HashMap<hern_core::ast::NodeId, Ty>>,
-    variant_env: Option<&VariantEnv>,
-) -> Option<String> {
-    let param_span = definition.location.span;
-    for stmt in &program.stmts {
-        if let Some(ty) = param_type_in_stmt(
-            stmt,
-            &definition.name,
-            param_span,
-            env,
-            expr_types,
-            variant_env,
-        ) {
-            return Some(ty);
-        }
-    }
-    None
-}
-
-fn param_type_in_stmt(
-    stmt: &Stmt,
-    name: &str,
-    param_span: SourceSpan,
-    env: Option<&TypeEnv>,
-    expr_types: Option<&HashMap<hern_core::ast::NodeId, Ty>>,
-    variant_env: Option<&VariantEnv>,
-) -> Option<String> {
-    match stmt {
-        Stmt::Fn {
-            name: fn_name,
-            params,
-            ..
-        }
-        | Stmt::Op {
-            name: fn_name,
-            params,
-            ..
-        } => param_type_from_fn_scheme(fn_name, params, name, param_span, env, variant_env),
-        Stmt::Impl(id) => {
-            let dict_key = format!("__{}__{}", id.trait_name, impl_target_name(&id.target));
-            for method in &id.methods {
-                if let Some(ty) =
-                    param_type_from_impl_dict(&dict_key, method, name, param_span, env, variant_env)
-                {
-                    return Some(ty);
-                }
-            }
-            None
-        }
-        Stmt::Let { value, .. } => {
-            param_type_in_expr_stmts(value, name, param_span, env, expr_types, variant_env)
-        }
-        Stmt::Expr(expr) => {
-            param_type_in_expr_stmts(expr, name, param_span, env, expr_types, variant_env)
-        }
-        _ => None,
-    }
-}
-
-/// Mirrors `impl_target_name` from the type inferencer.
-fn impl_target_name(target: &hern_core::ast::Type) -> String {
-    match target {
-        hern_core::ast::Type::Ident(name) => name.clone(),
-        hern_core::ast::Type::App(con, _) => impl_target_name(con),
-        _ => "Unknown".to_string(),
-    }
-}
-
-/// Find the param in `params` that owns the binding `(param_name, param_span)`, then
-/// extract the concrete type of *that binding* from the function's scheme.
-///
-/// For a top-level `Variable` param the binding type is the whole param type.
-/// For a `Record` param the binding type is the type of the matched field.
-fn param_type_from_fn_scheme(
-    fn_name: &str,
-    params: &[(Pattern, Option<hern_core::ast::Type>)],
-    param_name: &str,
-    param_span: SourceSpan,
-    env: Option<&TypeEnv>,
-    variant_env: Option<&VariantEnv>,
-) -> Option<String> {
-    let param_idx = params
-        .iter()
-        .position(|(pat, _)| pattern_has_binding_at(pat, param_name, param_span))?;
-    let param_pat = &params[param_idx].0;
-
-    let scheme = env.and_then(|e| e.get(fn_name))?;
-    let Ty::Func(param_tys, _) = &scheme.scheme.ty else {
-        return None;
-    };
-    let param_ty = param_tys.get(param_idx)?;
-
-    // Navigate through the pattern structure to find the type of the specific binding.
-    let binding_ty =
-        extract_binding_type(param_pat, param_name, param_span, param_ty, variant_env)?;
-    let display_scheme = Scheme {
-        vars: scheme.scheme.vars.clone(),
-        constraints: scheme.scheme.constraints.clone(),
-        ty: binding_ty,
-    };
-    Some(hover_scheme_to_string(&display_scheme))
-}
-
-/// Impl methods are stored in the type env as a trait dictionary: a record type
-/// whose fields are the method names and whose field types are the method function
-/// types.  Look up the dict, find the method's `Ty::Func`, then extract the
-/// param binding type the same way as for ordinary functions.
-fn param_type_from_impl_dict(
-    dict_key: &str,
-    method: &ImplMethod,
-    param_name: &str,
-    param_span: SourceSpan,
-    env: Option<&TypeEnv>,
-    variant_env: Option<&VariantEnv>,
-) -> Option<String> {
-    let param_idx = method
-        .params
-        .iter()
-        .position(|(pat, _)| pattern_has_binding_at(pat, param_name, param_span))?;
-    let param_pat = &method.params[param_idx].0;
-
-    let dict_scheme = env.and_then(|e| e.get(dict_key))?;
-    // The dict is stored as Ty::Record where each field is the method's Func type.
-    let Ty::Record(row) = &dict_scheme.scheme.ty else {
-        return None;
-    };
-    let method_ty = row
-        .fields
-        .iter()
-        .find(|(f, _)| f == &method.name)
-        .map(|(_, ty)| ty)?;
-    let Ty::Func(param_tys, _) = method_ty else {
-        return None;
-    };
-    let param_ty = param_tys.get(param_idx)?;
-
-    let binding_ty =
-        extract_binding_type(param_pat, param_name, param_span, param_ty, variant_env)?;
-    let display_scheme = Scheme {
-        vars: dict_scheme.scheme.vars.clone(),
-        constraints: dict_scheme.scheme.constraints.clone(),
-        ty: binding_ty,
-    };
-    Some(hover_scheme_to_string(&display_scheme))
-}
-
-/// Recursively navigate `pat` to find the sub-type corresponding to the binding
-/// `(target_name, target_span)` within the type `param_ty`.
-fn extract_binding_type(
-    pat: &Pattern,
-    target_name: &str,
-    target_span: SourceSpan,
-    param_ty: &Ty,
-    variant_env: Option<&VariantEnv>,
-) -> Option<Ty> {
-    match pat {
-        Pattern::Variable(n, s) if n == target_name && *s == target_span => Some(param_ty.clone()),
-        Pattern::Record { fields, rest } => {
-            let Ty::Record(row) = param_ty else {
-                return None;
-            };
-            // Named field bindings.
-            for (field_name, bind_name, bind_span) in fields {
-                if bind_name == target_name && *bind_span == target_span {
-                    return row
-                        .fields
-                        .iter()
-                        .find(|(f, _)| f == field_name)
-                        .map(|(_, ty)| ty.clone());
-                }
-            }
-            // Rest binding `..rest` — its type is the remaining record fields
-            // (those not bound by name in this pattern) plus the row's tail.
-            if let Some(Some((rest_name, rest_span))) = rest {
-                if rest_name == target_name && *rest_span == target_span {
-                    let named: std::collections::HashSet<&str> =
-                        fields.iter().map(|(f, _, _)| f.as_str()).collect();
-                    let rest_fields: Vec<(String, Ty)> = row
-                        .fields
-                        .iter()
-                        .filter(|(f, _)| !named.contains(f.as_str()))
-                        .cloned()
-                        .collect();
-                    return Some(Ty::Record(hern_core::types::Row {
-                        fields: rest_fields,
-                        tail: row.tail.clone(),
-                    }));
-                }
-            }
-            None
-        }
-        Pattern::List { elements, rest } => {
-            let Ty::App(con, args) = param_ty else {
-                return None;
-            };
-            let Ty::Con(name) = con.as_ref() else {
-                return None;
-            };
-            if name != "Array" {
-                return None;
-            }
-            let elem_ty = args.first()?;
-            for elem_pat in elements {
-                if let Some(ty) =
-                    extract_binding_type(elem_pat, target_name, target_span, elem_ty, variant_env)
-                {
-                    return Some(ty);
-                }
-            }
-            if let Some(Some((rest_name, rest_span))) = rest {
-                if rest_name == target_name && *rest_span == target_span {
-                    return Some(param_ty.clone());
-                }
-            }
-            None
-        }
-        // Tuple: element i binds to the i-th element type of a Ty::Tuple.
-        Pattern::Tuple(elems) => {
-            let Ty::Tuple(elem_tys) = param_ty else {
-                return None;
-            };
-            for (elem_pat, elem_ty) in elems.iter().zip(elem_tys.iter()) {
-                if let Some(ty) =
-                    extract_binding_type(elem_pat, target_name, target_span, elem_ty, variant_env)
-                {
-                    return Some(ty);
-                }
-            }
-            None
-        }
-        Pattern::Constructor { name, binding } => {
-            if let Some((bind_name, bind_span)) = binding {
-                if bind_name == target_name && *bind_span == target_span {
-                    return constructor_payload_type(name, param_ty, variant_env);
-                }
-            }
-            None
-        }
-        // Wildcards have no bindings; any other pattern is unreachable here after
-        // the irrefutability check in the type inferencer.
-        _ => None,
-    }
-}
-
-/// Resolve the payload type of a constructor binding such as `Some(x)` or `Err(e)`.
-///
-/// Uses the variant environment to correctly map type parameters to their instantiated
-/// types — for example, `Err(e)` in a `Result(f64, string)` correctly yields `string`
-/// rather than the first type argument.
-///
-/// Falls back to a positional heuristic (`args[0]` / `args[1]` for `Err`) only when the
-/// variant environment is unavailable.
-fn constructor_payload_type(
-    constructor: &str,
-    outer_ty: &Ty,
-    variant_env: Option<&VariantEnv>,
-) -> Option<Ty> {
-    let args = match outer_ty {
-        Ty::App(_, args) => args.as_slice(),
-        _ => &[],
-    };
-
-    if let Some(venv) = variant_env {
-        if let Some(info) = venv.0.get(constructor) {
-            if let Some(payload_ty) = &info.payload_ty {
-                return Some(instantiate_variant_template(
-                    payload_ty,
-                    &info.type_param_vars,
-                    args,
-                ));
-            }
-        }
-    }
-
-    // Fallback when variant_env is unavailable: use the position heuristic
-    // that works for Option('a) and Result('a, 'e).
-    match outer_ty {
-        Ty::App(_, args) if constructor == "Err" => args.get(1).cloned(),
-        Ty::App(_, args) => args.first().cloned(),
-        _ => None,
-    }
-}
-
-fn instantiate_variant_template(
-    template: &Ty,
-    type_param_vars: &[hern_core::types::TyVar],
-    args: &[Ty],
-) -> Ty {
-    match template {
-        Ty::Var(var) => type_param_vars
-            .iter()
-            .position(|param_var| param_var == var)
-            .and_then(|idx| args.get(idx).cloned())
-            .unwrap_or(Ty::Var(*var)),
-        Ty::Qualified(constraints, inner) => Ty::Qualified(
-            constraints
-                .iter()
-                .filter_map(|constraint| {
-                    let var = match type_param_vars
-                        .iter()
-                        .position(|param_var| param_var == &constraint.var)
-                        .and_then(|idx| args.get(idx))
-                    {
-                        Some(Ty::Var(var)) => *var,
-                        Some(_) => return None,
-                        None => constraint.var,
-                    };
-                    Some(hern_core::types::TraitConstraint {
-                        var,
-                        trait_name: constraint.trait_name.clone(),
-                    })
-                })
-                .collect(),
-            Box::new(instantiate_variant_template(inner, type_param_vars, args)),
-        ),
-        Ty::Tuple(items) => Ty::Tuple(
-            items
-                .iter()
-                .map(|ty| instantiate_variant_template(ty, type_param_vars, args))
-                .collect(),
-        ),
-        Ty::Func(params, ret) => Ty::Func(
-            params
-                .iter()
-                .map(|ty| instantiate_variant_template(ty, type_param_vars, args))
-                .collect(),
-            Box::new(instantiate_variant_template(ret, type_param_vars, args)),
-        ),
-        Ty::App(con, params) => Ty::App(
-            Box::new(instantiate_variant_template(con, type_param_vars, args)),
-            params
-                .iter()
-                .map(|ty| instantiate_variant_template(ty, type_param_vars, args))
-                .collect(),
-        ),
-        Ty::Record(row) => Ty::Record(hern_core::types::Row {
-            fields: row
-                .fields
-                .iter()
-                .map(|(name, ty)| {
-                    (
-                        name.clone(),
-                        instantiate_variant_template(ty, type_param_vars, args),
-                    )
-                })
-                .collect(),
-            tail: Box::new(instantiate_variant_template(
-                &row.tail,
-                type_param_vars,
-                args,
-            )),
-        }),
-        Ty::F64 | Ty::Unit | Ty::Con(_) => template.clone(),
-    }
-}
-
-fn param_type_in_expr_stmts(
-    expr: &Expr,
-    name: &str,
-    param_span: SourceSpan,
-    env: Option<&TypeEnv>,
-    expr_types: Option<&HashMap<hern_core::ast::NodeId, Ty>>,
-    variant_env: Option<&VariantEnv>,
-) -> Option<String> {
-    match &expr.kind {
-        ExprKind::Lambda { params, body } => {
-            if let Some(idx) = params
-                .iter()
-                .position(|(pat, _)| pattern_has_binding_at(pat, name, param_span))
-            {
-                // Look up the lambda's Ty::Func from expr_types to get the param type.
-                let types = expr_types?;
-                let Ty::Func(param_tys, _) = types.get(&expr.id)? else {
-                    return None;
-                };
-                let param_ty = param_tys.get(idx)?;
-                let pat = &params[idx].0;
-                return extract_binding_type(pat, name, param_span, param_ty, variant_env)
-                    .map(|ty| ty_to_display_string(&ty));
-            }
-            param_type_in_expr_stmts(body, name, param_span, env, expr_types, variant_env)
-        }
-        ExprKind::Block { stmts, final_expr } => {
-            for stmt in stmts {
-                if let Some(ty) =
-                    param_type_in_stmt(stmt, name, param_span, env, expr_types, variant_env)
-                {
-                    return Some(ty);
-                }
-            }
-            final_expr.as_deref().and_then(|e| {
-                param_type_in_expr_stmts(e, name, param_span, env, expr_types, variant_env)
-            })
-        }
-        ExprKind::Not(e)
-        | ExprKind::Loop(e)
-        | ExprKind::Break(Some(e))
-        | ExprKind::Return(Some(e))
-        | ExprKind::FieldAccess { expr: e, .. } => {
-            param_type_in_expr_stmts(e, name, param_span, env, expr_types, variant_env)
-        }
-        ExprKind::Assign { target, value }
-        | ExprKind::Binary {
-            lhs: target,
-            rhs: value,
-            ..
-        } => param_type_in_expr_stmts(target, name, param_span, env, expr_types, variant_env)
-            .or_else(|| {
-                param_type_in_expr_stmts(value, name, param_span, env, expr_types, variant_env)
-            }),
-        ExprKind::Call { callee, args, .. } => {
-            param_type_in_expr_stmts(callee, name, param_span, env, expr_types, variant_env)
-                .or_else(|| {
-                    args.iter().find_map(|a| {
-                        param_type_in_expr_stmts(a, name, param_span, env, expr_types, variant_env)
-                    })
-                })
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => param_type_in_expr_stmts(cond, name, param_span, env, expr_types, variant_env)
-            .or_else(|| {
-                param_type_in_expr_stmts(
-                    then_branch,
-                    name,
-                    param_span,
-                    env,
-                    expr_types,
-                    variant_env,
-                )
-            })
-            .or_else(|| {
-                param_type_in_expr_stmts(
-                    else_branch,
-                    name,
-                    param_span,
-                    env,
-                    expr_types,
-                    variant_env,
-                )
-            }),
-        ExprKind::Match { scrutinee, arms } => {
-            param_type_in_expr_stmts(scrutinee, name, param_span, env, expr_types, variant_env)
-                .or_else(|| {
-                    arms.iter().find_map(|(_, body)| {
-                        param_type_in_expr_stmts(
-                            body,
-                            name,
-                            param_span,
-                            env,
-                            expr_types,
-                            variant_env,
-                        )
-                    })
-                })
-        }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => items.iter().find_map(|item| {
-            param_type_in_expr_stmts(item, name, param_span, env, expr_types, variant_env)
-        }),
-        ExprKind::Record(fields) => fields.iter().find_map(|(_, v)| {
-            param_type_in_expr_stmts(v, name, param_span, env, expr_types, variant_env)
-        }),
-        ExprKind::For { iterable, body, .. } => {
-            param_type_in_expr_stmts(iterable, name, param_span, env, expr_types, variant_env)
-                .or_else(|| {
-                    param_type_in_expr_stmts(body, name, param_span, env, expr_types, variant_env)
-                })
-        }
-        ExprKind::Break(None)
-        | ExprKind::Return(None)
-        | ExprKind::Continue
-        | ExprKind::Number(_)
-        | ExprKind::StringLit(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Ident(_)
-        | ExprKind::Import(_)
-        | ExprKind::Unit => None,
-    }
-}
-
-fn pattern_has_binding_at(pat: &Pattern, name: &str, span: SourceSpan) -> bool {
-    match pat {
-        Pattern::Variable(n, s) => n == name && *s == span,
-        Pattern::Constructor {
-            binding: Some((n, s)),
-            ..
-        } => n == name && *s == span,
-        Pattern::Record { fields, rest } => {
-            fields.iter().any(|(_, b, s)| b == name && *s == span)
-                || matches!(rest, Some(Some((n, s))) if n == name && *s == span)
-        }
-        Pattern::List { elements, rest } => {
-            elements
-                .iter()
-                .any(|elem| pattern_has_binding_at(elem, name, span))
-                || matches!(rest, Some(Some((n, s))) if n == name && *s == span)
-        }
-        Pattern::Tuple(elems) => elems.iter().any(|e| pattern_has_binding_at(e, name, span)),
-        _ => false,
-    }
-}
-
-/// Returns true if any binding span in `pat` equals `span`.
-fn pattern_has_span_at(pat: &Pattern, span: SourceSpan) -> bool {
-    match pat {
-        Pattern::Variable(_, s) => *s == span,
-        Pattern::Constructor {
-            binding: Some((_, s)),
-            ..
-        } => *s == span,
-        Pattern::Record { fields, rest } => {
-            fields.iter().any(|(_, _, s)| *s == span)
-                || matches!(rest, Some(Some((_, s))) if *s == span)
-        }
-        Pattern::List { elements, rest } => {
-            elements.iter().any(|elem| pattern_has_span_at(elem, span))
-                || matches!(rest, Some(Some((_, s))) if *s == span)
-        }
-        Pattern::Tuple(elems) => elems.iter().any(|e| pattern_has_span_at(e, span)),
-        _ => false,
-    }
-}
-
-/// For a local binding introduced by `let`, `for`, or `match`, recover the binding type
-/// by traversing the expression and pattern structure.
-fn local_pattern_binding_type(
-    program: &Program,
-    name: &str,
-    binding_span: SourceSpan,
-    expr_types: &HashMap<hern_core::ast::NodeId, Ty>,
-    binding_types: Option<&HashMap<SourceSpan, Ty>>,
-    variant_env: Option<&VariantEnv>,
-) -> Option<String> {
-    if let Some(ty) = binding_types.and_then(|types| types.get(&binding_span)) {
-        return Some(ty_to_display_string(ty));
-    }
-
-    for stmt in &program.stmts {
-        if let Some(ty) =
-            local_pattern_binding_type_in_stmt(stmt, name, binding_span, expr_types, variant_env)
-        {
-            return Some(ty);
-        }
-    }
-    None
-}
-
-fn local_pattern_binding_type_in_stmt(
-    stmt: &Stmt,
-    name: &str,
-    binding_span: SourceSpan,
-    expr_types: &HashMap<hern_core::ast::NodeId, Ty>,
-    variant_env: Option<&VariantEnv>,
-) -> Option<String> {
-    match stmt {
-        Stmt::Let { pat, value, .. } => {
-            if !matches!(pat, Pattern::Variable(_, _) | Pattern::Wildcard)
-                && pattern_has_binding_at(pat, name, binding_span)
-            {
-                if let Some(rhs_ty) = expr_types.get(&value.id) {
-                    if let Some(binding_ty) =
-                        extract_binding_type(pat, name, binding_span, rhs_ty, variant_env)
-                    {
-                        return Some(ty_to_display_string(&binding_ty));
-                    }
-                }
-            }
-            local_pattern_binding_type_in_expr(value, name, binding_span, expr_types, variant_env)
-        }
-        Stmt::Expr(value) => {
-            local_pattern_binding_type_in_expr(value, name, binding_span, expr_types, variant_env)
-        }
-        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
-            local_pattern_binding_type_in_expr(body, name, binding_span, expr_types, variant_env)
-        }
-        Stmt::Impl(impl_def) => impl_def.methods.iter().find_map(|method| {
-            local_pattern_binding_type_in_expr(
-                &method.body,
-                name,
-                binding_span,
-                expr_types,
-                variant_env,
-            )
-        }),
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
-    }
-}
-
-fn local_pattern_binding_type_in_expr(
-    expr: &Expr,
-    name: &str,
-    binding_span: SourceSpan,
-    expr_types: &HashMap<hern_core::ast::NodeId, Ty>,
-    variant_env: Option<&VariantEnv>,
-) -> Option<String> {
-    match &expr.kind {
-        ExprKind::For {
-            pat,
-            iterable,
-            body,
-            ..
-        } => {
-            if pattern_has_binding_at(pat, name, binding_span) {
-                if let Some(iterable_ty) = expr_types.get(&iterable.id) {
-                    if let Some(elem_ty) = iterable_element_type(iterable_ty) {
-                        if let Some(binding_ty) =
-                            extract_binding_type(pat, name, binding_span, elem_ty, variant_env)
-                        {
-                            return Some(ty_to_display_string(&binding_ty));
-                        }
-                    }
-                }
-            }
-            local_pattern_binding_type_in_expr(
-                iterable,
-                name,
-                binding_span,
-                expr_types,
-                variant_env,
-            )
-            .or_else(|| {
-                local_pattern_binding_type_in_expr(
-                    body,
-                    name,
-                    binding_span,
-                    expr_types,
-                    variant_env,
-                )
-            })
-        }
-        ExprKind::Block { stmts, final_expr } => {
-            for stmt in stmts {
-                if let Some(ty) = local_pattern_binding_type_in_stmt(
-                    stmt,
-                    name,
-                    binding_span,
-                    expr_types,
-                    variant_env,
-                ) {
-                    return Some(ty);
-                }
-            }
-            final_expr.as_deref().and_then(|e| {
-                local_pattern_binding_type_in_expr(e, name, binding_span, expr_types, variant_env)
-            })
-        }
-        ExprKind::Not(e)
-        | ExprKind::Loop(e)
-        | ExprKind::Break(Some(e))
-        | ExprKind::Return(Some(e))
-        | ExprKind::FieldAccess { expr: e, .. }
-        | ExprKind::Lambda { body: e, .. } => {
-            local_pattern_binding_type_in_expr(e, name, binding_span, expr_types, variant_env)
-        }
-        ExprKind::Assign { target, value }
-        | ExprKind::Binary {
-            lhs: target,
-            rhs: value,
-            ..
-        } => {
-            local_pattern_binding_type_in_expr(target, name, binding_span, expr_types, variant_env)
-                .or_else(|| {
-                    local_pattern_binding_type_in_expr(
-                        value,
-                        name,
-                        binding_span,
-                        expr_types,
-                        variant_env,
-                    )
-                })
-        }
-        ExprKind::Call { callee, args, .. } => {
-            local_pattern_binding_type_in_expr(callee, name, binding_span, expr_types, variant_env)
-                .or_else(|| {
-                    args.iter().find_map(|a| {
-                        local_pattern_binding_type_in_expr(
-                            a,
-                            name,
-                            binding_span,
-                            expr_types,
-                            variant_env,
-                        )
-                    })
-                })
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => local_pattern_binding_type_in_expr(cond, name, binding_span, expr_types, variant_env)
-            .or_else(|| {
-                local_pattern_binding_type_in_expr(
-                    then_branch,
-                    name,
-                    binding_span,
-                    expr_types,
-                    variant_env,
-                )
-            })
-            .or_else(|| {
-                local_pattern_binding_type_in_expr(
-                    else_branch,
-                    name,
-                    binding_span,
-                    expr_types,
-                    variant_env,
-                )
-            }),
-        ExprKind::Match { scrutinee, arms } => {
-            for (pat, body) in arms {
-                if pattern_has_binding_at(pat, name, binding_span) {
-                    if let Some(scrutinee_ty) = expr_types.get(&scrutinee.id) {
-                        if let Some(binding_ty) =
-                            extract_binding_type(pat, name, binding_span, scrutinee_ty, variant_env)
-                        {
-                            return Some(ty_to_display_string(&binding_ty));
-                        }
-                    }
-                }
-                if let Some(ty) = local_pattern_binding_type_in_expr(
-                    body,
-                    name,
-                    binding_span,
-                    expr_types,
-                    variant_env,
-                ) {
-                    return Some(ty);
-                }
-            }
-            local_pattern_binding_type_in_expr(
-                scrutinee,
-                name,
-                binding_span,
-                expr_types,
-                variant_env,
-            )
-        }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => items.iter().find_map(|item| {
-            local_pattern_binding_type_in_expr(item, name, binding_span, expr_types, variant_env)
-        }),
-        ExprKind::Record(fields) => fields.iter().find_map(|(_, v)| {
-            local_pattern_binding_type_in_expr(v, name, binding_span, expr_types, variant_env)
-        }),
-        ExprKind::Break(None)
-        | ExprKind::Return(None)
-        | ExprKind::Continue
-        | ExprKind::Number(_)
-        | ExprKind::StringLit(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Ident(_)
-        | ExprKind::Import(_)
-        | ExprKind::Unit => None,
-    }
-}
-
-fn iterable_element_type(iterable_ty: &Ty) -> Option<&Ty> {
-    // Convention: for single-type-argument iterables (e.g. `Array[T]`), the element
-    // type is the first type argument. This mirrors what the inferencer ultimately
-    // extracts from the Iterable.iter return type for these cases.
-    // Limitation: multi-parameter types where the element type is not the first
-    // argument will show the wrong type. The principled fix is to record the loop
-    // element type during inference and expose it in the output.
-    match iterable_ty {
-        Ty::App(_, args) if args.len() == 1 => args.first(),
-        _ => None,
-    }
-}
-
-fn declaration_value_type<'a>(
-    program: &'a Program,
-    span: SourceSpan,
-    expr_types: &'a HashMap<hern_core::ast::NodeId, Ty>,
-) -> Option<&'a Ty> {
-    for stmt in &program.stmts {
-        if let Some(ty) = declaration_value_type_in_stmt(stmt, span, expr_types) {
-            return Some(ty);
-        }
-    }
-    None
-}
-
-fn declaration_value_type_in_stmt<'a>(
-    stmt: &'a Stmt,
-    span: SourceSpan,
-    expr_types: &'a HashMap<hern_core::ast::NodeId, Ty>,
-) -> Option<&'a Ty> {
-    match stmt {
-        Stmt::Let { pat, value, .. } if pattern_has_span_at(pat, span) => expr_types.get(&value.id),
-        Stmt::Fn {
-            name_span, body, ..
-        }
-        | Stmt::Op {
-            name_span, body, ..
-        } if *name_span == span => expr_types.get(&body.id),
-        Stmt::Expr(expr) => declaration_value_type_in_expr(expr, span, expr_types),
-        Stmt::Impl(impl_def) => impl_def.methods.iter().find_map(|method| {
-            (method.name_span == span)
-                .then(|| expr_types.get(&method.body.id))
-                .flatten()
-        }),
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
-        Stmt::Let { value, .. } => declaration_value_type_in_expr(value, span, expr_types),
-        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
-            declaration_value_type_in_expr(body, span, expr_types)
-        }
-    }
-}
-
-fn declaration_value_type_in_expr<'a>(
-    expr: &'a Expr,
-    span: SourceSpan,
-    expr_types: &'a HashMap<hern_core::ast::NodeId, Ty>,
-) -> Option<&'a Ty> {
-    match &expr.kind {
-        ExprKind::Block { stmts, final_expr } => {
-            for stmt in stmts {
-                if let Some(ty) = declaration_value_type_in_stmt(stmt, span, expr_types) {
-                    return Some(ty);
-                }
-            }
-            final_expr
-                .as_deref()
-                .and_then(|expr| declaration_value_type_in_expr(expr, span, expr_types))
-        }
-        ExprKind::Not(expr)
-        | ExprKind::Loop(expr)
-        | ExprKind::Break(Some(expr))
-        | ExprKind::Return(Some(expr))
-        | ExprKind::FieldAccess { expr, .. }
-        | ExprKind::Lambda { body: expr, .. } => {
-            declaration_value_type_in_expr(expr, span, expr_types)
-        }
-        ExprKind::Assign { target, value }
-        | ExprKind::Binary {
-            lhs: target,
-            rhs: value,
-            ..
-        } => declaration_value_type_in_expr(target, span, expr_types)
-            .or_else(|| declaration_value_type_in_expr(value, span, expr_types)),
-        ExprKind::Call { callee, args, .. } => {
-            declaration_value_type_in_expr(callee, span, expr_types).or_else(|| {
-                args.iter()
-                    .find_map(|arg| declaration_value_type_in_expr(arg, span, expr_types))
-            })
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => declaration_value_type_in_expr(cond, span, expr_types)
-            .or_else(|| declaration_value_type_in_expr(then_branch, span, expr_types))
-            .or_else(|| declaration_value_type_in_expr(else_branch, span, expr_types)),
-        ExprKind::Match { scrutinee, arms } => {
-            declaration_value_type_in_expr(scrutinee, span, expr_types).or_else(|| {
-                arms.iter()
-                    .find_map(|(_, body)| declaration_value_type_in_expr(body, span, expr_types))
-            })
-        }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => items
-            .iter()
-            .find_map(|item| declaration_value_type_in_expr(item, span, expr_types)),
-        ExprKind::Record(fields) => fields
-            .iter()
-            .find_map(|(_, value)| declaration_value_type_in_expr(value, span, expr_types)),
-        ExprKind::For { iterable, body, .. } => {
-            declaration_value_type_in_expr(iterable, span, expr_types)
-                .or_else(|| declaration_value_type_in_expr(body, span, expr_types))
-        }
-        ExprKind::Break(None)
-        | ExprKind::Return(None)
-        | ExprKind::Continue
-        | ExprKind::Number(_)
-        | ExprKind::StringLit(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Ident(_)
-        | ExprKind::Import(_)
-        | ExprKind::Unit => None,
-    }
-}
-
-pub(crate) fn definition(state: &ServerState, uri: Uri, position: Position) -> Option<Location> {
-    let path = uri_to_path(&uri)?;
-    let fallback;
-    let graph = if let Some(analysis) = cached_analysis(state, &uri) {
-        &analysis.graph
-    } else {
-        fallback = load_document_graph(state, &uri).ok()?;
-        &fallback.0
-    };
-    let (_, program) = graph.module_for_path(&path)?;
-    let index = index_program(program);
-    let position = SourcePosition {
-        line: position.line as usize + 1,
-        col: position.character as usize + 1,
-    };
-    if let Some(reference) = index.import_member_reference_at(position) {
-        let target_program = graph.module(&reference.module_name)?;
-        let target_path = graph.module_path(&reference.module_name)?;
-        let target_index = index_program(target_program);
-        let target_definition = target_index.definition_named(&reference.member_name)?;
-        return Some(Location::new(
-            path_to_uri(target_path)?,
-            source_span_to_range(target_definition.location.span),
-        ));
-    }
-    let definition = index.definition_for_reference_at(SourcePosition {
-        line: position.line,
-        col: position.col,
-    })?;
-    Some(Location::new(
-        uri,
-        source_span_to_range(definition.location.span),
-    ))
-}
-
-pub(crate) fn references(
-    state: &ServerState,
-    uri: Uri,
-    position: Position,
-    include_declaration: bool,
-) -> Vec<Location> {
-    let Some(path) = uri_to_path(&uri) else {
-        return Vec::new();
-    };
-    let fallback;
-    let graph = if let Some(analysis) = cached_analysis(state, &uri) {
-        &analysis.graph
-    } else {
-        let Ok(loaded) = load_document_graph(state, &uri) else {
-            return Vec::new();
-        };
-        fallback = loaded;
-        &fallback.0
-    };
-    let Some((_, program)) = graph.module_for_path(&path) else {
-        return Vec::new();
-    };
-    let index = index_program(program);
-    let position = SourcePosition {
-        line: position.line as usize + 1,
-        col: position.character as usize + 1,
-    };
-
-    if let Some(import_ref) = index.import_member_reference_at(position) {
-        let module_name = import_ref.module_name.clone();
-        let member_name = import_ref.member_name.clone();
-        references_for_import_member(graph, &module_name, &member_name, include_declaration)
-    } else {
-        let spans = index.references_for_symbol_at(position, include_declaration);
-        spans
-            .into_iter()
-            .map(|span| Location::new(uri.clone(), source_span_to_range(span)))
-            .collect()
-    }
-}
-
-/// Collects all `Location`s for references to `member_name` exported from `module_name`,
-/// scanning every module in the graph in graph order. Optionally includes the definition site
-/// in the target module when `include_declaration` is true.
-fn references_for_import_member(
-    graph: &ModuleGraph,
-    module_name: &str,
-    member_name: &str,
-    include_declaration: bool,
-) -> Vec<Location> {
-    let mut locations = Vec::new();
-
-    if include_declaration && let Some(target_program) = graph.module(module_name) {
-        let target_index = index_program(target_program);
-        if let Some(def) = target_index.definition_named(member_name)
-            && let Some(target_path) = graph.module_path(module_name)
-            && let Some(target_uri) = path_to_uri(target_path)
-        {
-            locations.push(Location::new(
-                target_uri,
-                source_span_to_range(def.location.span),
-            ));
-        }
-    }
-
-    for name in &graph.order {
-        let Some(prog) = graph.module(name) else {
-            continue;
-        };
-        let prog_index = index_program(prog);
-        let mut spans = prog_index.import_member_references_for(module_name, member_name);
-        if spans.is_empty() {
-            continue;
-        }
-        let Some(module_path) = graph.module_path(name) else {
-            continue;
-        };
-        let Some(module_uri) = path_to_uri(module_path) else {
-            continue;
-        };
-        spans.sort_by_key(|s| (s.start_line, s.start_col));
-        for span in spans {
-            locations.push(Location::new(
-                module_uri.clone(),
-                source_span_to_range(span),
-            ));
-        }
-    }
-
-    locations
-}
-
-/// Returns `true` if `name` is a well-formed Hern identifier that is not a reserved keyword.
-///
-/// The keyword list and identifier character rules mirror `hern_core::lex`. If the lexer gains
-/// new keywords, this list must be updated to match.
-fn is_valid_identifier(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    const KEYWORDS: &[&str] = &[
-        "let", "mut", "fn", "if", "else", "trait", "impl", "for", "type", "match", "loop", "break",
-        "continue", "return", "extern", "import", "true", "false", "in",
-    ];
-    if KEYWORDS.contains(&name) {
-        return false;
-    }
-    let mut bytes = name.bytes();
-    let first = bytes.next().unwrap();
-    if !first.is_ascii_alphabetic() && first != b'_' {
-        return false;
-    }
-    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
-}
-
-fn renameable_definition_kind(kind: DefinitionKind) -> bool {
-    matches!(kind, DefinitionKind::Function | DefinitionKind::Let)
-}
-
-/// Renames the symbol at `position` in `uri` to `new_name`.
-///
-/// Returns `Ok(Some(edit))` on success, `Ok(None)` if the cursor is not on a known symbol,
-/// and `Err(message)` for invalid names or unsupported rename targets (imported members).
-pub(crate) fn rename(
-    state: &ServerState,
-    uri: Uri,
-    position: Position,
-    new_name: String,
-) -> Result<Option<WorkspaceEdit>, String> {
-    if !is_valid_identifier(&new_name) {
-        return Err(format!("invalid identifier: {:?}", new_name));
-    }
-    let Some(path) = uri_to_path(&uri) else {
-        return Ok(None);
-    };
-    let fallback;
-    let graph = if let Some(analysis) = cached_analysis(state, &uri) {
-        &analysis.graph
-    } else {
-        let Ok(loaded) = load_document_graph(state, &uri) else {
-            return Ok(None);
-        };
-        fallback = loaded;
-        &fallback.0
-    };
-    let Some((_, program)) = graph.module_for_path(&path) else {
-        return Ok(None);
-    };
-    let index = index_program(program);
-    let position = SourcePosition {
-        line: position.line as usize + 1,
-        col: position.character as usize + 1,
-    };
-    // Reject rename when the cursor is on a *member access* of an imported module (e.g. `dep.value`),
-    // because the definition lives in another file and cross-file rename is out of scope for now.
-    // Renaming the import binding itself (e.g. `dep` in `let dep = import "dep"`) is allowed: it
-    // is just a local let binding resolved by references_for_symbol_at like any other local.
-    if index.import_member_reference_at(position).is_some() {
-        return Err("rename of imported members is not supported".to_string());
-    }
-    let Some(definition) = index
-        .definition_at(position)
-        .or_else(|| index.definition_for_reference_at(position))
-    else {
-        return Ok(None);
-    };
-    if !renameable_definition_kind(definition.kind) {
-        return Err(format!(
-            "rename is not supported for {:?} symbols",
-            definition.kind
-        ));
-    }
-    let spans = index.references_for_symbol_at(position, true);
-    if spans.is_empty() {
-        return Ok(None);
-    }
-    let edits: Vec<TextEdit> = spans
-        .into_iter()
-        .map(|span| TextEdit {
-            range: source_span_to_range(span),
-            new_text: new_name.clone(),
-        })
-        .collect();
-    let mut changes = HashMap::new();
-    changes.insert(uri, edits);
-    Ok(Some(WorkspaceEdit {
-        changes: Some(changes),
-        ..Default::default()
-    }))
-}
-
-/// Returns completion candidates visible at `position` in `uri`.
-///
-/// Tries three sources in order:
-/// 1. Cached analysis (graph + type inference) — full type details.
-/// 2. Fresh analysis (`analyze_document_graph`) — full type details when cache is stale.
-/// 3. Recovering graph load (`load_document_graph_recovering`) — names without type details.
-///    Used when inference fails or the file has a syntax error (e.g. mid-edit).
-///
-/// Returns an empty vec if the URI cannot be resolved or the file fails to parse entirely.
-pub(crate) fn completion(state: &ServerState, uri: Uri, position: Position) -> Vec<CompletionItem> {
-    let Some(path) = uri_to_path(&uri) else {
-        return Vec::new();
-    };
-
-    let full_fallback;
-    let partial_fallback;
-    let parse_fallback;
-    let default_inference;
-
-    let (graph, inference) = if let Some(cached) = cached_analysis(state, &uri) {
-        (&cached.graph, &cached.inference)
-    } else if let Ok(wa) = analyze_document_graph(state, &uri) {
-        full_fallback = wa;
-        (&full_fallback.graph, &full_fallback.inference)
-    } else {
-        let analysis = analyze_workspace(WorkspaceInputs {
-            entry: path.clone(),
-            overlays: document_overlays(state),
-            prelude: Some(state.prelude.program.clone()),
-        });
-        if let (Some(graph), Some(inference)) = (analysis.graph, analysis.inference) {
-            partial_fallback = WorkspaceAnalysis { graph, inference };
-            (&partial_fallback.graph, &partial_fallback.inference)
-        } else if let Some(g) = load_document_graph_recovering(state, &uri) {
-            default_inference = GraphInference::default();
-            parse_fallback = g;
-            (&parse_fallback, &default_inference)
-        } else {
-            return Vec::new();
-        }
-    };
-
-    let Some((module_name, program)) = graph.module_for_path(&path) else {
-        return Vec::new();
-    };
-
-    let lsp_position = position;
-    let position = SourcePosition {
-        line: lsp_position.line as usize + 1,
-        col: lsp_position.character as usize + 1,
-    };
-
-    let index = index_program(program);
-    let candidates = index.visible_names_at(position);
-    let env = inference.env_for_module(module_name);
-    let binding_types = inference.binding_types_for_module(module_name);
-    let definition_schemes = inference.definition_schemes_for_module(module_name);
-    let replacement_range = completion_replacement_range(state, &uri, lsp_position);
-
-    candidates
-        .into_iter()
-        .map(|candidate| {
-            let detail = completion_detail(
-                &index,
-                &candidate.name,
-                position,
-                env,
-                binding_types,
-                definition_schemes,
-            );
-            let kind = Some(match candidate.kind {
-                CompletionCandidateKind::Function => CompletionItemKind::FUNCTION,
-                CompletionCandidateKind::ImportBinding => CompletionItemKind::MODULE,
-                _ => CompletionItemKind::VARIABLE,
-            });
-            CompletionItem {
-                label: candidate.name.clone(),
-                kind,
-                filter_text: Some(candidate.name.clone()),
-                insert_text: Some(candidate.name.clone()),
-                text_edit: replacement_range.map(|range| {
-                    CompletionTextEdit::Edit(TextEdit {
-                        range,
-                        new_text: candidate.name.clone(),
-                    })
-                }),
-                label_details: detail.as_ref().map(|detail| CompletionItemLabelDetails {
-                    detail: Some(format!(": {detail}")),
-                    description: None,
-                }),
-                detail,
-                ..Default::default()
-            }
-        })
-        .collect()
-}
-
-fn completion_replacement_range(
-    state: &ServerState,
-    uri: &Uri,
-    position: Position,
-) -> Option<Range> {
-    let line = state
-        .documents
-        .get(uri)?
-        .lines()
-        .nth(position.line as usize)?;
-    let cursor_byte = utf16_col_to_byte(line, position.character);
-    let start_byte = line[..cursor_byte.min(line.len())]
-        .rfind(|c: char| !is_completion_identifier_char(c))
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
-    Some(Range::new(
-        Position::new(position.line, byte_to_utf16_col(line, start_byte)),
-        position,
-    ))
-}
-
-fn is_completion_identifier_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-fn utf16_col_to_byte(line: &str, col: u32) -> usize {
-    let mut utf16 = 0u32;
-    for (byte_idx, ch) in line.char_indices() {
-        if utf16 >= col {
-            return byte_idx;
-        }
-        utf16 += ch.len_utf16() as u32;
-        if utf16 > col {
-            return byte_idx;
-        }
-    }
-    line.len()
-}
-
-fn byte_to_utf16_col(line: &str, byte: usize) -> u32 {
-    line[..byte.min(line.len())]
-        .chars()
-        .map(|ch| ch.len_utf16() as u32)
-        .sum()
-}
-
-fn completion_detail(
-    index: &hern_core::source_index::SourceIndex,
-    name: &str,
-    position: SourcePosition,
-    env: Option<&TypeEnv>,
-    binding_types: Option<&HashMap<SourceSpan, Ty>>,
-    definition_schemes: Option<&HashMap<SourceSpan, Scheme>>,
-) -> Option<String> {
-    let definition = visible_definition_named(index, name, position);
-    if let Some(definition) = definition {
-        if let Some(scheme) =
-            definition_schemes.and_then(|schemes| schemes.get(&definition.location.span))
-        {
-            return Some(completion_scheme_to_string(scheme));
-        }
-        if matches!(
-            definition.kind,
-            DefinitionKind::Let | DefinitionKind::Parameter
-        ) && let Some(ty) = binding_types.and_then(|types| types.get(&definition.location.span))
-        {
-            return Some(completion_ty_to_display_string(ty));
-        }
-    }
-
-    env.and_then(|e| e.get(name))
-        .map(|info| completion_scheme_to_string(&info.scheme))
-}
-
-fn visible_definition_named<'a>(
-    index: &'a hern_core::source_index::SourceIndex,
-    name: &str,
-    position: SourcePosition,
-) -> Option<&'a Definition> {
-    let mut best = None;
-    for definition in index
-        .definitions
-        .iter()
-        .filter(|definition| definition.name == name)
-    {
-        if !matches!(
-            definition.kind,
-            DefinitionKind::Function
-                | DefinitionKind::Let
-                | DefinitionKind::Parameter
-                | DefinitionKind::Extern
-        ) {
-            continue;
-        }
-        let visible = definition.visibility_end.line == usize::MAX || {
-            let start = (
-                definition.visibility_start.line,
-                definition.visibility_start.col,
-            );
-            let end = (
-                definition.visibility_end.line,
-                definition.visibility_end.col,
-            );
-            let cursor = (position.line, position.col);
-            cursor >= start && cursor < end
-        };
-        if visible {
-            best = Some(definition);
-        }
-    }
-    best
-}
-
-pub(crate) fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
-    if !uri.scheme()?.as_str().eq_ignore_ascii_case("file") {
-        return None;
-    }
-    let path = percent_decode(uri.path().as_str())?;
-    Some(PathBuf::from(path))
-}
-
-pub(crate) fn path_to_uri(path: &Path) -> Option<Uri> {
-    Uri::from_str(&format!("file://{}", percent_encode_path(path))).ok()
-}
-
-fn diagnostics_from_compiler_diagnostics(
-    entry_uri: &Uri,
-    diagnostics: Vec<CompilerDiagnostic>,
-) -> DiagnosticsByUri {
-    let mut by_uri = DiagnosticsByUri::new();
-    by_uri.insert(entry_uri.clone(), Vec::new());
-    for diagnostic in diagnostics {
-        let uri = diagnostic_source_uri(&diagnostic).unwrap_or_else(|| entry_uri.clone());
-        by_uri
-            .entry(uri)
-            .or_default()
-            .push(compiler_diagnostic_to_lsp(diagnostic));
-    }
-    by_uri
-}
-
-fn diagnostic_identity(diagnostic: &Diagnostic) -> String {
-    format!(
-        "{:?}:{:?}:{}",
-        diagnostic.range, diagnostic.severity, diagnostic.message
-    )
-}
-
-struct WorkspaceAnalysis {
-    graph: ModuleGraph,
-    inference: GraphInference,
-}
-
-fn analyze_document_graph(
-    state: &ServerState,
-    uri: &Uri,
-) -> Result<WorkspaceAnalysis, CompilerDiagnostic> {
-    let (mut graph, _) = load_document_graph(state, uri)?;
-    let inference = infer_graph(&mut graph)?;
-    Ok(WorkspaceAnalysis { graph, inference })
-}
-
-fn load_document_graph(
-    state: &ServerState,
-    uri: &Uri,
-) -> Result<(ModuleGraph, String), CompilerDiagnostic> {
-    let path = uri_to_path(uri).ok_or_else(|| {
-        CompilerDiagnostic::error(None, format!("unsupported document URI: {}", uri.as_str()))
-    })?;
-    let overlays = document_overlays(state);
-    ModuleGraph::load_entry_with_prelude_and_overlays(
-        &path,
-        state.prelude.program.clone(),
-        overlays,
-    )
-}
-
-/// Loads the module graph using parse-error recovery. Unlike `load_document_graph`, this
-/// can return a partial graph even when the current document overlay has a syntax error —
-/// making it suitable as a last-resort fallback for completion while the user is mid-edit.
-/// Lex errors or missing entry-module paths can still cause this to return `None`.
-fn load_document_graph_recovering(state: &ServerState, uri: &Uri) -> Option<ModuleGraph> {
-    let path = uri_to_path(uri)?;
-    let overlays = document_overlays(state);
-    ModuleGraph::load_entry_with_prelude_and_overlays_recovering(
-        &path,
-        state.prelude.program.clone(),
-        overlays,
-    )
-    .value
-    .map(|loaded| loaded.graph)
-}
-
-fn cached_analysis<'a>(state: &'a ServerState, entry_uri: &Uri) -> Option<&'a CachedAnalysis> {
-    let analysis = state.cached_analyses.get(entry_uri)?;
-    analysis
-        .document_versions
-        .iter()
-        .all(|(uri, version)| state.document_versions.get(uri) == Some(version))
-        .then_some(analysis)
-}
-
-fn document_overlays(state: &ServerState) -> HashMap<PathBuf, String> {
-    state
-        .documents
-        .iter()
-        .filter_map(|(uri, source)| {
-            let path = uri_to_path(uri)?;
-            let canonical = fs::canonicalize(path).ok()?;
-            Some((canonical, source.clone()))
-        })
-        .collect()
-}
-
-fn graph_module_uris(graph: &ModuleGraph) -> HashSet<Uri> {
-    graph
-        .paths
-        .values()
-        .filter_map(|p| path_to_uri(p))
-        .collect()
-}
-
-fn document_versions_for_uris(state: &ServerState, uris: &HashSet<Uri>) -> HashMap<Uri, i32> {
-    uris.iter()
-        .filter_map(|uri| {
-            let version = state.document_versions.get(uri)?;
-            Some((uri.clone(), *version))
-        })
-        .collect()
-}
-
-fn percent_decode(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx] == b'%' {
-            let hi = *bytes.get(idx + 1)?;
-            let lo = *bytes.get(idx + 2)?;
-            out.push(hex_val(hi)? << 4 | hex_val(lo)?);
-            idx += 3;
-        } else {
-            out.push(bytes[idx]);
-            idx += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn hex_val(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn span_to_position(line: usize, col: usize) -> Position {
-    Position::new(line.saturating_sub(1) as u32, col.saturating_sub(1) as u32)
-}
-
-fn compiler_diagnostic_to_lsp(diagnostic: CompilerDiagnostic) -> Diagnostic {
-    let range = diagnostic
-        .span
-        .map(source_span_to_range)
-        .unwrap_or_else(|| Range::new(Position::new(0, 0), Position::new(0, 0)));
-    Diagnostic {
-        range,
-        severity: Some(match diagnostic.severity {
-            CoreDiagnosticSeverity::Error => DiagnosticSeverity::ERROR,
-        }),
-        message: diagnostic.message,
-        ..Default::default()
-    }
-}
-
-fn source_span_to_range(span: SourceSpan) -> Range {
-    Range::new(
-        span_to_position(span.start_line, span.start_col),
-        span_to_position(span.end_line, span.end_col),
-    )
-}
-
-fn diagnostic_source_uri(diagnostic: &CompilerDiagnostic) -> Option<Uri> {
-    let DiagnosticSource::Path(path) = diagnostic.source.as_ref()? else {
-        return None;
-    };
-    path_to_uri(path)
-}
-
-fn percent_encode_path(path: &Path) -> String {
-    let path = path.to_string_lossy();
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+    Some(semantic_tokens::semantic_tokens_for_source(&source, program))
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    use lsp_types::Uri;
+    use super::uri::path_to_uri;
+    use hern_core::analysis::analyze_prelude;
+    use lsp_types::{CompletionItem, Diagnostic, DiagnosticSeverity, Hover, HoverContents, MarkupContent, Position, Range, Uri};
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::str::FromStr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn uri(value: &str) -> Uri {
+    pub(super) fn uri(value: &str) -> Uri {
         Uri::from_str(value).expect("test URI should parse")
     }
 
-    fn diagnostic(message: &str) -> Diagnostic {
+    pub(super) fn diagnostic(message: &str) -> Diagnostic {
         Diagnostic {
             range: Range::new(Position::new(0, 0), Position::new(0, 1)),
             severity: Some(DiagnosticSeverity::ERROR),
@@ -2231,7 +63,7 @@ mod tests {
         }
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    pub(super) fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "hern-lsp-{name}-{}-{}",
             std::process::id(),
@@ -2244,25 +76,25 @@ mod tests {
         path
     }
 
-    fn state_with_document(uri: Uri, source: String) -> ServerState {
+    pub(super) fn state_with_document(uri: Uri, source: String) -> ServerState {
         let mut state = ServerState::new().expect("server state should initialize");
         state.set_document(uri.clone(), source, 0);
         state.mark_open_entry(uri);
         state
     }
 
-    struct TestProject {
-        root: PathBuf,
+    pub(super) struct TestProject {
+        pub(super) root: PathBuf,
     }
 
     impl TestProject {
-        fn new(name: &str) -> Self {
+        pub(super) fn new(name: &str) -> Self {
             Self {
                 root: temp_dir(name),
             }
         }
 
-        fn write(&self, relative_path: &str, source: &str) -> Uri {
+        pub(super) fn write(&self, relative_path: &str, source: &str) -> Uri {
             let path = self.root.join(relative_path);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).expect("test parent directory should be created");
@@ -2272,19 +104,19 @@ mod tests {
                 .expect("test URI should encode")
         }
 
-        fn open(&self, relative_path: &str, source: &str) -> (ServerState, Uri) {
+        pub(super) fn open(&self, relative_path: &str, source: &str) -> (ServerState, Uri) {
             let uri = self.write(relative_path, source);
             (state_with_document(uri.clone(), source.to_string()), uri)
         }
     }
 
-    struct ImportFixture {
-        state: ServerState,
-        entry_uri: Uri,
-        dep_uri: Uri,
+    pub(super) struct ImportFixture {
+        pub(super) state: ServerState,
+        pub(super) entry_uri: Uri,
+        pub(super) dep_uri: Uri,
     }
 
-    fn import_fixture(name: &str, entry_source: &str, dep_source: &str) -> ImportFixture {
+    pub(super) fn import_fixture(name: &str, entry_source: &str, dep_source: &str) -> ImportFixture {
         let project = TestProject::new(name);
         let entry_uri = project.write("main.hern", entry_source);
         let dep_uri = project.write("dep.hern", dep_source);
@@ -2297,7 +129,7 @@ mod tests {
         }
     }
 
-    fn hover_text(hover: Hover) -> String {
+    pub(super) fn hover_text(hover: Hover) -> String {
         match hover.contents {
             HoverContents::Markup(MarkupContent { value, .. }) => {
                 // Strip the ```hern ... ``` fences added by type_hover.
@@ -2312,12 +144,16 @@ mod tests {
         }
     }
 
-    fn completion_insert_name(item: &CompletionItem) -> &str {
+    pub(super) fn completion_insert_name(item: &CompletionItem) -> &str {
         item.insert_text.as_deref().unwrap_or(&item.label)
     }
 
     #[test]
     fn diagnostics_from_compiler_diagnostics_routes_source_path_to_that_uri() {
+        use diagnostics::diagnostics_from_compiler_diagnostics;
+        use hern_core::analysis::{CompilerDiagnostic, DiagnosticSource};
+        use hern_core::ast::SourceSpan;
+
         let entry = uri("file:///workspace/main.hern");
         let dep_path = PathBuf::from("/workspace/dep.hern");
         let diagnostic = CompilerDiagnostic::error_in(
@@ -2507,6 +343,85 @@ mod tests {
     }
 
     #[test]
+    fn closed_imported_file_edit_makes_cached_analysis_stale() {
+        let ImportFixture {
+            mut state,
+            entry_uri,
+            dep_uri,
+        } = import_fixture(
+            "closed-dependency-fingerprint",
+            "let dep = import \"dep\";\ndep.value\n",
+            "#{ value: 1 }\n",
+        );
+
+        diagnostics_for_document(&mut state, &entry_uri);
+        assert!(state::cached_analysis(&state, &entry_uri).is_some());
+
+        let dep_path = uri_to_path(&dep_uri).expect("dep URI should resolve to path");
+        fs::write(&dep_path, "#{ value: 12345 }\n").expect("dep file should be updated");
+
+        assert!(
+            state::cached_analysis(&state, &entry_uri).is_none(),
+            "closed dependency fingerprint change should make cache unusable"
+        );
+    }
+
+    #[test]
+    fn closed_imported_file_delete_makes_cached_analysis_stale_and_reports_import_error() {
+        let ImportFixture {
+            mut state,
+            entry_uri,
+            dep_uri,
+        } = import_fixture(
+            "closed-dependency-delete",
+            "let dep = import \"dep\";\ndep.value\n",
+            "#{ value: 1 }\n",
+        );
+
+        diagnostics_for_document(&mut state, &entry_uri);
+        assert!(state::cached_analysis(&state, &entry_uri).is_some());
+
+        let dep_path = uri_to_path(&dep_uri).expect("dep URI should resolve to path");
+        fs::remove_file(&dep_path).expect("dep file should be deleted");
+
+        assert!(state::cached_analysis(&state, &entry_uri).is_none());
+        let diagnostics = diagnostics_for_document(&mut state, &entry_uri);
+        let messages: Vec<_> = diagnostics
+            .values()
+            .flat_map(|items| items.iter())
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("error resolving file")),
+            "deleted dependency should report import resolution error; got {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn watched_file_change_invalidates_dependent_entry_cache() {
+        let ImportFixture {
+            mut state,
+            entry_uri,
+            dep_uri,
+        } = import_fixture(
+            "watched-file-invalidation",
+            "let dep = import \"dep\";\ndep.value\n",
+            "#{ value: 1 }\n",
+        );
+
+        diagnostics_for_document(&mut state, &entry_uri);
+        assert!(state.cached_analyses.contains_key(&entry_uri));
+
+        let affected = state.invalidate_cached_analyses_for_documents([dep_uri]);
+
+        assert!(affected.contains(&entry_uri));
+        assert!(!state.cached_analyses.contains_key(&entry_uri));
+    }
+
+    #[test]
     fn unrelated_document_change_keeps_entry_cache_usable() {
         let project = TestProject::new("unrelated-cache-invalidation");
         let entry_a_source = "let dep = import \"dep_a\";\ndep.value\n";
@@ -2521,13 +436,13 @@ mod tests {
 
         diagnostics_for_document(&mut state, &entry_a_uri);
         diagnostics_for_document(&mut state, &entry_b_uri);
-        assert!(cached_analysis(&state, &entry_a_uri).is_some());
-        assert!(cached_analysis(&state, &entry_b_uri).is_some());
+        assert!(state::cached_analysis(&state, &entry_a_uri).is_some());
+        assert!(state::cached_analysis(&state, &entry_b_uri).is_some());
 
         state.set_document(dep_a_uri, "#{ value: 3 }\n".to_string(), 1);
 
-        assert!(cached_analysis(&state, &entry_a_uri).is_none());
-        assert!(cached_analysis(&state, &entry_b_uri).is_some());
+        assert!(state::cached_analysis(&state, &entry_a_uri).is_none());
+        assert!(state::cached_analysis(&state, &entry_b_uri).is_some());
     }
 
     #[test]
@@ -2577,12 +492,13 @@ mod tests {
 
     #[test]
     fn display_names_type_vars_by_visible_type_order() {
+        use hern_core::types::Ty;
         let ty = Ty::Func(
             vec![Ty::Var(78), Ty::Tuple(vec![Ty::Var(12), Ty::Var(78)])],
             Box::new(Ty::Var(12)),
         );
 
-        assert_eq!(ty_to_display_string(&ty), "fn('a, ('b, 'a)) -> 'b");
+        assert_eq!(hover::ty_to_display_string(&ty), "fn('a, ('b, 'a)) -> 'b");
     }
 
     #[test]
@@ -3061,6 +977,63 @@ mod tests {
     }
 
     #[test]
+    fn document_highlights_mark_declaration_write_and_uses_read() {
+        use lsp_types::DocumentHighlightKind;
+        let project = TestProject::new("document-highlights-local");
+        let source = "let value = 1;\nvalue\nvalue\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let highlights = document_highlights(&state, uri, Position::new(1, 1));
+
+        assert_eq!(highlights.len(), 3);
+        assert_eq!(highlights[0].kind, Some(DocumentHighlightKind::WRITE));
+        assert_eq!(highlights[0].range.start, Position::new(0, 4));
+        assert_eq!(highlights[1].kind, Some(DocumentHighlightKind::READ));
+        assert_eq!(highlights[2].kind, Some(DocumentHighlightKind::READ));
+    }
+
+    #[test]
+    fn document_highlights_respect_shadowing() {
+        let project = TestProject::new("document-highlights-shadow");
+        let source = "let value = 1;\n{ let value = 2; value };\nvalue\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let inner = document_highlights(&state, uri.clone(), Position::new(1, 17));
+        let outer = document_highlights(&state, uri, Position::new(2, 1));
+
+        assert_eq!(inner.len(), 2);
+        assert!(inner.iter().all(|item| item.range.start.line == 1));
+        assert_eq!(outer.len(), 2);
+        assert!(
+            outer
+                .iter()
+                .all(|item| item.range.start.line == 0 || item.range.start.line == 2)
+        );
+    }
+
+    #[test]
+    fn document_highlights_imported_member_uses_in_current_document() {
+        use lsp_types::DocumentHighlightKind;
+        let source = "let dep = import \"dep\";\ndep.value\ndep.value\n";
+        let ImportFixture {
+            state, entry_uri, ..
+        } = import_fixture(
+            "document-highlights-import",
+            source,
+            "fn value() { 1 }\n#{ value: value }\n",
+        );
+
+        let highlights = document_highlights(&state, entry_uri, Position::new(1, 4));
+
+        assert_eq!(highlights.len(), 2);
+        assert!(
+            highlights
+                .iter()
+                .all(|item| item.kind == Some(DocumentHighlightKind::READ))
+        );
+    }
+
+    #[test]
     fn references_imported_member_include_declaration_adds_target_definition() {
         let source = "let dep = import \"dep\";\ndep.value\n";
         let ImportFixture {
@@ -3090,6 +1063,55 @@ mod tests {
             .expect("overlay parse diagnostics should target entry");
 
         assert_eq!(entry_diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn new_unsaved_file_gets_full_analysis_from_open_buffer() {
+        let project = TestProject::new("new-unsaved-file");
+        let path = project.root.join("main.hern");
+        let uri = path_to_uri(&path).expect("test URI should encode");
+        let source = "let value = 1;\nvalue\n";
+        let mut state = state_with_document(uri.clone(), source.to_string());
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let info = hover(&state, uri.clone(), Position::new(1, 1)).expect("hover should resolve");
+        let items = completion(&state, uri, Position::new(1, 1));
+
+        assert!(
+            !path.exists(),
+            "test must exercise a file that has not been saved to disk"
+        );
+        assert!(diagnostics.values().all(Vec::is_empty));
+        assert_eq!(hover_text(info), "f64");
+        assert!(
+            items
+                .iter()
+                .any(|item| completion_insert_name(item) == "value"),
+            "completion should use the open unsaved buffer"
+        );
+    }
+
+    #[test]
+    fn new_unsaved_file_can_import_another_open_unsaved_file() {
+        let project = TestProject::new("new-unsaved-import");
+        let entry_path = project.root.join("main.hern");
+        let dep_path = project.root.join("dep.hern");
+        let entry_uri = path_to_uri(&entry_path).expect("entry URI should encode");
+        let dep_uri = path_to_uri(&dep_path).expect("dep URI should encode");
+        let mut state = state_with_document(
+            entry_uri.clone(),
+            "let dep = import \"dep\";\ndep.value\n".to_string(),
+        );
+        state.set_document(dep_uri.clone(), "#{ value: 1 }\n".to_string(), 0);
+
+        let diagnostics = diagnostics_for_document(&mut state, &entry_uri);
+        let info =
+            hover(&state, entry_uri, Position::new(1, 5)).expect("import hover should resolve");
+
+        assert!(!entry_path.exists());
+        assert!(!dep_path.exists());
+        assert!(diagnostics.values().all(Vec::is_empty));
+        assert_eq!(hover_text(info), "f64");
     }
 
     #[test]
@@ -3129,6 +1151,30 @@ mod tests {
         assert!(file_edits.iter().all(|e| e.new_text == "amount"));
         // declaration before use in source order
         assert!(file_edits[0].range.start < file_edits[1].range.start);
+    }
+
+    #[test]
+    fn prepare_rename_local_let_returns_current_identifier_range() {
+        use lsp_types::PrepareRenameResponse;
+        let project = TestProject::new("prepare-rename-local-let");
+        let source = "{ let value = 1; value }\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let declaration = prepare_rename(&state, uri.clone(), Position::new(0, 6))
+            .expect("prepare rename should not error")
+            .expect("declaration should be renameable");
+        let reference = prepare_rename(&state, uri, Position::new(0, 17))
+            .expect("prepare rename should not error")
+            .expect("reference should be renameable");
+
+        assert_eq!(
+            declaration,
+            PrepareRenameResponse::Range(Range::new(Position::new(0, 6), Position::new(0, 11)))
+        );
+        assert_eq!(
+            reference,
+            PrepareRenameResponse::Range(Range::new(Position::new(0, 17), Position::new(0, 22)))
+        );
     }
 
     #[test]
@@ -3246,12 +1292,39 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rename_imported_member_returns_error() {
+        let source = "let dep = import \"dep\";\ndep.value\n";
+        let ImportFixture {
+            state, entry_uri, ..
+        } = import_fixture(
+            "prepare-rename-import-member",
+            source,
+            "fn value() { 1 }\n#{ value: value }\n",
+        );
+
+        let result = prepare_rename(&state, entry_uri, Position::new(1, 4));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn rename_type_definition_returns_error() {
         let project = TestProject::new("rename-type");
         let source = "type Option('a) = None | Some('a)\n";
         let (state, uri) = project.open("main.hern", source);
 
         let result = rename(&state, uri, Position::new(0, 5), "Maybe".to_string());
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn prepare_rename_type_definition_returns_error() {
+        let project = TestProject::new("prepare-rename-type");
+        let source = "type Option('a) = None | Some('a)\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let result = prepare_rename(&state, uri, Position::new(0, 5));
 
         assert!(result.is_err());
     }
@@ -3293,6 +1366,7 @@ mod tests {
 
     #[test]
     fn completion_shadowing_returns_inner_binding() {
+        use lsp_types::CompletionItemKind;
         let project = TestProject::new("completion-shadow");
         let source = "let x = 1;\n{ let x = 2; x }\n";
         let (state, uri) = project.open("main.hern", source);
@@ -3314,6 +1388,7 @@ mod tests {
 
     #[test]
     fn completion_import_binding_has_module_kind() {
+        use lsp_types::CompletionItemKind;
         let source = "let dep = import \"dep\";\ndep\n";
         let ImportFixture {
             state, entry_uri, ..
@@ -3333,7 +1408,57 @@ mod tests {
     }
 
     #[test]
+    fn completion_suggests_import_paths_inside_import_string() {
+        use lsp_types::CompletionItemKind;
+        let project = TestProject::new("completion-import-path");
+        let uri = project.write("main.hern", "let dep = import \"de\";\n");
+        project.write("dep.hern", "#{ value: 1 }\n");
+        project.write("other.hern", "#{ value: 2 }\n");
+        let state = state_with_document(uri.clone(), "let dep = import \"de\";\n".to_string());
+
+        let items = completion(&state, uri, Position::new(0, 20));
+
+        assert!(
+            items.iter().any(|item| item.label == "dep"
+                && item.kind == Some(CompletionItemKind::FILE)
+                && item.detail.as_deref() == Some("local module")),
+            "expected dep.hern import completion, got {:?}",
+            items
+        );
+        assert!(!items.iter().any(|item| item.label == "other"));
+    }
+
+    #[test]
+    fn completion_suggests_imported_module_members_after_dot() {
+        use lsp_types::CompletionItemKind;
+        let source = "let dep = import \"dep\";\ndep.\n";
+        let ImportFixture {
+            state, entry_uri, ..
+        } = import_fixture(
+            "completion-import-member",
+            source,
+            "#{ value: 1, name: \"hern\" }\n",
+        );
+
+        let items = completion(&state, entry_uri, Position::new(1, 4));
+
+        let names: Vec<_> = items.iter().map(completion_insert_name).collect();
+        assert!(
+            names.contains(&"value"),
+            "expected value member: {:?}",
+            names
+        );
+        assert!(names.contains(&"name"), "expected name member: {:?}", names);
+        assert!(
+            items
+                .iter()
+                .all(|item| item.kind == Some(CompletionItemKind::FIELD))
+        );
+    }
+
+    #[test]
     fn completion_provides_type_detail_for_top_level_function() {
+        use lsp_types::{CompletionTextEdit, TextEdit};
         let project = TestProject::new("completion-type-detail");
         let source = "fn double(x: f64) -> f64 { x + x }\ndouble(1)\n";
         let (state, uri) = project.open("main.hern", source);
@@ -3358,6 +1483,7 @@ mod tests {
 
     #[test]
     fn completion_keeps_type_detail_during_partial_identifier_edit() {
+        use lsp_types::{CompletionTextEdit, TextEdit};
         let project = TestProject::new("completion-partial-identifier-type-detail");
         let source = "fn double(x: f64) -> f64 { x + x }\ndo\n";
         let (state, uri) = project.open("main.hern", source);
@@ -3675,10 +1801,10 @@ mod tests {
         );
 
         assert!(diagnostics_for_document(&mut state, &entry_uri)[&entry_uri].is_empty());
-        assert!(cached_analysis(&state, &entry_uri).is_some());
+        assert!(state::cached_analysis(&state, &entry_uri).is_some());
 
         state.set_document(dep_uri, "#{ value: \"hello\" }\n".to_string(), 1);
-        assert!(cached_analysis(&state, &entry_uri).is_none());
+        assert!(state::cached_analysis(&state, &entry_uri).is_none());
 
         assert!(diagnostics_for_document(&mut state, &entry_uri)[&entry_uri].is_empty());
 

@@ -95,6 +95,7 @@ impl ModuleGraph {
         prelude: Program,
         overlays: HashMap<PathBuf, String>,
     ) -> Self {
+        let overlays = normalize_overlays(overlays);
         Self {
             prelude,
             modules: HashMap::new(),
@@ -197,11 +198,11 @@ impl ModuleGraph {
     }
 
     pub fn module_name_for_path(&self, path: &Path) -> Option<&str> {
-        let canonical = fs::canonicalize(path).ok();
+        let normalized = self.normalize_load_path(path).ok();
         self.paths
             .iter()
             .find(|(_, module_path)| {
-                canonical.as_ref().map_or_else(
+                normalized.as_ref().map_or_else(
                     || module_path.as_path() == path,
                     |path| *module_path == path,
                 )
@@ -216,7 +217,7 @@ impl ModuleGraph {
     }
 
     pub fn load_module(&mut self, path: &Path) -> Result<String, CompilerDiagnostic> {
-        let path = canonicalize_existing(path)?;
+        let path = self.normalize_load_path(path)?;
         let name = module_name(&path);
         if self.modules.contains_key(&name) {
             return Ok(name);
@@ -252,7 +253,7 @@ impl ModuleGraph {
     }
 
     fn load_module_recovering(&mut self, path: &Path) -> (String, Vec<CompilerDiagnostic>) {
-        let path = match canonicalize_existing(path) {
+        let path = match self.normalize_load_path(path) {
             Ok(path) => path,
             Err(diagnostic) => return (module_name(path), vec![diagnostic]),
         };
@@ -322,6 +323,49 @@ impl ModuleGraph {
                 format!("error reading file {}: {}", path.display(), err),
             )
         })
+    }
+
+    fn normalize_load_path(&self, path: &Path) -> Result<PathBuf, CompilerDiagnostic> {
+        match fs::canonicalize(path) {
+            Ok(path) => Ok(path),
+            Err(err) => {
+                let overlay_path = normalize_overlay_path(path);
+                if self.overlays.contains_key(&overlay_path) {
+                    Ok(overlay_path)
+                } else {
+                    Err(CompilerDiagnostic::error_in(
+                        DiagnosticSource::Path(path.to_path_buf()),
+                        None,
+                        format!("error resolving file {}: {}", path.display(), err),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn resolve_import_path(
+        &self,
+        base_dir: &Path,
+        spec: &str,
+    ) -> Result<PathBuf, CompilerDiagnostic> {
+        let mut path = base_dir.join(spec);
+        if path.extension().is_none() {
+            path.set_extension("hern");
+        }
+        match fs::canonicalize(&path) {
+            Ok(path) => Ok(path),
+            Err(err) => {
+                let overlay_path = normalize_overlay_path(&path);
+                if self.overlays.contains_key(&overlay_path) {
+                    Ok(overlay_path)
+                } else {
+                    Err(CompilerDiagnostic::error(
+                        None,
+                        format!("error resolving file {}: {}", path.display(), err),
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -588,27 +632,28 @@ impl ModuleEnv {
     }
 }
 
-fn canonicalize_existing(path: &Path) -> Result<PathBuf, CompilerDiagnostic> {
-    fs::canonicalize(path).map_err(|err| {
-        CompilerDiagnostic::error_in(
-            DiagnosticSource::Path(path.to_path_buf()),
-            None,
-            format!("error resolving file {}: {}", path.display(), err),
-        )
-    })
+fn normalize_overlays(overlays: HashMap<PathBuf, String>) -> HashMap<PathBuf, String> {
+    overlays
+        .into_iter()
+        .map(|(path, source)| (normalize_overlay_path(&path), source))
+        .collect()
 }
 
-fn resolve_import_path(base_dir: &Path, spec: &str) -> Result<PathBuf, CompilerDiagnostic> {
-    let mut path = base_dir.join(spec);
-    if path.extension().is_none() {
-        path.set_extension("hern");
+/// Normalizes a source-overlay path to the key used by `ModuleGraph`.
+///
+/// Existing files use their canonical filesystem path. Non-existing files keep a stable absolute
+/// path so open editor buffers can be analyzed before they are saved to disk.
+pub fn normalize_overlay_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
     }
-    fs::canonicalize(&path).map_err(|err| {
-        CompilerDiagnostic::error(
-            None,
-            format!("error resolving file {}: {}", path.display(), err),
-        )
-    })
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
 }
 
 fn module_name(path: &Path) -> String {
@@ -708,7 +753,7 @@ fn resolve_imports_in_expr(
 ) -> Result<(), CompilerDiagnostic> {
     match &mut expr.kind {
         ExprKind::Import(spec) => {
-            let path = resolve_import_path(base_dir, spec)?;
+            let path = graph.resolve_import_path(base_dir, spec)?;
             *spec = graph.load_module(&path)?;
             Ok(())
         }
@@ -795,7 +840,7 @@ fn resolve_imports_in_expr_recovering(
 ) {
     match &mut expr.kind {
         ExprKind::Import(spec) => {
-            let path = match resolve_import_path(base_dir, spec) {
+            let path = match graph.resolve_import_path(base_dir, spec) {
                 Ok(path) => path,
                 Err(err) => {
                     diagnostics.push(err.with_source_if_absent(source));
@@ -1242,6 +1287,43 @@ mod tests {
             .expect("imported module should be found by path");
         assert!(graph.module(dep_name).is_some());
         assert!(graph.module_path(dep_name).is_some());
+    }
+
+    #[test]
+    fn load_entry_uses_overlay_for_nonexistent_entry_and_import() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "hern-overlay-entry-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&test_dir).expect("temp test directory should be created");
+
+        let entry_path = test_dir.join("main.hern");
+        let dep_path = test_dir.join("dep.hern");
+        let overlays = HashMap::from([
+            (
+                entry_path.clone(),
+                "let dep = import \"dep\";\ndep.value\n".to_string(),
+            ),
+            (dep_path.clone(), "#{ value: 1 }\n".to_string()),
+        ]);
+
+        let (graph, entry_name) = ModuleGraph::load_entry_with_overlays(&entry_path, overlays)
+            .expect("graph should load from unsaved overlays");
+
+        assert!(graph.module(&entry_name).is_some());
+        assert!(graph.module_name_for_path(&dep_path).is_some());
+        assert!(
+            !entry_path.exists(),
+            "test must exercise non-existing entry overlays"
+        );
+        assert!(
+            !dep_path.exists(),
+            "test must exercise non-existing imported overlays"
+        );
     }
 
     #[test]

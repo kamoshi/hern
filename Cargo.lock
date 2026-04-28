@@ -155,6 +155,7 @@ dependencies = [
  "hern-core",
  "lsp-server",
  "lsp-types",
+ "serde",
  "serde_json",
 ]
 
