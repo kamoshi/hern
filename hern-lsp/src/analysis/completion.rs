@@ -7,7 +7,9 @@ use super::workspace::{
 };
 use hern_core::ast::{Program, SourcePosition};
 use hern_core::module::{GraphInference, ModuleGraph, infer_graph_collecting};
-use hern_core::source_index::{Definition, DefinitionKind, index_program};
+use hern_core::source_index::{
+    CompletionCandidate, Definition, DefinitionKind, SourceIndex, index_program,
+};
 use hern_core::types::Ty;
 use hern_core::types::infer::TypeEnv;
 use lsp_types::{
@@ -70,10 +72,11 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
     };
 
     let index = state.timed("source indexing", || index_program(program));
+    let prelude_index = state.timed("prelude source indexing", || index_program(&graph.prelude));
     if is_binding_declaration_position(state, &uri, lsp_position) {
         return Vec::new();
     }
-    let candidates = index.visible_names_at(position);
+    let candidates = visible_completion_candidates(&index, &prelude_index, position);
     let env = inference.env_for_module(module_name);
     let binding_types = inference.binding_types_for_module(module_name);
     let definition_schemes = inference.definition_schemes_for_module(module_name);
@@ -86,15 +89,21 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
         inference,
         module_name,
         &index,
+        &prelude_index,
         position,
         lsp_position,
     ) {
         return items;
     }
 
-    if let Some(items) =
-        type_position_completion(state, &uri, &index, lsp_position, replacement_range)
-    {
+    if let Some(items) = type_position_completion(
+        state,
+        &uri,
+        &index,
+        &prelude_index,
+        lsp_position,
+        replacement_range,
+    ) {
         return items;
     }
 
@@ -104,6 +113,7 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
         .map(|candidate| {
             let detail = completion_detail(
                 &index,
+                &prelude_index,
                 &candidate.name,
                 position,
                 env,
@@ -226,7 +236,8 @@ fn member_completion(
     graph: &ModuleGraph,
     inference: &GraphInference,
     current_module: &str,
-    index: &hern_core::source_index::SourceIndex,
+    index: &SourceIndex,
+    prelude_index: &SourceIndex,
     position: SourcePosition,
     lsp_position: Position,
 ) -> Option<Vec<CompletionItem>> {
@@ -250,7 +261,8 @@ fn member_completion(
     if receiver.is_empty() {
         return None;
     }
-    let definition = visible_definition_named(index, receiver, position)?;
+    let definition = visible_definition_named(index, receiver, position)
+        .or_else(|| visible_definition_named(prelude_index, receiver, position))?;
     let replacement_range = completion_replacement_range(state, uri, lsp_position)?;
     let items = if let Some(module_name) = definition.import_module.as_ref() {
         imported_member_completion_items(graph, inference, module_name, replacement_range)
@@ -365,22 +377,30 @@ fn record_field_completion_items(ty: &Ty, replacement_range: Range) -> Vec<Compl
 fn type_position_completion(
     state: &ServerState,
     uri: &Uri,
-    index: &hern_core::source_index::SourceIndex,
+    index: &SourceIndex,
+    prelude_index: &SourceIndex,
     position: Position,
     replacement_range: Option<Range>,
 ) -> Option<Vec<CompletionItem>> {
     if !is_type_position(state, uri, position) {
         return None;
     }
+    let current_type_names = index
+        .definitions
+        .iter()
+        .filter(|definition| is_type_completion_kind(definition.kind))
+        .map(|definition| definition.name.clone())
+        .collect::<std::collections::HashSet<_>>();
     let mut items = index
         .definitions
         .iter()
-        .filter(|definition| {
-            matches!(
-                definition.kind,
-                DefinitionKind::Type | DefinitionKind::TypeAlias | DefinitionKind::Trait
-            )
-        })
+        .chain(
+            prelude_index
+                .definitions
+                .iter()
+                .filter(|definition| !current_type_names.contains(&definition.name)),
+        )
+        .filter(|definition| is_type_completion_kind(definition.kind))
         .map(|definition| {
             let kind = match definition.kind {
                 DefinitionKind::Trait => CompletionItemKind::INTERFACE,
@@ -404,6 +424,13 @@ fn type_position_completion(
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items.dedup_by(|a, b| a.label == b.label);
     Some(items)
+}
+
+fn is_type_completion_kind(kind: DefinitionKind) -> bool {
+    matches!(
+        kind,
+        DefinitionKind::Type | DefinitionKind::TypeAlias | DefinitionKind::Trait
+    )
 }
 
 fn is_binding_declaration_position(state: &ServerState, uri: &Uri, position: Position) -> bool {
@@ -521,14 +548,16 @@ fn byte_to_utf16_col(line: &str, byte: usize) -> u32 {
 }
 
 fn completion_detail(
-    index: &hern_core::source_index::SourceIndex,
+    index: &SourceIndex,
+    prelude_index: &SourceIndex,
     name: &str,
     position: SourcePosition,
     env: Option<&TypeEnv>,
     binding_types: Option<&HashMap<hern_core::ast::SourceSpan, Ty>>,
     definition_schemes: Option<&HashMap<hern_core::ast::SourceSpan, hern_core::types::Scheme>>,
 ) -> Option<String> {
-    let definition = visible_definition_named(index, name, position);
+    let definition = visible_definition_named(index, name, position)
+        .or_else(|| visible_definition_named(prelude_index, name, position));
     if let Some(definition) = definition {
         if let Some(scheme) =
             definition_schemes.and_then(|schemes| schemes.get(&definition.location.span))
@@ -546,6 +575,28 @@ fn completion_detail(
 
     env.and_then(|e| e.get(name))
         .map(|info| completion_scheme_to_string(&info.scheme))
+}
+
+fn visible_completion_candidates(
+    index: &SourceIndex,
+    prelude_index: &SourceIndex,
+    position: SourcePosition,
+) -> Vec<CompletionCandidate> {
+    let mut candidates = index.visible_names_at(position);
+    let local_names = candidates
+        .iter()
+        .map(|candidate| candidate.name.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    candidates.extend(
+        prelude_index
+            .visible_names_at(position)
+            .into_iter()
+            .filter(|candidate| !candidate.name.starts_with("__"))
+            .filter(|candidate| !local_names.contains(&candidate.name)),
+    );
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    candidates
 }
 
 fn visible_definition_named<'a>(

@@ -1398,6 +1398,75 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn completion_includes_prelude_values() {
+        let project = TestProject::new("completion-prelude-values");
+        let source = "m\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let items = completion(&state, uri, Position::new(0, 1));
+
+        let math = items
+            .iter()
+            .find(|item| completion_insert_name(item) == "math")
+            .expect("prelude value `math` should be a completion candidate");
+        assert!(
+            math.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("sqrt: fn(f64) -> f64")),
+            "math should include its prelude module type detail, got {:?}",
+            math.detail
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| completion_insert_name(item).starts_with("__")),
+            "private prelude helpers should not be completion candidates"
+        );
+    }
+
+    #[test]
+    fn completion_suggests_prelude_record_fields_after_dot() {
+        use lsp_types::CompletionItemKind;
+        let project = TestProject::new("completion-prelude-member");
+        let source = "math.s\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let items = completion(&state, uri, Position::new(0, 6));
+
+        let sqrt = items
+            .iter()
+            .find(|item| completion_insert_name(item) == "sqrt")
+            .expect("prelude record field `math.sqrt` should be a completion candidate");
+        assert_eq!(sqrt.kind, Some(CompletionItemKind::FIELD));
+        assert_eq!(sqrt.detail.as_deref(), Some("fn(f64) -> f64"));
+    }
+
+    #[test]
+    fn completion_includes_prelude_types_in_type_position() {
+        use lsp_types::CompletionItemKind;
+        let project = TestProject::new("completion-prelude-types");
+        let source = "let value: M = math;\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let items = completion(&state, uri, Position::new(0, 12));
+
+        assert!(
+            items
+                .iter()
+                .any(|item| completion_insert_name(item) == "Math"
+                    && item.kind == Some(CompletionItemKind::STRUCT)),
+            "prelude type `Math` should be a type-position completion"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| completion_insert_name(item) == "Functor"
+                    && item.kind == Some(CompletionItemKind::INTERFACE)),
+            "prelude trait `Functor` should be a type-position completion"
+        );
+    }
+
+    #[test]
     fn instrumentation_is_disabled_by_default() {
         let state = ServerState::new().expect("server state should initialize");
 
