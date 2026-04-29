@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 hern-core = { path = "../hern-core" }
 hern-lsp = { path = "../hern-lsp" }
+hern-repl = { path = "../hern-repl" }
 clap = { version = "4.5", features = ["derive"] }

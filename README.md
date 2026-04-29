@@ -73,6 +73,7 @@ cargo run -p hern -- typecheck path/to/file.hern
 cargo run -p hern -- lua path/to/file.hern
 cargo run -p hern -- run path/to/file.hern
 cargo run -p hern -- bundle path/to/file.hern
+cargo run -p hern -- repl
 cargo run -p hern -- lsp
 ```
 
@@ -84,6 +85,7 @@ through a local Lua runtime.
 - `hern-core`: lexer, parser, type inference, module loading, source indexing,
   and Lua code generation.
 - `hern`: CLI.
+- `hern-repl`: ratatui-based interactive REPL.
 - `hern-lsp`: language server support for diagnostics, hover, definitions,
   references, rename, and completions.
 - `std/prelude.hern`: built-in prelude loaded by the compiler.
@@ -93,6 +95,7 @@ through a local Lua runtime.
 
 ```sh
 cargo test -q -p hern-core
+cargo check -q -p hern-repl
 cargo test -q -p hern-lsp
 cargo test -q -p hern
 python3 tests/run.py

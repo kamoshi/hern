@@ -3,5 +3,6 @@ members = [
     "hern",
     "hern-core",
     "hern-lsp",
+    "hern-repl",
 ]
 resolver = "2"

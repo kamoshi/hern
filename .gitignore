@@ -26,6 +26,11 @@
 !hern-lsp/Cargo.toml
 !hern-lsp/**/*.rs
 
+!hern-repl/
+!hern-repl/**/
+!hern-repl/Cargo.toml
+!hern-repl/**/*.rs
+
 # Standard library
 !std/
 !std/**/
