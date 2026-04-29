@@ -6,7 +6,7 @@ use hern_core::ast::{
     BinOp, Expr, ExprKind, Fixity, ImplMethod, Pattern, Program, SourcePosition, SourceSpan, Stmt,
     TraitMethod,
 };
-use hern_core::module::{GraphInference, ModuleGraph};
+use hern_core::module::{GraphInference, ModuleEnv, ModuleGraph};
 use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
 use hern_core::types::infer::{TypeEnv, VariantEnv};
 use hern_core::types::{
@@ -37,6 +37,14 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
         return Some(type_hover(contents, markdown));
     }
     if let Some(contents) = operator_hover(graph, inference, module_name, program, position) {
+        return Some(type_hover(contents, markdown));
+    }
+    // Hover for `TraitName.method(...)` call sites: the trait name and the method field.
+    if let Some(contents) = trait_access_hover(
+        program,
+        inference.module_env_for_module(module_name),
+        position,
+    ) {
         return Some(type_hover(contents, markdown));
     }
     let info = hover_at(program, expr_types, symbol_types, position)?;
@@ -94,6 +102,141 @@ fn symbol_hover(
         program,
     )
 }
+
+// ── Trait access hover ────────────────────────────────────────────────────────
+
+/// Returns hover text when the cursor is on the trait name or method field in
+/// an explicit `TraitName.method(...)` call expression.
+fn trait_access_hover(
+    program: &Program,
+    module_env: Option<&ModuleEnv>,
+    position: SourcePosition,
+) -> Option<String> {
+    let module_env = module_env?;
+    program
+        .stmts
+        .iter()
+        .find_map(|stmt| trait_access_hover_in_stmt(stmt, module_env, position))
+}
+
+fn trait_access_hover_in_stmt(
+    stmt: &Stmt,
+    module_env: &ModuleEnv,
+    position: SourcePosition,
+) -> Option<String> {
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Expr(value) => {
+            trait_access_hover_in_expr(value, module_env, position)
+        }
+        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
+            trait_access_hover_in_expr(body, module_env, position)
+        }
+        Stmt::Impl(impl_def) => impl_def
+            .methods
+            .iter()
+            .find_map(|m| trait_access_hover_in_expr(&m.body, module_env, position)),
+        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
+    }
+}
+
+fn trait_access_hover_in_expr(
+    expr: &Expr,
+    module_env: &ModuleEnv,
+    position: SourcePosition,
+) -> Option<String> {
+    if !contains(expr.span, position) {
+        return None;
+    }
+    // Check if this is a `TraitName.method` field access
+    if let ExprKind::FieldAccess {
+        expr: base,
+        field,
+        field_span,
+    } = &expr.kind
+    {
+        if let ExprKind::Ident(trait_name) = &base.kind {
+            if let Some(trait_def) = module_env.trait_def(trait_name) {
+                // Cursor on the trait name itself
+                if contains(base.span, position) {
+                    return Some(format!("trait {} {}", trait_def.name, trait_def.param));
+                }
+                // Cursor on the method field
+                if contains(*field_span, position) {
+                    if let Some(method) = trait_def.methods.iter().find(|m| m.name == *field) {
+                        return Some(trait_method_signature(method));
+                    }
+                }
+            }
+        }
+        return trait_access_hover_in_expr(base, module_env, position);
+    }
+    // Recurse into sub-expressions
+    match &expr.kind {
+        ExprKind::Call { callee, args, .. } => {
+            trait_access_hover_in_expr(callee, module_env, position).or_else(|| {
+                args.iter()
+                    .find_map(|a| trait_access_hover_in_expr(a, module_env, position))
+            })
+        }
+        ExprKind::Not(inner)
+        | ExprKind::Loop(inner)
+        | ExprKind::Break(Some(inner))
+        | ExprKind::Return(Some(inner))
+        | ExprKind::Lambda { body: inner, .. } => {
+            trait_access_hover_in_expr(inner, module_env, position)
+        }
+        ExprKind::Assign { target, value }
+        | ExprKind::Binary {
+            lhs: target,
+            rhs: value,
+            ..
+        } => trait_access_hover_in_expr(target, module_env, position)
+            .or_else(|| trait_access_hover_in_expr(value, module_env, position)),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => trait_access_hover_in_expr(cond, module_env, position)
+            .or_else(|| trait_access_hover_in_expr(then_branch, module_env, position))
+            .or_else(|| trait_access_hover_in_expr(else_branch, module_env, position)),
+        ExprKind::Match { scrutinee, arms } => {
+            trait_access_hover_in_expr(scrutinee, module_env, position).or_else(|| {
+                arms.iter()
+                    .find_map(|(_, body)| trait_access_hover_in_expr(body, module_env, position))
+            })
+        }
+        ExprKind::Block { stmts, final_expr } => stmts
+            .iter()
+            .find_map(|s| trait_access_hover_in_stmt(s, module_env, position))
+            .or_else(|| {
+                final_expr
+                    .as_deref()
+                    .and_then(|e| trait_access_hover_in_expr(e, module_env, position))
+            }),
+        ExprKind::Tuple(items) | ExprKind::Array(items) => items
+            .iter()
+            .find_map(|i| trait_access_hover_in_expr(i, module_env, position)),
+        ExprKind::Record(fields) => fields
+            .iter()
+            .find_map(|(_, v)| trait_access_hover_in_expr(v, module_env, position)),
+        ExprKind::For { iterable, body, .. } => {
+            trait_access_hover_in_expr(iterable, module_env, position)
+                .or_else(|| trait_access_hover_in_expr(body, module_env, position))
+        }
+        ExprKind::FieldAccess { .. } => unreachable!("handled above"),
+        ExprKind::Ident(_)
+        | ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Import(_)
+        | ExprKind::Unit
+        | ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None) => None,
+    }
+}
+
+// ── Operator hover ────────────────────────────────────────────────────────────
 
 struct OperatorUse<'a> {
     name: &'a str,
@@ -520,7 +663,7 @@ fn type_params_suffix(params: &[String]) -> String {
     }
 }
 
-fn ast_type_to_string(ty: &hern_core::ast::Type) -> String {
+pub(super) fn ast_type_to_string(ty: &hern_core::ast::Type) -> String {
     use hern_core::ast::Type;
     match ty {
         Type::Ident(name) | Type::Var(name) => name.clone(),

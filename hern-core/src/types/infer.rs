@@ -68,6 +68,11 @@ impl TypeEnv {
     }
 }
 
+struct ResolvedTraitMethod {
+    trait_def: TraitDef,
+    method: TraitMethod,
+}
+
 // ── Variant environment ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -131,6 +136,7 @@ pub struct Infer {
     declared_types: HashSet<String>,
     op_trait_map: HashMap<String, String>,
     import_types: HashMap<String, Ty>,
+    known_impl_dicts: HashSet<String>,
     loop_break_tys: Vec<Ty>,
     fn_return_tys: Vec<Ty>,
     pending_constraints: Vec<TraitConstraint>,
@@ -262,6 +268,7 @@ impl Infer {
             declared_types: HashSet::new(),
             op_trait_map: HashMap::new(),
             import_types: HashMap::new(),
+            known_impl_dicts: HashSet::new(),
             loop_break_tys: Vec::new(),
             fn_return_tys: Vec::new(),
             pending_constraints: Vec::new(),
@@ -278,6 +285,10 @@ impl Infer {
 
     pub fn set_import_types(&mut self, import_types: HashMap<String, Ty>) {
         self.import_types = import_types;
+    }
+
+    pub fn set_known_impl_dicts(&mut self, dicts: HashSet<String>) {
+        self.known_impl_dicts = dicts;
     }
 
     pub fn set_trait_scope(
@@ -596,6 +607,7 @@ impl Infer {
         // Pre-pass 2: operator-to-trait registry
         for stmt in seed_stmts.iter().chain(program.stmts.iter()) {
             if let Stmt::Trait(td) = stmt {
+                validate_trait_methods_have_target(td)?;
                 self.trait_env.insert(td.name.clone(), td.clone());
                 for method in &td.methods {
                     if method.fixity.is_some() {
@@ -612,6 +624,10 @@ impl Infer {
                 }
             }
         }
+        // Seed this program's own impl dictionaries for standalone inference. Graph
+        // inference also calls set_known_impl_dicts with the full module env; the
+        // overlap is harmless and keeps both entry points on the same call path.
+        self.register_impl_dict_names(seed_stmts.iter().chain(program.stmts.iter()));
 
         // Pre-pass 3: constructor types and externs
         for stmt in &mut program.stmts {
@@ -744,6 +760,9 @@ impl Infer {
         // Pre-pass 2: operator-to-trait registry. Fail-fast.
         for stmt in seed_stmts.iter().chain(program.stmts.iter()) {
             if let Stmt::Trait(td) = stmt {
+                if let Err(err) = validate_trait_methods_have_target(td) {
+                    return (ModuleInference::default(), vec![err]);
+                }
                 self.trait_env.insert(td.name.clone(), td.clone());
                 for method in &td.methods {
                     if method.fixity.is_some() {
@@ -767,6 +786,10 @@ impl Infer {
                 }
             }
         }
+        // Seed this program's own impl dictionaries for standalone inference. Graph
+        // inference also calls set_known_impl_dicts with the full module env; the
+        // overlap is harmless and keeps both entry points on the same call path.
+        self.register_impl_dict_names(seed_stmts.iter().chain(program.stmts.iter()));
 
         let mut diagnostics: Vec<SpannedTypeError> = Vec::new();
         let mut unavailable = CollectedNames::default();
@@ -929,6 +952,18 @@ impl Infer {
         self.symbol_types.clear();
         self.binding_types.clear();
         self.definition_schemes.clear();
+    }
+
+    fn register_impl_dict_names<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
+        for stmt in stmts {
+            if let Stmt::Impl(impl_def) = stmt {
+                self.known_impl_dicts.insert(format!(
+                    "__{}__{}",
+                    impl_def.trait_name,
+                    impl_target_name(&impl_def.target)
+                ));
+            }
+        }
     }
 
     fn infer_stmt(&mut self, env: &mut TypeEnv, stmt: &mut Stmt) -> Result<Ty, SpannedTypeError> {
@@ -1463,7 +1498,7 @@ impl Infer {
                 dict_args,
                 pending_dict_args,
             } => {
-                // Trait method call: `TraitName.method(args...)`
+                // Trait method call: `TraitName.method(args...)`.
                 if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind
                     && let ExprKind::Ident(trait_name) = &expr.kind
                     && let Some(trait_def) = self.trait_env.get(trait_name).cloned()
@@ -1478,76 +1513,35 @@ impl Infer {
                         })?
                         .clone();
 
-                    let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-                    let Some(first_arg_ty) = arg_tys.first() else {
-                        return Err(TypeError::ArityMismatch {
-                            expected: method.params.len(),
-                            got: 0,
-                        }
-                        .into());
-                    };
-                    if arg_tys.len() != method.params.len() {
-                        return Err(TypeError::ArityMismatch {
-                            expected: method.params.len(),
-                            got: arg_tys.len(),
-                        }
-                        .into());
+                    return self.resolve_trait_method_call(
+                        env,
+                        args,
+                        arg_wrappers,
+                        resolved_callee,
+                        trait_def,
+                        method,
+                        "trait method call",
+                    );
+                }
+
+                // Bare trait method call: `method(args...)` without explicit `Trait.` prefix.
+                // This is call-only sugar: bare trait methods are not first-class values,
+                // because dispatch is resolved from the first argument's concrete target.
+                // Allowed only when the method name belongs to exactly one trait in scope.
+                if let ExprKind::Ident(method_name) = &callee.kind
+                    && env.get(method_name.as_str()).is_none()
+                {
+                    if let Some(resolved) = self.bare_trait_method(method_name)? {
+                        return self.resolve_trait_method_call(
+                            env,
+                            args,
+                            arg_wrappers,
+                            resolved_callee,
+                            resolved.trait_def,
+                            resolved.method,
+                            "bare trait method call",
+                        );
                     }
-
-                    let resolved_target = self.subst.apply(first_arg_ty);
-                    let target_name = ty_target_name(&resolved_target).ok_or_else(|| {
-                        TypeError::UnresolvedTrait {
-                            context: "trait method call".to_string(),
-                            trait_name: trait_name.clone(),
-                        }
-                    })?;
-                    let dict_name = format!("__{}__{}", trait_name, target_name);
-                    let ret_ty = if let Some(dict_info) = env.get(&dict_name) {
-                        let dict_ty = self.instantiate(&dict_info.scheme);
-                        let method_ty = record_field_ty(&self.subst.apply(&dict_ty), field)
-                            .ok_or_else(|| TypeError::UnknownTraitMethod {
-                                trait_name: trait_name.clone(),
-                                method: field.clone(),
-                            })?;
-                        let ret_ty = Ty::Var(self.fresh_var());
-                        unify(
-                            &mut self.subst,
-                            method_ty,
-                            Ty::Func(arg_tys, Box::new(ret_ty.clone())),
-                        )?;
-                        ret_ty
-                    } else {
-                        let mut param_vars = HashMap::new();
-                        let target_var = self.fresh_var();
-                        param_vars.insert(trait_def.param.clone(), target_var);
-                        let method_param_tys: Vec<Ty> = method
-                            .params
-                            .iter()
-                            .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
-                            .collect::<Result<_, _>>()?;
-                        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-                        for (arg_ty, expected_ty) in
-                            arg_tys.into_iter().zip(method_param_tys.into_iter())
-                        {
-                            unify(&mut self.subst, expected_ty, arg_ty)?;
-                        }
-                        let resolved_target = self.subst.apply(&Ty::Var(target_var));
-                        ty_target_name(&resolved_target).ok_or_else(|| {
-                            TypeError::UnresolvedTrait {
-                                context: "trait method call".to_string(),
-                                trait_name: trait_name.clone(),
-                            }
-                        })?;
-                        ret_ty
-                    };
-
-                    *resolved_callee = Some(format!(
-                        "__{}__{}.{}",
-                        trait_name,
-                        target_name,
-                        mangle_op(field)
-                    ));
-                    return Ok(self.subst.apply(&ret_ty));
                 }
 
                 // Constrained function call: resolve dict args
@@ -1856,6 +1850,136 @@ impl Infer {
             self.expr_types.insert(expr.id, self.subst.apply(ty));
         }
         result.map_err(|err: SpannedTypeError| err.with_span_if_absent(expr.span))
+    }
+
+    fn resolve_trait_method_call(
+        &mut self,
+        env: &TypeEnv,
+        args: &mut [Expr],
+        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
+        resolved_callee: &mut Option<String>,
+        trait_def: TraitDef,
+        method: TraitMethod,
+        context: &str,
+    ) -> Result<Ty, SpannedTypeError> {
+        let trait_name = trait_def.name.clone();
+        let method_name = method.name.clone();
+        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
+
+        let Some(first_arg_ty) = arg_tys.first() else {
+            return Err(TypeError::ArityMismatch {
+                expected: method.params.len(),
+                got: 0,
+            }
+            .into());
+        };
+        if arg_tys.len() != method.params.len() {
+            return Err(TypeError::ArityMismatch {
+                expected: method.params.len(),
+                got: arg_tys.len(),
+            }
+            .into());
+        }
+        let resolved_target = self.subst.apply(first_arg_ty);
+        let target_name =
+            ty_target_name(&resolved_target).ok_or_else(|| TypeError::UnresolvedTrait {
+                context: context.to_string(),
+                trait_name: trait_name.clone(),
+            })?;
+        let dict_name = format!("__{}__{}", trait_name, target_name);
+
+        let ret_ty =
+            if let Some(dict_info) = env.get(&dict_name) {
+                let dict_ty = self.instantiate(&dict_info.scheme);
+                let method_ty = record_field_ty(&self.subst.apply(&dict_ty), &method_name)
+                    .ok_or_else(|| TypeError::UnknownTraitMethod {
+                        trait_name: trait_name.clone(),
+                        method: method_name.clone(),
+                    })?;
+                let ret_ty = Ty::Var(self.fresh_var());
+                unify(
+                    &mut self.subst,
+                    method_ty,
+                    Ty::Func(arg_tys, Box::new(ret_ty.clone())),
+                )?;
+                ret_ty
+            } else if self.known_impl_dicts.contains(&dict_name) {
+                self.check_trait_method_signature(&trait_def, &method, arg_tys, context)?
+            } else {
+                return Err(TypeError::MissingTraitImpl {
+                    trait_name: trait_name.clone(),
+                    impl_target: target_name.to_string(),
+                }
+                .into());
+            };
+
+        *resolved_callee = Some(format!(
+            "__{}__{}.{}",
+            trait_name,
+            target_name,
+            mangle_op(&method_name)
+        ));
+        Ok(self.subst.apply(&ret_ty))
+    }
+
+    fn check_trait_method_signature(
+        &mut self,
+        trait_def: &TraitDef,
+        method: &TraitMethod,
+        arg_tys: Vec<Ty>,
+        context: &str,
+    ) -> Result<Ty, SpannedTypeError> {
+        let mut param_vars = HashMap::new();
+        let target_var = self.fresh_var();
+        param_vars.insert(trait_def.param.clone(), target_var);
+        let method_param_tys: Vec<Ty> = method
+            .params
+            .iter()
+            .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
+            .collect::<Result<_, _>>()?;
+        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
+        for (arg_ty, expected_ty) in arg_tys.into_iter().zip(method_param_tys) {
+            unify(&mut self.subst, expected_ty, arg_ty)?;
+        }
+        let resolved_target = self.subst.apply(&Ty::Var(target_var));
+        ty_target_name(&resolved_target).ok_or_else(|| TypeError::UnresolvedTrait {
+            context: context.to_string(),
+            trait_name: trait_def.name.clone(),
+        })?;
+        Ok(ret_ty)
+    }
+
+    fn bare_trait_method(
+        &self,
+        method_name: &str,
+    ) -> Result<Option<ResolvedTraitMethod>, TypeError> {
+        let mut matching: Vec<_> = self
+            .trait_env
+            .values()
+            .filter_map(|trait_def| {
+                trait_def
+                    .methods
+                    .iter()
+                    .find(|method| method.name == method_name)
+                    .map(|method| ResolvedTraitMethod {
+                        trait_def: trait_def.clone(),
+                        method: method.clone(),
+                    })
+            })
+            .collect();
+        matching.sort_by(|a, b| a.trait_def.name.cmp(&b.trait_def.name));
+
+        if matching.len() > 1 {
+            return Err(TypeError::AmbiguousTraitMethod {
+                method: method_name.to_string(),
+                candidates: matching
+                    .iter()
+                    .map(|candidate| candidate.trait_def.name.clone())
+                    .collect(),
+            });
+        }
+
+        Ok(matching.into_iter().next())
     }
 
     fn infer_args(
@@ -2374,6 +2498,19 @@ fn impl_target_name(target: &Type) -> String {
         Type::App(con, _) => impl_target_name(con),
         _ => "Unknown".to_string(),
     }
+}
+
+fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeError> {
+    for method in &td.methods {
+        if method.params.is_empty() {
+            return Err(TypeError::TraitMethodMissingTarget {
+                trait_name: td.name.clone(),
+                method: method.name.clone(),
+            }
+            .at(method.span));
+        }
+    }
+    Ok(())
 }
 
 /// Returns `true` if `pat` is irrefutable, i.e. always matches regardless of

@@ -1,11 +1,13 @@
-use super::hover::{completion_scheme_to_string, completion_ty_to_display_string};
+use super::hover::{
+    ast_type_to_string, completion_scheme_to_string, completion_ty_to_display_string,
+};
 use super::state::{ServerState, cached_analysis};
 use super::uri::uri_to_path;
 use super::workspace::{
     WorkspaceAnalysis, analyze_document_graph, load_document_graph_recovering,
     load_workspace_graphs,
 };
-use hern_core::ast::{Program, SourcePosition};
+use hern_core::ast::{Program, SourcePosition, TraitDef};
 use hern_core::module::{GraphInference, ModuleGraph, infer_graph_collecting};
 use hern_core::source_index::{
     CompletionCandidate, Definition, DefinitionKind, SourceIndex, index_program,
@@ -108,7 +110,7 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
     }
 
     use hern_core::source_index::CompletionCandidateKind;
-    candidates
+    let mut items: Vec<CompletionItem> = candidates
         .into_iter()
         .map(|candidate| {
             let detail = completion_detail(
@@ -144,7 +146,45 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
                 ..Default::default()
             }
         })
-        .collect()
+        .collect();
+
+    // Add trait names from the module environment. Traits are used in value position
+    // as `TraitName.method(...)`, so they belong in the default completion list.
+    if let Some(module_env) = inference.module_env_for_module(module_name) {
+        let trait_items = {
+            let existing: std::collections::HashSet<&str> =
+                items.iter().map(|i| i.label.as_str()).collect();
+            module_env
+                .all_trait_defs()
+                .filter(|(trait_name, _)| !existing.contains(trait_name))
+                .map(|(trait_name, trait_def)| {
+                    let detail = Some(format!("trait {} {}", trait_name, trait_def.param));
+                    CompletionItem {
+                        label: trait_name.to_string(),
+                        kind: Some(CompletionItemKind::INTERFACE),
+                        detail: detail.clone(),
+                        filter_text: Some(trait_name.to_string()),
+                        insert_text: Some(trait_name.to_string()),
+                        text_edit: replacement_range.map(|range| {
+                            CompletionTextEdit::Edit(TextEdit {
+                                range,
+                                new_text: trait_name.to_string(),
+                            })
+                        }),
+                        label_details: detail.map(|d| CompletionItemLabelDetails {
+                            detail: Some(format!(": {d}")),
+                            description: None,
+                        }),
+                        ..Default::default()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        items.extend(trait_items);
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+    }
+
+    items
 }
 
 fn import_path_completion(
@@ -261,17 +301,35 @@ fn member_completion(
     if receiver.is_empty() {
         return None;
     }
-    let definition = visible_definition_named(index, receiver, position)
-        .or_else(|| visible_definition_named(prelude_index, receiver, position))?;
     let replacement_range = completion_replacement_range(state, uri, lsp_position)?;
-    let items = if let Some(module_name) = definition.import_module.as_ref() {
-        imported_member_completion_items(graph, inference, module_name, replacement_range)
-    } else if let Some(ty) = completion_type_for_definition(inference, current_module, definition) {
-        record_field_completion_items(&ty, replacement_range)
-    } else {
-        Vec::new()
-    };
-    (!items.is_empty()).then_some(items)
+
+    // Definition-based completions: import module members and record fields.
+    if let Some(definition) = visible_definition_named(index, receiver, position)
+        .or_else(|| visible_definition_named(prelude_index, receiver, position))
+    {
+        let items = if let Some(mod_name) = definition.import_module.as_ref() {
+            imported_member_completion_items(graph, inference, mod_name, replacement_range)
+        } else if let Some(ty) =
+            completion_type_for_definition(inference, current_module, definition)
+        {
+            record_field_completion_items(&ty, replacement_range)
+        } else {
+            Vec::new()
+        };
+        if !items.is_empty() {
+            return Some(items);
+        }
+    }
+
+    // Trait method completions: `TraitName.` triggers suggestions of the trait's methods.
+    if let Some(module_env) = inference.module_env_for_module(current_module)
+        && let Some(trait_def) = module_env.trait_def(receiver)
+    {
+        let items = trait_method_completion_items(trait_def, replacement_range);
+        return (!items.is_empty()).then_some(items);
+    }
+
+    None
 }
 
 fn imported_member_completion_items(
@@ -370,6 +428,47 @@ fn record_field_completion_items(ty: &Ty, replacement_range: Range) -> Vec<Compl
             ..Default::default()
         })
         .collect::<Vec<_>>();
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items
+}
+
+fn trait_method_completion_items(
+    trait_def: &TraitDef,
+    replacement_range: Range,
+) -> Vec<CompletionItem> {
+    let mut items: Vec<CompletionItem> = trait_def
+        .methods
+        .iter()
+        .map(|method| {
+            let params = method
+                .params
+                .iter()
+                .map(|(name, ty)| format!("{name}: {}", ast_type_to_string(ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = Some(format!(
+                "fn({}) -> {}",
+                params,
+                ast_type_to_string(&method.ret_type)
+            ));
+            CompletionItem {
+                label: method.name.clone(),
+                kind: Some(CompletionItemKind::METHOD),
+                detail: detail.clone(),
+                filter_text: Some(method.name.clone()),
+                insert_text: Some(method.name.clone()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: method.name.clone(),
+                })),
+                label_details: detail.map(|d| CompletionItemLabelDetails {
+                    detail: Some(format!(": {d}")),
+                    description: None,
+                }),
+                ..Default::default()
+            }
+        })
+        .collect();
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items
 }

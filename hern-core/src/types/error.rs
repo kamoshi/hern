@@ -29,6 +29,10 @@ pub enum TypeError {
         expected: usize,
         got: usize,
     },
+    TraitMethodMissingTarget {
+        trait_name: String,
+        method: String,
+    },
     ExtraTraitMethod {
         trait_name: String,
         method: String,
@@ -47,6 +51,14 @@ pub enum TypeError {
     },
     UnknownImport(String),
     UnknownType(String),
+    MissingTraitImpl {
+        trait_name: String,
+        impl_target: String,
+    },
+    AmbiguousTraitMethod {
+        method: String,
+        candidates: Vec<String>,
+    },
     /// A refutable pattern was used in a function-parameter position.
     /// Only irrefutable patterns (variable, wildcard, record, `[..rest]`) are allowed.
     RefutableParamPattern,
@@ -147,6 +159,11 @@ impl fmt::Display for TypeError {
                 "impl method `{}` for trait `{}` has wrong number of arguments: expected {}, got {}",
                 method, trait_name, expected, got
             ),
+            TypeError::TraitMethodMissingTarget { trait_name, method } => write!(
+                f,
+                "trait method `{}` in trait `{}` must have at least one parameter",
+                method, trait_name
+            ),
             TypeError::ExtraTraitMethod { trait_name, method } => {
                 write!(
                     f,
@@ -171,6 +188,22 @@ impl fmt::Display for TypeError {
             }
             TypeError::UnknownImport(path) => write!(f, "unknown import: `{}`", path),
             TypeError::UnknownType(name) => write!(f, "unknown type: `{}`", name),
+            TypeError::MissingTraitImpl {
+                trait_name,
+                impl_target,
+            } => write!(
+                f,
+                "trait `{}` is not implemented for `{}`",
+                trait_name, impl_target
+            ),
+            TypeError::AmbiguousTraitMethod { method, candidates } => write!(
+                f,
+                "ambiguous method `{}`: defined in multiple traits ({}); \
+                 use explicit TraitName.{}() syntax to disambiguate",
+                method,
+                candidates.join(", "),
+                method,
+            ),
             TypeError::RefutableParamPattern => write!(
                 f,
                 "refutable pattern in function parameter: only variable, wildcard, record, and \

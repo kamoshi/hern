@@ -522,6 +522,7 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
             };
         let (traits, ops) = module_env.to_infer_scope();
         infer.set_trait_scope(traits, ops);
+        infer.set_known_impl_dicts(module_env.all_dict_names());
         infer.set_import_types(result.import_types.clone());
         let program = match graph.modules.get_mut(&name) {
             Some(program) => program,
@@ -613,6 +614,21 @@ impl ModuleEnv {
             .map(|(op, entry)| (op.clone(), entry.trait_name.clone()))
             .collect();
         (traits, ops)
+    }
+
+    /// Return all in-scope trait implementation dictionary names.
+    pub fn all_dict_names(&self) -> HashSet<String> {
+        self.impls.values().map(|e| e.dict_name.clone()).collect()
+    }
+
+    /// Look up a trait definition by name. Covers all in-scope traits: local, imported, prelude.
+    pub fn trait_def(&self, name: &str) -> Option<&TraitDef> {
+        self.traits.get(name).map(|e| &e.def)
+    }
+
+    /// Iterate over all in-scope trait definitions: local, imported, and prelude.
+    pub fn all_trait_defs(&self) -> impl Iterator<Item = (&str, &TraitDef)> + '_ {
+        self.traits.iter().map(|(k, v)| (k.as_str(), &v.def))
     }
 
     pub fn exported_dict_names(&self) -> Vec<String> {

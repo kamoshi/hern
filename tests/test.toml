@@ -349,6 +349,43 @@ output = """
 0
 """
 
+[tests.bare_trait_method]
+path = "tests/hern/bare_trait_method.hern"
+expect = "typecheck"
+output = """
+42
+0
+"""
+
+[tests.bare_imported_trait_method]
+path = "tests/hern/bare_imported_trait_method.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
+[tests.bare_trait_method_shadowed]
+path = "tests/hern/bare_trait_method_shadowed.hern"
+expect = "typecheck"
+output = """
+11
+"""
+
+[tests.ambiguous_trait_method]
+path = "tests/hern/ambiguous_trait_method.hern"
+expect = "error"
+error_contains = "ambiguous method `run`"
+
+[tests.missing_trait_impl]
+path = "tests/hern/missing_trait_impl.hern"
+expect = "error"
+error_contains = "trait `Show` is not implemented for `f64`"
+
+[tests.trait_method_missing_target]
+path = "tests/hern/trait_method_missing_target.hern"
+expect = "error"
+error_contains = "must have at least one parameter"
+
 [tests.let_destructure]
 path = "tests/hern/let_destructure.hern"
 expect = "typecheck"

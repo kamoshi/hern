@@ -326,4 +326,21 @@ mod tests {
         assert!(inference.env.get("via_trait").is_some());
         assert!(inference.env.get("other").is_none());
     }
+
+    #[test]
+    fn trait_methods_require_target_parameter() {
+        let mut program =
+            parse_source("trait Ping 'a {\n    fn ping() -> 'a\n}\n").expect("source should parse");
+        reassociate_standalone(&mut program);
+
+        let output = infer_program_collecting(&mut program);
+
+        assert!(output.value.is_some());
+        assert_eq!(output.diagnostics.len(), 1);
+        assert!(
+            output.diagnostics[0]
+                .message
+                .contains("must have at least one parameter")
+        );
+    }
 }

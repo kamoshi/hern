@@ -602,6 +602,29 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn hover_returns_trait_access_information() {
+        let project = TestProject::new("trait-access-hover");
+        let source = concat!(
+            "trait Show 'a {\n",
+            "  fn show(x: 'a) -> string\n",
+            "}\n",
+            "impl Show for f64 {\n",
+            "  fn show(x) { \"ok\" }\n",
+            "}\n",
+            "Show.show(1)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let trait_info =
+            hover(&state, uri.clone(), Position::new(6, 1)).expect("trait hover should resolve");
+        let method_info =
+            hover(&state, uri, Position::new(6, 6)).expect("method hover should resolve");
+
+        assert_eq!(hover_text(trait_info), "trait Show 'a");
+        assert_eq!(hover_text(method_info), "fn show(x: 'a) -> string");
+    }
+
+    #[test]
     fn hover_uses_imported_module_types() {
         let source = "let dep = import \"dep\";\ndep.value()\n";
         let ImportFixture {
@@ -1501,6 +1524,23 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn completion_includes_traits_in_value_position() {
+        use lsp_types::CompletionItemKind;
+        let project = TestProject::new("completion-trait-value-position");
+        let source = "F\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let items = completion(&state, uri, Position::new(0, 1));
+
+        let functor = items
+            .iter()
+            .find(|item| completion_insert_name(item) == "Functor")
+            .expect("prelude trait `Functor` should be a completion candidate");
+        assert_eq!(functor.kind, Some(CompletionItemKind::INTERFACE));
+        assert_eq!(functor.detail.as_deref(), Some("trait Functor 'f"));
+    }
+
+    #[test]
     fn instrumentation_is_disabled_by_default() {
         let state = ServerState::new().expect("server state should initialize");
 
@@ -1651,6 +1691,23 @@ pub(super) mod tests {
                 .iter()
                 .all(|item| item.kind == Some(CompletionItemKind::FIELD))
         );
+    }
+
+    #[test]
+    fn completion_suggests_trait_methods_after_dot() {
+        use lsp_types::CompletionItemKind;
+        let project = TestProject::new("completion-trait-method");
+        let source = "trait Show 'a { fn show(x: 'a) -> string }\nShow.\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let items = completion(&state, uri, Position::new(1, 5));
+
+        let show = items
+            .iter()
+            .find(|item| completion_insert_name(item) == "show")
+            .expect("trait method `show` should be suggested");
+        assert_eq!(show.kind, Some(CompletionItemKind::METHOD));
+        assert_eq!(show.detail.as_deref(), Some("fn(x: 'a) -> string"));
     }
 
     #[test]
