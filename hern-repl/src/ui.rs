@@ -1,48 +1,63 @@
 use crate::app::{App, Entry, EntryKind};
 use crate::highlight::{highlight_line, highlight_source_lines};
+use crate::style::user_message_style;
 use crate::terminal::TerminalGuard;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Margin;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use std::io;
 
+const MAX_COMPOSER_INNER: u16 = 3;
+
+fn composer_inner_height(app: &App) -> u16 {
+    (app.input.split('\n').count() as u16).clamp(1, MAX_COMPOSER_INNER)
+}
+
 pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
+    let composer_inner = composer_inner_height(app);
+    let completions_height = 4 - composer_inner; // 3→1 as composer grows 1→3
     let [
+        top_spacer_area,
         status_area,
-        spacer_area,
         composer_area,
         hint_area,
+        hint_completions_spacer_area,
         completions_area,
+        spacer_area,
         footer_area,
     ] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(4),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(composer_inner + 2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(completions_height),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(area);
 
+    let _ = top_spacer_area;
     render_status(frame, status_area);
-    let _ = spacer_area;
     let input_area = render_composer(frame, composer_area, app);
     render_type_hint(frame, hint_area, app);
+    let _ = hint_completions_spacer_area;
     render_completion_preview(frame, completions_area, app);
-    render_footer(frame, footer_area);
+    let _ = spacer_area;
+    render_footer(frame, footer_area, app);
     if app.bindings_overlay.open {
         render_bindings_popover(frame, area, app);
     }
 
     let (cursor_line, cursor_col, scroll) = cursor_metrics(app, input_area.height);
     frame.set_cursor_position((
-        input_area.x + 2 + cursor_col.min(input_area.width.saturating_sub(3)),
+        input_area.x + cursor_col.min(input_area.width.saturating_sub(1)),
         input_area.y + cursor_line.saturating_sub(scroll),
     ));
 }
@@ -59,21 +74,31 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect) {
 }
 
 fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) -> Rect {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            " input ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area).inner(Margin {
-        horizontal: 1,
-        vertical: 0,
-    });
-    frame.render_widget(block, area);
+    let inner = Rect {
+        x: area.x.saturating_add(2),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(3),
+        height: area.height.saturating_sub(2),
+    };
+    let input_style = user_message_style();
+    if area.height > 0 {
+        frame.render_widget(Block::default().style(input_style), area);
+    }
+
+    let prompt = if app.input.is_empty() {
+        Span::styled("λ", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::styled("λ", Style::default().fg(Color::Cyan).bold())
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(prompt)),
+        Rect {
+            x: area.x,
+            y: inner.y,
+            width: 1,
+            height: 1,
+        },
+    );
 
     let lines = composer_lines(app);
     let (_, _, scroll) = cursor_metrics(app, inner.height);
@@ -82,15 +107,22 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) -> Rec
         .skip(scroll as usize)
         .take(inner.height as usize)
         .collect();
-    frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), inner);
+    frame.render_widget(
+        Paragraph::new(visible)
+            .wrap(Wrap { trim: false })
+            .style(input_style),
+        inner,
+    );
     inner
 }
 
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect) {
+fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let newline_key = if app.enhanced_keys { "shift+enter" } else { "ctrl+j" };
     let footer = Line::from(vec![
+        "  ".into(),
         "enter".cyan().bold(),
         " run   ".into(),
-        "shift+enter".cyan().bold(),
+        newline_key.to_string().cyan().bold(),
         " newline   ".into(),
         "up/down".cyan().bold(),
         " history   ".into(),
@@ -100,9 +132,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect) {
         " exit".into(),
     ]);
     frame.render_widget(
-        Paragraph::new(footer)
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center),
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         area,
     );
 }
@@ -285,32 +315,21 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 
 fn composer_lines(app: &App) -> Vec<Line<'static>> {
     if app.input.is_empty() {
-        return vec![Line::from(vec![
-            Span::styled("λ ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "Type Hern expression or definition...",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])];
+        return vec![Line::from(Span::styled(
+            "Type Hern expression or definition...",
+            Style::default().fg(Color::DarkGray),
+        ))];
     }
 
     app.input
         .split('\n')
-        .enumerate()
-        .map(|(idx, line)| {
-            let prompt = if idx == 0 { "λ " } else { "  " };
-            let mut spans = vec![Span::styled(
-                prompt.to_string(),
-                Style::default().fg(Color::Cyan),
-            )];
-            spans.extend(highlight_line(line).spans);
-            Line::from(spans)
-        })
+        .map(|line| highlight_line(line))
         .collect()
 }
 
 fn cursor_metrics(app: &App, height: u16) -> (u16, u16, u16) {
-    let before_cursor = &app.input[..app.cursor];
+    let cursor = clamp_to_char_boundary(&app.input, app.cursor);
+    let before_cursor = &app.input[..cursor];
     let cursor_line = before_cursor.chars().filter(|ch| *ch == '\n').count() as u16;
     let cursor_col = before_cursor
         .rsplit('\n')
@@ -323,6 +342,14 @@ fn cursor_metrics(app: &App, height: u16) -> (u16, u16, u16) {
         cursor_line + 1 - height
     };
     (cursor_line, cursor_col, scroll)
+}
+
+fn clamp_to_char_boundary(input: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(input.len());
+    while cursor > 0 && !input.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
 }
 
 pub(crate) fn insert_entries(terminal: &mut TerminalGuard, entries: Vec<Entry>) -> io::Result<()> {
@@ -359,7 +386,7 @@ fn rendered_height(lines: &[Line<'static>], width: u16) -> u16 {
 }
 
 fn entries_to_lines(entries: &[Entry]) -> Vec<Line<'static>> {
-    entries
+    let mut lines: Vec<Line<'static>> = entries
         .iter()
         .flat_map(|entry| {
             let (prefix, style) = match entry.kind {
@@ -389,12 +416,60 @@ fn entries_to_lines(entries: &[Entry]) -> Vec<Line<'static>> {
                 })
                 .collect::<Vec<_>>()
         })
-        .collect()
+        .collect();
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entries_to_lines_includes_all_entries() {
+        let entries = vec![
+            Entry {
+                kind: EntryKind::Input,
+                text: "2".to_string(),
+            },
+            Entry {
+                kind: EntryKind::Output,
+                text: "2".to_string(),
+            },
+        ];
+        let lines = entries_to_lines(&entries);
+        // Input adds 1 line (> 2)
+        // Output adds 1 line (  2)
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].spans.iter().any(|s| s.content == "> "));
+        assert!(lines[1].spans.iter().any(|s| s.content == "  "));
+        assert!(lines[1].spans.iter().any(|s| s.content == "2"));
+        assert!(lines[2].spans.is_empty() || lines[2].spans.iter().all(|s| s.content.trim().is_empty()));
+    }
+
+    #[test]
+    fn entries_to_lines_handles_multi_line_error() {
+        let entries = vec![
+            Entry {
+                kind: EntryKind::Input,
+                text: "bad".to_string(),
+            },
+            Entry {
+                kind: EntryKind::Error,
+                text: "error line 1\nerror line 2".to_string(),
+            },
+        ];
+        let lines = entries_to_lines(&entries);
+        // Input: 1 line
+        // Error: 2 lines
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].spans.iter().any(|s| s.content == "! "));
+        assert!(lines[1].spans.iter().any(|s| s.content == "error line 1"));
+        assert!(lines[2].spans.iter().any(|s| s.content == "  "));
+        assert!(lines[2].spans.iter().any(|s| s.content == "error line 2"));
+    }
 
     #[test]
     fn truncation_keeps_binding_rows_single_line() {

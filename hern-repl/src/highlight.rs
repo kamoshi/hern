@@ -22,10 +22,16 @@ pub(crate) fn highlight_line(line: &str) -> Line<'static> {
         }
 
         let offset = token.span.col.saturating_sub(1);
+        if !line.is_char_boundary(offset) {
+            return Line::from(Span::raw(line.to_string()));
+        }
         if offset > cursor && offset <= line.len() {
             spans.push(Span::raw(line[cursor..offset].to_string()));
         }
         let end = (offset + token.span.len).min(line.len());
+        if !line.is_char_boundary(end) {
+            return Line::from(Span::raw(line.to_string()));
+        }
         if end <= offset {
             continue;
         }

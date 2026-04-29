@@ -48,7 +48,10 @@ enum Commands {
         path: PathBuf,
     },
     /// Start the interactive Hern REPL
-    Repl,
+    Repl {
+        /// Optional file to load into the REPL before interaction starts
+        path: Option<PathBuf>,
+    },
     /// Start the Hern language server (LSP)
     Lsp,
 }
@@ -148,8 +151,12 @@ fn run_cli() -> Result<(), CliError> {
                 gen_lua_iife_bundle(&graph, &inference.module_envs, &entry)
             );
         }
-        Commands::Repl => {
-            if let Err(err) = hern_repl::run() {
+        Commands::Repl { path } => {
+            let result = match path {
+                Some(path) => hern_repl::run_with_path(path),
+                None => hern_repl::run(),
+            };
+            if let Err(err) = result {
                 eprintln!("REPL error: {}", err);
                 std::process::exit(1);
             }

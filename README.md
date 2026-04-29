@@ -74,6 +74,7 @@ cargo run -p hern -- lua path/to/file.hern
 cargo run -p hern -- run path/to/file.hern
 cargo run -p hern -- bundle path/to/file.hern
 cargo run -p hern -- repl
+cargo run -p hern -- repl path/to/file.hern
 cargo run -p hern -- lsp
 ```
 
