@@ -3,7 +3,8 @@ use super::uri::uri_to_path;
 use super::workspace::load_workspace_graphs;
 use hern_core::analysis::hover_at;
 use hern_core::ast::{
-    Expr, ExprKind, ImplMethod, Pattern, Program, SourcePosition, SourceSpan, Stmt,
+    BinOp, Expr, ExprKind, Fixity, ImplMethod, Pattern, Program, SourcePosition, SourceSpan, Stmt,
+    TraitMethod,
 };
 use hern_core::module::{GraphInference, ModuleGraph};
 use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
@@ -33,6 +34,9 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
     };
     let markdown = state.supports_markdown_hover;
     if let Some(contents) = symbol_hover(graph, inference, module_name, program, position) {
+        return Some(type_hover(contents, markdown));
+    }
+    if let Some(contents) = operator_hover(graph, inference, module_name, program, position) {
         return Some(type_hover(contents, markdown));
     }
     let info = hover_at(program, expr_types, symbol_types, position)?;
@@ -91,6 +95,197 @@ fn symbol_hover(
     )
 }
 
+struct OperatorUse<'a> {
+    name: &'a str,
+}
+
+fn operator_hover(
+    graph: &ModuleGraph,
+    inference: &GraphInference,
+    module_name: &str,
+    program: &Program,
+    position: SourcePosition,
+) -> Option<String> {
+    let operator = operator_use_at(program, position)?;
+    operator_definition_hover_text(
+        program,
+        inference.env_for_module(module_name),
+        inference.definition_schemes_for_module(module_name),
+        operator.name,
+    )
+    .or_else(|| operator_definition_hover_text(&graph.prelude, None, None, operator.name))
+}
+
+fn operator_use_at(program: &Program, position: SourcePosition) -> Option<OperatorUse<'_>> {
+    program
+        .stmts
+        .iter()
+        .find_map(|stmt| operator_use_in_stmt(stmt, position))
+}
+
+fn operator_use_in_stmt(stmt: &Stmt, position: SourcePosition) -> Option<OperatorUse<'_>> {
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Expr(value) => operator_use_in_expr(value, position),
+        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => operator_use_in_expr(body, position),
+        Stmt::Impl(impl_def) => impl_def
+            .methods
+            .iter()
+            .find_map(|method| operator_use_in_expr(&method.body, position)),
+        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
+    }
+}
+
+fn operator_use_in_expr(expr: &Expr, position: SourcePosition) -> Option<OperatorUse<'_>> {
+    if !contains(expr.span, position) {
+        return None;
+    }
+
+    match &expr.kind {
+        ExprKind::Binary {
+            lhs,
+            op,
+            op_span,
+            rhs,
+            ..
+        } => {
+            if contains(*op_span, position)
+                && let BinOp::Custom(name) = op
+            {
+                return Some(OperatorUse { name });
+            }
+            operator_use_in_expr(lhs, position).or_else(|| operator_use_in_expr(rhs, position))
+        }
+        ExprKind::Not(inner)
+        | ExprKind::Loop(inner)
+        | ExprKind::Break(Some(inner))
+        | ExprKind::Return(Some(inner))
+        | ExprKind::FieldAccess { expr: inner, .. }
+        | ExprKind::Lambda { body: inner, .. } => operator_use_in_expr(inner, position),
+        ExprKind::Assign { target, value } => {
+            operator_use_in_expr(target, position).or_else(|| operator_use_in_expr(value, position))
+        }
+        ExprKind::Call { callee, args, .. } => {
+            operator_use_in_expr(callee, position).or_else(|| {
+                args.iter()
+                    .find_map(|arg| operator_use_in_expr(arg, position))
+            })
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => operator_use_in_expr(cond, position)
+            .or_else(|| operator_use_in_expr(then_branch, position))
+            .or_else(|| operator_use_in_expr(else_branch, position)),
+        ExprKind::Match { scrutinee, arms } => {
+            operator_use_in_expr(scrutinee, position).or_else(|| {
+                arms.iter()
+                    .find_map(|(_, body)| operator_use_in_expr(body, position))
+            })
+        }
+        ExprKind::Block { stmts, final_expr } => stmts
+            .iter()
+            .find_map(|stmt| operator_use_in_stmt(stmt, position))
+            .or_else(|| {
+                final_expr
+                    .as_deref()
+                    .and_then(|expr| operator_use_in_expr(expr, position))
+            }),
+        ExprKind::Tuple(items) | ExprKind::Array(items) => items
+            .iter()
+            .find_map(|item| operator_use_in_expr(item, position)),
+        ExprKind::Record(fields) => fields
+            .iter()
+            .find_map(|(_, value)| operator_use_in_expr(value, position)),
+        ExprKind::For { iterable, body, .. } => operator_use_in_expr(iterable, position)
+            .or_else(|| operator_use_in_expr(body, position)),
+        ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None)
+        | ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Import(_)
+        | ExprKind::Unit => None,
+    }
+}
+
+fn operator_definition_hover_text(
+    program: &Program,
+    env: Option<&TypeEnv>,
+    definition_schemes: Option<&HashMap<SourceSpan, Scheme>>,
+    operator: &str,
+) -> Option<String> {
+    program.stmts.iter().find_map(|stmt| match stmt {
+        Stmt::Op {
+            name,
+            name_span,
+            fixity,
+            prec,
+            ..
+        } if name == operator => {
+            let ty = definition_schemes
+                .and_then(|schemes| schemes.get(name_span))
+                .map(hover_scheme_to_string)
+                .or_else(|| {
+                    env.and_then(|env| env.get(name))
+                        .map(|info| hover_scheme_to_string(&info.scheme))
+                })?;
+            Some(with_fixity_line(ty, *fixity, *prec))
+        }
+        Stmt::Trait(trait_def) => trait_def
+            .methods
+            .iter()
+            .find(|method| method.name == operator)
+            .and_then(trait_operator_hover_text),
+        _ => None,
+    })
+}
+
+fn operator_definition_fixity(program: &Program, span: SourceSpan) -> Option<(Fixity, u8)> {
+    program.stmts.iter().find_map(|stmt| match stmt {
+        Stmt::Op {
+            name_span,
+            fixity,
+            prec,
+            ..
+        } if *name_span == span => Some((*fixity, *prec)),
+        _ => None,
+    })
+}
+
+fn trait_operator_hover_text(method: &TraitMethod) -> Option<String> {
+    let (fixity, prec) = method.fixity?;
+    let params = method
+        .params
+        .iter()
+        .map(|(_, ty)| ast_type_to_string(ty))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ty = format!("fn({}) -> {}", params, ast_type_to_string(&method.ret_type));
+    Some(with_fixity_line(ty, fixity, prec))
+}
+
+fn with_fixity_line(ty: String, fixity: Fixity, prec: u8) -> String {
+    format!("{ty}\n{} {prec}", fixity_keyword(fixity))
+}
+
+fn fixity_keyword(fixity: Fixity) -> &'static str {
+    match fixity {
+        Fixity::Left => "infixl",
+        Fixity::Right => "infixr",
+        Fixity::Non => "infix",
+    }
+}
+
+fn contains(span: SourceSpan, pos: SourcePosition) -> bool {
+    let start = (span.start_line, span.start_col);
+    let end = (span.end_line, span.end_col);
+    let cursor = (pos.line, pos.col);
+    cursor >= start && cursor < end
+}
+
 /// Display a bare `Ty` with normalized type variable names.
 ///
 /// Unlike `ty.to_string()`, this wraps the type in a `Scheme` so that internal
@@ -141,9 +336,9 @@ fn scheme_to_display_string(scheme: &Scheme, include_constraints: bool) -> Strin
     if include_constraints {
         let constraints = constraints_by_var(scheme, &names);
         if !constraints.is_empty() {
-            out.push_str("\n\nConstraints:");
+            out.push_str("\n");
             for (name, traits) in constraints {
-                out.push_str(&format!("\n- '{}: {}", name, traits.join(" + ")));
+                out.push_str(&format!("\n'{}: {}", name, traits.join(" + ")));
             }
         }
     }
@@ -281,12 +476,16 @@ fn trait_method_signature(method: &hern_core::ast::TraitMethod) -> String {
         .map(|(name, ty)| format!("{name}: {}", ast_type_to_string(ty)))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let signature = format!(
         "fn {}({}) -> {}",
         method.name,
         params,
         ast_type_to_string(&method.ret_type)
-    )
+    );
+    method
+        .fixity
+        .map(|(fixity, prec)| with_fixity_line(signature.clone(), fixity, prec))
+        .unwrap_or(signature)
 }
 
 fn impl_method_signature(method: &ImplMethod) -> String {
@@ -472,7 +671,12 @@ fn definition_hover_text(
     if let Some(scheme) =
         definition_schemes.and_then(|schemes| schemes.get(&definition.location.span))
     {
-        return Some(hover_scheme_to_string(scheme));
+        let text = hover_scheme_to_string(scheme);
+        return Some(
+            operator_definition_fixity(program, definition.location.span)
+                .map(|(fixity, prec)| with_fixity_line(text.clone(), fixity, prec))
+                .unwrap_or(text),
+        );
     }
 
     if matches!(

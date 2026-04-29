@@ -668,6 +668,40 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn hover_returns_prelude_operator_type_and_fixity() {
+        let project = TestProject::new("operator-hover-prelude");
+        let source = "let sum = 1 + 2;\nlet product = 3 * 4;\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let plus = hover(&state, uri.clone(), Position::new(0, 12))
+            .expect("plus operator hover should resolve");
+        let star =
+            hover(&state, uri, Position::new(1, 16)).expect("star operator hover should resolve");
+
+        assert_eq!(hover_text(plus), "fn('a, 'a) -> 'a\nFixity: infixl 6");
+        assert_eq!(hover_text(star), "fn('a, 'a) -> 'a\nFixity: infixl 7");
+    }
+
+    #[test]
+    fn hover_returns_custom_operator_definition_type_and_fixity() {
+        let project = TestProject::new("operator-hover-custom");
+        let source = concat!(
+            "fn infixr 5 <~>(lhs: string, rhs: string) -> string { lhs .. rhs }\n",
+            "\"a\" <~> \"b\"\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let use_hover = hover(&state, uri.clone(), Position::new(1, 5))
+            .expect("custom operator use hover should resolve");
+        let def_hover = hover(&state, uri, Position::new(0, 12))
+            .expect("custom operator definition hover should resolve");
+
+        let expected = "fn(string, string) -> string\nFixity: infixr 5";
+        assert_eq!(hover_text(use_hover), expected);
+        assert_eq!(hover_text(def_hover), expected);
+    }
+
+    #[test]
     fn hover_groups_multiple_constraints_by_type_variable() {
         let project = TestProject::new("multi-constraint-hover");
         let source = concat!(
