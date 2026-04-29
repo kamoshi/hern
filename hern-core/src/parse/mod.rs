@@ -1932,6 +1932,7 @@ impl<'tokens> Parser<'tokens> {
                 ExprKind::Lambda {
                     params,
                     body: Box::new(body),
+                    dict_params: Vec::new(),
                 },
             ),
         ))

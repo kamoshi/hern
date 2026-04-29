@@ -320,6 +320,7 @@ pub enum ExprKind {
     Lambda {
         params: Vec<(Pattern, Option<Type>)>,
         body: Box<Expr>,
+        dict_params: Vec<String>,
     },
     For {
         pat: Pattern,

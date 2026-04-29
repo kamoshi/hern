@@ -631,8 +631,12 @@ impl LuaCodegen {
                 let v = self.gen_expr(value, pre);
                 format!("(function() {} = {}; return {{}} end)()", t, v)
             }
-            ExprKind::Lambda { params, body } => {
-                let mut param_names: Vec<String> = Vec::new();
+            ExprKind::Lambda {
+                params,
+                body,
+                dict_params,
+            } => {
+                let mut param_names: Vec<String> = dict_params.clone();
                 let mut pattern_destructures = String::new();
                 for (i, (pat, _)) in params.iter().enumerate() {
                     match pat {

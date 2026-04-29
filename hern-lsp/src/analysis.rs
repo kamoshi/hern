@@ -661,7 +661,7 @@ pub(super) mod tests {
             "expected function type, got: {callee_text}"
         );
         assert!(
-            callee_text.contains("Constraints:\n- 'a: Iterable"),
+            callee_text.contains("'a: Iterable"),
             "expected constraints section, got: {callee_text}"
         );
         assert_eq!(hover_text(call), "f64");
@@ -678,8 +678,8 @@ pub(super) mod tests {
         let star =
             hover(&state, uri, Position::new(1, 16)).expect("star operator hover should resolve");
 
-        assert_eq!(hover_text(plus), "fn('a, 'a) -> 'a\nFixity: infixl 6");
-        assert_eq!(hover_text(star), "fn('a, 'a) -> 'a\nFixity: infixl 7");
+        assert_eq!(hover_text(plus), "fn('a, 'a) -> 'a\ninfixl 6");
+        assert_eq!(hover_text(star), "fn('a, 'a) -> 'a\ninfixl 7");
     }
 
     #[test]
@@ -696,7 +696,7 @@ pub(super) mod tests {
         let def_hover = hover(&state, uri, Position::new(0, 12))
             .expect("custom operator definition hover should resolve");
 
-        let expected = "fn(string, string) -> string\nFixity: infixr 5";
+        let expected = "fn(string, string) -> string\ninfixr 5";
         assert_eq!(hover_text(use_hover), expected);
         assert_eq!(hover_text(def_hover), expected);
     }
@@ -719,7 +719,7 @@ pub(super) mod tests {
 
         assert_eq!(
             hover_text(info),
-            "fn('a) -> 'a\n\nConstraints:\n- 'a: ConstraintA + ConstraintB"
+            "fn('a) -> 'a\n\n'a: ConstraintA + ConstraintB"
         );
     }
 

@@ -1092,7 +1092,7 @@ fn param_type_in_expr_stmts(
     variant_env: Option<&VariantEnv>,
 ) -> Option<String> {
     match &expr.kind {
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             if let Some(idx) = params
                 .iter()
                 .position(|(pat, _)| pattern_has_binding_at(pat, name, param_span))

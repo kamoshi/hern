@@ -1668,11 +1668,15 @@ impl Infer {
                 unify(&mut self.subst, expr_ty, expected)?;
                 Ok(field_ty)
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda {
+                params,
+                body,
+                dict_params,
+            } => {
                 let mut param_vars: HashMap<String, TyVar> = HashMap::new();
                 let mut param_tys = Vec::new();
                 let mut body_env = env.clone();
-                for (pat, p_type) in params {
+                for (pat, p_type) in params.iter() {
                     if !is_irrefutable_param(pat) {
                         return Err(TypeError::RefutableParamPattern.at(body.span));
                     }
@@ -1684,9 +1688,6 @@ impl Infer {
                     self.check_pattern(pat, p_ty, &mut body_env, false)?;
                 }
 
-                // Lambda constraints are not propagated to the enclosing scope.
-                // Any pending dict requirements must be resolvable at the lambda's
-                // own call site or via the final resolution pass.
                 let saved_pending = std::mem::take(&mut self.pending_constraints);
 
                 let ret_var = self.fresh_var();
@@ -1696,9 +1697,23 @@ impl Infer {
                 self.fn_return_tys.pop();
                 unify(&mut self.subst, body_ty, ret_ty.clone())?;
 
-                self.pending_constraints = saved_pending;
+                let fn_ty = Ty::Func(param_tys, Box::new(self.subst.apply(&ret_ty)));
+                let fn_constraints =
+                    std::mem::replace(&mut self.pending_constraints, saved_pending);
+                let (gen_scheme, final_constraints) =
+                    self.finalize_constraints(env, fn_ty, fn_constraints);
+                *dict_params = final_constraints.iter().map(dict_param_name).collect();
 
-                Ok(Ty::Func(param_tys, Box::new(self.subst.apply(&ret_ty))))
+                let resolver = |p: &PendingDictArg| {
+                    resolve_local_or_concrete(p, &final_constraints, &self.subst)
+                };
+                resolve_dict_uses_expr(body, &resolver, false)?;
+
+                Ok(if final_constraints.is_empty() {
+                    gen_scheme.ty
+                } else {
+                    Ty::Qualified(final_constraints, Box::new(gen_scheme.ty))
+                })
             }
             ExprKind::For {
                 pat,
@@ -2595,7 +2610,7 @@ fn collect_expr_referenced_names(
                 collect_expr_referenced_names(value, refs, value_scope, type_scope);
             }
         }
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             let mut lambda_scope = value_scope.clone();
             for (pat, param_ty) in params {
                 if let Some(param_ty) = param_ty {

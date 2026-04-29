@@ -693,7 +693,7 @@ impl IndexBuilder {
                 self.index_expr(body);
                 self.pop_scope();
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { params, body, .. } => {
                 let scope_end = SourcePosition {
                     line: body.span.end_line,
                     col: body.span.end_col,
