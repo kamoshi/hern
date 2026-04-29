@@ -5,9 +5,9 @@
 mod analysis;
 
 use analysis::{
-    DiagnosticsByUri, ServerState, combined_diagnostics_for_uri, completion, definition,
-    diagnostics_for_document, document_highlights, hover, prepare_rename, references, rename,
-    semantic_tokens, semantic_tokens_legend,
+    DiagnosticsByUri, ServerState, code_actions, combined_diagnostics_for_uri, completion,
+    definition, diagnostics_for_document, document_highlights, document_symbols, hover,
+    prepare_rename, references, rename, semantic_tokens, semantic_tokens_legend, signature_help,
 };
 use lsp_server::{Connection, Message, Notification, RequestId, Response};
 use lsp_types::notification::{
@@ -15,24 +15,23 @@ use lsp_types::notification::{
     Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentHighlightRequest, GotoDefinition, HoverRequest, PrepareRenameRequest,
-    References, Rename, Request as _, SemanticTokensFullRequest,
+    CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, GotoDefinition,
+    HoverRequest, PrepareRenameRequest, References, Rename, Request as _,
+    SemanticTokensFullRequest, SemanticTokensRangeRequest, SignatureHelpRequest,
 };
 use lsp_types::{
-    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, DocumentHighlightParams,
-    GotoDefinitionParams, GotoDefinitionResponse, HoverParams, HoverProviderCapability,
-    InitializeParams, MarkupKind, OneOf, PublishDiagnosticsParams,
-    ReferenceParams, RenameOptions, RenameParams, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, TextDocumentPositionParams, TextDocumentSyncCapability,
+    CodeActionOrCommand, CodeActionParams, CompletionOptions, CompletionParams, CompletionResponse,
+    Diagnostic, DocumentHighlightParams, DocumentSymbolParams, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverParams, HoverProviderCapability, InitializeParams, MarkupKind,
+    OneOf, PublishDiagnosticsParams, ReferenceParams, RenameOptions, RenameParams,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
+    SignatureHelpParams, TextDocumentPositionParams, TextDocumentSyncCapability,
     TextDocumentSyncKind, Uri,
 };
 use serde::de::DeserializeOwned;
 use std::collections::HashSet;
-use std::time::Duration;
-
-const VALIDATION_DEBOUNCE: Duration = Duration::from_millis(150);
-
 /// Decode request params or immediately send an `InvalidParams` response and return.
 /// Requires `conn` and `req` to be in scope.
 macro_rules! decode_params {
@@ -53,6 +52,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(true)),
         rename_provider: Some(OneOf::Right(RenameOptions {
             prepare_provider: Some(true),
             work_done_progress_options: Default::default(),
@@ -62,11 +63,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
             trigger_characters: Some(vec![".".to_string(), "\"".to_string(), "/".to_string()]),
             ..Default::default()
         }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: None,
+            work_done_progress_options: Default::default(),
+        }),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 legend: semantic_tokens_legend(),
                 full: Some(SemanticTokensFullOptions::Bool(true)),
-                range: None,
+                range: Some(true),
                 ..Default::default()
             },
         )),
@@ -85,6 +91,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
 
     let mut state = ServerState::new()?;
     state.supports_markdown_hover = supports_markdown_hover;
+    state.configure_from_initialize(&init_params);
     main_loop(&connection, &mut state)?;
 
     io_threads.join()?;
@@ -97,7 +104,10 @@ fn main_loop(
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let mut pending_validations = HashSet::new();
     loop {
-        match conn.receiver.recv_timeout(VALIDATION_DEBOUNCE) {
+        match conn
+            .receiver
+            .recv_timeout(state.config.diagnostics_debounce)
+        {
             Ok(msg) => match msg {
                 Message::Request(req) => {
                     if conn.handle_shutdown(&req)? {
@@ -217,6 +227,45 @@ fn handle_request(
             let params: SemanticTokensParams = decode_params!(conn, req, SemanticTokensParams);
             let result: Option<SemanticTokensResult> =
                 semantic_tokens(state, params.text_document.uri);
+            conn.sender
+                .send(Message::Response(Response::new_ok(req.id, result)))?;
+        }
+        SemanticTokensRangeRequest::METHOD => {
+            let params: SemanticTokensRangeParams =
+                decode_params!(conn, req, SemanticTokensRangeParams);
+            let result = semantic_tokens(state, params.text_document.uri).and_then(|result| {
+                let SemanticTokensResult::Tokens(tokens) = result else {
+                    return None;
+                };
+                Some(SemanticTokensRangeResult::Tokens(tokens))
+            });
+            conn.sender
+                .send(Message::Response(Response::new_ok(req.id, result)))?;
+        }
+        DocumentSymbolRequest::METHOD => {
+            let params: DocumentSymbolParams = decode_params!(conn, req, DocumentSymbolParams);
+            let result = document_symbols(state, params.text_document.uri);
+            conn.sender
+                .send(Message::Response(Response::new_ok(req.id, result)))?;
+        }
+        SignatureHelpRequest::METHOD => {
+            let params: SignatureHelpParams = decode_params!(conn, req, SignatureHelpParams);
+            let result: Option<SignatureHelp> = signature_help(
+                state,
+                params.text_document_position_params.text_document.uri,
+                params.text_document_position_params.position,
+            );
+            conn.sender
+                .send(Message::Response(Response::new_ok(req.id, result)))?;
+        }
+        CodeActionRequest::METHOD => {
+            let params: CodeActionParams = decode_params!(conn, req, CodeActionParams);
+            let result: Vec<CodeActionOrCommand> = code_actions(
+                state,
+                params.text_document.uri,
+                params.range,
+                params.context,
+            );
             conn.sender
                 .send(Message::Response(Response::new_ok(req.id, result)))?;
         }
@@ -448,7 +497,15 @@ fn send_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_server::{Message, Request};
+    use lsp_types::{
+        DidChangeTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverContents, MarkedString,
+        Position, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+        VersionedTextDocumentIdentifier,
+    };
     use std::str::FromStr;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn uri(value: &str) -> Uri {
         Uri::from_str(value).expect("test URI should parse")
@@ -495,5 +552,214 @@ mod tests {
 
         assert!(pending.contains(&entry));
         assert!(!pending.contains(&dep));
+    }
+
+    #[test]
+    fn e2e_malformed_request_returns_error_and_server_continues() {
+        let mut harness = LspHarness::new();
+        let bad_id = RequestId::from(1);
+        harness.send_request(Request::new(
+            bad_id.clone(),
+            HoverRequest::METHOD.to_string(),
+            serde_json::json!({ "unexpected": true }),
+        ));
+
+        let response = harness.recv_response(bad_id);
+        assert_eq!(
+            response.error.expect("malformed request should error").code,
+            lsp_server::ErrorCode::InvalidParams as i32
+        );
+
+        let uri = harness.write_and_open("malformed-continues.hern", "let value = 1;\nvalue\n");
+        let hover_id = RequestId::from(2);
+        harness.send_hover_request(hover_id.clone(), uri, Position::new(1, 1));
+
+        let response = harness.recv_response(hover_id);
+        assert!(response.error.is_none());
+        assert!(response.result.is_some());
+        harness.shutdown();
+    }
+
+    #[test]
+    fn e2e_open_change_hover_lifecycle() {
+        let mut harness = LspHarness::new();
+        let uri = harness.write_and_open("lifecycle.hern", "let value = 1;\nvalue\n");
+
+        let first = RequestId::from(1);
+        harness.send_hover_request(first.clone(), uri.clone(), Position::new(1, 1));
+        assert_eq!(
+            hover_result_text(harness.recv_response(first)),
+            Some("f64".to_string())
+        );
+
+        harness.send_change(uri.clone(), 1, "let value = \"hi\";\nvalue\n");
+        let second = RequestId::from(2);
+        harness.send_hover_request(second.clone(), uri, Position::new(1, 1));
+        assert_eq!(
+            hover_result_text(harness.recv_response(second)),
+            Some("string".to_string())
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn e2e_shutdown_exits_cleanly() {
+        let mut harness = LspHarness::new();
+        harness.shutdown();
+    }
+
+    struct LspHarness {
+        client: Connection,
+        root: std::path::PathBuf,
+        next_version: i32,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl LspHarness {
+        fn new() -> Self {
+            let (server, client) = Connection::memory();
+            let handle = thread::spawn(move || {
+                let mut state = ServerState::new().expect("server state should initialize");
+                main_loop(&server, &mut state).expect("main loop should exit cleanly");
+            });
+            let root = std::env::temp_dir().join(format!(
+                "hern-lsp-e2e-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time should be after epoch")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).expect("test root should be created");
+            Self {
+                client,
+                root,
+                next_version: 0,
+                handle: Some(handle),
+            }
+        }
+
+        fn write_and_open(&mut self, relative_path: &str, source: &str) -> Uri {
+            let path = self.root.join(relative_path);
+            std::fs::write(&path, source).expect("source file should be written");
+            let uri = Uri::from_str(&format!("file://{}", path.to_string_lossy()))
+                .expect("test URI should parse");
+            self.client
+                .sender
+                .send(Message::Notification(Notification::new(
+                    DidOpenTextDocument::METHOD.to_string(),
+                    DidOpenTextDocumentParams {
+                        text_document: TextDocumentItem {
+                            uri: uri.clone(),
+                            language_id: "hern".to_string(),
+                            version: self.next_version,
+                            text: source.to_string(),
+                        },
+                    },
+                )))
+                .expect("didOpen should send");
+            self.next_version += 1;
+            uri
+        }
+
+        fn send_change(&mut self, uri: Uri, version: i32, source: &str) {
+            self.client
+                .sender
+                .send(Message::Notification(Notification::new(
+                    DidChangeTextDocument::METHOD.to_string(),
+                    DidChangeTextDocumentParams {
+                        text_document: VersionedTextDocumentIdentifier { uri, version },
+                        content_changes: vec![TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: source.to_string(),
+                        }],
+                    },
+                )))
+                .expect("didChange should send");
+        }
+
+        fn send_hover_request(&self, id: RequestId, uri: Uri, position: Position) {
+            self.send_request(Request::new(
+                id,
+                HoverRequest::METHOD.to_string(),
+                HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri },
+                        position,
+                    },
+                    work_done_progress_params: Default::default(),
+                },
+            ));
+        }
+
+        fn send_request(&self, request: Request) {
+            self.client
+                .sender
+                .send(Message::Request(request))
+                .expect("request should send");
+        }
+
+        fn recv_response(&self, id: RequestId) -> Response {
+            loop {
+                match self
+                    .client
+                    .receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("server should respond")
+                {
+                    Message::Response(response) if response.id == id => return response,
+                    Message::Response(_) | Message::Notification(_) | Message::Request(_) => {}
+                }
+            }
+        }
+
+        fn shutdown(&mut self) {
+            let id = RequestId::from(10_000);
+            self.send_request(Request::new(
+                id.clone(),
+                lsp_types::request::Shutdown::METHOD.to_string(),
+                serde_json::Value::Null,
+            ));
+            let response = self.recv_response(id);
+            assert!(response.error.is_none());
+            self.client
+                .sender
+                .send(Message::Notification(Notification::new(
+                    lsp_types::notification::Exit::METHOD.to_string(),
+                    serde_json::Value::Null,
+                )))
+                .expect("exit notification should send");
+            if let Some(handle) = self.handle.take() {
+                handle.join().expect("server thread should join");
+            }
+        }
+    }
+
+    impl Drop for LspHarness {
+        fn drop(&mut self) {
+            if self.handle.is_some() {
+                self.shutdown();
+            }
+        }
+    }
+
+    fn hover_result_text(response: Response) -> Option<String> {
+        let value = response.result?;
+        let hover: Hover = serde_json::from_value(value).expect("hover response should decode");
+        match hover.contents {
+            HoverContents::Markup(markup) => Some(
+                markup
+                    .value
+                    .trim()
+                    .strip_prefix("```hern\n")
+                    .and_then(|text| text.strip_suffix("\n```"))
+                    .unwrap_or(&markup.value)
+                    .to_string(),
+            ),
+            HoverContents::Scalar(MarkedString::String(value)) => Some(value),
+            HoverContents::Scalar(MarkedString::LanguageString(value)) => Some(value.value),
+            HoverContents::Array(_) => None,
+        }
     }
 }

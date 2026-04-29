@@ -1,20 +1,26 @@
+mod code_actions;
 mod completion;
 mod diagnostics;
+mod document_symbols;
 mod hover;
 mod navigation;
 mod rename;
 mod semantic_tokens;
+mod signature_help;
 mod state;
 mod uri;
 mod workspace;
 
+pub(crate) use code_actions::code_actions;
+pub(crate) use completion::completion;
 pub(crate) use diagnostics::DiagnosticsByUri;
-pub(crate) use semantic_tokens::legend as semantic_tokens_legend;
-pub(crate) use state::{ServerState, combined_diagnostics_for_uri, diagnostics_for_document};
+pub(crate) use document_symbols::document_symbols;
 pub(crate) use hover::hover;
 pub(crate) use navigation::{definition, document_highlights, references};
 pub(crate) use rename::{prepare_rename, rename};
-pub(crate) use completion::completion;
+pub(crate) use semantic_tokens::legend as semantic_tokens_legend;
+pub(crate) use signature_help::signature_help;
+pub(crate) use state::{ServerState, combined_diagnostics_for_uri, diagnostics_for_document};
 
 use uri::uri_to_path;
 
@@ -24,26 +30,44 @@ pub(crate) fn semantic_tokens(
 ) -> Option<lsp_types::SemanticTokensResult> {
     let source = workspace::document_source(state, &uri)?;
     let path = uri_to_path(&uri)?;
-    let fallback;
-    let program = if let Some(analysis) = state::cached_analysis(state, &uri) {
-        analysis
-            .graph
-            .module_for_path(&path)
-            .map(|(_, program)| program)
-    } else {
-        let analysis = workspace::load_document_graph_recovering(state, &uri)?;
-        fallback = analysis;
-        fallback.module_for_path(&path).map(|(_, program)| program)
-    };
-    Some(semantic_tokens::semantic_tokens_for_source(&source, program))
+    if let Some(analysis) = state::cached_analysis(state, &uri)
+        && let Some((module_name, program)) = analysis.graph.module_for_path(&path)
+    {
+        return Some(state.timed("semantic tokens", || {
+            semantic_tokens::semantic_tokens_for_source(
+                &source,
+                Some(program),
+                semantic_tokens::SemanticContext::new(&analysis.inference, module_name),
+            )
+        }));
+    }
+    if let Some(analysis) = workspace::load_workspace_graphs(state, &uri)
+        && let Some((module_name, program)) = analysis.graph.module_for_path(&path)
+    {
+        return Some(state.timed("semantic tokens", || {
+            semantic_tokens::semantic_tokens_for_source(
+                &source,
+                Some(program),
+                semantic_tokens::SemanticContext::new(&analysis.inference, module_name),
+            )
+        }));
+    }
+    let graph = workspace::load_document_graph_recovering(state, &uri)?;
+    let program = graph.module_for_path(&path).map(|(_, program)| program);
+    Some(state.timed("semantic tokens", || {
+        semantic_tokens::semantic_tokens_for_source(&source, program, None)
+    }))
 }
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::*;
     use super::uri::path_to_uri;
+    use super::*;
     use hern_core::analysis::analyze_prelude;
-    use lsp_types::{CompletionItem, Diagnostic, DiagnosticSeverity, Hover, HoverContents, MarkupContent, Position, Range, Uri};
+    use lsp_types::{
+        CompletionItem, Diagnostic, DiagnosticSeverity, Hover, HoverContents, MarkupContent,
+        Position, Range, Uri,
+    };
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
@@ -116,7 +140,11 @@ pub(super) mod tests {
         pub(super) dep_uri: Uri,
     }
 
-    pub(super) fn import_fixture(name: &str, entry_source: &str, dep_source: &str) -> ImportFixture {
+    pub(super) fn import_fixture(
+        name: &str,
+        entry_source: &str,
+        dep_source: &str,
+    ) -> ImportFixture {
         let project = TestProject::new(name);
         let entry_uri = project.write("main.hern", entry_source);
         let dep_uri = project.write("dep.hern", dep_source);
@@ -190,6 +218,9 @@ pub(super) mod tests {
             open_entry_uris: HashSet::new(),
             prelude: analyze_prelude().expect("prelude should analyze"),
             supports_markdown_hover: true,
+            workspace_roots: Vec::new(),
+            config: state::LspConfig::default(),
+            perf: state::LspPerf::default(),
         };
         state.diagnostics_by_entry.insert(
             entry_a.clone(),
@@ -219,6 +250,9 @@ pub(super) mod tests {
             open_entry_uris: HashSet::new(),
             prelude: analyze_prelude().expect("prelude should analyze"),
             supports_markdown_hover: true,
+            workspace_roots: Vec::new(),
+            config: state::LspConfig::default(),
+            perf: state::LspPerf::default(),
         };
 
         let diagnostics = diagnostics_for_document(&mut state, &entry);
@@ -270,6 +304,9 @@ pub(super) mod tests {
             open_entry_uris: HashSet::new(),
             prelude: analyze_prelude().expect("prelude should analyze"),
             supports_markdown_hover: true,
+            workspace_roots: Vec::new(),
+            config: state::LspConfig::default(),
+            perf: state::LspPerf::default(),
         };
 
         let diagnostics = diagnostics_for_document(&mut state, &entry);
@@ -830,7 +867,19 @@ pub(super) mod tests {
 
         let info = hover(&state, entry_uri, Position::new(1, 5)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "fn() -> f64");
+        assert_eq!(hover_text(info), "dep.value: fn() -> f64");
+    }
+
+    #[test]
+    fn hover_plain_text_fallback_preserves_content() {
+        let project = TestProject::new("hover-plain-text");
+        let source = "fn id(x) { x }\nid(1)\n";
+        let (mut state, uri) = project.open("main.hern", source);
+        state.supports_markdown_hover = false;
+
+        let info = hover(&state, uri, Position::new(1, 1)).expect("hover should resolve");
+
+        assert_eq!(hover_text(info), "fn(f64) -> f64");
     }
 
     #[test]
@@ -1111,7 +1160,7 @@ pub(super) mod tests {
         assert!(!entry_path.exists());
         assert!(!dep_path.exists());
         assert!(diagnostics.values().all(Vec::is_empty));
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "dep.value: f64");
     }
 
     #[test]
@@ -1349,6 +1398,32 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn instrumentation_is_disabled_by_default() {
+        let state = ServerState::new().expect("server state should initialize");
+
+        assert!(!state.config.debug_timing);
+        assert_eq!(state.perf.cache_hits.get(), 0);
+        assert_eq!(state.perf.cache_misses.get(), 0);
+    }
+
+    #[test]
+    fn debug_timing_does_not_change_completion_results() {
+        let project = TestProject::new("completion-timing");
+        let source = "fn greet() { 1 }\nlet count = 42;\ngreet()\n";
+        let (state, uri) = project.open("main.hern", source);
+        let mut timed_state = state_with_document(uri.clone(), source.to_string());
+        timed_state.config.debug_timing = true;
+
+        let plain = completion(&state, uri.clone(), Position::new(2, 1));
+        let timed = completion(&timed_state, uri, Position::new(2, 1));
+
+        assert_eq!(
+            plain.iter().map(completion_insert_name).collect::<Vec<_>>(),
+            timed.iter().map(completion_insert_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn completion_returns_block_local_inside_scope() {
         let project = TestProject::new("completion-block-local");
         let source = "fn run() { let total = 1; total }\n";
@@ -1457,8 +1532,59 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn completion_suggests_record_fields_after_dot() {
+        use lsp_types::CompletionItemKind;
+        let project = TestProject::new("completion-record-field");
+        let source = "let point = #{ x: 1, y: 2 };\npoint.\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let items = completion(&state, uri, Position::new(1, 6));
+
+        let names: Vec<_> = items.iter().map(completion_insert_name).collect();
+        assert!(names.contains(&"x"), "expected x field: {names:?}");
+        assert!(names.contains(&"y"), "expected y field: {names:?}");
+        assert!(
+            items
+                .iter()
+                .all(|item| item.kind == Some(CompletionItemKind::FIELD))
+        );
+    }
+
+    #[test]
+    fn completion_suggests_types_in_annotation_position() {
+        use lsp_types::CompletionItemKind;
+        let project = TestProject::new("completion-type-position");
+        let source = "type Option('a) = None | Some('a)\ntrait Show 'a { fn show(x: 'a) -> string }\nlet value: O = 1;\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let items = completion(&state, uri, Position::new(2, 12));
+
+        let option = items
+            .iter()
+            .find(|item| completion_insert_name(item) == "Option")
+            .expect("Option should be suggested");
+        assert_eq!(option.kind, Some(CompletionItemKind::STRUCT));
+        assert!(
+            items
+                .iter()
+                .any(|item| completion_insert_name(item) == "Show"
+                    && item.kind == Some(CompletionItemKind::INTERFACE))
+        );
+    }
+
+    #[test]
+    fn completion_suppresses_scope_names_after_let_keyword() {
+        let project = TestProject::new("completion-let-suppression");
+        let source = "let existing = 1;\nlet \n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let items = completion(&state, uri, Position::new(1, 4));
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
     fn completion_provides_type_detail_for_top_level_function() {
-        use lsp_types::{CompletionTextEdit, TextEdit};
         let project = TestProject::new("completion-type-detail");
         let source = "fn double(x: f64) -> f64 { x + x }\ndouble(1)\n";
         let (state, uri) = project.open("main.hern", source);
@@ -1811,7 +1937,7 @@ pub(super) mod tests {
         let info = hover(&state, entry_uri, Position::new(1, 5)).expect("hover should resolve");
         assert_eq!(
             hover_text(info),
-            "string",
+            "dep.value: string",
             "hover should reflect the updated dep type"
         );
     }

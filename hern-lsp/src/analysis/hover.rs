@@ -6,9 +6,7 @@ use hern_core::ast::{
     Expr, ExprKind, ImplMethod, Pattern, Program, SourcePosition, SourceSpan, Stmt,
 };
 use hern_core::module::{GraphInference, ModuleGraph};
-use hern_core::source_index::{
-    Definition, DefinitionKind, ImportMemberReference, index_program,
-};
+use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
 use hern_core::types::infer::{TypeEnv, VariantEnv};
 use hern_core::types::{
     Scheme, TraitConstraint, Ty, TyVar, display_ty_with_var_names, free_type_vars_in_display_order,
@@ -73,7 +71,12 @@ fn symbol_hover(
 ) -> Option<String> {
     let index = index_program(program);
     if let Some(reference) = index.import_member_reference_at(position) {
-        return imported_member_hover_text(graph, inference, reference);
+        let import_alias = index
+            .definitions
+            .iter()
+            .find(|definition| definition.symbol == reference.import_symbol)
+            .map(|definition| definition.name.as_str());
+        return imported_member_hover_text(graph, inference, reference, import_alias);
     }
 
     let definition = index.definition_at(position)?;
@@ -418,12 +421,17 @@ fn imported_member_hover_text(
     graph: &ModuleGraph,
     inference: &GraphInference,
     reference: &ImportMemberReference,
+    import_alias: Option<&str>,
 ) -> Option<String> {
     // Primary path: look up the field from the module's concrete export type.
     // This is correct for all export shapes, including aliased names.
     if let Some(Ty::Record(row)) = inference.import_types.get(&reference.module_name) {
         if let Some((_, field_ty)) = row.fields.iter().find(|(f, _)| f == &reference.member_name) {
-            return Some(ty_to_display_string(field_ty));
+            return Some(imported_member_display(
+                import_alias,
+                reference,
+                ty_to_display_string(field_ty),
+            ));
         }
     }
 
@@ -440,6 +448,16 @@ fn imported_member_hover_text(
         inference.variant_env_for_module(&reference.module_name),
         target_program,
     )
+    .map(|text| imported_member_display(import_alias, reference, text))
+}
+
+fn imported_member_display(
+    import_alias: Option<&str>,
+    reference: &ImportMemberReference,
+    text: String,
+) -> String {
+    let module = import_alias.unwrap_or(&reference.module_name);
+    format!("{}.{}: {}", module, reference.member_name, text)
 }
 
 fn definition_hover_text(

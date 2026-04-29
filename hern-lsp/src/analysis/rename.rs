@@ -66,7 +66,10 @@ fn rename_target_at(
         .find(|span| source_span_contains_position(*span, position))
         .unwrap_or(definition.location.span);
 
-    Ok(Some(RenameTarget { current_span, spans }))
+    Ok(Some(RenameTarget {
+        current_span,
+        spans,
+    }))
 }
 
 fn source_span_contains_position(span: SourceSpan, position: SourcePosition) -> bool {

@@ -1,15 +1,20 @@
 #![allow(clippy::mutable_key_type)]
 
-use super::diagnostics::{DiagnosticsByUri, diagnostic_identity, diagnostics_from_compiler_diagnostics};
+use super::diagnostics::{
+    DiagnosticsByUri, diagnostic_identity, diagnostics_from_compiler_diagnostics,
+};
 use super::uri::{path_to_uri, uri_to_path};
 use hern_core::analysis::{CompilerDiagnostic, PreludeAnalysis, analyze_prelude};
 use hern_core::module::{GraphInference, ModuleGraph, normalize_overlay_path};
 use hern_core::workspace::{WorkspaceInputs, analyze_workspace};
-use lsp_types::{Diagnostic, Uri};
+use lsp_types::{Diagnostic, InitializeParams, Uri};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+
+const DEFAULT_DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(150);
 
 pub(crate) struct ServerState {
     pub(crate) documents: HashMap<Uri, String>,
@@ -26,6 +31,34 @@ pub(crate) struct ServerState {
     /// Whether the client advertised `markdown` in its hover `contentFormat` capability.
     /// When false, plain text is used instead of Markdown fenced blocks.
     pub(crate) supports_markdown_hover: bool,
+    pub(crate) workspace_roots: Vec<PathBuf>,
+    pub(crate) config: LspConfig,
+    pub(crate) perf: LspPerf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LspConfig {
+    pub(crate) diagnostics_debounce: Duration,
+    pub(crate) max_indexed_files: usize,
+    pub(crate) debug_timing: bool,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            diagnostics_debounce: DEFAULT_DIAGNOSTICS_DEBOUNCE,
+            max_indexed_files: 10_000,
+            debug_timing: false,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct LspPerf {
+    pub(crate) cache_hits: Cell<u64>,
+    pub(crate) cache_misses: Cell<u64>,
+    pub(crate) document_invalidations: Cell<u64>,
+    pub(crate) watched_file_invalidations: Cell<u64>,
 }
 
 #[derive(Clone)]
@@ -53,7 +86,25 @@ impl ServerState {
             open_entry_uris: HashSet::new(),
             prelude: analyze_prelude()?,
             supports_markdown_hover: true,
+            workspace_roots: Vec::new(),
+            config: LspConfig::default(),
+            perf: LspPerf::default(),
         })
+    }
+
+    pub(crate) fn configure_from_initialize(&mut self, params: &InitializeParams) {
+        self.workspace_roots = workspace_roots_from_initialize(params);
+        self.config = lsp_config_from_initialize(params);
+    }
+
+    pub(crate) fn path_is_in_workspace(&self, path: &Path) -> bool {
+        if self.workspace_roots.is_empty() {
+            return true;
+        }
+        let normalized = normalize_overlay_path(path);
+        self.workspace_roots
+            .iter()
+            .any(|root| normalized.starts_with(root))
     }
 
     /// Marks `uri` as a client-opened entry document. Call this when a didOpen notification
@@ -77,13 +128,19 @@ impl ServerState {
     pub(crate) fn set_document(&mut self, uri: Uri, text: String, version: i32) {
         self.documents.insert(uri.clone(), text);
         self.document_versions.insert(uri.clone(), version);
-        self.invalidate_cached_analyses_for_document(&uri);
+        let affected = self.invalidate_cached_analyses_for_document(&uri);
+        self.perf
+            .document_invalidations
+            .set(self.perf.document_invalidations.get() + affected.len() as u64);
     }
 
     pub(crate) fn remove_document(&mut self, uri: &Uri) {
         self.documents.remove(uri);
         self.document_versions.remove(uri);
-        self.invalidate_cached_analyses_for_document(uri);
+        let affected = self.invalidate_cached_analyses_for_document(uri);
+        self.perf
+            .document_invalidations
+            .set(self.perf.document_invalidations.get() + affected.len() as u64);
     }
 
     pub(crate) fn invalidate_cached_analyses_for_documents(
@@ -94,6 +151,9 @@ impl ServerState {
         for uri in uris {
             affected.extend(self.invalidate_cached_analyses_for_document(&uri));
         }
+        self.perf
+            .watched_file_invalidations
+            .set(self.perf.watched_file_invalidations.get() + affected.len() as u64);
         affected
     }
 
@@ -140,6 +200,105 @@ impl ServerState {
         self.entry_dependencies.remove(entry_uri);
         self.cached_analyses.remove(entry_uri);
     }
+
+    pub(super) fn timed<T>(&self, label: &str, f: impl FnOnce() -> T) -> T {
+        if !self.config.debug_timing {
+            return f();
+        }
+        let start = Instant::now();
+        let result = f();
+        eprintln!("hern-lsp timing {label}: {:?}", start.elapsed());
+        result
+    }
+}
+
+fn workspace_roots_from_initialize(params: &InitializeParams) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(folders) = &params.workspace_folders {
+        for folder in folders {
+            if let Some(path) = uri_to_path(&folder.uri) {
+                roots.push(normalize_overlay_path(&path));
+            }
+        }
+    }
+    if roots.is_empty() {
+        #[allow(deprecated)]
+        if let Some(root_uri) = &params.root_uri
+            && let Some(path) = uri_to_path(root_uri)
+        {
+            roots.push(normalize_overlay_path(&path));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn lsp_config_from_initialize(params: &InitializeParams) -> LspConfig {
+    let mut config = LspConfig::default();
+    let Some(options) = params.initialization_options.as_ref() else {
+        return config;
+    };
+    if let Some(ms) = options
+        .get("diagnosticsDebounceMs")
+        .and_then(serde_json::Value::as_u64)
+    {
+        config.diagnostics_debounce = Duration::from_millis(ms);
+    }
+    if let Some(max) = options
+        .get("maxIndexedFiles")
+        .and_then(serde_json::Value::as_u64)
+    {
+        config.max_indexed_files = max as usize;
+    }
+    if let Some(debug) = options
+        .get("debugTiming")
+        .and_then(serde_json::Value::as_bool)
+    {
+        config.debug_timing = debug;
+    }
+    config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::WorkspaceFolder;
+
+    #[test]
+    fn initialize_configuration_sets_workspace_roots_and_options() {
+        let root = std::env::temp_dir().join("hern-lsp-workspace-root");
+        let root_uri = path_to_uri(&root).expect("root URI should encode");
+        let params = InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root_uri,
+                name: "root".to_string(),
+            }]),
+            initialization_options: Some(serde_json::json!({
+                "diagnosticsDebounceMs": 25,
+                "maxIndexedFiles": 123,
+                "debugTiming": true
+            })),
+            ..InitializeParams::default()
+        };
+
+        let mut state = ServerState::new().expect("server state should initialize");
+        state.configure_from_initialize(&params);
+
+        assert_eq!(state.workspace_roots, vec![normalize_overlay_path(&root)]);
+        assert_eq!(state.config.diagnostics_debounce, Duration::from_millis(25));
+        assert_eq!(state.config.max_indexed_files, 123);
+        assert!(state.config.debug_timing);
+    }
+
+    #[test]
+    fn path_workspace_check_respects_configured_roots() {
+        let mut state = ServerState::new().expect("server state should initialize");
+        state.workspace_roots = vec![PathBuf::from("/workspace/project")];
+
+        assert!(state.path_is_in_workspace(Path::new("/workspace/project/src/main.hern")));
+        assert!(!state.path_is_in_workspace(Path::new("/workspace/other/main.hern")));
+    }
 }
 
 pub(crate) fn diagnostics_for_document(
@@ -174,10 +333,12 @@ pub(crate) fn diagnostics_for_document(
             );
         }
     };
-    let analysis = analyze_workspace(WorkspaceInputs {
-        entry: path,
-        overlays: document_overlays(state),
-        prelude: Some(state.prelude.program.clone()),
+    let analysis = state.timed("workspace analysis", || {
+        analyze_workspace(WorkspaceInputs {
+            entry: path,
+            overlays: document_overlays(state),
+            prelude: Some(state.prelude.program.clone()),
+        })
     });
     let dependencies = state.update_entry_dependencies(entry_uri, analysis.graph.as_ref());
     if analysis.diagnostics.is_empty()
@@ -211,8 +372,17 @@ pub(crate) fn combined_diagnostics_for_uri(state: &ServerState, uri: &Uri) -> Ve
     diagnostics
 }
 
-pub(super) fn cached_analysis<'a>(state: &'a ServerState, entry_uri: &Uri) -> Option<&'a CachedAnalysis> {
-    let analysis = state.cached_analyses.get(entry_uri)?;
+pub(super) fn cached_analysis<'a>(
+    state: &'a ServerState,
+    entry_uri: &Uri,
+) -> Option<&'a CachedAnalysis> {
+    let Some(analysis) = state.cached_analyses.get(entry_uri) else {
+        state
+            .perf
+            .cache_misses
+            .set(state.perf.cache_misses.get() + 1);
+        return None;
+    };
     let open_documents_match = analysis
         .document_versions
         .iter()
@@ -221,18 +391,29 @@ pub(super) fn cached_analysis<'a>(state: &'a ServerState, entry_uri: &Uri) -> Op
         .file_fingerprints
         .iter()
         .all(|(uri, fingerprint)| file_fingerprint_for_uri(uri) == *fingerprint);
-    (open_documents_match && closed_files_match).then_some(analysis)
+    if open_documents_match && closed_files_match {
+        state.perf.cache_hits.set(state.perf.cache_hits.get() + 1);
+        Some(analysis)
+    } else {
+        state
+            .perf
+            .cache_misses
+            .set(state.perf.cache_misses.get() + 1);
+        None
+    }
 }
 
 pub(super) fn document_overlays(state: &ServerState) -> HashMap<PathBuf, String> {
-    state
-        .documents
-        .iter()
-        .filter_map(|(uri, source)| {
-            let path = uri_to_path(uri)?;
-            Some((normalize_overlay_path(&path), source.clone()))
-        })
-        .collect()
+    state.timed("overlay construction", || {
+        state
+            .documents
+            .iter()
+            .filter_map(|(uri, source)| {
+                let path = uri_to_path(uri)?;
+                Some((normalize_overlay_path(&path), source.clone()))
+            })
+            .collect()
+    })
 }
 
 fn graph_module_uris(graph: &ModuleGraph) -> HashSet<Uri> {

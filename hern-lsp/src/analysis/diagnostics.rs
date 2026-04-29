@@ -27,8 +27,12 @@ pub(super) fn diagnostic_identity(diagnostic: &Diagnostic) -> String {
     let r = &diagnostic.range;
     format!(
         "{},{},{},{},{:?}:{}",
-        r.start.line, r.start.character, r.end.line, r.end.character,
-        diagnostic.severity, diagnostic.message
+        r.start.line,
+        r.start.character,
+        r.end.line,
+        r.end.character,
+        diagnostic.severity,
+        diagnostic.message
     )
 }
 

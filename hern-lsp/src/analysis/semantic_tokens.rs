@@ -1,6 +1,8 @@
 use hern_core::ast::{Program, SourceSpan};
 use hern_core::lex::{Lexer, Token};
+use hern_core::module::GraphInference;
 use hern_core::source_index::{DefinitionKind, SourceIndex, index_program};
+use hern_core::types::Ty;
 use lsp_types::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensLegend,
     SemanticTokensResult,
@@ -34,33 +36,54 @@ struct RawToken {
 
 pub(crate) fn legend() -> SemanticTokensLegend {
     let token_types = vec![
-        SemanticTokenType::KEYWORD,    // TY_KEYWORD = 0
-        SemanticTokenType::VARIABLE,   // TY_VARIABLE = 1
-        SemanticTokenType::TYPE,       // TY_TYPE = 2
-        SemanticTokenType::NUMBER,     // TY_NUMBER = 3
-        SemanticTokenType::STRING,     // TY_STRING = 4
-        SemanticTokenType::OPERATOR,   // TY_OPERATOR = 5
-        SemanticTokenType::COMMENT,    // TY_COMMENT = 6
-        SemanticTokenType::FUNCTION,   // TY_FUNCTION = 7
-        SemanticTokenType::METHOD,     // TY_METHOD = 8
-        SemanticTokenType::ENUM_MEMBER, // TY_ENUM_MEMBER = 9
-        SemanticTokenType::PARAMETER,  // TY_PARAMETER = 10
-        SemanticTokenType::PROPERTY,   // TY_PROPERTY = 11
+        SemanticTokenType::KEYWORD,        // TY_KEYWORD = 0
+        SemanticTokenType::VARIABLE,       // TY_VARIABLE = 1
+        SemanticTokenType::TYPE,           // TY_TYPE = 2
+        SemanticTokenType::NUMBER,         // TY_NUMBER = 3
+        SemanticTokenType::STRING,         // TY_STRING = 4
+        SemanticTokenType::OPERATOR,       // TY_OPERATOR = 5
+        SemanticTokenType::COMMENT,        // TY_COMMENT = 6
+        SemanticTokenType::FUNCTION,       // TY_FUNCTION = 7
+        SemanticTokenType::METHOD,         // TY_METHOD = 8
+        SemanticTokenType::ENUM_MEMBER,    // TY_ENUM_MEMBER = 9
+        SemanticTokenType::PARAMETER,      // TY_PARAMETER = 10
+        SemanticTokenType::PROPERTY,       // TY_PROPERTY = 11
         SemanticTokenType::TYPE_PARAMETER, // TY_TYPE_PARAMETER = 12
     ];
     debug_assert_eq!(token_types[TY_KEYWORD as usize], SemanticTokenType::KEYWORD);
-    debug_assert_eq!(token_types[TY_VARIABLE as usize], SemanticTokenType::VARIABLE);
+    debug_assert_eq!(
+        token_types[TY_VARIABLE as usize],
+        SemanticTokenType::VARIABLE
+    );
     debug_assert_eq!(token_types[TY_TYPE as usize], SemanticTokenType::TYPE);
     debug_assert_eq!(token_types[TY_NUMBER as usize], SemanticTokenType::NUMBER);
     debug_assert_eq!(token_types[TY_STRING as usize], SemanticTokenType::STRING);
-    debug_assert_eq!(token_types[TY_OPERATOR as usize], SemanticTokenType::OPERATOR);
+    debug_assert_eq!(
+        token_types[TY_OPERATOR as usize],
+        SemanticTokenType::OPERATOR
+    );
     debug_assert_eq!(token_types[TY_COMMENT as usize], SemanticTokenType::COMMENT);
-    debug_assert_eq!(token_types[TY_FUNCTION as usize], SemanticTokenType::FUNCTION);
+    debug_assert_eq!(
+        token_types[TY_FUNCTION as usize],
+        SemanticTokenType::FUNCTION
+    );
     debug_assert_eq!(token_types[TY_METHOD as usize], SemanticTokenType::METHOD);
-    debug_assert_eq!(token_types[TY_ENUM_MEMBER as usize], SemanticTokenType::ENUM_MEMBER);
-    debug_assert_eq!(token_types[TY_PARAMETER as usize], SemanticTokenType::PARAMETER);
-    debug_assert_eq!(token_types[TY_PROPERTY as usize], SemanticTokenType::PROPERTY);
-    debug_assert_eq!(token_types[TY_TYPE_PARAMETER as usize], SemanticTokenType::TYPE_PARAMETER);
+    debug_assert_eq!(
+        token_types[TY_ENUM_MEMBER as usize],
+        SemanticTokenType::ENUM_MEMBER
+    );
+    debug_assert_eq!(
+        token_types[TY_PARAMETER as usize],
+        SemanticTokenType::PARAMETER
+    );
+    debug_assert_eq!(
+        token_types[TY_PROPERTY as usize],
+        SemanticTokenType::PROPERTY
+    );
+    debug_assert_eq!(
+        token_types[TY_TYPE_PARAMETER as usize],
+        SemanticTokenType::TYPE_PARAMETER
+    );
     SemanticTokensLegend {
         token_types,
         token_modifiers: vec![SemanticTokenModifier::DECLARATION],
@@ -70,10 +93,11 @@ pub(crate) fn legend() -> SemanticTokensLegend {
 pub(crate) fn semantic_tokens_for_source(
     source: &str,
     program: Option<&Program>,
+    context: Option<SemanticContext<'_>>,
 ) -> SemanticTokensResult {
     let mut raw = lex_tokens(source);
     if let Some(program) = program {
-        apply_semantic_overrides(&mut raw, &index_program(program), source);
+        apply_semantic_overrides(&mut raw, &index_program(program), source, context);
     }
     raw.sort_by_key(|token| (token.line, token.col, token.len));
     raw.dedup_by_key(|token| (token.line, token.col, token.len));
@@ -81,6 +105,20 @@ pub(crate) fn semantic_tokens_for_source(
         result_id: None,
         data: delta_encode(raw),
     })
+}
+
+pub(crate) struct SemanticContext<'a> {
+    inference: &'a GraphInference,
+    module_name: &'a str,
+}
+
+impl<'a> SemanticContext<'a> {
+    pub(crate) fn new(inference: &'a GraphInference, module_name: &'a str) -> Option<Self> {
+        Some(Self {
+            inference,
+            module_name,
+        })
+    }
 }
 
 fn lex_tokens(source: &str) -> Vec<RawToken> {
@@ -163,7 +201,12 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
     })
 }
 
-fn apply_semantic_overrides(raw: &mut Vec<RawToken>, index: &SourceIndex, source: &str) {
+fn apply_semantic_overrides(
+    raw: &mut Vec<RawToken>,
+    index: &SourceIndex,
+    source: &str,
+    context: Option<SemanticContext<'_>>,
+) {
     // Build a position index into `raw` for O(1) override lookups instead of O(n) scans.
     let mut pos_to_idx: HashMap<(u32, u32), usize> = raw
         .iter()
@@ -173,18 +216,22 @@ fn apply_semantic_overrides(raw: &mut Vec<RawToken>, index: &SourceIndex, source
 
     let mut by_symbol = HashMap::new();
     for definition in &index.definitions {
-        by_symbol.insert(definition.symbol, definition.kind);
+        let token_type = semantic_type_for_definition(
+            definition.kind,
+            definition_type(context.as_ref(), definition.location.span, &definition.name),
+        );
+        by_symbol.insert(definition.symbol, token_type);
         push_semantic_span(
             raw,
             &mut pos_to_idx,
             source,
             definition.location.span,
-            semantic_type_for_definition(definition.kind),
+            token_type,
             MOD_DECLARATION,
         );
     }
     for reference in &index.references {
-        let Some(kind) = by_symbol.get(&reference.symbol).copied() else {
+        let Some(token_type) = by_symbol.get(&reference.symbol).copied() else {
             continue;
         };
         push_semantic_span(
@@ -192,23 +239,93 @@ fn apply_semantic_overrides(raw: &mut Vec<RawToken>, index: &SourceIndex, source
             &mut pos_to_idx,
             source,
             reference.location.span,
-            semantic_type_for_definition(kind),
+            token_type,
             0,
         );
     }
     for reference in &index.import_member_references {
-        push_semantic_span(raw, &mut pos_to_idx, source, reference.location.span, TY_PROPERTY, 0);
+        push_semantic_span(
+            raw,
+            &mut pos_to_idx,
+            source,
+            reference.location.span,
+            import_member_token_type(
+                context.as_ref(),
+                &reference.module_name,
+                &reference.member_name,
+            ),
+            0,
+        );
     }
 }
 
-fn semantic_type_for_definition(kind: DefinitionKind) -> u32 {
+fn semantic_type_for_definition(kind: DefinitionKind, ty: Option<&Ty>) -> u32 {
     match kind {
         DefinitionKind::Function | DefinitionKind::Extern => TY_FUNCTION,
         DefinitionKind::ImplMethod | DefinitionKind::TraitMethod => TY_METHOD,
+        DefinitionKind::Let if ty.is_some_and(is_function_type) => TY_FUNCTION,
         DefinitionKind::Let => TY_VARIABLE,
         DefinitionKind::Parameter => TY_PARAMETER,
         DefinitionKind::Trait | DefinitionKind::Type | DefinitionKind::TypeAlias => TY_TYPE,
         DefinitionKind::Variant => TY_ENUM_MEMBER,
+    }
+}
+
+fn definition_type<'a>(
+    context: Option<&'a SemanticContext<'_>>,
+    span: SourceSpan,
+    name: &str,
+) -> Option<&'a Ty> {
+    let context = context?;
+    context
+        .inference
+        .definition_schemes_for_module(context.module_name)
+        .and_then(|schemes| schemes.get(&span))
+        .map(|scheme| &scheme.ty)
+        .or_else(|| {
+            context
+                .inference
+                .binding_types_for_module(context.module_name)
+                .and_then(|types| types.get(&span))
+        })
+        .or_else(|| {
+            context
+                .inference
+                .env_for_module(context.module_name)
+                .and_then(|env| env.get(name))
+                .map(|info| &info.scheme.ty)
+        })
+}
+
+fn import_member_token_type(
+    context: Option<&SemanticContext<'_>>,
+    module_name: &str,
+    member_name: &str,
+) -> u32 {
+    let Some(context) = context else {
+        return TY_PROPERTY;
+    };
+    let Some(Ty::Record(row)) = context.inference.import_types.get(module_name) else {
+        return TY_PROPERTY;
+    };
+    row.fields
+        .iter()
+        .find(|(name, _)| name == member_name)
+        .map(|(_, ty)| {
+            if is_function_type(ty) {
+                TY_METHOD
+            } else {
+                TY_PROPERTY
+            }
+        })
+        .unwrap_or(TY_PROPERTY)
+}
+
+fn is_function_type(ty: &Ty) -> bool {
+    match ty {
+        Ty::Func(_, _) => true,
+        Ty::Qualified(_, inner) => is_function_type(inner),
+        _ => false,
     }
 }
 
@@ -230,7 +347,13 @@ fn push_semantic_span(
     } else {
         let idx = raw.len();
         pos_to_idx.insert((line, col), idx);
-        raw.push(RawToken { line, col, len, token_type, token_mods });
+        raw.push(RawToken {
+            line,
+            col,
+            len,
+            token_type,
+            token_mods,
+        });
     }
 }
 
@@ -313,7 +436,8 @@ fn find_line_comment_start(line: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hern_core::pipeline::parse_source;
+    use hern_core::pipeline::{infer_program, parse_source};
+    use hern_core::types::Row;
 
     fn token_tuples(result: SemanticTokensResult) -> Vec<(u32, u32, u32, u32, u32)> {
         let SemanticTokensResult::Tokens(tokens) = result else {
@@ -347,6 +471,7 @@ mod tests {
         let tokens = token_tuples(semantic_tokens_for_source(
             "let value = 1; // comment\n\"hi\"\n",
             None,
+            None,
         ));
 
         assert!(tokens.iter().any(|token| token.3 == TY_KEYWORD));
@@ -361,6 +486,7 @@ mod tests {
         let tokens = token_tuples(semantic_tokens_for_source(
             "fn value(x) { x }\nvalue(1)\n",
             Some(&program),
+            None,
         ));
 
         assert!(tokens.iter().any(|token| {
@@ -372,5 +498,72 @@ mod tests {
         assert!(tokens.iter().any(|token| {
             token.0 == 1 && token.1 == 0 && token.3 == TY_FUNCTION && token.4 == 0
         }));
+    }
+
+    #[test]
+    fn semantic_tokens_classify_let_bound_functions_from_inference() {
+        let source = "let id = fn(x) { x };\nid(1)\n";
+        let mut program = parse_source(source).expect("source should parse");
+        let inference = infer_program(&mut program).expect("source should infer");
+        let graph_inference = graph_inference_for_test("main", inference);
+
+        let tokens = token_tuples(semantic_tokens_for_source(
+            source,
+            Some(&program),
+            SemanticContext::new(&graph_inference, "main"),
+        ));
+
+        assert!(tokens.iter().any(|token| {
+            token.0 == 0 && token.1 == 4 && token.3 == TY_FUNCTION && token.4 == MOD_DECLARATION
+        }));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| { token.0 == 1 && token.1 == 0 && token.3 == TY_FUNCTION })
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_classify_imported_function_members_as_methods() {
+        let source = "let dep = import \"dep\";\ndep.add(1)\n";
+        let program = parse_source(source).expect("source should parse");
+        let mut graph_inference = GraphInference::default();
+        graph_inference.import_types.insert(
+            "dep".to_string(),
+            Ty::Record(Row {
+                fields: vec![(
+                    "add".to_string(),
+                    Ty::Func(vec![Ty::F64], Box::new(Ty::F64)),
+                )],
+                tail: Box::new(Ty::Unit),
+            }),
+        );
+
+        let tokens = token_tuples(semantic_tokens_for_source(
+            source,
+            Some(&program),
+            SemanticContext::new(&graph_inference, "main"),
+        ));
+
+        assert!(
+            tokens
+                .iter()
+                .any(|token| { token.0 == 1 && token.1 == 4 && token.3 == TY_METHOD })
+        );
+    }
+
+    fn graph_inference_for_test(
+        module: &str,
+        inference: hern_core::types::infer::InferenceResult,
+    ) -> GraphInference {
+        GraphInference {
+            envs: HashMap::from([(module.to_string(), inference.env)]),
+            variant_envs: HashMap::from([(module.to_string(), inference.variant_env)]),
+            expr_types: HashMap::from([(module.to_string(), inference.expr_types)]),
+            symbol_types: HashMap::from([(module.to_string(), inference.symbol_types)]),
+            binding_types: HashMap::from([(module.to_string(), inference.binding_types)]),
+            definition_schemes: HashMap::from([(module.to_string(), inference.definition_schemes)]),
+            ..GraphInference::default()
+        }
     }
 }

@@ -15,7 +15,7 @@ pub(super) fn analyze_document_graph(
     uri: &lsp_types::Uri,
 ) -> Result<WorkspaceAnalysis, CompilerDiagnostic> {
     let mut graph = load_document_graph(state, uri)?;
-    let inference = infer_graph(&mut graph)?;
+    let inference = state.timed("inference", || infer_graph(&mut graph))?;
     Ok(WorkspaceAnalysis { graph, inference })
 }
 
@@ -27,12 +27,15 @@ pub(super) fn load_document_graph(
         CompilerDiagnostic::error(None, format!("unsupported document URI: {}", uri.as_str()))
     })?;
     let overlays = document_overlays(state);
-    ModuleGraph::load_entry_with_prelude_and_overlays(
-        &path,
-        state.prelude.program.clone(),
-        overlays,
-    )
-    .map(|(graph, _)| graph)
+    state
+        .timed("module graph loading", || {
+            ModuleGraph::load_entry_with_prelude_and_overlays(
+                &path,
+                state.prelude.program.clone(),
+                overlays,
+            )
+        })
+        .map(|(graph, _)| graph)
 }
 
 /// Loads the module graph using parse-error recovery. Unlike `load_document_graph`, this
@@ -45,13 +48,16 @@ pub(super) fn load_document_graph_recovering(
 ) -> Option<ModuleGraph> {
     let path = uri_to_path(uri)?;
     let overlays = document_overlays(state);
-    ModuleGraph::load_entry_with_prelude_and_overlays_recovering(
-        &path,
-        state.prelude.program.clone(),
-        overlays,
-    )
-    .value
-    .map(|loaded| loaded.graph)
+    state
+        .timed("recovering module graph loading", || {
+            ModuleGraph::load_entry_with_prelude_and_overlays_recovering(
+                &path,
+                state.prelude.program.clone(),
+                overlays,
+            )
+        })
+        .value
+        .map(|loaded| loaded.graph)
 }
 
 /// Loads the graph and inference, accepting partial results even when type errors exist.
@@ -63,10 +69,12 @@ pub(super) fn load_workspace_graphs(
     uri: &lsp_types::Uri,
 ) -> Option<WorkspaceAnalysis> {
     let path = uri_to_path(uri)?;
-    let analysis = analyze_workspace(WorkspaceInputs {
-        entry: path,
-        overlays: document_overlays(state),
-        prelude: Some(state.prelude.program.clone()),
+    let analysis = state.timed("workspace analysis", || {
+        analyze_workspace(WorkspaceInputs {
+            entry: path,
+            overlays: document_overlays(state),
+            prelude: Some(state.prelude.program.clone()),
+        })
     });
     Some(WorkspaceAnalysis {
         graph: analysis.graph?,

@@ -6,13 +6,13 @@ use super::workspace::{
     load_workspace_graphs,
 };
 use hern_core::ast::{Program, SourcePosition};
-use hern_core::module::{GraphInference, ModuleGraph};
+use hern_core::module::{GraphInference, ModuleGraph, infer_graph_collecting};
 use hern_core::source_index::{Definition, DefinitionKind, index_program};
 use hern_core::types::Ty;
 use hern_core::types::infer::TypeEnv;
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
-    Position, Range, TextEdit, Uri,
+    CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit, Position,
+    Range, TextEdit, Uri,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -29,15 +29,16 @@ fn acquire_completion_graphs(state: &ServerState, uri: &Uri) -> Option<Workspace
         return Some(wa);
     }
     // Parse-only: syntax errors but we can still suggest names from scope.
-    let graph = load_document_graph_recovering(state, uri)?;
-    Some(WorkspaceAnalysis { graph, inference: GraphInference::default() })
+    let mut graph = load_document_graph_recovering(state, uri)?;
+    let inference = infer_graph_collecting(&mut graph).value.unwrap_or_default();
+    Some(WorkspaceAnalysis { graph, inference })
 }
 
-pub(crate) fn completion(
-    state: &ServerState,
-    uri: Uri,
-    position: Position,
-) -> Vec<CompletionItem> {
+pub(crate) fn completion(state: &ServerState, uri: Uri, position: Position) -> Vec<CompletionItem> {
+    state.timed("completion", || completion_inner(state, uri, position))
+}
+
+fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<CompletionItem> {
     let Some(path) = uri_to_path(&uri) else {
         return Vec::new();
     };
@@ -68,22 +69,32 @@ pub(crate) fn completion(
         col: lsp_position.character as usize + 1,
     };
 
-    let index = index_program(program);
+    let index = state.timed("source indexing", || index_program(program));
+    if is_binding_declaration_position(state, &uri, lsp_position) {
+        return Vec::new();
+    }
     let candidates = index.visible_names_at(position);
     let env = inference.env_for_module(module_name);
     let binding_types = inference.binding_types_for_module(module_name);
     let definition_schemes = inference.definition_schemes_for_module(module_name);
     let replacement_range = completion_replacement_range(state, &uri, lsp_position);
 
-    if let Some(items) = imported_member_completion(
+    if let Some(items) = member_completion(
         state,
         &uri,
         graph,
         inference,
+        module_name,
         &index,
         position,
         lsp_position,
     ) {
+        return items;
+    }
+
+    if let Some(items) =
+        type_position_completion(state, &uri, &index, lsp_position, replacement_range)
+    {
         return items;
     }
 
@@ -147,6 +158,9 @@ fn import_path_completion(
         None => ("", prefix),
     };
     let search_dir = doc_dir.join(dir_part);
+    if !state.path_is_in_workspace(&search_dir) {
+        return Some(Vec::new());
+    }
     let entries = fs::read_dir(search_dir).ok()?;
     let replace_range = Range::new(
         Position::new(position.line, byte_to_utf16_col(line, quote + 1)),
@@ -206,11 +220,12 @@ fn path_completion_item(
     }
 }
 
-fn imported_member_completion(
+fn member_completion(
     state: &ServerState,
     uri: &Uri,
     graph: &ModuleGraph,
     inference: &GraphInference,
+    current_module: &str,
     index: &hern_core::source_index::SourceIndex,
     position: SourcePosition,
     lsp_position: Position,
@@ -236,9 +251,14 @@ fn imported_member_completion(
         return None;
     }
     let definition = visible_definition_named(index, receiver, position)?;
-    let module_name = definition.import_module.as_ref()?;
     let replacement_range = completion_replacement_range(state, uri, lsp_position)?;
-    let items = imported_member_completion_items(graph, inference, module_name, replacement_range);
+    let items = if let Some(module_name) = definition.import_module.as_ref() {
+        imported_member_completion_items(graph, inference, module_name, replacement_range)
+    } else if let Some(ty) = completion_type_for_definition(inference, current_module, definition) {
+        record_field_completion_items(&ty, replacement_range)
+    } else {
+        Vec::new()
+    };
     (!items.is_empty()).then_some(items)
 }
 
@@ -312,6 +332,135 @@ fn imported_member_completion_items(
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items.dedup_by(|a, b| a.label == b.label);
     items
+}
+
+fn record_field_completion_items(ty: &Ty, replacement_range: Range) -> Vec<CompletionItem> {
+    let ty = match ty {
+        Ty::Qualified(_, inner) => inner.as_ref(),
+        other => other,
+    };
+    let Ty::Record(row) = ty else {
+        return Vec::new();
+    };
+    let mut items = row
+        .fields
+        .iter()
+        .map(|(name, ty)| CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            filter_text: Some(name.clone()),
+            insert_text: Some(name.clone()),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: replacement_range,
+                new_text: name.clone(),
+            })),
+            detail: Some(completion_ty_to_display_string(ty)),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items
+}
+
+fn type_position_completion(
+    state: &ServerState,
+    uri: &Uri,
+    index: &hern_core::source_index::SourceIndex,
+    position: Position,
+    replacement_range: Option<Range>,
+) -> Option<Vec<CompletionItem>> {
+    if !is_type_position(state, uri, position) {
+        return None;
+    }
+    let mut items = index
+        .definitions
+        .iter()
+        .filter(|definition| {
+            matches!(
+                definition.kind,
+                DefinitionKind::Type | DefinitionKind::TypeAlias | DefinitionKind::Trait
+            )
+        })
+        .map(|definition| {
+            let kind = match definition.kind {
+                DefinitionKind::Trait => CompletionItemKind::INTERFACE,
+                _ => CompletionItemKind::STRUCT,
+            };
+            CompletionItem {
+                label: definition.name.clone(),
+                kind: Some(kind),
+                filter_text: Some(definition.name.clone()),
+                insert_text: Some(definition.name.clone()),
+                text_edit: replacement_range.map(|range| {
+                    CompletionTextEdit::Edit(TextEdit {
+                        range,
+                        new_text: definition.name.clone(),
+                    })
+                }),
+                ..Default::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items.dedup_by(|a, b| a.label == b.label);
+    Some(items)
+}
+
+fn is_binding_declaration_position(state: &ServerState, uri: &Uri, position: Position) -> bool {
+    let Some(line) = state
+        .documents
+        .get(uri)
+        .and_then(|source| source.lines().nth(position.line as usize))
+    else {
+        return false;
+    };
+    let cursor_byte = utf16_col_to_byte(line, position.character).min(line.len());
+    let before = line[..cursor_byte].trim_end();
+    before.ends_with("let") || before.ends_with("let mut")
+}
+
+fn is_type_position(state: &ServerState, uri: &Uri, position: Position) -> bool {
+    let Some(line) = state
+        .documents
+        .get(uri)
+        .and_then(|source| source.lines().nth(position.line as usize))
+    else {
+        return false;
+    };
+    let cursor_byte = utf16_col_to_byte(line, position.character).min(line.len());
+    let before = &line[..cursor_byte];
+    let Some(colon) = before.rfind(':') else {
+        return false;
+    };
+    !before[colon + 1..].contains('=')
+        && !before[colon + 1..].contains('{')
+        && !before[colon + 1..].contains('}')
+}
+
+fn completion_type_for_definition(
+    inference: &GraphInference,
+    current_module: &str,
+    definition: &Definition,
+) -> Option<Ty> {
+    if let Some(module_name) = definition.import_module.as_ref() {
+        return inference.import_types.get(module_name).cloned();
+    }
+    inference
+        .definition_schemes_for_module(current_module)
+        .and_then(|schemes| schemes.get(&definition.location.span))
+        .map(|scheme| scheme.ty.clone())
+        .or_else(|| {
+            inference
+                .binding_types_for_module(current_module)
+                .and_then(|types| types.get(&definition.location.span))
+                .cloned()
+        })
+        .or_else(|| {
+            inference
+                .env_for_module(current_module)
+                .and_then(|env| env.get(&definition.name))
+                .map(|info| info.scheme.ty.clone())
+        })
 }
 
 fn exported_record_fields(program: &Program) -> Option<Vec<String>> {
