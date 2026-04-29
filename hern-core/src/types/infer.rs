@@ -51,6 +51,21 @@ impl TypeEnv {
         }
         vars
     }
+
+    fn free_vars_syntactic(&self) -> HashSet<TyVar> {
+        let mut vars = HashSet::new();
+        for info in self.0.values() {
+            let mut scheme_vars = free_type_vars(&info.scheme.ty);
+            for constraint in &info.scheme.constraints {
+                scheme_vars.insert(constraint.var);
+            }
+            for quantified in &info.scheme.vars {
+                scheme_vars.remove(quantified);
+            }
+            vars.extend(scheme_vars);
+        }
+        vars
+    }
 }
 
 // ── Variant environment ───────────────────────────────────────────────────────
@@ -96,6 +111,7 @@ pub fn is_value(expr: &Expr) -> bool {
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
         | ExprKind::Ident(_)
+        | ExprKind::Lambda { .. }
         | ExprKind::Import(_)
         | ExprKind::Unit => true,
         ExprKind::Tuple(exprs) => exprs.iter().all(is_value),
@@ -127,6 +143,13 @@ pub struct Infer {
 struct InstantiatedScheme {
     ty: Ty,
     constraints: Vec<TraitConstraint>,
+}
+
+#[derive(Debug, Clone)]
+struct FinalizedConstraints {
+    scheme: Scheme,
+    owned: Vec<TraitConstraint>,
+    bubbled: Vec<TraitConstraint>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +380,16 @@ impl Infer {
         }
     }
 
+    fn normalized_free_vars_syntactic(&self, env: &TypeEnv) -> HashSet<TyVar> {
+        env.free_vars_syntactic()
+            .into_iter()
+            .filter_map(|var| match self.subst.apply(&Ty::Var(var)) {
+                Ty::Var(resolved) => Some(resolved),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn collect_type_bound_constraints(
         &mut self,
         param_vars: &mut HashMap<String, TyVar>,
@@ -386,26 +419,43 @@ impl Infer {
         env: &TypeEnv,
         fn_ty: Ty,
         fn_constraints: Vec<TraitConstraint>,
-    ) -> (Scheme, Vec<TraitConstraint>) {
+    ) -> FinalizedConstraints {
         let mut scheme = self.generalize(env, fn_ty);
+        let env_vars = self.normalized_free_vars_syntactic(env);
         let mut seen = HashSet::new();
-        let mut constraints = Vec::new();
+        let mut seen_bubbled = HashSet::new();
+        let mut owned = Vec::new();
+        let mut bubbled = Vec::new();
 
         for constraint in fn_constraints {
-            let resolved = self.subst.apply(&Ty::Var(constraint.var));
-            if let Ty::Var(var) = resolved {
-                let normalized = TraitConstraint {
-                    var,
-                    trait_name: constraint.trait_name,
-                };
-                if scheme.vars.contains(&normalized.var) && seen.insert(normalized.clone()) {
-                    constraints.push(normalized);
+            match self.subst.apply(&Ty::Var(constraint.var)) {
+                Ty::Var(var) => {
+                    let normalized = TraitConstraint {
+                        var,
+                        trait_name: constraint.trait_name,
+                    };
+                    if env_vars.contains(&normalized.var) || !scheme.vars.contains(&normalized.var)
+                    {
+                        if seen_bubbled.insert(normalized.clone()) {
+                            bubbled.push(normalized);
+                        }
+                    } else if seen.insert(normalized.clone()) {
+                        owned.push(normalized);
+                    }
                 }
+                // Concrete constraints do not become callable dictionary
+                // parameters. Their pending dict uses are resolved by the
+                // local/concrete resolver after inference has finished.
+                _ => {}
             }
         }
 
-        scheme.constraints = constraints.clone();
-        (scheme, constraints)
+        scheme.constraints = owned.clone();
+        FinalizedConstraints {
+            scheme,
+            owned,
+            bubbled,
+        }
     }
 
     // ── Shared Fn/Op inference helper ─────────────────────────────────────────
@@ -469,22 +519,23 @@ impl Infer {
         unify(&mut self.subst, body_ty, ret_ty).map_err(|err| err.at(body.span))?;
 
         let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
-        let (gen_scheme, final_constraints) = self.finalize_constraints(env, fn_ty, fn_constraints);
+        let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
+        self.pending_constraints.extend(finalized.bubbled.clone());
 
-        *dict_params = final_constraints.iter().map(dict_param_name).collect();
+        *dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
         let resolver =
-            |p: &PendingDictArg| resolve_local_or_concrete(p, &final_constraints, &self.subst);
+            |p: &PendingDictArg| resolve_local_or_concrete(p, &finalized.owned, &self.subst);
         resolve_dict_uses_expr(body, &resolver, false)?;
 
         env.insert(
             name.to_string(),
             EnvInfo {
-                scheme: gen_scheme.clone(),
+                scheme: finalized.scheme.clone(),
                 is_mutable: false,
             },
         );
-        self.definition_schemes.insert(name_span, gen_scheme);
+        self.definition_schemes.insert(name_span, finalized.scheme);
         Ok(())
     }
 
@@ -1407,6 +1458,7 @@ impl Infer {
             ExprKind::Call {
                 callee,
                 args,
+                arg_wrappers,
                 resolved_callee,
                 dict_args,
                 pending_dict_args,
@@ -1426,7 +1478,7 @@ impl Infer {
                         })?
                         .clone();
 
-                    let arg_tys = self.infer_args(env, args)?;
+                    let arg_tys = self.infer_args(env, args, arg_wrappers)?;
                     let Some(first_arg_ty) = arg_tys.first() else {
                         return Err(TypeError::ArityMismatch {
                             expected: method.params.len(),
@@ -1512,7 +1564,7 @@ impl Infer {
                             self.symbol_types
                                 .insert(callee.id, self.subst.apply(&instantiated));
                         }
-                        let arg_tys = self.infer_args(env, args)?;
+                        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
                         return self.infer_constrained_apply(
                             &scheme,
                             arg_tys,
@@ -1531,7 +1583,7 @@ impl Infer {
                 } else {
                     Vec::new()
                 };
-                let arg_tys = self.infer_args(env, args)?;
+                let arg_tys = self.infer_args(env, args, arg_wrappers)?;
                 let ret_ty = Ty::Var(self.fresh_var());
                 unify(
                     &mut self.subst,
@@ -1700,19 +1752,27 @@ impl Infer {
                 let fn_ty = Ty::Func(param_tys, Box::new(self.subst.apply(&ret_ty)));
                 let fn_constraints =
                     std::mem::replace(&mut self.pending_constraints, saved_pending);
-                let (gen_scheme, final_constraints) =
-                    self.finalize_constraints(env, fn_ty, fn_constraints);
-                *dict_params = final_constraints.iter().map(dict_param_name).collect();
+                let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
+                self.pending_constraints.extend(finalized.bubbled.clone());
+                *dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
                 let resolver = |p: &PendingDictArg| {
-                    resolve_local_or_concrete(p, &final_constraints, &self.subst)
+                    resolve_local_or_concrete(p, &finalized.owned, &self.subst)
                 };
-                resolve_dict_uses_expr(body, &resolver, false)?;
-
-                Ok(if final_constraints.is_empty() {
-                    gen_scheme.ty
+                if finalized.bubbled.is_empty() {
+                    resolve_dict_uses_expr(body, &resolver, false)?;
                 } else {
-                    Ty::Qualified(final_constraints, Box::new(gen_scheme.ty))
+                    // Bubbled constraints belong to an enclosing callable. They
+                    // are deliberately absent from this lambda's owned dict
+                    // params, so this pass must leave those pending uses for the
+                    // enclosing resolver instead of reporting them as unresolved.
+                    resolve_dict_uses_expr_lenient(body, &resolver, false)?;
+                }
+
+                Ok(if finalized.owned.is_empty() {
+                    finalized.scheme.ty
+                } else {
+                    Ty::Qualified(finalized.owned, Box::new(finalized.scheme.ty))
                 })
             }
             ExprKind::For {
@@ -1802,10 +1862,34 @@ impl Infer {
         &mut self,
         env: &TypeEnv,
         args: &mut [Expr],
+        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
     ) -> Result<Vec<Ty>, SpannedTypeError> {
-        args.iter_mut()
-            .map(|arg| self.infer_expr(env, arg))
-            .collect()
+        arg_wrappers.clear();
+        let mut arg_tys = Vec::with_capacity(args.len());
+        for arg in args {
+            let inferred = self.infer_expr(env, arg)?;
+            let mut arg_ty = self.subst.apply(&inferred);
+            let wrapper = if let Ty::Qualified(constraints, inner) = arg_ty {
+                let mut wrapper = ArgWrapper {
+                    dict_args: Vec::new(),
+                    pending_dict_args: Vec::new(),
+                };
+                attach_dict_args(
+                    &mut wrapper.dict_args,
+                    &mut wrapper.pending_dict_args,
+                    &mut self.pending_constraints,
+                    &constraints,
+                    &self.subst,
+                );
+                arg_ty = *inner;
+                Some(wrapper)
+            } else {
+                None
+            };
+            arg_wrappers.push(wrapper);
+            arg_tys.push(arg_ty);
+        }
+        Ok(arg_tys)
     }
 
     fn infer_constrained_apply(
@@ -2772,6 +2856,23 @@ fn resolve_dict_uses_expr(
     resolve: &impl Fn(&PendingDictArg) -> Option<String>,
     process_fn: bool,
 ) -> Result<(), TypeError> {
+    resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, true)
+}
+
+fn resolve_dict_uses_expr_lenient(
+    expr: &mut Expr,
+    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    process_fn: bool,
+) -> Result<(), TypeError> {
+    resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, false)
+}
+
+fn resolve_dict_uses_expr_with_mode(
+    expr: &mut Expr,
+    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    process_fn: bool,
+    hard_unresolved: bool,
+) -> Result<(), TypeError> {
     match &mut expr.kind {
         ExprKind::Binary {
             lhs,
@@ -2786,38 +2887,57 @@ fn resolve_dict_uses_expr(
             if let BinOp::Custom(op_str) = op
                 && let Some(pending) = pending_op.as_ref()
             {
-                let dict_name = resolve(pending).ok_or_else(|| TypeError::UnresolvedTrait {
-                    context: "operator".to_string(),
-                    trait_name: pending.trait_name.clone(),
-                })?;
-                *resolved_op = Some(format!("{}.{}", dict_name, mangle_op(op_str)));
-                *pending_op = None;
+                if let Some(dict_name) = resolve(pending) {
+                    *resolved_op = Some(format!("{}.{}", dict_name, mangle_op(op_str)));
+                    *pending_op = None;
+                } else if hard_unresolved {
+                    return Err(TypeError::UnresolvedTrait {
+                        context: "operator".to_string(),
+                        trait_name: pending.trait_name.clone(),
+                    });
+                }
             }
-            drain_pending(pending_dict_args, dict_args, "call", resolve)?;
-            resolve_dict_uses_expr(lhs, resolve, process_fn)?;
-            resolve_dict_uses_expr(rhs, resolve, process_fn)?;
+            if hard_unresolved {
+                drain_pending(pending_dict_args, dict_args, "call", resolve)?;
+            } else {
+                drain_pending_lenient(pending_dict_args, dict_args, resolve);
+            }
+            resolve_dict_uses_expr_with_mode(lhs, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(rhs, resolve, process_fn, hard_unresolved)?;
             Ok(())
         }
         ExprKind::Call {
             callee,
             args,
+            arg_wrappers,
             dict_args,
             pending_dict_args,
             ..
         } => {
-            drain_pending(pending_dict_args, dict_args, "call", resolve)?;
-            resolve_dict_uses_expr(callee, resolve, process_fn)?;
+            if hard_unresolved {
+                drain_pending(pending_dict_args, dict_args, "call", resolve)?;
+            } else {
+                drain_pending_lenient(pending_dict_args, dict_args, resolve);
+            }
+            for wrapper in arg_wrappers.iter_mut().flatten() {
+                drain_pending_lenient(
+                    &mut wrapper.pending_dict_args,
+                    &mut wrapper.dict_args,
+                    resolve,
+                );
+            }
+            resolve_dict_uses_expr_with_mode(callee, resolve, process_fn, hard_unresolved)?;
             for arg in args {
-                resolve_dict_uses_expr(arg, resolve, process_fn)?;
+                resolve_dict_uses_expr_with_mode(arg, resolve, process_fn, hard_unresolved)?;
             }
             Ok(())
         }
         ExprKind::Block { stmts, final_expr } => {
             for stmt in stmts {
-                resolve_dict_uses_stmt_inner(stmt, resolve, process_fn)?;
+                resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, hard_unresolved)?;
             }
             if let Some(e) = final_expr {
-                resolve_dict_uses_expr(e, resolve, process_fn)?;
+                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)?;
             }
             Ok(())
         }
@@ -2826,42 +2946,50 @@ fn resolve_dict_uses_expr(
             then_branch,
             else_branch,
         } => {
-            resolve_dict_uses_expr(cond, resolve, process_fn)?;
-            resolve_dict_uses_expr(then_branch, resolve, process_fn)?;
-            resolve_dict_uses_expr(else_branch, resolve, process_fn)?;
+            resolve_dict_uses_expr_with_mode(cond, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(then_branch, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(else_branch, resolve, process_fn, hard_unresolved)?;
             Ok(())
         }
-        ExprKind::Lambda { body, .. } => resolve_dict_uses_expr(body, resolve, process_fn),
+        ExprKind::Lambda { body, .. } => {
+            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)
+        }
         ExprKind::Match { scrutinee, arms } => {
-            resolve_dict_uses_expr(scrutinee, resolve, process_fn)?;
+            resolve_dict_uses_expr_with_mode(scrutinee, resolve, process_fn, hard_unresolved)?;
             for (_, arm_expr) in arms {
-                resolve_dict_uses_expr(arm_expr, resolve, process_fn)?;
+                resolve_dict_uses_expr_with_mode(arm_expr, resolve, process_fn, hard_unresolved)?;
             }
             Ok(())
         }
-        ExprKind::Loop(body) => resolve_dict_uses_expr(body, resolve, process_fn),
+        ExprKind::Loop(body) => {
+            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)
+        }
         ExprKind::Assign { target, value } => {
-            resolve_dict_uses_expr(target, resolve, process_fn)?;
-            resolve_dict_uses_expr(value, resolve, process_fn)?;
+            resolve_dict_uses_expr_with_mode(target, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(value, resolve, process_fn, hard_unresolved)?;
             Ok(())
         }
-        ExprKind::Not(e) => resolve_dict_uses_expr(e, resolve, process_fn),
+        ExprKind::Not(e) => {
+            resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)
+        }
         ExprKind::Break(Some(e)) | ExprKind::Return(Some(e)) => {
-            resolve_dict_uses_expr(e, resolve, process_fn)
+            resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)
         }
         ExprKind::Tuple(es) | ExprKind::Array(es) => {
             for e in es {
-                resolve_dict_uses_expr(e, resolve, process_fn)?;
+                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)?;
             }
             Ok(())
         }
         ExprKind::Record(fields) => {
             for (_, e) in fields {
-                resolve_dict_uses_expr(e, resolve, process_fn)?;
+                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)?;
             }
             Ok(())
         }
-        ExprKind::FieldAccess { expr, .. } => resolve_dict_uses_expr(expr, resolve, process_fn),
+        ExprKind::FieldAccess { expr, .. } => {
+            resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, hard_unresolved)
+        }
         ExprKind::For {
             iterable,
             body,
@@ -2870,15 +2998,18 @@ fn resolve_dict_uses_expr(
             ..
         } => {
             if let Some(pending) = pending_iter.as_ref() {
-                let dict_name = resolve(pending).ok_or_else(|| TypeError::UnresolvedTrait {
-                    context: "iterator".to_string(),
-                    trait_name: pending.trait_name.clone(),
-                })?;
-                *resolved_iter = Some(format!("{}.iter", dict_name));
-                *pending_iter = None;
+                if let Some(dict_name) = resolve(pending) {
+                    *resolved_iter = Some(format!("{}.iter", dict_name));
+                    *pending_iter = None;
+                } else if hard_unresolved {
+                    return Err(TypeError::UnresolvedTrait {
+                        context: "iterator".to_string(),
+                        trait_name: pending.trait_name.clone(),
+                    });
+                }
             }
-            resolve_dict_uses_expr(iterable, resolve, process_fn)?;
-            resolve_dict_uses_expr(body, resolve, process_fn)?;
+            resolve_dict_uses_expr_with_mode(iterable, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)?;
             Ok(())
         }
         ExprKind::Import(_) => Ok(()),
@@ -2893,19 +3024,35 @@ fn resolve_dict_uses_stmt_inner(
     resolve: &impl Fn(&PendingDictArg) -> Option<String>,
     process_fn: bool,
 ) -> Result<(), TypeError> {
+    resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, true)
+}
+
+fn resolve_dict_uses_stmt_inner_with_mode(
+    stmt: &mut Stmt,
+    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    process_fn: bool,
+    hard_unresolved: bool,
+) -> Result<(), TypeError> {
     match stmt {
         Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
             if process_fn {
-                resolve_dict_uses_expr(body, resolve, process_fn)
+                resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)
             } else {
                 Ok(()) // handled during that function's own inference
             }
         }
-        Stmt::Let { value, .. } => resolve_dict_uses_expr(value, resolve, process_fn),
-        Stmt::Expr(e) => resolve_dict_uses_expr(e, resolve, process_fn),
+        Stmt::Let { value, .. } => {
+            resolve_dict_uses_expr_with_mode(value, resolve, process_fn, hard_unresolved)
+        }
+        Stmt::Expr(e) => resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved),
         Stmt::Impl(id) => {
             for method in &mut id.methods {
-                resolve_dict_uses_expr(&mut method.body, resolve, process_fn)?;
+                resolve_dict_uses_expr_with_mode(
+                    &mut method.body,
+                    resolve,
+                    process_fn,
+                    hard_unresolved,
+                )?;
             }
             Ok(())
         }
@@ -2943,6 +3090,22 @@ fn drain_pending(
     resolved.extend(names?);
     pending.clear();
     Ok(())
+}
+
+fn drain_pending_lenient(
+    pending: &mut Vec<PendingDictArg>,
+    resolved: &mut Vec<String>,
+    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+) {
+    let mut unresolved = Vec::new();
+    for item in pending.drain(..) {
+        if let Some(name) = resolve(&item) {
+            resolved.push(name);
+        } else {
+            unresolved.push(item);
+        }
+    }
+    *pending = unresolved;
 }
 
 fn expr_always_exits(expr: &Expr, include_bc: bool) -> bool {
@@ -3059,5 +3222,47 @@ mod tests {
         );
         assert!(inference.env.get("dependent").is_none());
         assert!(inference.env.get("other").is_none());
+    }
+
+    #[test]
+    fn syntactic_env_vars_are_normalized_before_constraint_partitioning() {
+        let mut infer = Infer::new();
+        let mut env = TypeEnv::new();
+        env.insert(
+            "outer".to_string(),
+            EnvInfo {
+                scheme: Scheme::mono(Ty::Var(0)),
+                is_mutable: false,
+            },
+        );
+
+        infer.subst.bind_ty(0, Ty::Var(1)).expect("valid alias");
+
+        assert_eq!(
+            infer.normalized_free_vars_syntactic(&env),
+            HashSet::from([1])
+        );
+    }
+
+    #[test]
+    fn concrete_constraints_are_resolved_without_callable_dict_params() {
+        let mut infer = Infer::new();
+        infer
+            .subst
+            .bind_ty(0, Ty::F64)
+            .expect("valid concrete type");
+
+        let finalized = infer.finalize_constraints(
+            &TypeEnv::new(),
+            Ty::Func(vec![Ty::F64], Box::new(Ty::F64)),
+            vec![TraitConstraint {
+                var: 0,
+                trait_name: "Add".to_string(),
+            }],
+        );
+
+        assert!(finalized.owned.is_empty());
+        assert!(finalized.bubbled.is_empty());
+        assert!(finalized.scheme.constraints.is_empty());
     }
 }

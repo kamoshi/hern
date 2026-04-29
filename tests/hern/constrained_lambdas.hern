@@ -1,0 +1,29 @@
+fn apply_twice(f, x) {
+    f(f(x))
+}
+
+fn double['a: Add](x: 'a) -> 'a {
+    x + x
+}
+
+let inline_result = apply_twice(fn(z) { z + z }, 1.0);
+print(inline_result);
+
+let local_double = fn(z) { z + z };
+let local_result = apply_twice(local_double, 1.0);
+print(local_result);
+
+let named_result = apply_twice(double, 1.0);
+print(named_result);
+
+fn make_adder(n) {
+    let inner = fn(x) { x + n };
+    inner
+}
+
+let add_two = make_adder(2.0);
+print(add_two(3.0));
+
+let id = fn(x) { x };
+print(id(1.0));
+print(id("ok"));

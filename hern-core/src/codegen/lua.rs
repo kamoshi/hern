@@ -509,6 +509,7 @@ impl LuaCodegen {
             ExprKind::Call {
                 callee,
                 args,
+                arg_wrappers,
                 resolved_callee,
                 dict_args,
                 ..
@@ -517,11 +518,18 @@ impl LuaCodegen {
                     .clone()
                     .or_else(|| self.gen_expr_with_subst(callee, subst, pre))?;
                 let mut all_args: Vec<String> = dict_args.clone();
-                all_args.extend(
-                    args.iter()
-                        .map(|arg| self.gen_expr_with_subst(arg, subst, pre))
-                        .collect::<Option<Vec<_>>>()?,
-                );
+                let generated_args = args
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, arg)| {
+                        let arg_s = self.gen_expr_with_subst(arg, subst, pre)?;
+                        Some(wrap_call_argument(
+                            arg_s,
+                            arg_wrappers.get(idx).and_then(Option::as_ref),
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                all_args.extend(generated_args);
                 if dict_args.is_empty()
                     && let Some(inlined) = self.gen_inline_call(&callee_s, &all_args, pre)
                 {
@@ -664,6 +672,7 @@ impl LuaCodegen {
             ExprKind::Call {
                 callee,
                 args,
+                arg_wrappers,
                 resolved_callee,
                 dict_args,
                 ..
@@ -672,7 +681,10 @@ impl LuaCodegen {
                     .clone()
                     .unwrap_or_else(|| self.gen_expr(callee, pre));
                 let mut all_args: Vec<String> = dict_args.clone();
-                all_args.extend(args.iter().map(|a| self.gen_expr(a, pre)));
+                all_args.extend(args.iter().enumerate().map(|(idx, arg)| {
+                    let arg_s = self.gen_expr(arg, pre);
+                    wrap_call_argument(arg_s, arg_wrappers.get(idx).and_then(Option::as_ref))
+                }));
                 if dict_args.is_empty()
                     && let Some(inlined) = self.gen_inline_call(&callee_s, &all_args, pre)
                 {
@@ -1647,6 +1659,20 @@ fn prelude_value_names(stmts: &[Stmt]) -> Vec<String> {
     names
 }
 
+fn wrap_call_argument(arg: String, wrapper: Option<&ArgWrapper>) -> String {
+    let Some(wrapper) = wrapper else {
+        return arg;
+    };
+    if wrapper.dict_args.is_empty() {
+        return arg;
+    }
+    format!(
+        "(function(...) return {}({}, ...) end)",
+        arg,
+        wrapper.dict_args.join(", ")
+    )
+}
+
 fn bundle_module_var(name: &str) -> String {
     format!("__mod_{}", name)
 }
@@ -1659,4 +1685,47 @@ fn lua_string(s: &str) -> String {
         .replace('\r', "\\r")
         .replace('\t', "\\t");
     format!("\"{}\"", escaped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::{WorkspaceInputs, analyze_workspace};
+    use std::collections::HashMap;
+
+    #[test]
+    fn constrained_let_bound_lambda_higher_order_wrapper_uses_concrete_dict() {
+        let source = r#"
+fn apply_twice(f, x) {
+    f(f(x))
+}
+
+let local_double = fn(z) { z + z };
+let hof_result = apply_twice(local_double, 1.0);
+"#;
+        let entry_path = std::env::temp_dir().join("hern_codegen_wrapper_test.hern");
+        let analysis = analyze_workspace(WorkspaceInputs {
+            entry: entry_path.clone(),
+            overlays: HashMap::from([(entry_path, source.to_string())]),
+            prelude: None,
+        });
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "source should analyze without diagnostics: {:?}",
+            analysis.diagnostics
+        );
+
+        let graph = analysis.graph.expect("workspace should return a graph");
+        let entry = analysis.entry.expect("workspace should return an entry");
+        let program = graph.module(&entry).expect("entry module should be loaded");
+
+        let lua = LuaCodegen::new().gen_program_with_prelude(&graph.prelude, program);
+
+        assert!(
+            lua.contains(
+                "local hof_result = apply_twice((function(...) return local_double(__Add__f64, ...) end), 1)"
+            ),
+            "higher-order constrained lambda arguments should eta-expand with the concrete dict:\n{lua}"
+        );
+    }
 }

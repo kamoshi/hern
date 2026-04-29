@@ -142,6 +142,12 @@ pub struct PendingDictArg {
     pub trait_name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ArgWrapper {
+    pub dict_args: Vec<String>,
+    pub pending_dict_args: Vec<PendingDictArg>,
+}
+
 // ── Trait / Impl ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -286,6 +292,7 @@ pub enum ExprKind {
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
+        arg_wrappers: Vec<Option<ArgWrapper>>,
         /// Resolved callee for trait methods, e.g. `__Functor__Option.map`
         resolved_callee: Option<String>,
         dict_args: Vec<String>,

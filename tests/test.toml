@@ -203,6 +203,18 @@ output = """
 42
 """
 
+[tests.constrained_lambdas]
+path = "tests/hern/constrained_lambdas.hern"
+expect = "typecheck"
+output = """
+4
+4
+4
+5
+1
+ok
+"""
+
 [tests.pipe]
 path = "tests/hern/pipe.hern"
 expect = "typecheck"

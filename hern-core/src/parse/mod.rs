@@ -1857,6 +1857,7 @@ impl<'tokens> Parser<'tokens> {
                 ExprKind::Call {
                     callee: Box::new(callee),
                     args,
+                    arg_wrappers: Vec::new(),
                     resolved_callee: None,
                     dict_args: vec![],
                     pending_dict_args: vec![],
