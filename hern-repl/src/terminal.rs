@@ -33,6 +33,7 @@ pub(crate) fn run(path: Option<PathBuf>) -> Result<()> {
         }
     }
 
+    terminal.clear()?;
     Ok(())
 }
 
