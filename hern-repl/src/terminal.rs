@@ -25,10 +25,14 @@ pub(crate) fn run(path: Option<PathBuf>) -> Result<()> {
     insert_entries(&mut terminal, startup_entries(path.as_deref()))?;
 
     loop {
+        app.update_hints();
         terminal.draw(|frame| draw(frame, &app))?;
         match handle_event(&mut app)? {
             EventAction::Continue => {}
-            EventAction::Commit(entries) => insert_entries(&mut terminal, entries)?,
+            EventAction::Commit(entries) => {
+                insert_entries(&mut terminal, entries)?;
+                app.mark_hints_dirty();
+            }
             EventAction::Exit => break,
         }
     }
@@ -52,14 +56,15 @@ impl TerminalGuard {
 
     fn enter_with_raw_mode() -> Result<Self> {
         let mut stdout = io::stdout();
-        let _ = execute!(
+        let enhanced_keys = execute!(
             stdout,
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                     | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
             )
-        );
+        )
+        .is_ok();
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::with_options(
             backend,
@@ -67,7 +72,7 @@ impl TerminalGuard {
                 viewport: Viewport::Inline(VIEWPORT_HEIGHT),
             },
         )?;
-        Ok(Self { terminal, enhanced_keys: true })
+        Ok(Self { terminal, enhanced_keys })
     }
 }
 

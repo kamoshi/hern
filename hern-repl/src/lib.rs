@@ -18,3 +18,7 @@ pub fn run() -> Result<(), ReplError> {
 pub fn run_with_path(path: PathBuf) -> Result<(), ReplError> {
     terminal::run(Some(path))
 }
+
+pub fn exec_lua(lua_code: &str) -> Result<(), ReplError> {
+    session::exec_lua_passthrough(lua_code)
+}

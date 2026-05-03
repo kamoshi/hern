@@ -23,6 +23,9 @@ pub(crate) struct App {
     pub(crate) input: String,
     pub(crate) cursor: usize,
     pub(crate) enhanced_keys: bool,
+    pub(crate) type_hint: Option<String>,
+    pub(crate) completions: Vec<BindingInfo>,
+    hints_dirty: bool,
     session: ReplSession,
     history: Vec<String>,
     history_cursor: Option<usize>,
@@ -49,6 +52,9 @@ impl App {
             input: String::new(),
             cursor: 0,
             enhanced_keys,
+            type_hint: None,
+            completions: Vec::new(),
+            hints_dirty: true,
             session: ReplSession::new(path)?,
             history: Vec::new(),
             history_cursor: None,
@@ -57,8 +63,40 @@ impl App {
         })
     }
 
-    pub(crate) fn type_hint(&self) -> Option<String> {
-        self.session.type_hint(&self.input)
+    pub(crate) fn update_hints(&mut self) {
+        if !self.hints_dirty {
+            return;
+        }
+        self.type_hint = self.session.type_hint(&self.input);
+        self.completions = self.compute_completions();
+        self.hints_dirty = false;
+    }
+
+    pub(crate) fn mark_hints_dirty(&mut self) {
+        self.hints_dirty = true;
+    }
+
+    fn compute_completions(&self) -> Vec<BindingInfo> {
+        if let Some((base, prefix)) = member_completion_context(&self.input, self.cursor) {
+            return self
+                .session
+                .member_bindings(base, prefix)
+                .into_iter()
+                .take(8)
+                .collect();
+        }
+        let prefix = current_word(&self.input, self.cursor).trim();
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<_> = self
+            .session
+            .bindings()
+            .into_iter()
+            .filter_map(|b| completion_score(&b, prefix).map(|s| (s, b)))
+            .collect();
+        scored.sort_by(|(ls, l), (rs, r)| ls.cmp(rs).then_with(|| l.name.cmp(&r.name)));
+        scored.into_iter().map(|(_, b)| b).take(8).collect()
     }
 
     pub(crate) fn filtered_bindings(&self) -> Vec<BindingInfo> {
@@ -71,39 +109,6 @@ impl App {
             });
         }
         bindings
-    }
-
-    pub(crate) fn completion_items(&self) -> Vec<BindingInfo> {
-        if let Some((base, prefix)) = member_completion_context(&self.input, self.cursor) {
-            return self
-                .session
-                .member_bindings(base, prefix)
-                .into_iter()
-                .take(8)
-                .collect();
-        }
-
-        let prefix = current_word(&self.input, self.cursor).trim();
-        if prefix.is_empty() {
-            return Vec::new();
-        }
-
-        let mut scored: Vec<_> = self
-            .session
-            .bindings()
-            .into_iter()
-            .filter_map(|binding| completion_score(&binding, prefix).map(|score| (score, binding)))
-            .collect();
-        scored.sort_by(|(left_score, left), (right_score, right)| {
-            left_score
-                .cmp(right_score)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        scored
-            .into_iter()
-            .map(|(_, binding)| binding)
-            .take(8)
-            .collect()
     }
 
     fn submit(&mut self) -> Vec<Entry> {
@@ -146,6 +151,7 @@ impl App {
 
         self.input.clear();
         self.cursor = 0;
+        self.hints_dirty = true;
         entries
     }
 
@@ -154,6 +160,7 @@ impl App {
         self.input.insert(self.cursor, '\n');
         self.cursor += 1;
         self.history_cursor = None;
+        self.hints_dirty = true;
     }
 
     fn insert_char(&mut self, ch: char) {
@@ -161,6 +168,7 @@ impl App {
         self.input.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
         self.history_cursor = None;
+        self.hints_dirty = true;
     }
 
     fn recall_older(&mut self) {
@@ -186,6 +194,7 @@ impl App {
             self.history_cursor = None;
             self.input = self.draft_before_history.clone();
             self.cursor = self.input.len();
+            self.hints_dirty = true;
             return;
         }
         self.apply_history_index(idx + 1);
@@ -195,6 +204,7 @@ impl App {
         self.history_cursor = Some(idx);
         self.input = self.history[idx].clone();
         self.cursor = self.input.len();
+        self.hints_dirty = true;
     }
 
     fn toggle_bindings_overlay(&mut self) {
@@ -215,6 +225,7 @@ impl App {
         self.cursor = start + name.len();
         self.bindings_overlay.open = false;
         self.history_cursor = None;
+        self.hints_dirty = true;
     }
 }
 
@@ -328,6 +339,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> EventAct
                 app.cursor = prev;
             }
             app.history_cursor = None;
+            app.hints_dirty = true;
             EventAction::Continue
         }
         (KeyCode::Delete, _) => {
@@ -338,6 +350,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> EventAct
                 app.cursor = cursor;
             }
             app.history_cursor = None;
+            app.hints_dirty = true;
             EventAction::Continue
         }
         (KeyCode::Up, _) => {
@@ -350,18 +363,22 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> EventAct
         }
         (KeyCode::Left, _) => {
             app.cursor = previous_char_boundary(&app.input, app.cursor);
+            app.hints_dirty = true;
             EventAction::Continue
         }
         (KeyCode::Right, _) => {
             app.cursor = next_char_boundary(&app.input, app.cursor);
+            app.hints_dirty = true;
             EventAction::Continue
         }
         (KeyCode::Home, _) => {
             app.cursor = 0;
+            app.hints_dirty = true;
             EventAction::Continue
         }
         (KeyCode::End, _) => {
             app.cursor = app.input.len();
+            app.hints_dirty = true;
             EventAction::Continue
         }
         (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
@@ -381,7 +398,7 @@ fn current_word_range(input: &str, cursor: usize) -> (usize, usize) {
     let cursor = clamp_to_char_boundary(input, cursor);
     let start = input[..cursor]
         .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .map(|idx| idx + 1)
+        .map(|idx| idx + input[idx..].chars().next().map_or(1, |ch| ch.len_utf8()))
         .unwrap_or(0);
     let end = input[cursor..]
         .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
@@ -394,7 +411,7 @@ fn member_completion_context(input: &str, cursor: usize) -> Option<(&str, &str)>
     let cursor = clamp_to_char_boundary(input, cursor);
     let token_start = input[..cursor]
         .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
-        .map(|idx| idx + 1)
+        .map(|idx| idx + input[idx..].chars().next().map_or(1, |ch| ch.len_utf8()))
         .unwrap_or(0);
     let token = &input[token_start..cursor];
     let dot = token.rfind('.')?;
@@ -414,7 +431,7 @@ fn member_completion_context(input: &str, cursor: usize) -> Option<(&str, &str)>
     Some((base, prefix))
 }
 
-fn clamp_to_char_boundary(input: &str, cursor: usize) -> usize {
+pub(crate) fn clamp_to_char_boundary(input: &str, cursor: usize) -> usize {
     let mut cursor = cursor.min(input.len());
     while cursor > 0 && !input.is_char_boundary(cursor) {
         cursor -= 1;

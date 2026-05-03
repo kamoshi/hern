@@ -1,4 +1,5 @@
-use crate::app::{App, Entry, EntryKind};
+use crate::app::{App, Entry, EntryKind, clamp_to_char_boundary};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::highlight::{highlight_line, highlight_source_lines};
 use crate::style::user_message_style;
 use crate::terminal::TerminalGuard;
@@ -138,10 +139,10 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_type_hint(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let line = match app.type_hint() {
+    let line = match &app.type_hint {
         Some(ty) => Line::from(vec![
             Span::styled("  : ", Style::default().fg(Color::DarkGray)),
-            Span::styled(ty, Style::default().fg(Color::Yellow)),
+            Span::styled(ty.clone(), Style::default().fg(Color::Yellow)),
         ]),
         None => Line::from(Span::styled("  ", Style::default().fg(Color::DarkGray))),
     };
@@ -149,9 +150,9 @@ fn render_type_hint(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_completion_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let completions = app.completion_items();
     let width = area.width.saturating_sub(2) as usize;
-    let rows: Vec<Line<'static>> = completions
+    let rows: Vec<Line<'static>> = app
+        .completions
         .iter()
         .take(area.height as usize)
         .map(|binding| completion_preview_row(binding, width))
@@ -303,11 +304,25 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
         return String::new();
     }
     let mut out = String::new();
-    for ch in text.chars().take(max_width) {
+    let mut used = 0usize;
+    let mut truncated = false;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > max_width {
+            truncated = true;
+            break;
+        }
         out.push(ch);
+        used += w;
     }
-    if text.chars().count() > max_width && max_width > 1 {
-        out.pop();
+    if truncated && max_width > 1 {
+        while used + 1 > max_width {
+            if let Some(ch) = out.pop() {
+                used -= ch.width().unwrap_or(0);
+            } else {
+                break;
+            }
+        }
         out.push('~');
     }
     out
@@ -339,13 +354,13 @@ fn cursor_metrics(app: &App, height: u16, width: u16) -> (u16, u16, u16) {
     let cursor_logical_col = before_cursor
         .rsplit('\n')
         .next()
-        .map(|l| l.chars().count())
+        .map(|l| UnicodeWidthStr::width(l))
         .unwrap_or(0);
 
     let visual_rows_per_line: Vec<u16> = app
         .input
         .split('\n')
-        .map(|l| (l.chars().count().div_ceil(w)).max(1) as u16)
+        .map(|l| (UnicodeWidthStr::width(l).div_ceil(w)).max(1) as u16)
         .collect();
 
     let cursor_visual_row: u16 = visual_rows_per_line[..cursor_logical_line]
@@ -370,14 +385,6 @@ fn cursor_metrics(app: &App, height: u16, width: u16) -> (u16, u16, u16) {
     };
 
     (cursor_visual_row - skipped_visual, visual_col, logical_scroll)
-}
-
-fn clamp_to_char_boundary(input: &str, cursor: usize) -> usize {
-    let mut cursor = cursor.min(input.len());
-    while cursor > 0 && !input.is_char_boundary(cursor) {
-        cursor -= 1;
-    }
-    cursor
 }
 
 pub(crate) fn insert_entries(terminal: &mut TerminalGuard, entries: Vec<Entry>) -> io::Result<()> {
@@ -416,11 +423,11 @@ fn rendered_height(lines: &[Line<'static>], width: u16) -> u16 {
     lines
         .iter()
         .map(|line| {
-            let text_width = line
+            let text_width: usize = line
                 .spans
                 .iter()
-                .map(|span| span.content.chars().count())
-                .sum::<usize>();
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
             text_width.max(1).div_ceil(width) as u16
         })
         .sum::<u16>()

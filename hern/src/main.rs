@@ -5,9 +5,7 @@ use hern_core::module::{ModuleGraph, parse_file_recovering};
 use hern_core::workspace::{WorkspaceInputs, analyze_workspace};
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 #[derive(ClapParser)]
 #[command(name = "hern")]
@@ -126,23 +124,8 @@ fn run_cli() -> Result<(), CliError> {
         Commands::Run { path } => {
             let (graph, inference, entry) = analyze_workspace_for_cli(path)?;
             let lua_code = gen_lua_iife_bundle(&graph, &inference.module_envs, &entry);
-
-            let mut child = Command::new("luajit")
-                .stdin(Stdio::piped())
-                .spawn()
-                .or_else(|_| Command::new("lua").stdin(Stdio::piped()).spawn())
-                .expect("Failed to execute luajit or lua. Is it installed?");
-
-            let mut stdin = child.stdin.take().expect("Failed to open stdin");
-            stdin
-                .write_all(lua_code.as_bytes())
-                .expect("Failed to write to stdin");
-            drop(stdin);
-
-            let status = child.wait().expect("Failed to wait on child");
-            if !status.success() {
-                std::process::exit(status.code().unwrap_or(1));
-            }
+            hern_repl::exec_lua(&lua_code)
+                .map_err(|e| CliError::Single(CompilerDiagnostic::error(None, &e.to_string())))?;
         }
         Commands::Bundle { path } => {
             let (graph, inference, entry) = analyze_workspace_for_cli(path)?;

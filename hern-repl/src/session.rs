@@ -4,11 +4,12 @@ use hern_core::codegen::bundle::gen_lua_iife_bundle;
 use hern_core::types::Ty;
 use hern_core::types::infer::TypeEnv;
 use hern_core::workspace::{WorkspaceInputs, analyze_workspace};
+use mlua::{Function, Lua, MultiValue};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::rc::Rc;
 
 type Result<T> = std::result::Result<T, ReplError>;
 const TYPE_HINT_BINDING: &str = "hern_repl_hint_value";
@@ -230,37 +231,34 @@ fn analyze_source(
 }
 
 fn run_lua(lua_code: &str) -> Result<String> {
-    let mut child = Command::new("luajit")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .or_else(|_| {
-            Command::new("lua")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-        })?;
+    let lua = Lua::new();
+    let buf = Rc::new(RefCell::new(String::new()));
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "failed to open Lua stdin"))?;
-    stdin.write_all(lua_code.as_bytes())?;
-    drop(stdin);
+    let tostring: Function = lua.globals().get("tostring")?;
+    let buf_clone = Rc::clone(&buf);
+    let print_fn = lua.create_function(move |_lua, args: MultiValue| {
+        let mut line = String::new();
+        for (i, v) in args.iter().enumerate() {
+            if i > 0 {
+                line.push('\t');
+            }
+            let s: String = tostring.call(v.clone())?;
+            line.push_str(&s);
+        }
+        line.push('\n');
+        buf_clone.borrow_mut().push_str(&line);
+        Ok(())
+    })?;
+    lua.globals().set("print", print_fn)?;
 
-    let output = child.wait_with_output()?;
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    if !output.status.success() {
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-        return Err(ReplError::Io(io::Error::other(text.trim().to_string())));
-    }
-    if !output.stderr.is_empty() {
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-    }
-    Ok(text)
+    lua.load(lua_code).exec()?;
+
+    Ok(buf.borrow().clone())
+}
+
+pub(crate) fn exec_lua_passthrough(lua_code: &str) -> Result<()> {
+    Lua::new().load(lua_code).exec()?;
+    Ok(())
 }
 
 #[cfg(test)]

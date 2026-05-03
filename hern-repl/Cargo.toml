@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-crossterm = "0.28"
+crossterm = "0.29"
 hern-core = { path = "../hern-core" }
-ratatui = "0.29"
+mlua = { version = "0.11", features = ["luajit", "vendored"] }
+ratatui = "0.30"
+unicode-width = "0.2"
 supports-color = "3"
-terminal-colorsaurus = "0.4"
+terminal-colorsaurus = "1"
