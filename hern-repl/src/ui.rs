@@ -55,10 +55,10 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         render_bindings_popover(frame, area, app);
     }
 
-    let (cursor_line, cursor_col, scroll) = cursor_metrics(app, input_area.height);
+    let (cursor_row, cursor_col, _) = cursor_metrics(app, input_area.height, input_area.width);
     frame.set_cursor_position((
-        input_area.x + cursor_col.min(input_area.width.saturating_sub(1)),
-        input_area.y + cursor_line.saturating_sub(scroll),
+        input_area.x + cursor_col,
+        input_area.y + cursor_row,
     ));
 }
 
@@ -101,7 +101,7 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) -> Rec
     );
 
     let lines = composer_lines(app);
-    let (_, _, scroll) = cursor_metrics(app, inner.height);
+    let (_, _, scroll) = cursor_metrics(app, inner.height, inner.width);
     let visible: Vec<Line<'static>> = lines
         .into_iter()
         .skip(scroll as usize)
@@ -327,21 +327,49 @@ fn composer_lines(app: &App) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn cursor_metrics(app: &App, height: u16) -> (u16, u16, u16) {
+// Returns (cursor_row, cursor_col, logical_scroll) where cursor_row and cursor_col
+// are relative to the first visible line after applying logical_scroll.
+// All three account for visual line wrapping at `width` columns.
+fn cursor_metrics(app: &App, height: u16, width: u16) -> (u16, u16, u16) {
     let cursor = clamp_to_char_boundary(&app.input, app.cursor);
+    let w = width.max(1) as usize;
     let before_cursor = &app.input[..cursor];
-    let cursor_line = before_cursor.chars().filter(|ch| *ch == '\n').count() as u16;
-    let cursor_col = before_cursor
+
+    let cursor_logical_line = before_cursor.bytes().filter(|&b| b == b'\n').count();
+    let cursor_logical_col = before_cursor
         .rsplit('\n')
         .next()
-        .map(|line| line.chars().count())
-        .unwrap_or(0) as u16;
-    let scroll = if height == 0 || cursor_line < height {
-        0
+        .map(|l| l.chars().count())
+        .unwrap_or(0);
+
+    let visual_rows_per_line: Vec<u16> = app
+        .input
+        .split('\n')
+        .map(|l| (l.chars().count().div_ceil(w)).max(1) as u16)
+        .collect();
+
+    let cursor_visual_row: u16 = visual_rows_per_line[..cursor_logical_line]
+        .iter()
+        .sum::<u16>()
+        + (cursor_logical_col / w) as u16;
+    let visual_col = (cursor_logical_col % w) as u16;
+
+    let (logical_scroll, skipped_visual) = if height == 0 || cursor_visual_row < height {
+        (0u16, 0u16)
     } else {
-        cursor_line + 1 - height
+        let mut skip = 0u16;
+        let mut skipped = 0u16;
+        for &vrows in &visual_rows_per_line[..cursor_logical_line] {
+            if cursor_visual_row - skipped < height {
+                break;
+            }
+            skip += 1;
+            skipped += vrows;
+        }
+        (skip, skipped)
     };
-    (cursor_line, cursor_col, scroll)
+
+    (cursor_visual_row - skipped_visual, visual_col, logical_scroll)
 }
 
 fn clamp_to_char_boundary(input: &str, cursor: usize) -> usize {
@@ -367,6 +395,20 @@ fn render_history(buf: &mut Buffer, lines: &[Line<'static>]) {
     Paragraph::new(lines.to_vec())
         .wrap(Wrap { trim: false })
         .render(area, buf);
+    for y in area.top()..area.bottom() {
+        let row_bg = (area.left()..area.right()).find_map(|x| {
+            let cell = buf.cell((x, y))?;
+            (cell.bg != Color::Reset).then_some(cell.bg)
+        });
+        let Some(bg) = row_bg else { continue };
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if cell.bg == Color::Reset {
+                    cell.bg = bg;
+                }
+            }
+        }
+    }
 }
 
 fn rendered_height(lines: &[Line<'static>], width: u16) -> u16 {
@@ -390,13 +432,15 @@ fn entries_to_lines(entries: &[Entry]) -> Vec<Line<'static>> {
         .iter()
         .flat_map(|entry| {
             let (prefix, style) = match entry.kind {
-                EntryKind::Input => ("> ", Style::default().fg(Color::Cyan)),
+                EntryKind::Input => ("λ ", Style::default().fg(Color::Cyan)),
                 EntryKind::Output => ("  ", Style::default().fg(Color::Green)),
                 EntryKind::Error => ("! ", Style::default().fg(Color::Red)),
                 EntryKind::Info => ("  ", Style::default().fg(Color::Gray)),
             };
+            let is_input = matches!(entry.kind, EntryKind::Input);
             let highlighted_input =
-                matches!(entry.kind, EntryKind::Input).then(|| highlight_source_lines(&entry.text));
+                is_input.then(|| highlight_source_lines(&entry.text));
+            let line_style = if is_input { user_message_style() } else { Style::default() };
             entry
                 .text
                 .lines()
@@ -412,7 +456,7 @@ fn entries_to_lines(entries: &[Entry]) -> Vec<Line<'static>> {
                     } else {
                         spans.push(Span::styled(line.to_string(), style));
                     }
-                    Line::from(spans)
+                    Line::from(spans).style(line_style)
                 })
                 .collect::<Vec<_>>()
         })
@@ -443,7 +487,7 @@ mod tests {
         // Input adds 1 line (> 2)
         // Output adds 1 line (  2)
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].spans.iter().any(|s| s.content == "> "));
+        assert!(lines[0].spans.iter().any(|s| s.content == "λ "));
         assert!(lines[1].spans.iter().any(|s| s.content == "  "));
         assert!(lines[1].spans.iter().any(|s| s.content == "2"));
         assert!(lines[2].spans.is_empty() || lines[2].spans.iter().all(|s| s.content.trim().is_empty()));

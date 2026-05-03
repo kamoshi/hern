@@ -639,14 +639,19 @@ impl IndexBuilder {
                 }
                 self.pop_scope();
             }
-            ExprKind::Tuple(items) | ExprKind::Array(items) => {
+            ExprKind::Tuple(items) => {
                 for item in items {
                     self.index_expr(item);
                 }
             }
-            ExprKind::Record(fields) => {
-                for (_, value) in fields {
-                    self.index_expr(value);
+            ExprKind::Array(entries) => {
+                for entry in entries {
+                    self.index_expr(entry.expr());
+                }
+            }
+            ExprKind::Record(entries) => {
+                for entry in entries {
+                    self.index_expr(entry.expr());
                 }
             }
             ExprKind::FieldAccess {

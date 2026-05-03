@@ -112,14 +112,19 @@ fn reassoc_expr(expr: &mut Expr, table: &FixityTable) {
                 reassoc_expr(e, table);
             }
         }
-        ExprKind::Tuple(es) | ExprKind::Array(es) => {
+        ExprKind::Tuple(es) => {
             for e in es {
                 reassoc_expr(e, table);
             }
         }
-        ExprKind::Record(fields) => {
-            for (_, e) in fields {
-                reassoc_expr(e, table);
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                reassoc_expr(entry.expr_mut(), table);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                reassoc_expr(entry.expr_mut(), table);
             }
         }
         ExprKind::FieldAccess { expr, .. } => reassoc_expr(expr, table),

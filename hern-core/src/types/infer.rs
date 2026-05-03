@@ -120,8 +120,8 @@ pub fn is_value(expr: &Expr) -> bool {
         | ExprKind::Import(_)
         | ExprKind::Unit => true,
         ExprKind::Tuple(exprs) => exprs.iter().all(is_value),
-        ExprKind::Array(exprs) => exprs.iter().all(is_value),
-        ExprKind::Record(fields) => fields.iter().all(|(_, e)| is_value(e)),
+        ExprKind::Array(entries) => entries.iter().all(|e| is_value(e.expr())),
+        ExprKind::Record(entries) => entries.iter().all(|e| is_value(e.expr())),
         _ => false,
     }
 }
@@ -1681,26 +1681,66 @@ impl Infer {
                     .collect::<Result<_, _>>()?;
                 Ok(Ty::Tuple(tys))
             }
-            ExprKind::Array(exprs) => {
+            ExprKind::Array(entries) => {
                 let elt_ty = self.subst.fresh_var();
-                for expr in exprs {
-                    let ty = self.infer_expr(env, expr)?;
-                    unify(&mut self.subst, elt_ty.clone(), ty)?;
+                for entry in entries {
+                    match entry {
+                        ArrayEntry::Elem(expr) => {
+                            let ty = self.infer_expr(env, expr)?;
+                            unify(&mut self.subst, elt_ty.clone(), ty)?;
+                        }
+                        ArrayEntry::Spread(expr) => {
+                            let ty = self.infer_expr(env, expr)?;
+                            let expected = Ty::App(
+                                Box::new(Ty::Con("Array".to_string())),
+                                vec![elt_ty.clone()],
+                            );
+                            unify(&mut self.subst, ty, expected)?;
+                        }
+                    }
                 }
                 Ok(Ty::App(
                     Box::new(Ty::Con("Array".to_string())),
                     vec![elt_ty],
                 ))
             }
-            ExprKind::Record(fields) => {
-                let mut field_tys: Vec<(String, Ty)> = fields
-                    .iter_mut()
-                    .map(|(n, e)| self.infer_expr(env, e).map(|t| (n.clone(), t)))
-                    .collect::<Result<_, _>>()?;
+            ExprKind::Record(entries) => {
+                let mut field_tys: Vec<(String, Ty)> = Vec::new();
+                let mut has_spread = false;
+                for entry in entries {
+                    match entry {
+                        RecordEntry::Field(name, expr) => {
+                            let ty = self.infer_expr(env, expr)?;
+                            if let Some(pos) = field_tys.iter().position(|(n, _)| n == name) {
+                                field_tys[pos].1 = ty;
+                            } else {
+                                field_tys.push((name.clone(), ty));
+                            }
+                        }
+                        RecordEntry::Spread(expr) => {
+                            has_spread = true;
+                            let spread_ty = self.infer_expr(env, expr)?;
+                            let tail_var = self.subst.fresh_var();
+                            unify(
+                                &mut self.subst,
+                                spread_ty,
+                                Ty::Record(Row {
+                                    fields: vec![],
+                                    tail: Box::new(tail_var),
+                                }),
+                            )?;
+                        }
+                    }
+                }
                 field_tys.sort_by(|(a, _), (b, _)| a.cmp(b));
+                let tail = if has_spread {
+                    self.subst.fresh_var()
+                } else {
+                    Ty::Unit
+                };
                 Ok(Ty::Record(Row {
                     fields: field_tys,
-                    tail: Box::new(Ty::Unit),
+                    tail: Box::new(tail),
                 }))
             }
             ExprKind::FieldAccess { expr, field, .. } => {
@@ -2821,14 +2861,19 @@ fn collect_expr_referenced_names(
                 collect_expr_referenced_names(expr, refs, &block_value_scope, &block_type_scope);
             }
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+        ExprKind::Tuple(items) => {
             for item in items {
                 collect_expr_referenced_names(item, refs, value_scope, type_scope);
             }
         }
-        ExprKind::Record(fields) => {
-            for (_, value) in fields {
-                collect_expr_referenced_names(value, refs, value_scope, type_scope);
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                collect_expr_referenced_names(entry.expr(), refs, value_scope, type_scope);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                collect_expr_referenced_names(entry.expr(), refs, value_scope, type_scope);
             }
         }
         ExprKind::Lambda { params, body, .. } => {
@@ -3112,15 +3157,31 @@ fn resolve_dict_uses_expr_with_mode(
         ExprKind::Break(Some(e)) | ExprKind::Return(Some(e)) => {
             resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)
         }
-        ExprKind::Tuple(es) | ExprKind::Array(es) => {
+        ExprKind::Tuple(es) => {
             for e in es {
                 resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)?;
             }
             Ok(())
         }
-        ExprKind::Record(fields) => {
-            for (_, e) in fields {
-                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)?;
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                resolve_dict_uses_expr_with_mode(
+                    entry.expr_mut(),
+                    resolve,
+                    process_fn,
+                    hard_unresolved,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                resolve_dict_uses_expr_with_mode(
+                    entry.expr_mut(),
+                    resolve,
+                    process_fn,
+                    hard_unresolved,
+                )?;
             }
             Ok(())
         }
@@ -3262,12 +3323,13 @@ fn expr_always_exits(expr: &Expr, include_bc: bool) -> bool {
             expr_always_exits(callee, include_bc)
                 || args.iter().any(|arg| expr_always_exits(arg, include_bc))
         }
-        ExprKind::Tuple(es) | ExprKind::Array(es) => {
-            es.iter().any(|expr| expr_always_exits(expr, include_bc))
-        }
-        ExprKind::Record(fields) => fields
+        ExprKind::Tuple(es) => es.iter().any(|expr| expr_always_exits(expr, include_bc)),
+        ExprKind::Array(entries) => entries
             .iter()
-            .any(|(_, expr)| expr_always_exits(expr, include_bc)),
+            .any(|entry| expr_always_exits(entry.expr(), include_bc)),
+        ExprKind::Record(entries) => entries
+            .iter()
+            .any(|entry| expr_always_exits(entry.expr(), include_bc)),
         ExprKind::If {
             cond,
             then_branch,

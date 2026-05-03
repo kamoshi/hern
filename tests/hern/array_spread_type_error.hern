@@ -1,0 +1,3 @@
+let nums = [1, 2, 3];
+let strs = ["a", "b"];
+let bad = [..nums, ..strs];

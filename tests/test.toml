@@ -386,6 +386,32 @@ path = "tests/hern/trait_method_missing_target.hern"
 expect = "error"
 error_contains = "must have at least one parameter"
 
+[tests.array_spread]
+path = "tests/hern/array_spread.hern"
+expect = "typecheck"
+output = """
+1
+2
+3
+4
+5
+6
+"""
+
+[tests.record_spread]
+path = "tests/hern/record_spread.hern"
+expect = "typecheck"
+output = """
+1
+2
+3
+"""
+
+[tests.array_spread_type_error]
+path = "tests/hern/array_spread_type_error.hern"
+expect = "error"
+error_contains = "type mismatch"
+
 [tests.let_destructure]
 path = "tests/hern/let_destructure.hern"
 expect = "typecheck"

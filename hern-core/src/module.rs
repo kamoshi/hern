@@ -819,15 +819,21 @@ fn resolve_imports_in_expr(
             }
             Ok(())
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+        ExprKind::Tuple(items) => {
             for item in items {
                 resolve_imports_in_expr(item, base_dir, graph)?;
             }
             Ok(())
         }
-        ExprKind::Record(fields) => {
-            for (_, value) in fields {
-                resolve_imports_in_expr(value, base_dir, graph)?;
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                resolve_imports_in_expr(entry.expr_mut(), base_dir, graph)?;
+            }
+            Ok(())
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                resolve_imports_in_expr(entry.expr_mut(), base_dir, graph)?;
             }
             Ok(())
         }
@@ -954,7 +960,7 @@ fn resolve_imports_in_expr_recovering(
                 resolve_imports_in_expr_recovering(expr, base_dir, graph, source, diagnostics);
             }
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+        ExprKind::Tuple(items) => {
             for item in items {
                 resolve_imports_in_expr_recovering(
                     item,
@@ -965,10 +971,21 @@ fn resolve_imports_in_expr_recovering(
                 );
             }
         }
-        ExprKind::Record(fields) => {
-            for (_, value) in fields {
+        ExprKind::Array(entries) => {
+            for entry in entries {
                 resolve_imports_in_expr_recovering(
-                    value,
+                    entry.expr_mut(),
+                    base_dir,
+                    graph,
+                    source.clone(),
+                    diagnostics,
+                );
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                resolve_imports_in_expr_recovering(
+                    entry.expr_mut(),
                     base_dir,
                     graph,
                     source.clone(),
@@ -1059,14 +1076,19 @@ fn collect_imports_in_expr(expr: &Expr, imports: &mut Vec<String>) {
                 collect_imports_in_expr(expr, imports);
             }
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+        ExprKind::Tuple(items) => {
             for item in items {
                 collect_imports_in_expr(item, imports);
             }
         }
-        ExprKind::Record(fields) => {
-            for (_, value) in fields {
-                collect_imports_in_expr(value, imports);
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                collect_imports_in_expr(entry.expr(), imports);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                collect_imports_in_expr(entry.expr(), imports);
             }
         }
         ExprKind::Lambda { body, .. } => collect_imports_in_expr(body, imports),

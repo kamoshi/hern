@@ -141,14 +141,19 @@ fn collect_code_actions_for_expr(
                 collect_code_actions_for_expr(body, uri, range, binding_types, actions);
             }
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+        ExprKind::Tuple(items) => {
             for item in items {
                 collect_code_actions_for_expr(item, uri, range, binding_types, actions);
             }
         }
-        ExprKind::Record(fields) => {
-            for (_, value) in fields {
-                collect_code_actions_for_expr(value, uri, range, binding_types, actions);
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                collect_code_actions_for_expr(entry.expr(), uri, range, binding_types, actions);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                collect_code_actions_for_expr(entry.expr(), uri, range, binding_types, actions);
             }
         }
         ExprKind::For { iterable, body, .. } => {

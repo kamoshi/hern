@@ -158,14 +158,19 @@ fn find_call_in_expr<'a>(
                 find_call_in_expr(expr, position, best);
             }
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+        ExprKind::Tuple(items) => {
             for item in items {
                 find_call_in_expr(item, position, best);
             }
         }
-        ExprKind::Record(fields) => {
-            for (_, value) in fields {
-                find_call_in_expr(value, position, best);
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                find_call_in_expr(entry.expr(), position, best);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                find_call_in_expr(entry.expr(), position, best);
             }
         }
         ExprKind::Lambda { body, .. } => find_call_in_expr(body, position, best),

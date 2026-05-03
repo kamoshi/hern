@@ -8,6 +8,9 @@
 !Cargo.toml
 !Cargo.lock
 
+!flake.nix
+!flake.lock
+
 !README.md
 
 # Rust crates

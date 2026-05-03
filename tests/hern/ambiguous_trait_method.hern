@@ -1,0 +1,18 @@
+trait Runner 'a {
+    fn run(x: 'a) -> f64
+}
+
+trait Executor 'a {
+    fn run(x: 'a) -> f64
+}
+
+impl Runner for f64 {
+    fn run(x) { x }
+}
+
+impl Executor for f64 {
+    fn run(x) { x + 1 }
+}
+
+// ambiguous: both Runner and Executor have `run`
+print(run(1));

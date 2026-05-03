@@ -7,7 +7,7 @@ use super::workspace::{
     WorkspaceAnalysis, analyze_document_graph, load_document_graph_recovering,
     load_workspace_graphs,
 };
-use hern_core::ast::{Program, SourcePosition, TraitDef};
+use hern_core::ast::{Program, RecordEntry, SourcePosition, TraitDef};
 use hern_core::module::{GraphInference, ModuleGraph, infer_graph_collecting};
 use hern_core::source_index::{
     CompletionCandidate, Definition, DefinitionKind, SourceIndex, index_program,
@@ -594,10 +594,21 @@ fn exported_record_fields(program: &Program) -> Option<Vec<String>> {
     let Some(Stmt::Expr(expr)) = program.stmts.last() else {
         return None;
     };
-    let ExprKind::Record(fields) = &expr.kind else {
+    let ExprKind::Record(entries) = &expr.kind else {
         return None;
     };
-    Some(fields.iter().map(|(name, _)| name.clone()).collect())
+    Some(
+        entries
+            .iter()
+            .filter_map(|e| {
+                if let RecordEntry::Field(name, _) = e {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
 }
 
 fn completion_replacement_range(

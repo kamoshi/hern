@@ -244,6 +244,46 @@ pub enum Pattern {
     Tuple(Vec<Pattern>),
 }
 
+// ── Spread entries ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum ArrayEntry {
+    Elem(Expr),
+    Spread(Expr),
+}
+
+impl ArrayEntry {
+    pub fn expr(&self) -> &Expr {
+        match self {
+            Self::Elem(e) | Self::Spread(e) => e,
+        }
+    }
+    pub fn expr_mut(&mut self) -> &mut Expr {
+        match self {
+            Self::Elem(e) | Self::Spread(e) => e,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RecordEntry {
+    Field(String, Expr),
+    Spread(Expr),
+}
+
+impl RecordEntry {
+    pub fn expr(&self) -> &Expr {
+        match self {
+            Self::Field(_, e) | Self::Spread(e) => e,
+        }
+    }
+    pub fn expr_mut(&mut self) -> &mut Expr {
+        match self {
+            Self::Field(_, e) | Self::Spread(e) => e,
+        }
+    }
+}
+
 // ── Expressions ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -316,8 +356,8 @@ pub enum ExprKind {
         final_expr: Option<Box<Expr>>,
     },
     Tuple(Vec<Expr>),
-    Array(Vec<Expr>),
-    Record(Vec<(String, Expr)>),
+    Array(Vec<ArrayEntry>),
+    Record(Vec<RecordEntry>),
     FieldAccess {
         expr: Box<Expr>,
         field: String,

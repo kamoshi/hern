@@ -1,0 +1,12 @@
+trait Double 'a {
+    fn double(x: 'a) -> 'a
+}
+
+impl Double for f64 {
+    fn double(x) { x + x }
+}
+
+// local `double` shadows the trait method — this is a plain function call, not trait dispatch
+let double = fn(x) { x + 1 };
+
+print(double(10));

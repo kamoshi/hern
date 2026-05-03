@@ -219,12 +219,15 @@ impl App {
 }
 
 pub(crate) fn handle_event(app: &mut App) -> Result<EventAction> {
+    let event = event::read()?;
+    // Resize events are handled implicitly: the draw loop redraws with the new
+    // terminal dimensions on every iteration, so no explicit action is needed.
     let Event::Key(KeyEvent {
         code,
         modifiers,
         kind,
         ..
-    }) = event::read()?
+    }) = event
     else {
         return Ok(EventAction::Continue);
     };

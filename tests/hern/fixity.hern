@@ -1,4 +1,4 @@
-fn infixr 5 <>(a, b) {
+fn infixr 5 <+>(a, b) {
   a + b
 }
 
@@ -6,11 +6,11 @@ fn infixl 7 ><(a, b) {
   a + a + b
 }
 
-// Higher prec binds tighter: 1 <> 2 >< 3 => 1 <> (2 >< 3) = 1 <> 7 = 8
-print(1.0 <> 2.0 >< 3.0);
+// Higher prec binds tighter: 1 <+> 2 >< 3 => 1 <+> (2 >< 3) = 1 <+> 7 = 8
+print(1.0 <+> 2.0 >< 3.0);
 
-// Right-assoc: 1 <> 2 <> 3 => 1 <> (2 <> 3) = 1 <> 5 = 6
-print(1.0 <> 2.0 <> 3.0);
+// Right-assoc: 1 <+> 2 <+> 3 => 1 <+> (2 <+> 3) = 1 <+> 5 = 6
+print(1.0 <+> 2.0 <+> 3.0);
 
 // Left-assoc: 1 >< 2 >< 3 => (1 >< 2) >< 3 = 4 >< 3 = 11
 print(1.0 >< 2.0 >< 3.0);

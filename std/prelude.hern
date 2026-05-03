@@ -126,8 +126,8 @@ trait Eq 'a {
     fn infix 4 !=(lhs: 'a, rhs: 'a) -> bool
 }
 
-trait Concat 'a {
-    fn infixr 5 ..(lhs: 'a, rhs: 'a) -> 'a
+trait Semigroup 'a {
+    fn infixr 5 <>(lhs: 'a, rhs: 'a) -> 'a
 }
 
 trait And 'a {
@@ -197,11 +197,6 @@ impl Eq for bool {
     fn !=(lhs, rhs) { __neq_bool(lhs, rhs) }
 }
 
-impl Concat for string {
-    #[inline]
-    fn ..(lhs, rhs) { __concat(lhs, rhs) }
-}
-
 impl And for bool {
     #[inline]
     fn &&(lhs, rhs) { __and(lhs, rhs) }
@@ -210,6 +205,11 @@ impl And for bool {
 impl Or for bool {
     #[inline]
     fn ||(lhs, rhs) { __or(lhs, rhs) }
+}
+
+impl Semigroup for string {
+    #[inline]
+    fn <>(lhs, rhs) { __concat(lhs, rhs) }
 }
 
 // --- Iterable ---
@@ -343,3 +343,231 @@ extern tonumber: fn(string) -> Option(f64) = "(function(s)
   local n = _G.tonumber(s)
   if n then return { _tag = \"Some\", _0 = n } else return { _tag = \"None\" } end
 end)";
+
+// --- I/O ---
+
+extern read_file: fn(string) -> string = "(function(path)
+  local f = assert(io.open(path, \"r\"))
+  local s = f:read(\"*a\")
+  f:close()
+  return s
+end)";
+
+extern read_stdin: fn() -> string = "(function() return io.read(\"*a\") end)";
+
+// --- String utilities ---
+
+// Length of a string (O(1), uses Lua # operator).
+extern str_len: fn(string) -> f64 = #[template] "#($1)";
+
+// Single character at 1-based index i.
+extern char_at: fn(string, f64) -> string = #[template] "($1):sub(($2),($2))";
+
+// Split s into lines. Handles \r\n and \n; preserves empty lines; strips trailing newline.
+extern lines: fn(string) -> [string] = "(function(s)
+  local r = {}
+  s = s:gsub(\"\\r\\n\", \"\\n\")
+  if s:sub(-1) == \"\\n\" then s = s:sub(1, -2) end
+  for line in (s .. \"\\n\"):gmatch(\"([^\\n]*)\\n\") do r[#r+1] = line end
+  return r
+end)";
+
+// Split s on runs of whitespace. Empty string returns [].
+extern words: fn(string) -> [string] = "(function(s)
+  local r = {}
+  for w in s:gmatch(\"%S+\") do r[#r+1] = w end
+  return r
+end)";
+
+// Split s on the literal separator sep (not a Lua pattern). Multi-char separators ok.
+extern split: fn(string, string) -> [string] = "(function(s, sep)
+  local r, l, n = {}, 1, #sep
+  while true do
+    local f = s:find(sep, l, true)
+    if not f then break end
+    r[#r+1] = s:sub(l, f - 1)
+    l = f + n
+  end
+  r[#r+1] = s:sub(l)
+  return r
+end)";
+
+// Explode a string into an array of single-character strings.
+extern chars: fn(string) -> [string] = "(function(s)
+  local r = {}
+  for c in s:gmatch(\".\") do r[#r+1] = c end
+  return r
+end)";
+
+// Strip leading and trailing whitespace.
+extern trim: fn(string) -> string = "(function(s) return s:match(\"^%s*(.-)%s*$\") end)";
+
+// True if s contains the literal substring sub.
+extern contains: fn(string, string) -> bool =
+  "(function(s, sub) return s:find(sub, 1, true) ~= nil and 1 or 0 end)";
+
+// True if s starts with the given prefix.
+extern starts_with: fn(string, string) -> bool =
+  "(function(s, p) return s:sub(1, #p) == p and 1 or 0 end)";
+
+// True if s ends with the given suffix.
+extern ends_with: fn(string, string) -> bool =
+  "(function(s, p) return #p == 0 or s:sub(-#p) == p and 1 or 0 end)";
+
+// Parse a string as a number, panicking on failure.
+extern int: fn(string) -> f64 = "(function(s)
+  local n = _G.tonumber(s)
+  if not n then _G.error(\"int: cannot parse \" .. _G.tostring(s)) end
+  return n
+end)";
+
+// --- Array utilities ---
+
+// Length of an array (O(1), uses Lua # operator).
+extern array_len: fn(['a]) -> f64 = #[template] "#($1)";
+
+// Get element at 1-based index (no bounds check).
+extern array_get: fn(['a], f64) -> 'a = #[template] "($1)[($2)]";
+
+// Set element at 1-based index (mutates in place).
+extern array_set: fn(['a], f64, 'a) -> () = "(function(a, i, v) a[i] = v; return {} end)";
+
+// Append an element to an array (mutates in place).
+extern push: fn(['a], 'a) -> () = "(function(a, x) a[#a+1] = x; return {} end)";
+
+// Remove and return the last element (mutates in place).
+extern pop: fn(['a]) -> 'a = "(function(a) return table.remove(a) end)";
+
+// Map f over every element, returning a new array.
+extern array_map: fn(['a], fn('a) -> 'b) -> ['b] = "(function(a, f)
+  local r = {}
+  for i, v in ipairs(a) do r[i] = f(v) end
+  return r
+end)";
+
+// Keep only elements where f returns true, returning a new array.
+extern array_filter: fn(['a], fn('a) -> bool) -> ['a] = "(function(a, f)
+  local r = {}
+  for _, v in ipairs(a) do if f(v) ~= 0 then r[#r+1] = v end end
+  return r
+end)";
+
+// Left fold over an array.
+extern array_fold: fn(['a], 'b, fn('b, 'a) -> 'b) -> 'b = "(function(a, init, f)
+  local acc = init
+  for _, v in ipairs(a) do acc = f(acc, v) end
+  return acc
+end)";
+
+// Reverse an array, returning a new array.
+extern array_reverse: fn(['a]) -> ['a] = "(function(a)
+  local r = {}
+  for i = #a, 1, -1 do r[#r+1] = a[i] end
+  return r
+end)";
+
+// Sum of a numeric array.
+extern array_sum: fn([f64]) -> f64 = "(function(a)
+  local s = 0
+  for _, v in ipairs(a) do s = s + v end
+  return s
+end)";
+
+// Maximum of a numeric array (returns -math.huge for empty).
+extern array_max: fn([f64]) -> f64 = "(function(a)
+  local m = -math.huge
+  for _, v in ipairs(a) do if v > m then m = v end end
+  return m
+end)";
+
+// Minimum of a numeric array (returns math.huge for empty).
+extern array_min: fn([f64]) -> f64 = "(function(a)
+  local m = math.huge
+  for _, v in ipairs(a) do if v < m then m = v end end
+  return m
+end)";
+
+// Inclusive range [a, b] as an array. Step is always 1.
+extern array_range: fn(f64, f64) -> [f64] = "(function(a, b)
+  local r = {}
+  for i = a, b do r[#r+1] = i end
+  return r
+end)";
+
+// Concatenate two arrays, returning a new array.
+extern array_concat: fn(['a], ['a]) -> ['a] = "(function(a, b)
+  local r = {}
+  for _, v in ipairs(a) do r[#r+1] = v end
+  for _, v in ipairs(b) do r[#r+1] = v end
+  return r
+end)";
+
+impl Semigroup for ['a] {
+    fn <>(lhs, rhs) { array_concat(lhs, rhs) }
+}
+
+// --- Priority queue (min-heap) ---
+// Each entry is a (priority: f64, value: 'a) pair, stored in a 1-based array.
+
+fn heap_sift_up(heap: [(f64, 'a)], i: f64) -> () {
+    if i <= 1 {
+        ()
+    } else {
+        let parent = math.floor(i / 2);
+        let (pi, _) = array_get(heap, i);
+        let (pp, _) = array_get(heap, parent);
+        if pi < pp {
+            let a = array_get(heap, i);
+            let b = array_get(heap, parent);
+            array_set(heap, i, b);
+            array_set(heap, parent, a);
+            heap_sift_up(heap, parent)
+        }
+    }
+}
+
+fn heap_sift_down(heap: [(f64, 'a)], i: f64, n: f64) -> () {
+    let left = i * 2;
+    let right = left + 1;
+    let mut smallest = i;
+    let (pi, _) = array_get(heap, i);
+    let mut best = pi;
+    if left <= n {
+        let (pl, _) = array_get(heap, left);
+        if pl < best {
+            smallest = left;
+            best = pl;
+        }
+    };
+    if right <= n {
+        let (pr, _) = array_get(heap, right);
+        if pr < best {
+            smallest = right;
+        }
+    };
+    if smallest != i {
+        let a = array_get(heap, i);
+        let b = array_get(heap, smallest);
+        array_set(heap, i, b);
+        array_set(heap, smallest, a);
+        heap_sift_down(heap, smallest, n)
+    }
+}
+
+// Push an item onto the heap.
+fn heap_push(heap: [(f64, 'a)], item: (f64, 'a)) -> () {
+    push(heap, item);
+    heap_sift_up(heap, array_len(heap))
+}
+
+// Pop and return the item with the lowest priority.
+fn heap_pop(heap: [(f64, 'a)]) -> (f64, 'a) {
+    let n = array_len(heap);
+    let top = array_get(heap, 1);
+    array_set(heap, 1, array_get(heap, n));
+    pop(heap);
+    if n > 1 {
+        heap_sift_down(heap, 1, n - 1)
+    };
+    top
+}

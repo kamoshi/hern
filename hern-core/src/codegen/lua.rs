@@ -542,19 +542,36 @@ impl LuaCodegen {
                 }
                 Some(format!("{}({})", callee_s, all_args.join(", ")))
             }
-            ExprKind::Tuple(items) | ExprKind::Array(items) => {
+            ExprKind::Tuple(items) => {
                 let items_s = items
                     .iter()
                     .map(|e| self.gen_expr_with_subst(e, subst, pre))
                     .collect::<Option<Vec<_>>>()?;
                 Some(format!("{{ {} }}", items_s.join(", ")))
             }
-            ExprKind::Record(fields) => {
-                let fields_s = fields
+            ExprKind::Array(entries) => {
+                if entries.iter().any(|e| matches!(e, ArrayEntry::Spread(_))) {
+                    return None;
+                }
+                let items_s = entries
                     .iter()
-                    .map(|(n, e)| {
-                        self.gen_expr_with_subst(e, subst, pre)
-                            .map(|expr| format!("{} = {}", n, expr))
+                    .map(|e| self.gen_expr_with_subst(e.expr(), subst, pre))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(format!("{{ {} }}", items_s.join(", ")))
+            }
+            ExprKind::Record(entries) => {
+                if entries.iter().any(|e| matches!(e, RecordEntry::Spread(_))) {
+                    return None;
+                }
+                let fields_s = entries
+                    .iter()
+                    .map(|e| {
+                        if let RecordEntry::Field(n, expr) = e {
+                            self.gen_expr_with_subst(expr, subst, pre)
+                                .map(|v| format!("{} = {}", n, v))
+                        } else {
+                            unreachable!()
+                        }
                     })
                     .collect::<Option<Vec<_>>>()?;
                 Some(format!("{{ {} }}", fields_s.join(", ")))
@@ -697,19 +714,85 @@ impl LuaCodegen {
                 }
                 format!("{}({})", callee_s, all_args.join(", "))
             }
-            ExprKind::Tuple(items) | ExprKind::Array(items) => {
+            ExprKind::Tuple(items) => {
                 let items_s = items
                     .iter()
                     .map(|e| self.gen_expr(e, pre))
                     .collect::<Vec<_>>();
                 format!("{{ {} }}", items_s.join(", "))
             }
-            ExprKind::Record(fields) => {
-                let fields_s = fields
-                    .iter()
-                    .map(|(n, e)| format!("{} = {}", n, self.gen_expr(e, pre)))
-                    .collect::<Vec<_>>();
-                format!("{{ {} }}", fields_s.join(", "))
+            ExprKind::Array(entries) => {
+                if entries.iter().all(|e| matches!(e, ArrayEntry::Elem(_))) {
+                    let items_s = entries
+                        .iter()
+                        .map(|e| self.gen_expr(e.expr(), pre))
+                        .collect::<Vec<_>>();
+                    format!("{{ {} }}", items_s.join(", "))
+                } else {
+                    let tmp = self.fresh_tmp();
+                    let ind = self.ind();
+                    pre.push_str(&format!("{}local {} = {{}}\n", ind, tmp));
+                    for entry in entries {
+                        match entry {
+                            ArrayEntry::Elem(expr) => {
+                                let v = self.gen_expr(expr, pre);
+                                pre.push_str(&format!(
+                                    "{}{}[#{}+1] = {}\n",
+                                    ind, tmp, tmp, v
+                                ));
+                            }
+                            ArrayEntry::Spread(expr) => {
+                                let v = self.gen_expr(expr, pre);
+                                let iter_var = self.fresh_tmp();
+                                pre.push_str(&format!(
+                                    "{}for _, {} in ipairs({}) do {}[#{}+1] = {} end\n",
+                                    ind, iter_var, v, tmp, tmp, iter_var
+                                ));
+                            }
+                        }
+                    }
+                    tmp
+                }
+            }
+            ExprKind::Record(entries) => {
+                if entries.iter().all(|e| matches!(e, RecordEntry::Field(_, _))) {
+                    let fields_s = entries
+                        .iter()
+                        .map(|e| {
+                            if let RecordEntry::Field(n, expr) = e {
+                                format!("{} = {}", n, self.gen_expr(expr, pre))
+                            } else {
+                                unreachable!()
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    format!("{{ {} }}", fields_s.join(", "))
+                } else {
+                    let tmp = self.fresh_tmp();
+                    let ind = self.ind();
+                    pre.push_str(&format!("{}local {} = {{}}\n", ind, tmp));
+                    for entry in entries {
+                        match entry {
+                            RecordEntry::Field(name, expr) => {
+                                let v = self.gen_expr(expr, pre);
+                                pre.push_str(&format!(
+                                    "{}{}[\"{}\"] = {}\n",
+                                    ind, tmp, name, v
+                                ));
+                            }
+                            RecordEntry::Spread(expr) => {
+                                let v = self.gen_expr(expr, pre);
+                                let k_var = self.fresh_tmp();
+                                let v_var = self.fresh_tmp();
+                                pre.push_str(&format!(
+                                    "{}for {}, {} in pairs({}) do {}[{}] = {} end\n",
+                                    ind, k_var, v_var, v, tmp, k_var, v_var
+                                ));
+                            }
+                        }
+                    }
+                    tmp
+                }
             }
             ExprKind::FieldAccess { expr, field, .. } => {
                 let e = self.gen_expr(expr, pre);
@@ -1489,14 +1572,19 @@ fn expr_flow(expr: &Expr, include_bc: bool) -> Flow {
             .fold(expr_flow(callee, include_bc), |flow, arg| {
                 flow.seq(expr_flow(arg, include_bc))
             }),
-        ExprKind::Tuple(es) | ExprKind::Array(es) => {
-            es.iter().fold(Flow::FallsThrough, |flow, expr| {
-                flow.seq(expr_flow(expr, include_bc))
-            })
-        }
-        ExprKind::Record(fields) => fields.iter().fold(Flow::FallsThrough, |flow, (_, expr)| {
-            flow.seq(expr_flow(expr, include_bc))
-        }),
+        ExprKind::Tuple(es) => es
+            .iter()
+            .fold(Flow::FallsThrough, |flow, expr| flow.seq(expr_flow(expr, include_bc))),
+        ExprKind::Array(entries) => entries
+            .iter()
+            .fold(Flow::FallsThrough, |flow, entry| {
+                flow.seq(expr_flow(entry.expr(), include_bc))
+            }),
+        ExprKind::Record(entries) => entries
+            .iter()
+            .fold(Flow::FallsThrough, |flow, entry| {
+                flow.seq(expr_flow(entry.expr(), include_bc))
+            }),
         ExprKind::Lambda { .. }
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)

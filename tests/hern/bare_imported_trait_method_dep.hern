@@ -1,0 +1,7 @@
+trait Double 'a {
+    fn double(x: 'a) -> 'a
+}
+
+impl Double for f64 {
+    fn double(x) { x + x }
+}

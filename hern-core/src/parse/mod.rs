@@ -1674,12 +1674,20 @@ impl<'tokens> Parser<'tokens> {
     fn parse_array(&self, tokens: &[Spanned]) -> Result<(usize, Expr), ParseError> {
         let mut ptr = 0;
         ptr += self.expect(&tokens[ptr..], Token::LBracket)?;
-        let mut exprs = Vec::new();
+        let mut entries = Vec::new();
         if tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBracket) {
             loop {
-                let (consumed, expr) = self.parse_expr(&tokens[ptr..], 0)?;
-                ptr += consumed;
-                exprs.push(expr);
+                let entry = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::DotDot) {
+                    ptr += 1;
+                    let (consumed, expr) = self.parse_expr(&tokens[ptr..], 0)?;
+                    ptr += consumed;
+                    ArrayEntry::Spread(expr)
+                } else {
+                    let (consumed, expr) = self.parse_expr(&tokens[ptr..], 0)?;
+                    ptr += consumed;
+                    ArrayEntry::Elem(expr)
+                };
+                entries.push(entry);
                 if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
                     ptr += 1;
                     if tokens.get(ptr).map(|t| &t.token) == Some(&Token::RBracket) {
@@ -1693,7 +1701,7 @@ impl<'tokens> Parser<'tokens> {
         ptr += self.expect(&tokens[ptr..], Token::RBracket)?;
         Ok((
             ptr,
-            self.expr_from_tokens(tokens, ptr, ExprKind::Array(exprs)),
+            self.expr_from_tokens(tokens, ptr, ExprKind::Array(entries)),
         ))
     }
 
@@ -1701,15 +1709,23 @@ impl<'tokens> Parser<'tokens> {
         let mut ptr = 0;
         ptr += self.expect(&tokens[ptr..], Token::Hash)?;
         ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
-        let mut fields = Vec::new();
+        let mut entries = Vec::new();
         if tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
             loop {
-                let (c_name, name) = self.expect_ident(&tokens[ptr..])?;
-                ptr += c_name;
-                ptr += self.expect(&tokens[ptr..], Token::Colon)?;
-                let (c_expr, expr) = self.parse_expr(&tokens[ptr..], 0)?;
-                ptr += c_expr;
-                fields.push((name, expr));
+                let entry = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::DotDot) {
+                    ptr += 1;
+                    let (consumed, expr) = self.parse_expr(&tokens[ptr..], 0)?;
+                    ptr += consumed;
+                    RecordEntry::Spread(expr)
+                } else {
+                    let (c_name, name) = self.expect_ident(&tokens[ptr..])?;
+                    ptr += c_name;
+                    ptr += self.expect(&tokens[ptr..], Token::Colon)?;
+                    let (c_expr, expr) = self.parse_expr(&tokens[ptr..], 0)?;
+                    ptr += c_expr;
+                    RecordEntry::Field(name, expr)
+                };
+                entries.push(entry);
                 if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
                     ptr += 1;
                     if tokens.get(ptr).map(|t| &t.token) == Some(&Token::RBrace) {
@@ -1723,7 +1739,7 @@ impl<'tokens> Parser<'tokens> {
         ptr += self.expect(&tokens[ptr..], Token::RBrace)?;
         Ok((
             ptr,
-            self.expr_from_tokens(tokens, ptr, ExprKind::Record(fields)),
+            self.expr_from_tokens(tokens, ptr, ExprKind::Record(entries)),
         ))
     }
 

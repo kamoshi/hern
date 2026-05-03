@@ -213,12 +213,15 @@ fn trait_access_hover_in_expr(
                     .as_deref()
                     .and_then(|e| trait_access_hover_in_expr(e, module_env, position))
             }),
-        ExprKind::Tuple(items) | ExprKind::Array(items) => items
+        ExprKind::Tuple(items) => items
             .iter()
             .find_map(|i| trait_access_hover_in_expr(i, module_env, position)),
-        ExprKind::Record(fields) => fields
+        ExprKind::Array(entries) => entries
             .iter()
-            .find_map(|(_, v)| trait_access_hover_in_expr(v, module_env, position)),
+            .find_map(|e| trait_access_hover_in_expr(e.expr(), module_env, position)),
+        ExprKind::Record(entries) => entries
+            .iter()
+            .find_map(|e| trait_access_hover_in_expr(e.expr(), module_env, position)),
         ExprKind::For { iterable, body, .. } => {
             trait_access_hover_in_expr(iterable, module_env, position)
                 .or_else(|| trait_access_hover_in_expr(body, module_env, position))
@@ -334,12 +337,15 @@ fn operator_use_in_expr(expr: &Expr, position: SourcePosition) -> Option<Operato
                     .as_deref()
                     .and_then(|expr| operator_use_in_expr(expr, position))
             }),
-        ExprKind::Tuple(items) | ExprKind::Array(items) => items
+        ExprKind::Tuple(items) => items
             .iter()
             .find_map(|item| operator_use_in_expr(item, position)),
-        ExprKind::Record(fields) => fields
+        ExprKind::Array(entries) => entries
             .iter()
-            .find_map(|(_, value)| operator_use_in_expr(value, position)),
+            .find_map(|e| operator_use_in_expr(e.expr(), position)),
+        ExprKind::Record(entries) => entries
+            .iter()
+            .find_map(|e| operator_use_in_expr(e.expr(), position)),
         ExprKind::For { iterable, body, .. } => operator_use_in_expr(iterable, position)
             .or_else(|| operator_use_in_expr(body, position)),
         ExprKind::Break(None)
@@ -1328,11 +1334,14 @@ fn param_type_in_expr_stmts(
                     })
                 })
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => items.iter().find_map(|item| {
+        ExprKind::Tuple(items) => items.iter().find_map(|item| {
             param_type_in_expr_stmts(item, name, param_span, env, expr_types, variant_env)
         }),
-        ExprKind::Record(fields) => fields.iter().find_map(|(_, v)| {
-            param_type_in_expr_stmts(v, name, param_span, env, expr_types, variant_env)
+        ExprKind::Array(entries) => entries.iter().find_map(|e| {
+            param_type_in_expr_stmts(e.expr(), name, param_span, env, expr_types, variant_env)
+        }),
+        ExprKind::Record(entries) => entries.iter().find_map(|e| {
+            param_type_in_expr_stmts(e.expr(), name, param_span, env, expr_types, variant_env)
         }),
         ExprKind::For { iterable, body, .. } => {
             param_type_in_expr_stmts(iterable, name, param_span, env, expr_types, variant_env)
@@ -1609,11 +1618,26 @@ fn local_pattern_binding_type_in_expr(
                 variant_env,
             )
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => items.iter().find_map(|item| {
+        ExprKind::Tuple(items) => items.iter().find_map(|item| {
             local_pattern_binding_type_in_expr(item, name, binding_span, expr_types, variant_env)
         }),
-        ExprKind::Record(fields) => fields.iter().find_map(|(_, v)| {
-            local_pattern_binding_type_in_expr(v, name, binding_span, expr_types, variant_env)
+        ExprKind::Array(entries) => entries.iter().find_map(|e| {
+            local_pattern_binding_type_in_expr(
+                e.expr(),
+                name,
+                binding_span,
+                expr_types,
+                variant_env,
+            )
+        }),
+        ExprKind::Record(entries) => entries.iter().find_map(|e| {
+            local_pattern_binding_type_in_expr(
+                e.expr(),
+                name,
+                binding_span,
+                expr_types,
+                variant_env,
+            )
         }),
         ExprKind::Break(None)
         | ExprKind::Return(None)
@@ -1730,12 +1754,15 @@ fn declaration_value_type_in_expr<'a>(
                     .find_map(|(_, body)| declaration_value_type_in_expr(body, span, expr_types))
             })
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => items
+        ExprKind::Tuple(items) => items
             .iter()
             .find_map(|item| declaration_value_type_in_expr(item, span, expr_types)),
-        ExprKind::Record(fields) => fields
+        ExprKind::Array(entries) => entries
             .iter()
-            .find_map(|(_, value)| declaration_value_type_in_expr(value, span, expr_types)),
+            .find_map(|e| declaration_value_type_in_expr(e.expr(), span, expr_types)),
+        ExprKind::Record(entries) => entries
+            .iter()
+            .find_map(|e| declaration_value_type_in_expr(e.expr(), span, expr_types)),
         ExprKind::For { iterable, body, .. } => {
             declaration_value_type_in_expr(iterable, span, expr_types)
                 .or_else(|| declaration_value_type_in_expr(body, span, expr_types))

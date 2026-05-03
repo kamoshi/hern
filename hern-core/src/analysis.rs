@@ -271,14 +271,19 @@ fn find_hover_in_expr(
                 find_hover_in_expr(expr, expr_types, symbol_types, pos, best);
             }
         }
-        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+        ExprKind::Tuple(items) => {
             for item in items {
                 find_hover_in_expr(item, expr_types, symbol_types, pos, best);
             }
         }
-        ExprKind::Record(fields) => {
-            for (_, value) in fields {
-                find_hover_in_expr(value, expr_types, symbol_types, pos, best);
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                find_hover_in_expr(entry.expr(), expr_types, symbol_types, pos, best);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                find_hover_in_expr(entry.expr(), expr_types, symbol_types, pos, best);
             }
         }
         ExprKind::For { iterable, body, .. } => {

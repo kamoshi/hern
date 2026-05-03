@@ -1,0 +1,4 @@
+let dep = import "bare_imported_trait_method_dep";
+
+// bare call dispatches via imported Double trait
+print(double(21));
