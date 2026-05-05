@@ -1,72 +1,22 @@
+use super::{
+    patterns::{
+        insert_pattern_bindings, is_irrefutable_let, is_irrefutable_param, pattern_is_catch_all,
+    },
+    type_syntax::{
+        concrete_dict_name, impl_target_name, inherent_impl_dict_name, record_field_ty,
+        subst_hkt_param, ty_target_name, validate_inherent_impl_target,
+    },
+};
 use crate::ast::*;
 use crate::codegen::lua::mangle_op;
 use crate::types::{
     EnvInfo, Row, Scheme, Subst, TraitConstraint, Ty, TyVar,
+    env::build_variant_env_from_stmts,
     error::{SpannedTypeError, TypeError},
     free_type_vars, unify,
 };
+pub use crate::types::{TypeEnv, VariantEnv, VariantInfo, is_value};
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-
-impl fmt::Display for EnvInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let prefix = if self.is_mutable { "mut " } else { "" };
-        write!(f, "{}{}", prefix, self.scheme)
-    }
-}
-
-impl fmt::Display for TypeEnv {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut keys: Vec<_> = self.0.keys().collect();
-        keys.sort();
-        for key in keys {
-            writeln!(f, "  {}: {}", key, self.0.get(key).unwrap())?; // keys from self.0.keys()
-        }
-        Ok(())
-    }
-}
-
-// ── Type environment ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Default)]
-pub struct TypeEnv(pub HashMap<String, EnvInfo>);
-
-impl TypeEnv {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&mut self, name: String, info: EnvInfo) {
-        self.0.insert(name, info);
-    }
-
-    pub fn get(&self, name: &str) -> Option<&EnvInfo> {
-        self.0.get(name)
-    }
-
-    fn free_vars(&self, s: &Subst) -> HashSet<TyVar> {
-        let mut vars = HashSet::new();
-        for info in self.0.values() {
-            vars.extend(free_type_vars(&s.apply_scheme(&info.scheme).ty));
-        }
-        vars
-    }
-
-    fn free_vars_syntactic(&self) -> HashSet<TyVar> {
-        let mut vars = HashSet::new();
-        for info in self.0.values() {
-            let mut scheme_vars = free_type_vars(&info.scheme.ty);
-            for constraint in &info.scheme.constraints {
-                scheme_vars.insert(constraint.var);
-            }
-            for quantified in &info.scheme.vars {
-                scheme_vars.remove(quantified);
-            }
-            vars.extend(scheme_vars);
-        }
-        vars
-    }
-}
 
 struct ResolvedTraitMethod {
     trait_def: TraitDef,
@@ -77,59 +27,6 @@ struct ResolvedTraitMethod {
 struct InherentMethodInfo {
     scheme: Scheme,
     resolved_callee: String,
-}
-
-// ── Variant environment ───────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct VariantInfo {
-    pub type_name: String,
-    pub type_params: Vec<String>,
-    pub type_param_vars: Vec<TyVar>,
-    pub payload: Option<Type>,
-    pub payload_ty: Option<Ty>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct VariantEnv(pub HashMap<String, VariantInfo>);
-
-fn build_variant_env_from_stmts(seed_stmts: &[Stmt], stmts: &[Stmt]) -> VariantEnv {
-    let mut env = VariantEnv::default();
-    for stmt in seed_stmts.iter().chain(stmts.iter()) {
-        if let Stmt::Type(td) = stmt {
-            for variant in &td.variants {
-                env.0.insert(
-                    variant.name.clone(),
-                    VariantInfo {
-                        type_name: td.name.clone(),
-                        type_params: td.params.clone(),
-                        type_param_vars: Vec::new(),
-                        payload: variant.payload.clone(),
-                        payload_ty: None,
-                    },
-                );
-            }
-        }
-    }
-    env
-}
-
-// ── Value predicate ───────────────────────────────────────────────────────────
-
-pub fn is_value(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::Number(_)
-        | ExprKind::StringLit(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Ident(_)
-        | ExprKind::Lambda { .. }
-        | ExprKind::Import(_)
-        | ExprKind::Unit => true,
-        ExprKind::Tuple(exprs) => exprs.iter().all(is_value),
-        ExprKind::Array(entries) => entries.iter().all(|e| is_value(e.expr())),
-        ExprKind::Record(entries) => entries.iter().all(|e| is_value(e.expr())),
-        _ => false,
-    }
 }
 
 // ── Infer ─────────────────────────────────────────────────────────────────────
@@ -164,6 +61,13 @@ struct FinalizedConstraints {
     scheme: Scheme,
     owned: Vec<TraitConstraint>,
     bubbled: Vec<TraitConstraint>,
+}
+
+struct FinalizedTypeMaps {
+    expr_types: HashMap<NodeId, Ty>,
+    symbol_types: HashMap<NodeId, Ty>,
+    binding_types: HashMap<SourceSpan, Ty>,
+    definition_schemes: HashMap<SourceSpan, Scheme>,
 }
 
 #[derive(Debug, Clone)]
@@ -597,6 +501,124 @@ impl Infer {
         Ok(())
     }
 
+    fn register_type_declarations<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Type(td) => {
+                    self.declared_types.insert(td.name.clone());
+                }
+                Stmt::TypeAlias {
+                    name, params, ty, ..
+                } => {
+                    self.declared_types.insert(name.clone());
+                    self.type_aliases
+                        .insert(name.clone(), (params.clone(), ty.clone()));
+                }
+                _ => {}
+            }
+        }
+        self.resolve_variant_payload_types();
+    }
+
+    fn register_traits_and_ops<'a>(
+        &mut self,
+        stmts: impl Iterator<Item = &'a Stmt>,
+    ) -> Result<(), SpannedTypeError> {
+        for stmt in stmts {
+            let Stmt::Trait(td) = stmt else {
+                continue;
+            };
+            validate_trait_methods_have_target(td)?;
+            self.trait_env.insert(td.name.clone(), td.clone());
+            for method in &td.methods {
+                if method.fixity.is_none() {
+                    continue;
+                }
+                match self.op_trait_map.get(&method.name) {
+                    Some(existing) if existing != &td.name => {
+                        return Err(
+                            TypeError::DuplicateOperator(method.name.clone()).at(stmt.span())
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.op_trait_map
+                            .insert(method.name.clone(), td.name.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_constructors_and_externs(
+        &mut self,
+        env: &mut TypeEnv,
+        stmts: &mut [Stmt],
+    ) -> Result<(), SpannedTypeError> {
+        for stmt in stmts {
+            let span = stmt.span();
+            match stmt {
+                Stmt::Type(td) => self
+                    .add_constructors_to_env(env, td)
+                    .map_err(|err| err.at(span))?,
+                Stmt::Extern {
+                    name,
+                    name_span,
+                    ty,
+                    ..
+                } => {
+                    let mut param_vars = HashMap::new();
+                    let t = self
+                        .ast_to_ty_with_vars(ty, &mut param_vars)
+                        .map_err(|err| err.at(span))?;
+                    let scheme = self.generalize(env, t);
+                    self.definition_schemes.insert(*name_span, scheme.clone());
+                    env.insert(
+                        name.clone(),
+                        EnvInfo {
+                            scheme,
+                            is_mutable: false,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_env_subst(&self, env: &mut TypeEnv) {
+        for info in env.0.values_mut() {
+            info.scheme.ty = self.subst.apply(&info.scheme.ty);
+        }
+    }
+
+    fn finalized_type_maps(&self) -> FinalizedTypeMaps {
+        FinalizedTypeMaps {
+            expr_types: self
+                .expr_types
+                .iter()
+                .map(|(id, ty)| (*id, self.subst.apply(ty)))
+                .collect(),
+            symbol_types: self
+                .symbol_types
+                .iter()
+                .map(|(id, ty)| (*id, self.subst.apply(ty)))
+                .collect(),
+            binding_types: self
+                .binding_types
+                .iter()
+                .map(|(span, ty)| (*span, self.subst.apply(ty)))
+                .collect(),
+            definition_schemes: self
+                .definition_schemes
+                .iter()
+                .map(|(span, scheme)| (*span, self.subst.apply_scheme(scheme)))
+                .collect(),
+        }
+    }
+
     pub fn infer_program(&mut self, program: &mut Program) -> Result<TypeEnv, SpannedTypeError> {
         self.infer_program_with_value(program).map(|(env, _)| env)
     }
@@ -632,80 +654,14 @@ impl Infer {
         self.variant_env = build_variant_env_from_stmts(seed_stmts, &program.stmts);
 
         let mut env = seed_env.cloned().unwrap_or_else(TypeEnv::new);
-
-        // Pre-pass 1: type aliases
-        for stmt in seed_stmts.iter().chain(program.stmts.iter()) {
-            match stmt {
-                Stmt::Type(td) => {
-                    self.declared_types.insert(td.name.clone());
-                }
-                Stmt::TypeAlias {
-                    name, params, ty, ..
-                } => {
-                    self.declared_types.insert(name.clone());
-                    self.type_aliases
-                        .insert(name.clone(), (params.clone(), ty.clone()));
-                }
-                _ => {}
-            }
-        }
-        self.resolve_variant_payload_types();
-
-        // Pre-pass 2: operator-to-trait registry
-        for stmt in seed_stmts.iter().chain(program.stmts.iter()) {
-            if let Stmt::Trait(td) = stmt {
-                validate_trait_methods_have_target(td)?;
-                self.trait_env.insert(td.name.clone(), td.clone());
-                for method in &td.methods {
-                    if method.fixity.is_some() {
-                        if let Some(existing) = self.op_trait_map.get(&method.name) {
-                            if existing != &td.name {
-                                return Err(TypeError::DuplicateOperator(method.name.clone())
-                                    .at(stmt.span()));
-                            }
-                        } else {
-                            self.op_trait_map
-                                .insert(method.name.clone(), td.name.clone());
-                        }
-                    }
-                }
-            }
-        }
+        self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()));
+        self.register_traits_and_ops(seed_stmts.iter().chain(program.stmts.iter()))?;
         // Seed this program's own impl dictionaries for standalone inference. Graph
         // inference also calls set_known_impl_dicts with the full module env; the
         // overlap is harmless and keeps both entry points on the same call path.
         self.register_impl_dict_names(seed_stmts.iter().chain(program.stmts.iter()));
 
-        // Pre-pass 3: constructor types and externs
-        for stmt in &mut program.stmts {
-            let span = stmt.span();
-            match stmt {
-                Stmt::Type(td) => self
-                    .add_constructors_to_env(&mut env, td)
-                    .map_err(|err| err.at(span))?,
-                Stmt::Extern {
-                    name,
-                    name_span,
-                    ty,
-                    ..
-                } => {
-                    let mut param_vars = HashMap::new();
-                    let t = self
-                        .ast_to_ty_with_vars(ty, &mut param_vars)
-                        .map_err(|err| err.at(span))?;
-                    let scheme = self.generalize(&env, t);
-                    self.definition_schemes.insert(*name_span, scheme.clone());
-                    env.insert(
-                        name.clone(),
-                        EnvInfo {
-                            scheme,
-                            is_mutable: false,
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
+        self.add_constructors_and_externs(&mut env, &mut program.stmts)?;
 
         let mut value_ty = Ty::Unit;
         for stmt in &mut program.stmts {
@@ -716,45 +672,24 @@ impl Infer {
             };
         }
 
-        for info in env.0.values_mut() {
-            info.scheme.ty = self.subst.apply(&info.scheme.ty);
-        }
+        self.apply_env_subst(&mut env);
 
         for stmt in &mut program.stmts {
             let resolver = |p: &PendingDictArg| resolve_concrete(p, &self.subst);
             final_pass_stmt(stmt, &resolver)?;
         }
 
-        let expr_types = self
-            .expr_types
-            .iter()
-            .map(|(id, ty)| (*id, self.subst.apply(ty)))
-            .collect();
-        let symbol_types = self
-            .symbol_types
-            .iter()
-            .map(|(id, ty)| (*id, self.subst.apply(ty)))
-            .collect();
-        let binding_types = self
-            .binding_types
-            .iter()
-            .map(|(span, ty)| (*span, self.subst.apply(ty)))
-            .collect();
-        let definition_schemes = self
-            .definition_schemes
-            .iter()
-            .map(|(span, scheme)| (*span, self.subst.apply_scheme(scheme)))
-            .collect();
+        let maps = self.finalized_type_maps();
 
         Ok(InferenceResult {
             env,
             variant_env: self.variant_env.clone(),
             inherent_method_schemes: self.export_inherent_method_schemes(),
             value_ty: self.subst.apply(&value_ty),
-            expr_types,
-            symbol_types,
-            binding_types,
-            definition_schemes,
+            expr_types: maps.expr_types,
+            symbol_types: maps.symbol_types,
+            binding_types: maps.binding_types,
+            definition_schemes: maps.definition_schemes,
         })
     }
 
@@ -786,53 +721,11 @@ impl Infer {
         self.variant_env = build_variant_env_from_stmts(seed_stmts, &program.stmts);
 
         let mut env = seed_env.cloned().unwrap_or_else(TypeEnv::new);
-
-        // Pre-pass 1: type aliases (infallible).
-        for stmt in seed_stmts.iter().chain(program.stmts.iter()) {
-            match stmt {
-                Stmt::Type(td) => {
-                    self.declared_types.insert(td.name.clone());
-                }
-                Stmt::TypeAlias {
-                    name, params, ty, ..
-                } => {
-                    self.declared_types.insert(name.clone());
-                    self.type_aliases
-                        .insert(name.clone(), (params.clone(), ty.clone()));
-                }
-                _ => {}
-            }
-        }
-        self.resolve_variant_payload_types();
-
-        // Pre-pass 2: operator-to-trait registry. Fail-fast.
-        for stmt in seed_stmts.iter().chain(program.stmts.iter()) {
-            if let Stmt::Trait(td) = stmt {
-                if let Err(err) = validate_trait_methods_have_target(td) {
-                    return (ModuleInference::default(), vec![err]);
-                }
-                self.trait_env.insert(td.name.clone(), td.clone());
-                for method in &td.methods {
-                    if method.fixity.is_some() {
-                        match self.op_trait_map.get(&method.name) {
-                            Some(existing) if existing != &td.name => {
-                                return (
-                                    ModuleInference::default(),
-                                    vec![
-                                        TypeError::DuplicateOperator(method.name.clone())
-                                            .at(stmt.span()),
-                                    ],
-                                );
-                            }
-                            Some(_) => {}
-                            None => {
-                                self.op_trait_map
-                                    .insert(method.name.clone(), td.name.clone());
-                            }
-                        }
-                    }
-                }
-            }
+        self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()));
+        if let Err(err) =
+            self.register_traits_and_ops(seed_stmts.iter().chain(program.stmts.iter()))
+        {
+            return (ModuleInference::default(), vec![err]);
         }
         // Seed this program's own impl dictionaries for standalone inference. Graph
         // inference also calls set_known_impl_dicts with the full module env; the
@@ -938,9 +831,7 @@ impl Infer {
             }
         }
 
-        for info in env.0.values_mut() {
-            info.scheme.ty = self.subst.apply(&info.scheme.ty);
-        }
+        self.apply_env_subst(&mut env);
 
         // Final pass on succeeded statements only — restored statements may carry pending
         // dictionary args that reference type variables from the discarded inference.
@@ -955,26 +846,7 @@ impl Infer {
             }
         }
 
-        let expr_types = self
-            .expr_types
-            .iter()
-            .map(|(id, ty)| (*id, self.subst.apply(ty)))
-            .collect();
-        let symbol_types = self
-            .symbol_types
-            .iter()
-            .map(|(id, ty)| (*id, self.subst.apply(ty)))
-            .collect();
-        let binding_types = self
-            .binding_types
-            .iter()
-            .map(|(span, ty)| (*span, self.subst.apply(ty)))
-            .collect();
-        let definition_schemes = self
-            .definition_schemes
-            .iter()
-            .map(|(span, scheme)| (*span, self.subst.apply_scheme(scheme)))
-            .collect();
+        let maps = self.finalized_type_maps();
 
         (
             ModuleInference {
@@ -982,10 +854,10 @@ impl Infer {
                 variant_env: self.variant_env.clone(),
                 inherent_method_schemes: self.export_inherent_method_schemes(),
                 value_ty: self.subst.apply(&value_ty),
-                expr_types,
-                symbol_types,
-                binding_types,
-                definition_schemes,
+                expr_types: maps.expr_types,
+                symbol_types: maps.symbol_types,
+                binding_types: maps.binding_types,
+                definition_schemes: maps.definition_schemes,
             },
             diagnostics,
         )
@@ -2832,147 +2704,6 @@ impl Infer {
     }
 }
 
-// ── HKT substitution helpers ──────────────────────────────────────────────────
-
-fn subst_hkt_param(ty: &Type, param: &str, target: &Type) -> Type {
-    match ty {
-        Type::App(con, args) if matches!(con.as_ref(), Type::Var(v) if v == param) => {
-            if args.len() == 1 {
-                apply_hole(target, &subst_hkt_param(&args[0], param, target))
-            } else {
-                ty.clone()
-            }
-        }
-        Type::Var(v) if v == param => target.clone(),
-        Type::App(con, args) => Type::App(
-            Box::new(subst_hkt_param(con, param, target)),
-            args.iter()
-                .map(|a| subst_hkt_param(a, param, target))
-                .collect(),
-        ),
-        Type::Func(params, ret) => Type::Func(
-            params
-                .iter()
-                .map(|p| subst_hkt_param(p, param, target))
-                .collect(),
-            Box::new(subst_hkt_param(ret, param, target)),
-        ),
-        Type::Tuple(tys) => Type::Tuple(
-            tys.iter()
-                .map(|t| subst_hkt_param(t, param, target))
-                .collect(),
-        ),
-        Type::Record(fields, open) => Type::Record(
-            fields
-                .iter()
-                .map(|(n, t)| (n.clone(), subst_hkt_param(t, param, target)))
-                .collect(),
-            *open,
-        ),
-        other => other.clone(),
-    }
-}
-
-fn apply_hole(target: &Type, arg: &Type) -> Type {
-    if type_has_hole(target) {
-        substitute_hole(target, arg)
-    } else {
-        Type::App(Box::new(target.clone()), vec![arg.clone()])
-    }
-}
-
-fn type_has_hole(ty: &Type) -> bool {
-    match ty {
-        Type::Hole => true,
-        Type::App(con, args) => type_has_hole(con) || args.iter().any(type_has_hole),
-        _ => false,
-    }
-}
-
-fn substitute_hole(ty: &Type, arg: &Type) -> Type {
-    match ty {
-        Type::Hole => arg.clone(),
-        Type::App(con, args) => Type::App(
-            Box::new(substitute_hole(con, arg)),
-            args.iter().map(|a| substitute_hole(a, arg)).collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-fn impl_target_name(target: &Type) -> String {
-    match target {
-        Type::Ident(name) => name.clone(),
-        Type::App(con, _) => impl_target_name(con),
-        _ => "Unknown".to_string(),
-    }
-}
-
-fn inherent_impl_dict_name(target_name: &str) -> String {
-    format!("__impl__{}", target_name)
-}
-
-fn validate_inherent_impl_target(
-    target: &Type,
-    declared_types: &HashSet<String>,
-) -> Result<String, TypeError> {
-    match target {
-        Type::Ident(name) if is_named_inherent_target(name, declared_types) => Ok(name.clone()),
-        Type::App(con, args) => {
-            let Type::Ident(name) = con.as_ref() else {
-                return Err(TypeError::InvalidInherentImplTarget(type_name_for_error(
-                    target,
-                )));
-            };
-            if !is_named_inherent_target(name, declared_types)
-                || args.iter().any(|arg| !matches!(arg, Type::Var(_)))
-            {
-                return Err(TypeError::InvalidInherentImplTarget(type_name_for_error(
-                    target,
-                )));
-            }
-            let mut seen = HashSet::new();
-            if args.iter().any(|arg| {
-                let Type::Var(var) = arg else {
-                    return false;
-                };
-                !seen.insert(var)
-            }) {
-                return Err(TypeError::InvalidInherentImplTarget(type_name_for_error(
-                    target,
-                )));
-            }
-            Ok(name.clone())
-        }
-        _ => Err(TypeError::InvalidInherentImplTarget(type_name_for_error(
-            target,
-        ))),
-    }
-}
-
-fn is_named_inherent_target(name: &str, declared_types: &HashSet<String>) -> bool {
-    matches!(name, "string" | "f64" | "bool") || declared_types.contains(name)
-}
-
-fn type_name_for_error(target: &Type) -> String {
-    match target {
-        Type::Ident(name) | Type::Var(name) => name.clone(),
-        Type::App(con, args) => {
-            let args = args
-                .iter()
-                .map(type_name_for_error)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{}({})", type_name_for_error(con), args)
-        }
-        Type::Func(..) => "fn(...)".to_string(),
-        Type::Tuple(_) => "(...)".to_string(),
-        Type::Record(..) => "#{...}".to_string(),
-        Type::Unit => "()".to_string(),
-        Type::Hole => "*".to_string(),
-    }
-}
-
 fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeError> {
     for method in &td.methods {
         if method.params.is_empty() {
@@ -2984,80 +2715,6 @@ fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeEr
         }
     }
     Ok(())
-}
-
-/// Returns `true` if `pat` is irrefutable, i.e. always matches regardless of
-/// the runtime value.  Only irrefutable patterns may appear in function-parameter
-/// position; refutable patterns must use a `match` expression in the body.
-fn is_irrefutable_param(pat: &Pattern) -> bool {
-    match pat {
-        Pattern::Variable(..) | Pattern::Wildcard => true,
-        // Only OPEN records (with a rest binding) are irrefutable for fn params.
-        // A closed record like #{ x } is refutable at runtime.
-        Pattern::Record { rest, .. } => rest.is_some(),
-        // Tuples are irrefutable if all elements are irrefutable.
-        Pattern::Tuple(elems) => elems.iter().all(is_irrefutable_param),
-        // An empty list pattern with a rest binding (`[..]` / `[..rest]`) matches
-        // any list unconditionally.  Any other list pattern requires a specific
-        // length, so it is refutable.
-        Pattern::List { elements, rest } => elements.is_empty() && rest.is_some(),
-        // Constructor and string-literal patterns are refutable.
-        Pattern::Constructor { .. } | Pattern::StringLit(_) => false,
-    }
-}
-
-/// Like `is_irrefutable_param` but used for `let` bindings, where any record
-/// pattern is considered safe because the type system guarantees the value shape.
-fn is_irrefutable_let(pat: &Pattern) -> bool {
-    match pat {
-        Pattern::Variable(..) | Pattern::Wildcard => true,
-        // In let position the type system ensures the value has the right shape,
-        // so both open and closed record patterns are unconditionally safe.
-        Pattern::Record { .. } => true,
-        Pattern::Tuple(elems) => elems.iter().all(is_irrefutable_let),
-        Pattern::List { elements, rest } => elements.is_empty() && rest.is_some(),
-        Pattern::Constructor { .. } | Pattern::StringLit(_) => false,
-    }
-}
-
-/// Returns true if `p` is a catch-all pattern (no actual test at runtime).
-fn pattern_is_catch_all(p: &Pattern) -> bool {
-    match p {
-        Pattern::Wildcard | Pattern::Variable(_, _) => true,
-        Pattern::Record { .. } => true,
-        Pattern::Tuple(elems) => elems.iter().all(pattern_is_catch_all),
-        Pattern::List {
-            elements,
-            rest: Some(_),
-        } => elements.is_empty(),
-        _ => false,
-    }
-}
-
-/// Returns `Some(name)` for concrete types that can name a trait dictionary,
-/// or `None` for type variables and other unresolved types.
-fn ty_target_name(ty: &Ty) -> Option<String> {
-    match ty {
-        Ty::F64 => Some("f64".to_string()),
-        Ty::Con(name) => Some(name.clone()),
-        Ty::App(con, _) => ty_target_name(con),
-        _ => None,
-    }
-}
-
-fn concrete_dict_name(trait_name: &str, ty: &Ty) -> Option<String> {
-    ty_target_name(ty).map(|name| format!("__{}__{}", trait_name, name))
-}
-
-fn record_field_ty(ty: &Ty, field: &str) -> Option<Ty> {
-    if let Ty::Record(row) = ty {
-        row.fields
-            .iter()
-            .find(|(name, _)| name == field)
-            .map(|(_, ty)| ty.clone())
-    } else {
-        None
-    }
 }
 
 fn dict_param_name(constraint: &TraitConstraint) -> String {
@@ -3408,43 +3065,6 @@ fn collect_pattern_referenced_names(pat: &Pattern, refs: &mut CollectedNames) {
         | Pattern::StringLit(_)
         | Pattern::Variable(_, _)
         | Pattern::Record { .. } => {}
-    }
-}
-
-fn insert_pattern_bindings(scope: &mut HashSet<String>, pat: &Pattern) {
-    match pat {
-        Pattern::Wildcard | Pattern::StringLit(_) => {}
-        Pattern::Variable(name, _) => {
-            scope.insert(name.clone());
-        }
-        Pattern::Constructor { binding, .. } => {
-            if let Some((binding, _)) = binding {
-                scope.insert(binding.clone());
-            }
-        }
-        Pattern::Record { fields, rest } => {
-            for (_, binding, _) in fields {
-                if binding != "_" {
-                    scope.insert(binding.clone());
-                }
-            }
-            if let Some(Some((rest_name, _))) = rest {
-                scope.insert(rest_name.clone());
-            }
-        }
-        Pattern::List { elements, rest } => {
-            for element in elements {
-                insert_pattern_bindings(scope, element);
-            }
-            if let Some(Some((rest_name, _))) = rest {
-                scope.insert(rest_name.clone());
-            }
-        }
-        Pattern::Tuple(elems) => {
-            for elem in elems {
-                insert_pattern_bindings(scope, elem);
-            }
-        }
     }
 }
 

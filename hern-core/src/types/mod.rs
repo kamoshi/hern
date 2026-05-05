@@ -1,5 +1,12 @@
+mod env;
 pub mod error;
 pub mod infer;
+mod patterns;
+mod type_syntax;
+mod value;
+
+pub use env::{TypeEnv, VariantEnv, VariantInfo};
+pub use value::is_value;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
