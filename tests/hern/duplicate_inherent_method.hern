@@ -1,0 +1,9 @@
+type Boxed = MkBoxed(f64) | Empty
+
+impl Boxed {
+  fn value(self) { 1 }
+}
+
+impl Boxed {
+  fn value(self) { 2 }
+}

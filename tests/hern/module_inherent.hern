@@ -1,0 +1,21 @@
+type Boxed = MkBoxed(f64) | Empty
+
+impl Boxed {
+  fn value(self) -> f64 {
+    match self {
+      MkBoxed(v) -> v,
+      Empty -> 0,
+    }
+  }
+}
+
+impl Boxed {
+  fn fallback(self) {
+    match self {
+      MkBoxed(v) -> v,
+      Empty -> 99,
+    }
+  }
+}
+
+MkBoxed(11)

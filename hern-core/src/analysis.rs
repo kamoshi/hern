@@ -169,6 +169,11 @@ fn find_hover_in_stmt(
                 find_hover_in_expr(&method.body, expr_types, symbol_types, pos, best);
             }
         }
+        Stmt::InherentImpl(id) => {
+            for method in &id.methods {
+                find_hover_in_expr(&method.body, expr_types, symbol_types, pos, best);
+            }
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
     }
 }
@@ -319,6 +324,99 @@ fn span_len(span: SourceSpan) -> usize {
 mod tests {
     use super::*;
 
+    fn find_method_callee(program: &Program, method_name: &str) -> Option<(NodeId, SourceSpan)> {
+        fn find_in_expr(expr: &Expr, method_name: &str) -> Option<(NodeId, SourceSpan)> {
+            match &expr.kind {
+                ExprKind::Call { callee, args, .. } => {
+                    if let ExprKind::FieldAccess {
+                        field, field_span, ..
+                    } = &callee.kind
+                        && field == method_name
+                    {
+                        return Some((callee.id, *field_span));
+                    }
+                    find_in_expr(callee, method_name)
+                        .or_else(|| args.iter().find_map(|arg| find_in_expr(arg, method_name)))
+                }
+                ExprKind::FieldAccess { expr, .. }
+                | ExprKind::Not(expr)
+                | ExprKind::Loop(expr)
+                | ExprKind::Break(Some(expr))
+                | ExprKind::Return(Some(expr)) => find_in_expr(expr, method_name),
+                ExprKind::Assign { target, value }
+                | ExprKind::Binary {
+                    lhs: target,
+                    rhs: value,
+                    ..
+                } => find_in_expr(target, method_name).or_else(|| find_in_expr(value, method_name)),
+                ExprKind::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } => find_in_expr(cond, method_name)
+                    .or_else(|| find_in_expr(then_branch, method_name))
+                    .or_else(|| find_in_expr(else_branch, method_name)),
+                ExprKind::Match { scrutinee, arms } => find_in_expr(scrutinee, method_name)
+                    .or_else(|| {
+                        arms.iter()
+                            .find_map(|(_, body)| find_in_expr(body, method_name))
+                    }),
+                ExprKind::Block { stmts, final_expr } => stmts
+                    .iter()
+                    .find_map(|stmt| find_in_stmt(stmt, method_name))
+                    .or_else(|| {
+                        final_expr
+                            .as_deref()
+                            .and_then(|expr| find_in_expr(expr, method_name))
+                    }),
+                ExprKind::Tuple(items) => items
+                    .iter()
+                    .find_map(|item| find_in_expr(item, method_name)),
+                ExprKind::Array(entries) => entries
+                    .iter()
+                    .find_map(|entry| find_in_expr(entry.expr(), method_name)),
+                ExprKind::Record(entries) => entries
+                    .iter()
+                    .find_map(|entry| find_in_expr(entry.expr(), method_name)),
+                ExprKind::Lambda { body, .. } | ExprKind::For { body, .. } => {
+                    find_in_expr(body, method_name)
+                }
+                ExprKind::Number(_)
+                | ExprKind::StringLit(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Ident(_)
+                | ExprKind::Import(_)
+                | ExprKind::Unit
+                | ExprKind::Break(None)
+                | ExprKind::Continue
+                | ExprKind::Return(None) => None,
+            }
+        }
+
+        fn find_in_stmt(stmt: &Stmt, method_name: &str) -> Option<(NodeId, SourceSpan)> {
+            match stmt {
+                Stmt::Let { value, .. } | Stmt::Expr(value) => find_in_expr(value, method_name),
+                Stmt::Fn { body, .. } | Stmt::Op { body, .. } => find_in_expr(body, method_name),
+                Stmt::Impl(id) => id
+                    .methods
+                    .iter()
+                    .find_map(|method| find_in_expr(&method.body, method_name)),
+                Stmt::InherentImpl(id) => id
+                    .methods
+                    .iter()
+                    .find_map(|method| find_in_expr(&method.body, method_name)),
+                Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {
+                    None
+                }
+            }
+        }
+
+        program
+            .stmts
+            .iter()
+            .find_map(|stmt| find_in_stmt(stmt, method_name))
+    }
+
     #[test]
     fn type_error_in_expression_has_span() {
         let prelude = analyze_prelude().expect("prelude should analyze");
@@ -354,5 +452,46 @@ mod tests {
 
         assert!(contains(span, SourcePosition { line: 1, col: 5 }));
         assert!(!contains(span, SourcePosition { line: 1, col: 6 }));
+    }
+
+    #[test]
+    fn hover_reaches_resolved_inherent_method_name() {
+        let prelude = analyze_prelude().expect("prelude should analyze");
+        let analysis = analyze_source(
+            r#"
+impl Option('a) {
+  fn present(self) {
+    match self {
+      Some(_) -> true,
+      None -> false,
+    }
+  }
+}
+
+let wrapped = Some(1);
+let is_present = wrapped.present();
+"#,
+            &prelude,
+        )
+        .expect("source should analyze");
+
+        let (callee_id, method_span) = find_method_callee(&analysis.program, "present")
+            .expect("method call callee should be present");
+
+        assert!(analysis.inference.symbol_types.contains_key(&callee_id));
+
+        let hover = hover_at(
+            &analysis.program,
+            &analysis.inference.expr_types,
+            &analysis.inference.symbol_types,
+            SourcePosition {
+                line: method_span.start_line,
+                col: method_span.start_col,
+            },
+        )
+        .expect("method name should have hover info");
+
+        assert_eq!(hover.node_id, callee_id);
+        assert!(matches!(hover.ty, Ty::Func(_, _)));
     }
 }

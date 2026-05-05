@@ -85,12 +85,29 @@ extern __concat: fn(string, string) -> string = #[template] "(($1) .. ($2))";
 // --- Map ---
 
 extern map_new: fn() -> Map('k, 'v) = "(function() return {} end)";
-extern map_set: fn(Map('k, 'v), 'k, 'v) -> Map('k, 'v) = "(function(m, k, v) m[k] = v; return m end)";
-extern map_get: fn(Map('k, 'v), 'k) -> Option('v) = "(function(m, k) local v = m[k]; if v ~= nil then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end end)";
-extern map_delete: fn(Map('k, 'v), 'k) -> Map('k, 'v) = "(function(m, k) m[k] = nil; return m end)";
-extern map_has: fn(Map('k, 'v), 'k) -> bool = "(function(m, k) return m[k] ~= nil and 1 or 0 end)";
-extern map_keys: fn(Map('k, 'v)) -> ['k] = "(function(m) local ks = {}; for k in pairs(m) do ks[#ks + 1] = k end; return ks end)";
-extern map_size: fn(Map('k, 'v)) -> f64 = "(function(m) local n = 0; for _ in pairs(m) do n = n + 1 end; return n end)";
+
+extern __map_set: fn(Map('k, 'v), 'k, 'v) -> Map('k, 'v) = "(function(m, k, v) m[k] = v; return m end)";
+extern __map_get: fn(Map('k, 'v), 'k) -> Option('v) = "(function(m, k) local v = m[k]; if v ~= nil then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end end)";
+extern __map_delete: fn(Map('k, 'v), 'k) -> Map('k, 'v) = "(function(m, k) m[k] = nil; return m end)";
+extern __map_has: fn(Map('k, 'v), 'k) -> bool = "(function(m, k) return m[k] ~= nil and 1 or 0 end)";
+extern __map_keys: fn(Map('k, 'v)) -> ['k] = "(function(m) local ks = {}; for k in pairs(m) do ks[#ks + 1] = k end; return ks end)";
+extern __map_size: fn(Map('k, 'v)) -> f64 = "(function(m) local n = 0; for _ in pairs(m) do n = n + 1 end; return n end)";
+
+fn map_set(m: Map('k, 'v), key: 'k, value: 'v) -> Map('k, 'v) { __map_set(m, key, value) }
+fn map_get(m: Map('k, 'v), key: 'k) -> Option('v) { __map_get(m, key) }
+fn map_delete(m: Map('k, 'v), key: 'k) -> Map('k, 'v) { __map_delete(m, key) }
+fn map_has(m: Map('k, 'v), key: 'k) -> bool { __map_has(m, key) }
+fn map_keys(m: Map('k, 'v)) -> ['k] { __map_keys(m) }
+fn map_size(m: Map('k, 'v)) -> f64 { __map_size(m) }
+
+impl Map('k, 'v) {
+    fn set(self, key: 'k, value: 'v) -> Map('k, 'v) { map_set(self, key, value) }
+    fn get(self, key: 'k) -> Option('v) { map_get(self, key) }
+    fn delete(self, key: 'k) -> Map('k, 'v) { map_delete(self, key) }
+    fn has(self, key: 'k) -> bool { map_has(self, key) }
+    fn keys(self) -> ['k] { map_keys(self) }
+    fn size(self) -> f64 { map_size(self) }
+}
 
 // --- Standard Operator Traits ---
 

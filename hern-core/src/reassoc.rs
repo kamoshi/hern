@@ -41,6 +41,11 @@ fn reassoc_stmt(stmt: &mut Stmt, table: &FixityTable) {
                 reassoc_expr(&mut m.body, table);
             }
         }
+        Stmt::InherentImpl(id) => {
+            for m in &mut id.methods {
+                reassoc_expr(&mut m.body, table);
+            }
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
     }
 }

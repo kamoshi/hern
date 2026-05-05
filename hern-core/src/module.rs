@@ -46,6 +46,7 @@ pub struct ModuleEnv {
     traits: HashMap<String, EnvTrait>,
     ops: HashMap<String, EnvOp>,
     impls: HashMap<ImplKey, EnvImpl>,
+    inherent_impls: HashMap<String, EnvInherentImpl>,
 }
 
 #[derive(Clone)]
@@ -62,6 +63,13 @@ struct EnvOp {
 
 #[derive(Clone)]
 struct EnvImpl {
+    dict_name: String,
+    owner: String,
+}
+
+#[derive(Clone)]
+struct EnvInherentImpl {
+    methods: HashMap<String, Scheme>,
     dict_name: String,
     owner: String,
 }
@@ -470,19 +478,21 @@ pub fn infer_graph(graph: &mut ModuleGraph) -> Result<GraphInference, CompilerDi
 pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphInference> {
     let mut infer = Infer::new();
     let mut prelude_program = graph.prelude.clone();
-    let prelude_env = match infer.infer_program(&mut prelude_program) {
-        Ok(env) => env,
-        Err(err) => {
-            return AnalysisOutput::diagnostics(vec![CompilerDiagnostic::error_in(
-                DiagnosticSource::Prelude,
-                err.span,
-                format!("type error in <prelude>: {}", err),
-            )]);
-        }
-    };
+    let prelude_inference =
+        match infer.infer_program_with_seed_and_types(&mut prelude_program, &[], None) {
+            Ok(inference) => inference,
+            Err(err) => {
+                return AnalysisOutput::diagnostics(vec![CompilerDiagnostic::error_in(
+                    DiagnosticSource::Prelude,
+                    err.span,
+                    format!("type error in <prelude>: {}", err),
+                )]);
+            }
+        };
+    let prelude_env = prelude_inference.env.clone();
     graph.prelude = prelude_program;
 
-    let prelude_module_env = match module_env_from_program(&graph.prelude, PRELUDE_OWNER) {
+    let mut prelude_module_env = match module_env_from_program(&graph.prelude, PRELUDE_OWNER) {
         Ok(env) => env,
         Err(err) => {
             return AnalysisOutput::diagnostics(vec![
@@ -490,6 +500,7 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
             ]);
         }
     };
+    prelude_module_env.attach_inherent_method_schemes(&prelude_inference.inherent_method_schemes);
 
     let mut diagnostics = Vec::new();
     let mut unavailable_modules = HashSet::new();
@@ -520,8 +531,9 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
                     continue;
                 }
             };
-        let (traits, ops) = module_env.to_infer_scope();
+        let (traits, ops, inherent_methods) = module_env.to_infer_scope();
         infer.set_trait_scope(traits, ops);
+        infer.set_inherent_scope(inherent_methods);
         infer.set_known_impl_dicts(module_env.all_dict_names());
         infer.set_import_types(result.import_types.clone());
         let program = match graph.modules.get_mut(&name) {
@@ -548,6 +560,8 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
         result
             .variant_envs
             .insert(name.clone(), inference.variant_env);
+        let mut module_env = module_env;
+        module_env.attach_inherent_method_schemes(&inference.inherent_method_schemes);
         result.module_envs.insert(name.clone(), module_env);
         result.expr_types.insert(name.clone(), inference.expr_types);
         result
@@ -602,7 +616,13 @@ pub fn collect_imports_in_program(program: &Program) -> Vec<String> {
 }
 
 impl ModuleEnv {
-    fn to_infer_scope(&self) -> (HashMap<String, TraitDef>, HashMap<String, String>) {
+    fn to_infer_scope(
+        &self,
+    ) -> (
+        HashMap<String, TraitDef>,
+        HashMap<String, String>,
+        HashMap<String, HashMap<String, Scheme>>,
+    ) {
         let traits = self
             .traits
             .iter()
@@ -613,12 +633,21 @@ impl ModuleEnv {
             .iter()
             .map(|(op, entry)| (op.clone(), entry.trait_name.clone()))
             .collect();
-        (traits, ops)
+        let inherent = self
+            .inherent_impls
+            .iter()
+            .map(|(target_name, entry)| (target_name.clone(), entry.methods.clone()))
+            .collect();
+        (traits, ops, inherent)
     }
 
     /// Return all in-scope trait implementation dictionary names.
     pub fn all_dict_names(&self) -> HashSet<String> {
-        self.impls.values().map(|e| e.dict_name.clone()).collect()
+        self.impls
+            .values()
+            .map(|e| e.dict_name.clone())
+            .chain(self.inherent_impls.values().map(|e| e.dict_name.clone()))
+            .collect()
     }
 
     /// Look up a trait definition by name. Covers all in-scope traits: local, imported, prelude.
@@ -635,12 +664,33 @@ impl ModuleEnv {
         self.dict_names_excluding_owner(PRELUDE_OWNER)
     }
 
+    fn attach_inherent_method_schemes(
+        &mut self,
+        schemes: &HashMap<String, HashMap<String, Scheme>>,
+    ) {
+        for (target, methods) in schemes {
+            if let Some(entry) = self.inherent_impls.get_mut(target) {
+                for (name, scheme) in methods {
+                    if let Some(existing) = entry.methods.get_mut(name) {
+                        *existing = scheme.clone();
+                    }
+                }
+            }
+        }
+    }
+
     fn dict_names_excluding_owner(&self, excluded_owner: &str) -> Vec<String> {
         let mut names: Vec<_> = self
             .impls
             .values()
             .filter(|entry| entry.owner != excluded_owner)
             .map(|entry| entry.dict_name.clone())
+            .chain(
+                self.inherent_impls
+                    .values()
+                    .filter(|entry| entry.owner != excluded_owner)
+                    .map(|entry| entry.dict_name.clone()),
+            )
             .collect();
         names.sort();
         names.dedup();
@@ -729,6 +779,12 @@ fn resolve_imports_in_stmt(
             }
             Ok(())
         }
+        Stmt::InherentImpl(id) => {
+            for method in &mut id.methods {
+                resolve_imports_in_expr(&mut method.body, base_dir, graph)?;
+            }
+            Ok(())
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => Ok(()),
     }
 }
@@ -748,6 +804,17 @@ fn resolve_imports_in_stmt_recovering(
             resolve_imports_in_expr_recovering(body, base_dir, graph, source, diagnostics);
         }
         Stmt::Impl(id) => {
+            for method in &mut id.methods {
+                resolve_imports_in_expr_recovering(
+                    &mut method.body,
+                    base_dir,
+                    graph,
+                    source.clone(),
+                    diagnostics,
+                );
+            }
+        }
+        Stmt::InherentImpl(id) => {
             for method in &mut id.methods {
                 resolve_imports_in_expr_recovering(
                     &mut method.body,
@@ -1026,6 +1093,11 @@ fn collect_imports_in_stmt(stmt: &Stmt, imports: &mut Vec<String>) {
                 collect_imports_in_expr(&method.body, imports);
             }
         }
+        Stmt::InherentImpl(id) => {
+            for method in &id.methods {
+                collect_imports_in_expr(&method.body, imports);
+            }
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
     }
 }
@@ -1158,6 +1230,9 @@ fn merge_module_env(dst: &mut ModuleEnv, src: &ModuleEnv) -> Result<(), Compiler
     for (key, entry) in &src.impls {
         add_impl_env(dst, key.clone(), entry.clone(), true)?;
     }
+    for (target, entry) in &src.inherent_impls {
+        add_inherent_impl_env(dst, target.clone(), entry.clone(), true)?;
+    }
     Ok(())
 }
 
@@ -1205,6 +1280,24 @@ fn add_own_module_env(
                     key,
                     EnvImpl {
                         dict_name: format!("__{}__{}", id.trait_name, target),
+                        owner: owner.to_string(),
+                    },
+                    false,
+                )
+                .map_err(|err| err.with_span_if_absent(id.span))?;
+            }
+            Stmt::InherentImpl(id) => {
+                let target = impl_target_name(&id.target);
+                add_inherent_impl_env(
+                    env,
+                    target.clone(),
+                    EnvInherentImpl {
+                        methods: id
+                            .methods
+                            .iter()
+                            .map(|method| (method.name.clone(), Scheme::mono(Ty::Unit)))
+                            .collect(),
+                        dict_name: format!("__impl__{}", target),
                         owner: owner.to_string(),
                     },
                     false,
@@ -1272,6 +1365,36 @@ fn add_impl_env(
         ));
     }
     env.impls.entry(key).or_insert(entry);
+    Ok(())
+}
+
+fn add_inherent_impl_env(
+    env: &mut ModuleEnv,
+    target: String,
+    entry: EnvInherentImpl,
+    allow_same_owner: bool,
+) -> Result<(), CompilerDiagnostic> {
+    if let Some(existing) = env.inherent_impls.get_mut(&target) {
+        if !allow_same_owner || existing.owner != entry.owner {
+            let duplicate = entry
+                .methods
+                .keys()
+                .find(|method| existing.methods.contains_key(*method))
+                .cloned();
+            if let Some(method) = duplicate {
+                return Err(CompilerDiagnostic::error(
+                    None,
+                    format!(
+                        "method `{}` is already defined for inherent impl target `{}`",
+                        method, target
+                    ),
+                ));
+            }
+        }
+        existing.methods.extend(entry.methods);
+        return Ok(());
+    }
+    env.inherent_impls.insert(target, entry);
     Ok(())
 }
 

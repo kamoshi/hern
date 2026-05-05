@@ -72,7 +72,10 @@ impl TerminalGuard {
                 viewport: Viewport::Inline(VIEWPORT_HEIGHT),
             },
         )?;
-        Ok(Self { terminal, enhanced_keys })
+        Ok(Self {
+            terminal,
+            enhanced_keys,
+        })
     }
 }
 

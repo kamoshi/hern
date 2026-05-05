@@ -1,0 +1,56 @@
+type Option('a) = Some('a) | None
+type Wrap = Wrap(f64)
+
+fn twice(x: f64) { x + x }
+
+impl Option('a) {
+  fn is_some(self) {
+    match self {
+      Some(_) -> true,
+      None -> false,
+    }
+  }
+}
+
+impl Option('a) {
+  fn is_none(self) {
+    match self {
+      Some(_) -> false,
+      None -> true,
+    }
+  }
+}
+
+impl string {
+  fn keep(self) { self }
+}
+
+impl f64 {
+  fn double(self) { self + self }
+}
+
+impl Wrap {
+  fn unwrap(self) {
+    match self {
+      Wrap(value) -> value,
+    }
+  }
+}
+
+let some = Some(1);
+let none = None;
+let n = 21;
+let m = 5;
+let wrapped = Wrap(34);
+
+print(some.is_some());
+print(none.is_some());
+print(some.is_none());
+print(none.is_none());
+print(n.double());
+print(wrapped.unwrap());
+print(m.twice());
+print("hello".keep());
+
+let record = #{ twice: fn(x) { x + 1 } };
+print(record.twice(9));

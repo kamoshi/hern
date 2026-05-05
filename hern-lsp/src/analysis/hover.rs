@@ -3,8 +3,8 @@ use super::uri::uri_to_path;
 use super::workspace::load_workspace_graphs;
 use hern_core::analysis::hover_at;
 use hern_core::ast::{
-    BinOp, Expr, ExprKind, Fixity, ImplMethod, Pattern, Program, SourcePosition, SourceSpan, Stmt,
-    TraitMethod,
+    BinOp, Expr, ExprKind, Fixity, ImplMethod, InherentMethod, Pattern, Program, SourcePosition,
+    SourceSpan, Stmt, TraitMethod,
 };
 use hern_core::module::{GraphInference, ModuleEnv, ModuleGraph};
 use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
@@ -132,6 +132,10 @@ fn trait_access_hover_in_stmt(
             trait_access_hover_in_expr(body, module_env, position)
         }
         Stmt::Impl(impl_def) => impl_def
+            .methods
+            .iter()
+            .find_map(|m| trait_access_hover_in_expr(&m.body, module_env, position)),
+        Stmt::InherentImpl(impl_def) => impl_def
             .methods
             .iter()
             .find_map(|m| trait_access_hover_in_expr(&m.body, module_env, position)),
@@ -274,6 +278,10 @@ fn operator_use_in_stmt(stmt: &Stmt, position: SourcePosition) -> Option<Operato
         Stmt::Let { value, .. } | Stmt::Expr(value) => operator_use_in_expr(value, position),
         Stmt::Fn { body, .. } | Stmt::Op { body, .. } => operator_use_in_expr(body, position),
         Stmt::Impl(impl_def) => impl_def
+            .methods
+            .iter()
+            .find_map(|method| operator_use_in_expr(&method.body, position)),
+        Stmt::InherentImpl(impl_def) => impl_def
             .methods
             .iter()
             .find_map(|method| operator_use_in_expr(&method.body, position)),
@@ -612,6 +620,11 @@ fn type_declaration_hover_text(program: &Program, definition: &Definition) -> Op
                 .iter()
                 .find(|method| method.name_span == definition.location.span)
                 .map(impl_method_signature),
+            Stmt::InherentImpl(impl_def) => impl_def
+                .methods
+                .iter()
+                .find(|method| method.name_span == definition.location.span)
+                .map(inherent_method_signature),
             _ => None,
         }),
         _ => None,
@@ -638,6 +651,30 @@ fn trait_method_signature(method: &hern_core::ast::TraitMethod) -> String {
 }
 
 fn impl_method_signature(method: &ImplMethod) -> String {
+    let params = method
+        .params
+        .iter()
+        .map(|(pat, ty)| {
+            let pat = pattern_to_string(pat);
+            match ty {
+                Some(ty) => format!("{pat}: {}", ast_type_to_string(ty)),
+                None => pat,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match &method.ret_type {
+        Some(ret) => format!(
+            "fn {}({}) -> {}",
+            method.name,
+            params,
+            ast_type_to_string(ret)
+        ),
+        None => format!("fn {}({})", method.name, params),
+    }
+}
+
+fn inherent_method_signature(method: &InherentMethod) -> String {
     let params = method
         .params
         .iter()
@@ -1465,6 +1502,15 @@ fn local_pattern_binding_type_in_stmt(
                 variant_env,
             )
         }),
+        Stmt::InherentImpl(impl_def) => impl_def.methods.iter().find_map(|method| {
+            local_pattern_binding_type_in_expr(
+                &method.body,
+                name,
+                binding_span,
+                expr_types,
+                variant_env,
+            )
+        }),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
     }
 }
@@ -1692,6 +1738,11 @@ fn declaration_value_type_in_stmt<'a>(
         } if *name_span == span => expr_types.get(&body.id),
         Stmt::Expr(expr) => declaration_value_type_in_expr(expr, span, expr_types),
         Stmt::Impl(impl_def) => impl_def.methods.iter().find_map(|method| {
+            (method.name_span == span)
+                .then(|| expr_types.get(&method.body.id))
+                .flatten()
+        }),
+        Stmt::InherentImpl(impl_def) => impl_def.methods.iter().find_map(|method| {
             (method.name_span == span)
                 .then(|| expr_types.get(&method.body.id))
                 .flatten()

@@ -339,6 +339,7 @@ impl LuaCodegen {
             Stmt::Expr(expr) => self.gen_expr_as_stmt(expr),
             Stmt::Type(td) => self.gen_type_def(td),
             Stmt::Impl(id) => self.gen_impl(id),
+            Stmt::InherentImpl(id) => self.gen_inherent_impl(id),
             Stmt::Extern { name, kind, .. } => match kind {
                 ExternKind::Value(lib_path) if name == lib_path => String::new(),
                 ExternKind::Value(lib_path) => {
@@ -457,6 +458,7 @@ impl LuaCodegen {
         let ExprKind::Call {
             callee,
             resolved_callee,
+            is_method_call,
             dict_args,
             ..
         } = &expr.kind
@@ -464,6 +466,9 @@ impl LuaCodegen {
             return false;
         };
         let callee_name = resolved_callee.as_deref().or_else(|| {
+            if *is_method_call {
+                return None;
+            }
             if let ExprKind::Ident(name) = &callee.kind {
                 Some(name.as_str())
             } else {
@@ -536,6 +541,7 @@ impl LuaCodegen {
             ExprKind::Call {
                 callee,
                 args,
+                is_method_call,
                 arg_wrappers,
                 resolved_callee,
                 dict_args,
@@ -545,6 +551,9 @@ impl LuaCodegen {
                     .clone()
                     .or_else(|| self.gen_expr_with_subst(callee, subst, pre))?;
                 let mut all_args: Vec<String> = dict_args.clone();
+                if let Some(receiver) = method_receiver(callee, *is_method_call) {
+                    all_args.push(self.gen_expr_with_subst(receiver, subst, pre)?);
+                }
                 let generated_args = args
                     .iter()
                     .enumerate()
@@ -719,6 +728,7 @@ impl LuaCodegen {
             ExprKind::Call {
                 callee,
                 args,
+                is_method_call,
                 arg_wrappers,
                 resolved_callee,
                 dict_args,
@@ -728,6 +738,9 @@ impl LuaCodegen {
                     .clone()
                     .unwrap_or_else(|| self.gen_expr(callee, pre));
                 let mut all_args: Vec<String> = dict_args.clone();
+                if let Some(receiver) = method_receiver(callee, *is_method_call) {
+                    all_args.push(self.gen_expr(receiver, pre));
+                }
                 all_args.extend(args.iter().enumerate().map(|(idx, arg)| {
                     let arg_s = self.gen_expr(arg, pre);
                     wrap_call_argument(arg_s, arg_wrappers.get(idx).and_then(Option::as_ref))
@@ -1522,6 +1535,43 @@ impl LuaCodegen {
         out.push_str(&format!("{}}}", self.ind()));
         out
     }
+
+    fn gen_inherent_impl(&mut self, id: &InherentImplDef) -> String {
+        let dict_name = format!("__impl__{}", impl_target_name(&id.target));
+        let ind = self.ind();
+        let mut out = format!("{}local {} = {} or {{}}\n", ind, dict_name, dict_name);
+        for method in &id.methods {
+            let mut param_names = method.dict_params.clone();
+            let mut pattern_destructures = String::new();
+            for (i, (pat, _)) in method.params.iter().enumerate() {
+                match pat {
+                    Pattern::Variable(n, _) => param_names.push(n.clone()),
+                    Pattern::Wildcard => param_names.push("_".to_string()),
+                    _ => {
+                        let placeholder = format!("__p{}", i);
+                        param_names.push(placeholder.clone());
+                        self.indent += 2;
+                        pattern_destructures
+                            .push_str(&self.gen_for_pattern_bindings(pat, &placeholder));
+                        self.indent -= 2;
+                    }
+                }
+            }
+            out.push_str(&format!(
+                "{}{}.{} = function({})\n",
+                self.ind(),
+                dict_name,
+                mangle_op(&method.name),
+                param_names.join(", ")
+            ));
+            self.indent += 2;
+            out.push_str(&pattern_destructures);
+            out.push_str(&self.gen_expr_as_body(&method.body));
+            self.indent -= 2;
+            out.push_str(&format!("{}end\n", self.ind()));
+        }
+        out
+    }
 }
 
 // ── Control-flow analysis ─────────────────────────────────────────────────────
@@ -1653,6 +1703,16 @@ fn stmt_always_exits(stmt: &Stmt, include_bc: bool) -> bool {
     stmt_flow(stmt, include_bc).always_exits()
 }
 
+fn method_receiver(callee: &Expr, is_method_call: bool) -> Option<&Expr> {
+    if !is_method_call {
+        return None;
+    }
+    let ExprKind::FieldAccess { expr, .. } = &callee.kind else {
+        return None;
+    };
+    Some(expr)
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub(crate) fn mangle_op(name: &str) -> String {
@@ -1714,6 +1774,8 @@ fn impl_dict_names_from_stmts(stmts: &[Stmt]) -> Vec<String> {
                     id.trait_name,
                     impl_target_name(&id.target)
                 ))
+            } else if let Stmt::InherentImpl(id) = stmt {
+                Some(format!("__impl__{}", impl_target_name(&id.target)))
             } else {
                 None
             }
@@ -1774,6 +1836,7 @@ fn prelude_value_names(stmts: &[Stmt]) -> Vec<String> {
             | Stmt::Expr(_)
             | Stmt::Trait(_)
             | Stmt::Impl(_)
+            | Stmt::InherentImpl(_)
             | Stmt::TypeAlias { .. } => {}
         }
     }

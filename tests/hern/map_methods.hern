@@ -1,0 +1,22 @@
+let m: Map(string, f64) = map_new();
+
+m.set("a", 1);
+m.set("b", 2);
+m.set("c", 3);
+
+print(m.size());
+print(m.has("b"));
+print(m.has("z"));
+
+let got = m.get("a");
+match got {
+    Some(v) -> print(v),
+    None -> print(0),
+};
+
+m.delete("b");
+print(m.has("b"));
+print(m.size());
+
+let keys = m.keys();
+print(array_len(keys));

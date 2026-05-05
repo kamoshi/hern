@@ -115,6 +115,47 @@ hello
 1
 """
 
+[tests.map_methods]
+path = "tests/hern/map_methods.hern"
+expect = "typecheck"
+output = """
+3
+1
+0
+1
+0
+2
+2
+"""
+
+[tests.inherent_impls]
+path = "tests/hern/inherent_impls.hern"
+expect = "typecheck"
+output = """
+1
+0
+0
+1
+42
+34
+10
+hello
+10
+"""
+
+[tests.module_inherent_import]
+path = "tests/hern/module_inherent_import.hern"
+expect = "typecheck"
+output = """
+11
+11
+"""
+
+[tests.duplicate_inherent_method]
+path = "tests/hern/duplicate_inherent_method.hern"
+expect = "error"
+error_contains = "already defined"
+
 [tests.loop_test]
 path = "tests/hern/loop_test.hern"
 expect = "typecheck"

@@ -102,6 +102,24 @@ mod tests {
     }
 
     #[test]
+    fn workspace_analysis_supports_imported_record_method_syntax() {
+        let test_dir = temp_dir("import-record-method");
+        let entry = test_dir.join("main.hern");
+        let dep = test_dir.join("dep.hern");
+        fs::write(&dep, "fn value() { 1 }\n#{ value: value }\n").unwrap();
+        fs::write(&entry, "let dep = import \"dep\";\ndep.value()\n").unwrap();
+
+        let analysis = analyze_workspace(WorkspaceInputs {
+            entry,
+            overlays: HashMap::new(),
+            prelude: None,
+        });
+
+        assert!(analysis.diagnostics.is_empty(), "expected no diagnostics");
+        assert!(analysis.inference.is_some());
+    }
+
+    #[test]
     fn workspace_analysis_returns_successful_graph_and_inference() {
         let test_dir = temp_dir("success");
         let entry = test_dir.join("main.hern");

@@ -89,6 +89,11 @@ fn find_call_in_stmt<'a>(
                 find_call_in_expr(&method.body, position, best);
             }
         }
+        Stmt::InherentImpl(impl_def) => {
+            for method in &impl_def.methods {
+                find_call_in_expr(&method.body, position, best);
+            }
+        }
         Stmt::Expr(expr) => find_call_in_expr(expr, position, best),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
     }

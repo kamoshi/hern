@@ -83,6 +83,11 @@ fn collect_code_actions_for_stmt(
                 collect_code_actions_for_expr(&method.body, uri, range, binding_types, actions);
             }
         }
+        Stmt::InherentImpl(impl_def) => {
+            for method in &impl_def.methods {
+                collect_code_actions_for_expr(&method.body, uri, range, binding_types, actions);
+            }
+        }
         Stmt::Expr(expr) => collect_code_actions_for_expr(expr, uri, range, binding_types, actions),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
     }

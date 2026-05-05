@@ -90,6 +90,7 @@ pub enum Stmt {
     },
     Trait(TraitDef),
     Impl(ImplDef),
+    InherentImpl(InherentImplDef),
     Type(TypeDef),
     TypeAlias {
         span: SourceSpan,
@@ -118,6 +119,7 @@ impl Stmt {
             | Stmt::Extern { span, .. } => *span,
             Stmt::Trait(td) => td.span,
             Stmt::Impl(id) => id.span,
+            Stmt::InherentImpl(id) => id.span,
             Stmt::Type(td) => td.span,
             Stmt::Expr(expr) => expr.span,
         }
@@ -187,6 +189,25 @@ pub struct ImplDef {
     pub trait_name: String,
     pub target: Type,
     pub methods: Vec<ImplMethod>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InherentMethod {
+    pub span: SourceSpan,
+    pub name: String,
+    pub name_span: SourceSpan,
+    pub params: Vec<(Pattern, Option<Type>)>,
+    pub ret_type: Option<Type>,
+    pub body: Expr,
+    pub dict_params: Vec<String>,
+    pub type_bounds: Vec<TypeBound>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InherentImplDef {
+    pub span: SourceSpan,
+    pub target: Type,
+    pub methods: Vec<InherentMethod>,
 }
 
 // ── Sum types ─────────────────────────────────────────────────────────────────
@@ -332,6 +353,7 @@ pub enum ExprKind {
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
+        is_method_call: bool,
         arg_wrappers: Vec<Option<ArgWrapper>>,
         /// Resolved callee for trait methods, e.g. `__Functor__Option.map`
         resolved_callee: Option<String>,

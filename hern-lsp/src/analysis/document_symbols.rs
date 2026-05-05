@@ -1,6 +1,8 @@
 use super::uri::{source_span_to_range, uri_to_path};
 use super::workspace::load_document_graph_recovering;
-use hern_core::ast::{ExternKind, ImplDef, Pattern, Program, SourceSpan, Stmt, TraitDef, TypeDef};
+use hern_core::ast::{
+    ExternKind, ImplDef, InherentImplDef, Pattern, Program, SourceSpan, Stmt, TraitDef, TypeDef,
+};
 use lsp_types::{DocumentSymbol, DocumentSymbolResponse, SymbolKind, Uri};
 
 pub(crate) fn document_symbols(
@@ -46,6 +48,7 @@ fn symbols_for_stmt(stmt: &Stmt) -> Vec<DocumentSymbol> {
         )],
         Stmt::Trait(trait_def) => vec![trait_symbol(trait_def)],
         Stmt::Impl(impl_def) => vec![impl_symbol(impl_def)],
+        Stmt::InherentImpl(impl_def) => vec![inherent_impl_symbol(impl_def)],
         Stmt::Type(type_def) => vec![type_symbol(type_def)],
         Stmt::TypeAlias {
             span,
@@ -118,6 +121,29 @@ fn impl_symbol(impl_def: &ImplDef) -> DocumentSymbol {
         .collect();
     symbol(
         format!("impl {}", impl_def.trait_name),
+        SymbolKind::OBJECT,
+        impl_def.span,
+        impl_def.span,
+        Some(children),
+    )
+}
+
+fn inherent_impl_symbol(impl_def: &InherentImplDef) -> DocumentSymbol {
+    let children = impl_def
+        .methods
+        .iter()
+        .map(|method| {
+            symbol(
+                method.name.clone(),
+                SymbolKind::METHOD,
+                method.span,
+                method.name_span,
+                None,
+            )
+        })
+        .collect();
+    symbol(
+        "impl".to_string(),
         SymbolKind::OBJECT,
         impl_def.span,
         impl_def.span,

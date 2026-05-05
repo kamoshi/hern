@@ -420,6 +420,11 @@ impl IndexBuilder {
                     self.define(&method.name, method.name_span, DefinitionKind::ImplMethod);
                 }
             }
+            Stmt::InherentImpl(impl_def) => {
+                for method in &impl_def.methods {
+                    self.define(&method.name, method.name_span, DefinitionKind::ImplMethod);
+                }
+            }
             Stmt::Type(type_def) => {
                 self.define(&type_def.name, type_def.name_span, DefinitionKind::Type);
                 for variant in &type_def.variants {
@@ -460,6 +465,11 @@ impl IndexBuilder {
                     self.index_callable_body(&method.params, method.span, &method.body);
                 }
             }
+            Stmt::InherentImpl(impl_def) => {
+                for method in &impl_def.methods {
+                    self.index_callable_body(&method.params, method.span, &method.body);
+                }
+            }
             Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
         }
     }
@@ -495,6 +505,11 @@ impl IndexBuilder {
                 self.index_callable_body(params, *name_span, body);
             }
             Stmt::Impl(impl_def) => {
+                for method in &impl_def.methods {
+                    self.index_callable_body(&method.params, method.span, &method.body);
+                }
+            }
+            Stmt::InherentImpl(impl_def) => {
                 for method in &impl_def.methods {
                     self.index_callable_body(&method.params, method.span, &method.body);
                 }

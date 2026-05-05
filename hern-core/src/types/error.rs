@@ -51,6 +51,7 @@ pub enum TypeError {
     },
     UnknownImport(String),
     UnknownType(String),
+    RecursiveTypeAlias(String),
     MissingTraitImpl {
         trait_name: String,
         impl_target: String,
@@ -58,6 +59,22 @@ pub enum TypeError {
     AmbiguousTraitMethod {
         method: String,
         candidates: Vec<String>,
+    },
+    UnknownMethod {
+        receiver: String,
+        method: String,
+    },
+    AmbiguousMethodReceiver {
+        method: String,
+    },
+    InvalidInherentImplTarget(String),
+    DuplicateInherentMethod {
+        target: String,
+        method: String,
+    },
+    InherentMethodMissingReceiver {
+        target: String,
+        method: String,
     },
     /// A refutable pattern was used in a function-parameter position.
     /// Only irrefutable patterns (variable, wildcard, record, `[..rest]`) are allowed.
@@ -188,6 +205,11 @@ impl fmt::Display for TypeError {
             }
             TypeError::UnknownImport(path) => write!(f, "unknown import: `{}`", path),
             TypeError::UnknownType(name) => write!(f, "unknown type: `{}`", name),
+            TypeError::RecursiveTypeAlias(name) => write!(
+                f,
+                "recursive type alias `{}` is not supported; use a nominal type constructor instead",
+                name
+            ),
             TypeError::MissingTraitImpl {
                 trait_name,
                 impl_target,
@@ -203,6 +225,29 @@ impl fmt::Display for TypeError {
                 method,
                 candidates.join(", "),
                 method,
+            ),
+            TypeError::UnknownMethod { receiver, method } => {
+                write!(f, "type `{}` has no method `{}`", receiver, method)
+            }
+            TypeError::AmbiguousMethodReceiver { method } => write!(
+                f,
+                "cannot resolve method `{}` because the receiver type is unconstrained; add a type annotation",
+                method
+            ),
+            TypeError::InvalidInherentImplTarget(target) => write!(
+                f,
+                "invalid inherent impl target `{}`: expected a nominal type or one of `string`, `f64`, `bool`",
+                target
+            ),
+            TypeError::DuplicateInherentMethod { target, method } => write!(
+                f,
+                "method `{}` is already defined for inherent impl target `{}`",
+                method, target
+            ),
+            TypeError::InherentMethodMissingReceiver { target, method } => write!(
+                f,
+                "inherent method `{}` for `{}` must have a first receiver parameter",
+                method, target
             ),
             TypeError::RefutableParamPattern => write!(
                 f,

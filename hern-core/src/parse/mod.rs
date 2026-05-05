@@ -487,16 +487,18 @@ impl<'tokens> Parser<'tokens> {
             ));
         }
 
-        // Peek to see if it's a type alias or a sum type
+        // Peek to see if it's a type alias or a sum type.
+        //
+        // `type Wrap = Wrap(f64)` is the nominal-newtype spelling: the right-hand
+        // identifier is treated as a constructor when it matches the declared type.
+        // Other single `Ident(args...)` forms remain aliases, so `type Names = Array(string)`
+        // keeps its existing type-alias meaning.
         let is_sum_type = if let Some(tok) = tokens.get(ptr) {
             match tok.token {
                 Token::Hash | Token::LParen | Token::Fn | Token::LBracket | Token::Star => false,
                 Token::Ident(ref id) if id.starts_with('\'') => false,
-                Token::Ident(_) => {
+                Token::Ident(ref id) => {
                     // It could be a variant or a type ident alias.
-                    // If we see a '|' later, or if it's followed by '(', it's likely a sum type.
-                    // But `Type(Payload)` is also a variant.
-                    // Actually, let's look for a '|' in the remaining tokens of this statement.
                     let mut lookahead = ptr;
                     let mut pipe_found = false;
                     while lookahead < tokens.len() {
@@ -514,7 +516,7 @@ impl<'tokens> Parser<'tokens> {
                             _ => lookahead += 1,
                         }
                     }
-                    pipe_found
+                    pipe_found || id == &name
                 }
                 _ => false,
             }
@@ -668,8 +670,17 @@ impl<'tokens> Parser<'tokens> {
     fn parse_impl_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
         let mut ptr = 0;
         ptr += self.expect(&tokens[ptr..], Token::Impl)?;
-        let (c_tname, trait_name) = self.expect_ident(&tokens[ptr..])?;
-        ptr += c_tname;
+        let (c_head, head) = self.parse_type(&tokens[ptr..])?;
+        ptr += c_head;
+        if tokens.get(ptr).map(|t| &t.token) != Some(&Token::For) {
+            return self.parse_inherent_impl_tail(tokens, ptr, head);
+        }
+        let Type::Ident(trait_name) = head else {
+            return Err(ParseError::new(
+                "Expected trait name before `for` in trait impl",
+                tokens[0].span,
+            ));
+        };
         ptr += self.expect(&tokens[ptr..], Token::For)?;
         let (c_target, target) = self.parse_type(&tokens[ptr..])?;
         ptr += c_target;
@@ -736,6 +747,45 @@ impl<'tokens> Parser<'tokens> {
             Stmt::Impl(ImplDef {
                 span: consumed_span(tokens, ptr),
                 trait_name,
+                target,
+                methods,
+            }),
+        ))
+    }
+
+    fn parse_inherent_impl_tail(
+        &self,
+        tokens: &[Spanned],
+        mut ptr: usize,
+        target: Type,
+    ) -> Result<(usize, Stmt), ParseError> {
+        ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
+        let mut methods = Vec::new();
+        while tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
+            let method_start = ptr;
+            ptr += self.expect(&tokens[ptr..], Token::Fn)?;
+            let (c_mname, mname, mname_span) = self.expect_ident_with_span(&tokens[ptr..])?;
+            ptr += c_mname;
+            let (c_bounds, type_bounds) = self.parse_type_bounds(&tokens[ptr..])?;
+            ptr += c_bounds;
+            let (c_tail, params, ret_type, body) = self.parse_fn_params_body(&tokens[ptr..])?;
+            ptr += c_tail;
+            methods.push(InherentMethod {
+                span: consumed_span(&tokens[method_start..], ptr - method_start),
+                name: mname,
+                name_span: mname_span,
+                params,
+                ret_type,
+                body,
+                dict_params: vec![],
+                type_bounds,
+            });
+        }
+        ptr += self.expect(&tokens[ptr..], Token::RBrace)?;
+        Ok((
+            ptr,
+            Stmt::InherentImpl(InherentImplDef {
+                span: consumed_span(tokens, ptr),
                 target,
                 methods,
             }),
@@ -1873,6 +1923,7 @@ impl<'tokens> Parser<'tokens> {
                 ExprKind::Call {
                     callee: Box::new(callee),
                     args,
+                    is_method_call: false,
                     arg_wrappers: Vec::new(),
                     resolved_callee: None,
                     dict_args: vec![],

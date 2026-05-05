@@ -73,6 +73,12 @@ struct ResolvedTraitMethod {
     method: TraitMethod,
 }
 
+#[derive(Debug, Clone)]
+struct InherentMethodInfo {
+    scheme: Scheme,
+    resolved_callee: String,
+}
+
 // ── Variant environment ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -135,6 +141,8 @@ pub struct Infer {
     type_aliases: HashMap<String, (Vec<String>, Type)>,
     declared_types: HashSet<String>,
     op_trait_map: HashMap<String, String>,
+    inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
+    scoped_inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
     import_types: HashMap<String, Ty>,
     known_impl_dicts: HashSet<String>,
     loop_break_tys: Vec<Ty>,
@@ -162,6 +170,7 @@ struct FinalizedConstraints {
 pub struct InferenceResult {
     pub env: TypeEnv,
     pub variant_env: VariantEnv,
+    pub inherent_method_schemes: HashMap<String, HashMap<String, Scheme>>,
     pub value_ty: Ty,
     pub expr_types: HashMap<NodeId, Ty>,
     pub symbol_types: HashMap<NodeId, Ty>,
@@ -181,6 +190,7 @@ pub struct InferenceResult {
 pub struct ModuleInference {
     pub env: TypeEnv,
     pub variant_env: VariantEnv,
+    pub inherent_method_schemes: HashMap<String, HashMap<String, Scheme>>,
     pub value_ty: Ty,
     pub expr_types: HashMap<NodeId, Ty>,
     pub symbol_types: HashMap<NodeId, Ty>,
@@ -193,6 +203,7 @@ impl Default for ModuleInference {
         Self {
             env: TypeEnv::new(),
             variant_env: VariantEnv::default(),
+            inherent_method_schemes: HashMap::new(),
             value_ty: Ty::Unit,
             expr_types: HashMap::new(),
             symbol_types: HashMap::new(),
@@ -222,6 +233,7 @@ struct InferSnapshot {
     symbol_types: HashMap<NodeId, Ty>,
     binding_types: HashMap<SourceSpan, Ty>,
     definition_schemes: HashMap<SourceSpan, Scheme>,
+    inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
     env: TypeEnv,
 }
 
@@ -267,6 +279,8 @@ impl Infer {
             type_aliases: HashMap::new(),
             declared_types: HashSet::new(),
             op_trait_map: HashMap::new(),
+            inherent_methods: HashMap::new(),
+            scoped_inherent_methods: HashMap::new(),
             import_types: HashMap::new(),
             known_impl_dicts: HashSet::new(),
             loop_break_tys: Vec::new(),
@@ -298,6 +312,33 @@ impl Infer {
     ) {
         self.trait_env = traits;
         self.op_trait_map = op_trait_map;
+    }
+
+    pub fn set_inherent_scope(
+        &mut self,
+        inherent_methods: HashMap<String, HashMap<String, Scheme>>,
+    ) {
+        self.scoped_inherent_methods = inherent_methods
+            .into_iter()
+            .map(|(target, methods)| {
+                let dict_name = inherent_impl_dict_name(&target);
+                (
+                    target,
+                    methods
+                        .into_iter()
+                        .map(|(name, scheme)| {
+                            (
+                                name.clone(),
+                                InherentMethodInfo {
+                                    scheme,
+                                    resolved_callee: format!("{}.{}", dict_name, mangle_op(&name)),
+                                },
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
     }
 
     fn instantiate_scheme(&mut self, scheme: &Scheme) -> InstantiatedScheme {
@@ -335,6 +376,12 @@ impl Infer {
             instantiated.ty
         } else {
             Ty::Qualified(instantiated.constraints, Box::new(instantiated.ty))
+        }
+    }
+
+    fn record_symbol_type(&mut self, node_id: NodeId, ty: Ty) {
+        if node_id != 0 {
+            self.symbol_types.insert(node_id, self.subst.apply(&ty));
         }
     }
 
@@ -702,6 +749,7 @@ impl Infer {
         Ok(InferenceResult {
             env,
             variant_env: self.variant_env.clone(),
+            inherent_method_schemes: self.export_inherent_method_schemes(),
             value_ty: self.subst.apply(&value_ty),
             expr_types,
             symbol_types,
@@ -858,6 +906,7 @@ impl Infer {
                 symbol_types: self.symbol_types.clone(),
                 binding_types: self.binding_types.clone(),
                 definition_schemes: self.definition_schemes.clone(),
+                inherent_methods: self.inherent_methods.clone(),
                 env: env.clone(),
             };
 
@@ -881,6 +930,7 @@ impl Infer {
                     self.symbol_types = snapshot.symbol_types;
                     self.binding_types = snapshot.binding_types;
                     self.definition_schemes = snapshot.definition_schemes;
+                    self.inherent_methods = snapshot.inherent_methods;
                     env = snapshot.env;
                     unavailable.extend(bound);
                     diagnostics.push(err);
@@ -930,6 +980,7 @@ impl Infer {
             ModuleInference {
                 env,
                 variant_env: self.variant_env.clone(),
+                inherent_method_schemes: self.export_inherent_method_schemes(),
                 value_ty: self.subst.apply(&value_ty),
                 expr_types,
                 symbol_types,
@@ -944,7 +995,8 @@ impl Infer {
         self.type_aliases.clear();
         self.declared_types.clear();
         self.declared_types
-            .extend(["string", "bool", "Array", "Iter"].map(str::to_string));
+            .extend(["string", "bool", "f64", "Array", "Iter"].map(str::to_string));
+        self.inherent_methods.clear();
         self.pending_constraints.clear();
         self.loop_break_tys.clear();
         self.fn_return_tys.clear();
@@ -964,6 +1016,21 @@ impl Infer {
                 ));
             }
         }
+    }
+
+    fn export_inherent_method_schemes(&self) -> HashMap<String, HashMap<String, Scheme>> {
+        self.inherent_methods
+            .iter()
+            .map(|(target, methods)| {
+                (
+                    target.clone(),
+                    methods
+                        .iter()
+                        .map(|(name, info)| (name.clone(), self.subst.apply_scheme(&info.scheme)))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     fn infer_stmt(&mut self, env: &mut TypeEnv, stmt: &mut Stmt) -> Result<Ty, SpannedTypeError> {
@@ -1104,6 +1171,10 @@ impl Infer {
             Stmt::Trait(_) => Ok(Ty::Unit),
             Stmt::Impl(id) => {
                 self.infer_impl(env, id)?;
+                Ok(Ty::Unit)
+            }
+            Stmt::InherentImpl(id) => {
+                self.infer_inherent_impl(env, id)?;
                 Ok(Ty::Unit)
             }
             Stmt::Expr(expr) => self.infer_expr(env, expr),
@@ -1316,6 +1387,122 @@ impl Infer {
         Ok(())
     }
 
+    fn infer_inherent_impl(
+        &mut self,
+        env: &mut TypeEnv,
+        id: &mut InherentImplDef,
+    ) -> Result<(), SpannedTypeError> {
+        let target_name = validate_inherent_impl_target(&id.target, &self.declared_types)
+            .map_err(|err| err.at(id.span))?;
+        let dict_name = inherent_impl_dict_name(&target_name);
+        let mut seen_methods = HashSet::new();
+        let mut dict_fields = Vec::new();
+
+        for method in &mut id.methods {
+            if !seen_methods.insert(method.name.clone())
+                || self
+                    .inherent_methods
+                    .get(&target_name)
+                    .is_some_and(|methods| methods.contains_key(&method.name))
+            {
+                return Err(TypeError::DuplicateInherentMethod {
+                    target: target_name.clone(),
+                    method: method.name.clone(),
+                }
+                .at(method.name_span));
+            }
+            if method.params.is_empty() {
+                return Err(TypeError::InherentMethodMissingReceiver {
+                    target: target_name.clone(),
+                    method: method.name.clone(),
+                }
+                .at(method.span));
+            }
+
+            let mut param_vars = HashMap::new();
+            let target_ty = self.ast_to_ty_with_vars(&id.target, &mut param_vars)?;
+            let initial_constraints =
+                self.collect_type_bound_constraints(&mut param_vars, &method.type_bounds);
+            let mut param_tys = Vec::new();
+            let mut body_env = env.clone();
+
+            for (idx, (pat, p_type)) in method.params.iter().enumerate() {
+                if !is_irrefutable_param(pat) {
+                    return Err(TypeError::RefutableParamPattern.at(method.body.span));
+                }
+                let p_ty = if idx == 0 {
+                    let receiver_ty = target_ty.clone();
+                    if let Some(explicit) = p_type {
+                        let explicit_ty = self.ast_to_ty_with_vars(explicit, &mut param_vars)?;
+                        unify(&mut self.subst, receiver_ty.clone(), explicit_ty)
+                            .map_err(|err| err.at(method.body.span))?;
+                    }
+                    receiver_ty
+                } else {
+                    match p_type {
+                        Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
+                        None => self.subst.fresh_var(),
+                    }
+                };
+                param_tys.push(p_ty.clone());
+                self.check_pattern(pat, p_ty, &mut body_env, false)?;
+            }
+
+            let ret_ty = match &method.ret_type {
+                Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
+                None => self.subst.fresh_var(),
+            };
+            let fn_ty = Ty::Func(param_tys.clone(), Box::new(ret_ty.clone()));
+
+            let saved_pending = std::mem::take(&mut self.pending_constraints);
+            self.pending_constraints.extend(initial_constraints);
+            self.fn_return_tys.push(ret_ty.clone());
+            let body_ty = self.infer_expr(&body_env, &mut method.body)?;
+            self.fn_return_tys.pop();
+            unify(&mut self.subst, body_ty, ret_ty).map_err(|err| err.at(method.body.span))?;
+
+            let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
+            let finalized = self.finalize_constraints(env, fn_ty.clone(), fn_constraints);
+            self.pending_constraints.extend(finalized.bubbled.clone());
+            method.dict_params = finalized.owned.iter().map(dict_param_name).collect();
+
+            let resolver =
+                |p: &PendingDictArg| resolve_local_or_concrete(p, &finalized.owned, &self.subst);
+            resolve_dict_uses_expr(&mut method.body, &resolver, false)?;
+
+            let scheme = finalized.scheme.clone();
+            self.definition_schemes
+                .insert(method.name_span, scheme.clone());
+            self.inherent_methods
+                .entry(target_name.clone())
+                .or_default()
+                .insert(
+                    method.name.clone(),
+                    InherentMethodInfo {
+                        scheme,
+                        resolved_callee: format!("{}.{}", dict_name, mangle_op(&method.name)),
+                    },
+                );
+            dict_fields.push((method.name.clone(), self.subst.apply(&fn_ty)));
+        }
+
+        dict_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+        env.insert(
+            dict_name,
+            EnvInfo {
+                scheme: self.generalize(
+                    env,
+                    Ty::Record(Row {
+                        fields: dict_fields,
+                        tail: Box::new(Ty::Unit),
+                    }),
+                ),
+                is_mutable: false,
+            },
+        );
+        Ok(())
+    }
+
     fn infer_expr(&mut self, env: &TypeEnv, expr: &mut Expr) -> Result<Ty, SpannedTypeError> {
         let result: Result<Ty, SpannedTypeError> = match &mut expr.kind {
             ExprKind::Number(_) => Ok(Ty::F64),
@@ -1493,6 +1680,7 @@ impl Infer {
             ExprKind::Call {
                 callee,
                 args,
+                is_method_call,
                 arg_wrappers,
                 resolved_callee,
                 dict_args,
@@ -1521,6 +1709,22 @@ impl Infer {
                         trait_def,
                         method,
                         "trait method call",
+                    );
+                }
+
+                if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind {
+                    let callee_id = callee.id;
+                    return self.resolve_receiver_call(
+                        env,
+                        callee_id,
+                        expr,
+                        field,
+                        args,
+                        is_method_call,
+                        arg_wrappers,
+                        resolved_callee,
+                        dict_args,
+                        pending_dict_args,
                     );
                 }
 
@@ -1962,6 +2166,144 @@ impl Infer {
         Ok(self.subst.apply(&ret_ty))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_receiver_call(
+        &mut self,
+        env: &TypeEnv,
+        callee_id: NodeId,
+        receiver: &mut Box<Expr>,
+        method_name: &str,
+        args: &mut [Expr],
+        is_method_call: &mut bool,
+        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
+        resolved_callee: &mut Option<String>,
+        dict_args: &mut Vec<String>,
+        pending_dict_args: &mut Vec<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        let inferred_receiver_ty = self.infer_expr(env, receiver)?;
+        let receiver_ty = self.subst.apply(&inferred_receiver_ty);
+
+        if let Some(mut field_ty) = record_field_ty(&receiver_ty, method_name) {
+            if let Ty::Qualified(constraints, inner) = field_ty {
+                attach_dict_args(
+                    dict_args,
+                    pending_dict_args,
+                    &mut self.pending_constraints,
+                    &constraints,
+                    &self.subst,
+                );
+                field_ty = *inner;
+            }
+            let arg_tys = self.infer_args(env, args, arg_wrappers)?;
+            let ret_ty = Ty::Var(self.fresh_var());
+            let call_ty = Ty::Func(arg_tys, Box::new(ret_ty.clone()));
+            unify(&mut self.subst, field_ty, call_ty.clone())?;
+            self.record_symbol_type(callee_id, call_ty);
+            return Ok(self.subst.apply(&ret_ty));
+        }
+
+        if matches!(receiver_ty, Ty::Var(_)) {
+            if env.get(method_name).is_some()
+                || self
+                    .inherent_methods
+                    .values()
+                    .any(|methods| methods.contains_key(method_name))
+                || self
+                    .scoped_inherent_methods
+                    .values()
+                    .any(|methods| methods.contains_key(method_name))
+            {
+                return Err(TypeError::AmbiguousMethodReceiver {
+                    method: method_name.to_string(),
+                }
+                .into());
+            }
+            let field_ty = Ty::Var(self.fresh_var());
+            let tail_ty = Ty::Var(self.fresh_var());
+            unify(
+                &mut self.subst,
+                receiver_ty,
+                Ty::Record(Row {
+                    fields: vec![(method_name.to_string(), field_ty.clone())],
+                    tail: Box::new(tail_ty),
+                }),
+            )?;
+            let arg_tys = self.infer_args(env, args, arg_wrappers)?;
+            let ret_ty = Ty::Var(self.fresh_var());
+            let call_ty = Ty::Func(arg_tys, Box::new(ret_ty.clone()));
+            unify(&mut self.subst, field_ty, call_ty.clone())?;
+            self.record_symbol_type(callee_id, call_ty);
+            return Ok(self.subst.apply(&ret_ty));
+        }
+
+        let target_name = ty_target_name(&receiver_ty).unwrap_or_else(|| receiver_ty.to_string());
+
+        if let Some(method_info) = self
+            .inherent_methods
+            .get(&target_name)
+            .and_then(|methods| methods.get(method_name))
+            .cloned()
+        {
+            let mut arg_tys = Vec::with_capacity(args.len() + 1);
+            arg_tys.push(receiver_ty);
+            arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
+            let ret_ty = self.infer_constrained_apply(
+                &method_info.scheme,
+                arg_tys.clone(),
+                dict_args,
+                pending_dict_args,
+            )?;
+            self.record_symbol_type(callee_id, Ty::Func(arg_tys, Box::new(ret_ty.clone())));
+            *is_method_call = true;
+            *resolved_callee = Some(method_info.resolved_callee);
+            return Ok(ret_ty);
+        }
+
+        if let Some(method_info) = self
+            .scoped_inherent_methods
+            .get(&target_name)
+            .and_then(|methods| methods.get(method_name))
+            .cloned()
+        {
+            let mut arg_tys = Vec::with_capacity(args.len() + 1);
+            arg_tys.push(receiver_ty);
+            arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
+            let ret_ty = self.infer_constrained_apply(
+                &method_info.scheme,
+                arg_tys.clone(),
+                dict_args,
+                pending_dict_args,
+            )?;
+            self.record_symbol_type(callee_id, Ty::Func(arg_tys, Box::new(ret_ty.clone())));
+            *is_method_call = true;
+            *resolved_callee = Some(method_info.resolved_callee);
+            return Ok(ret_ty);
+        }
+
+        if let Some(info) = env.get(method_name) {
+            let scheme = info.scheme.clone();
+            let mut arg_tys = Vec::with_capacity(args.len() + 1);
+            arg_tys.push(receiver_ty);
+            arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
+            let ret_ty = self.infer_constrained_apply(
+                &scheme,
+                arg_tys.clone(),
+                dict_args,
+                pending_dict_args,
+            )?;
+            self.record_symbol_type(callee_id, Ty::Func(arg_tys, Box::new(ret_ty.clone())));
+            *is_method_call = true;
+            *resolved_callee = Some(method_name.to_string());
+            return Ok(ret_ty);
+        }
+
+        Err(TypeError::UnknownMethod {
+            receiver: target_name,
+            method: method_name.to_string(),
+        }
+        .into())
+    }
+
     fn check_trait_method_signature(
         &mut self,
         trait_def: &TraitDef,
@@ -2383,12 +2725,21 @@ impl Infer {
         ast_ty: &Type,
         param_vars: &mut HashMap<String, TyVar>,
     ) -> Result<Ty, TypeError> {
+        self.ast_to_ty_with_vars_inner(ast_ty, param_vars, &mut Vec::new())
+    }
+
+    fn ast_to_ty_with_vars_inner(
+        &mut self,
+        ast_ty: &Type,
+        param_vars: &mut HashMap<String, TyVar>,
+        alias_stack: &mut Vec<String>,
+    ) -> Result<Ty, TypeError> {
         Ok(match ast_ty {
             Type::Ident(name) => {
                 if let Some((params, aliased_ty)) = self.type_aliases.get(name).cloned()
                     && params.is_empty()
                 {
-                    return self.ast_to_ty_with_vars(&aliased_ty, param_vars);
+                    return self.expand_type_alias(name, &aliased_ty, param_vars, alias_stack);
                 }
                 match name.as_str() {
                     "f64" => Ty::F64,
@@ -2409,11 +2760,11 @@ impl Infer {
             Type::Func(params, ret) => {
                 let param_tys = params
                     .iter()
-                    .map(|p| self.ast_to_ty_with_vars(p, param_vars))
+                    .map(|p| self.ast_to_ty_with_vars_inner(p, param_vars, alias_stack))
                     .collect::<Result<_, _>>()?;
                 Ty::Func(
                     param_tys,
-                    Box::new(self.ast_to_ty_with_vars(ret, param_vars)?),
+                    Box::new(self.ast_to_ty_with_vars_inner(ret, param_vars, alias_stack)?),
                 )
             }
             Type::App(con, args) => {
@@ -2425,25 +2776,25 @@ impl Infer {
                     for (param, arg) in params.iter().zip(args.iter()) {
                         substituted = subst_hkt_param(&substituted, param, arg);
                     }
-                    return self.ast_to_ty_with_vars(&substituted, param_vars);
+                    return self.expand_type_alias(name, &substituted, param_vars, alias_stack);
                 }
-                let con_ty = self.ast_to_ty_with_vars(con, param_vars)?;
+                let con_ty = self.ast_to_ty_with_vars_inner(con, param_vars, alias_stack)?;
                 let arg_tys = args
                     .iter()
-                    .map(|a| self.ast_to_ty_with_vars(a, param_vars))
+                    .map(|a| self.ast_to_ty_with_vars_inner(a, param_vars, alias_stack))
                     .collect::<Result<_, _>>()?;
                 Ty::App(Box::new(con_ty), arg_tys)
             }
             Type::Tuple(tys) => Ty::Tuple(
                 tys.iter()
-                    .map(|t| self.ast_to_ty_with_vars(t, param_vars))
+                    .map(|t| self.ast_to_ty_with_vars_inner(t, param_vars, alias_stack))
                     .collect::<Result<_, _>>()?,
             ),
             Type::Record(fields, is_open) => {
                 let mut field_tys: Vec<_> = fields
                     .iter()
                     .map(|(n, t)| {
-                        self.ast_to_ty_with_vars(t, param_vars)
+                        self.ast_to_ty_with_vars_inner(t, param_vars, alias_stack)
                             .map(|ty| (n.clone(), ty))
                     })
                     .collect::<Result<_, _>>()?;
@@ -2461,6 +2812,23 @@ impl Infer {
             Type::Unit => Ty::Unit,
             Type::Hole => self.subst.fresh_var(),
         })
+    }
+
+    fn expand_type_alias(
+        &mut self,
+        name: &str,
+        aliased_ty: &Type,
+        param_vars: &mut HashMap<String, TyVar>,
+        alias_stack: &mut Vec<String>,
+    ) -> Result<Ty, TypeError> {
+        if alias_stack.iter().any(|alias| alias == name) {
+            return Err(TypeError::RecursiveTypeAlias(name.to_string()));
+        }
+
+        alias_stack.push(name.to_string());
+        let result = self.ast_to_ty_with_vars_inner(aliased_ty, param_vars, alias_stack);
+        alias_stack.pop();
+        result
     }
 }
 
@@ -2537,6 +2905,71 @@ fn impl_target_name(target: &Type) -> String {
         Type::Ident(name) => name.clone(),
         Type::App(con, _) => impl_target_name(con),
         _ => "Unknown".to_string(),
+    }
+}
+
+fn inherent_impl_dict_name(target_name: &str) -> String {
+    format!("__impl__{}", target_name)
+}
+
+fn validate_inherent_impl_target(
+    target: &Type,
+    declared_types: &HashSet<String>,
+) -> Result<String, TypeError> {
+    match target {
+        Type::Ident(name) if is_named_inherent_target(name, declared_types) => Ok(name.clone()),
+        Type::App(con, args) => {
+            let Type::Ident(name) = con.as_ref() else {
+                return Err(TypeError::InvalidInherentImplTarget(type_name_for_error(
+                    target,
+                )));
+            };
+            if !is_named_inherent_target(name, declared_types)
+                || args.iter().any(|arg| !matches!(arg, Type::Var(_)))
+            {
+                return Err(TypeError::InvalidInherentImplTarget(type_name_for_error(
+                    target,
+                )));
+            }
+            let mut seen = HashSet::new();
+            if args.iter().any(|arg| {
+                let Type::Var(var) = arg else {
+                    return false;
+                };
+                !seen.insert(var)
+            }) {
+                return Err(TypeError::InvalidInherentImplTarget(type_name_for_error(
+                    target,
+                )));
+            }
+            Ok(name.clone())
+        }
+        _ => Err(TypeError::InvalidInherentImplTarget(type_name_for_error(
+            target,
+        ))),
+    }
+}
+
+fn is_named_inherent_target(name: &str, declared_types: &HashSet<String>) -> bool {
+    matches!(name, "string" | "f64" | "bool") || declared_types.contains(name)
+}
+
+fn type_name_for_error(target: &Type) -> String {
+    match target {
+        Type::Ident(name) | Type::Var(name) => name.clone(),
+        Type::App(con, args) => {
+            let args = args
+                .iter()
+                .map(type_name_for_error)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({})", type_name_for_error(con), args)
+        }
+        Type::Func(..) => "fn(...)".to_string(),
+        Type::Tuple(_) => "(...)".to_string(),
+        Type::Record(..) => "#{...}".to_string(),
+        Type::Unit => "()".to_string(),
+        Type::Hole => "*".to_string(),
     }
 }
 
@@ -2683,7 +3116,7 @@ fn stmt_bound_names(stmt: &Stmt) -> CollectedNames {
         Stmt::TypeAlias { name, .. } => {
             names.types.insert(name.clone());
         }
-        Stmt::Trait(_) | Stmt::Impl(_) | Stmt::Expr(_) => {}
+        Stmt::Trait(_) | Stmt::Impl(_) | Stmt::InherentImpl(_) | Stmt::Expr(_) => {}
     }
     names
 }
@@ -2757,6 +3190,29 @@ fn collect_stmt_referenced_names(
             collect_type_referenced_names(&id.target, refs, type_scope);
             for method in &id.methods {
                 let mut method_scope = value_scope.clone();
+                for (pat, param_ty) in &method.params {
+                    if let Some(param_ty) = param_ty {
+                        collect_type_referenced_names(param_ty, refs, type_scope);
+                    }
+                    insert_pattern_bindings(&mut method_scope, pat);
+                }
+                if let Some(ret_type) = &method.ret_type {
+                    collect_type_referenced_names(ret_type, refs, type_scope);
+                }
+                collect_expr_referenced_names(&method.body, refs, &method_scope, type_scope);
+            }
+        }
+        Stmt::InherentImpl(id) => {
+            collect_type_referenced_names(&id.target, refs, type_scope);
+            for method in &id.methods {
+                let mut method_scope = value_scope.clone();
+                for bound in &method.type_bounds {
+                    for trait_name in &bound.traits {
+                        if !type_scope.contains(trait_name) {
+                            refs.types.insert(trait_name.clone());
+                        }
+                    }
+                }
                 for (pat, param_ty) in &method.params {
                     if let Some(param_ty) = param_ty {
                         collect_type_referenced_names(param_ty, refs, type_scope);
@@ -3254,6 +3710,17 @@ fn resolve_dict_uses_stmt_inner_with_mode(
             }
             Ok(())
         }
+        Stmt::InherentImpl(id) => {
+            for method in &mut id.methods {
+                resolve_dict_uses_expr_with_mode(
+                    &mut method.body,
+                    resolve,
+                    process_fn,
+                    hard_unresolved,
+                )?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -3421,6 +3888,48 @@ mod tests {
         );
         assert!(inference.env.get("dependent").is_none());
         assert!(inference.env.get("other").is_none());
+    }
+
+    #[test]
+    fn same_name_single_constructor_type_is_nominal() {
+        let mut program = parse_source(
+            "type Wrap = Wrap(f64)\n\
+             impl Wrap {\n\
+               fn unwrap(self) { match self { Wrap(value) -> value } }\n\
+             }\n\
+             let wrapped = Wrap(1);\n\
+             let value = wrapped.unwrap();\n",
+        )
+        .expect("source should parse");
+        reassociate_standalone(&mut program);
+
+        assert!(matches!(
+            &program.stmts[0],
+            Stmt::Type(td) if td.name == "Wrap" && td.variants.len() == 1
+        ));
+
+        let mut infer = Infer::new();
+        infer
+            .infer_program(&mut program)
+            .expect("same-name constructor should infer as a nominal type");
+    }
+
+    #[test]
+    fn recursive_type_alias_reports_error_instead_of_recursing() {
+        let mut program = parse_source(
+            "type A = B\n\
+             type B = A\n\
+             extern value: A = \"value\";\n",
+        )
+        .expect("source should parse");
+        reassociate_standalone(&mut program);
+
+        let mut infer = Infer::new();
+        let err = infer
+            .infer_program(&mut program)
+            .expect_err("recursive aliases should be rejected");
+
+        assert!(matches!(err.error, TypeError::RecursiveTypeAlias(_)));
     }
 
     #[test]

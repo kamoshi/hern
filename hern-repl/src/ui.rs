@@ -1,5 +1,4 @@
 use crate::app::{App, Entry, EntryKind, clamp_to_char_boundary};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::highlight::{highlight_line, highlight_source_lines};
 use crate::style::user_message_style;
 use crate::terminal::TerminalGuard;
@@ -10,6 +9,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use std::io;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MAX_COMPOSER_INNER: u16 = 3;
 
@@ -57,10 +57,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     }
 
     let (cursor_row, cursor_col, _) = cursor_metrics(app, input_area.height, input_area.width);
-    frame.set_cursor_position((
-        input_area.x + cursor_col,
-        input_area.y + cursor_row,
-    ));
+    frame.set_cursor_position((input_area.x + cursor_col, input_area.y + cursor_row));
 }
 
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -118,7 +115,11 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) -> Rec
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let newline_key = if app.enhanced_keys { "shift+enter" } else { "ctrl+j" };
+    let newline_key = if app.enhanced_keys {
+        "shift+enter"
+    } else {
+        "ctrl+j"
+    };
     let footer = Line::from(vec![
         "  ".into(),
         "enter".cyan().bold(),
@@ -384,7 +385,11 @@ fn cursor_metrics(app: &App, height: u16, width: u16) -> (u16, u16, u16) {
         (skip, skipped)
     };
 
-    (cursor_visual_row - skipped_visual, visual_col, logical_scroll)
+    (
+        cursor_visual_row - skipped_visual,
+        visual_col,
+        logical_scroll,
+    )
 }
 
 pub(crate) fn insert_entries(terminal: &mut TerminalGuard, entries: Vec<Entry>) -> io::Result<()> {
@@ -445,9 +450,12 @@ fn entries_to_lines(entries: &[Entry]) -> Vec<Line<'static>> {
                 EntryKind::Info => ("  ", Style::default().fg(Color::Gray)),
             };
             let is_input = matches!(entry.kind, EntryKind::Input);
-            let highlighted_input =
-                is_input.then(|| highlight_source_lines(&entry.text));
-            let line_style = if is_input { user_message_style() } else { Style::default() };
+            let highlighted_input = is_input.then(|| highlight_source_lines(&entry.text));
+            let line_style = if is_input {
+                user_message_style()
+            } else {
+                Style::default()
+            };
             entry
                 .text
                 .lines()
@@ -497,7 +505,9 @@ mod tests {
         assert!(lines[0].spans.iter().any(|s| s.content == "λ "));
         assert!(lines[1].spans.iter().any(|s| s.content == "  "));
         assert!(lines[1].spans.iter().any(|s| s.content == "2"));
-        assert!(lines[2].spans.is_empty() || lines[2].spans.iter().all(|s| s.content.trim().is_empty()));
+        assert!(
+            lines[2].spans.is_empty() || lines[2].spans.iter().all(|s| s.content.trim().is_empty())
+        );
     }
 
     #[test]

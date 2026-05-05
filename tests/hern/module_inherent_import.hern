@@ -1,0 +1,4 @@
+let boxed = import "module_inherent";
+
+print(boxed.value());
+print(boxed.fallback());
