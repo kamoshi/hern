@@ -1,0 +1,3 @@
+let inner = #{ x: 1 };
+let mut outer = #{ inner: inner };
+outer.inner.x = 2;

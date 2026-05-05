@@ -3,7 +3,7 @@ use super::state::{ServerState, cached_analysis};
 use super::uri::uri_to_path;
 use super::workspace::load_workspace_graphs;
 use hern_core::ast::{Expr, ExprKind, Program, SourcePosition, SourceSpan, Stmt};
-use hern_core::types::Ty;
+use hern_core::types::{ParamCapability, Ty};
 use lsp_types::{
     ParameterInformation, ParameterLabel, Position, SignatureHelp, SignatureInformation, Uri,
 };
@@ -24,6 +24,7 @@ pub(crate) fn signature_help(
     let (module_name, program) = graph.module_for_path(&path)?;
     let expr_types = inference.expr_types_for_module(module_name)?;
     let symbol_types = inference.symbol_types_for_module(module_name)?;
+    let callable_capabilities = inference.callable_capabilities_for_module(module_name);
     let source_position = SourcePosition {
         line: position.line as usize + 1,
         col: position.character as usize + 1,
@@ -36,7 +37,25 @@ pub(crate) fn signature_help(
         return None;
     };
 
-    let param_labels = params.iter().map(ty_to_display_string).collect::<Vec<_>>();
+    let capabilities = callable_capabilities
+        .and_then(|capabilities| capabilities.get(&call.callee.id))
+        .map(|capabilities| capabilities.param_capabilities.as_slice())
+        .unwrap_or(&[]);
+    let param_labels = params
+        .iter()
+        .enumerate()
+        .map(|(idx, ty)| {
+            let text = ty_to_display_string(ty);
+            if capabilities
+                .get(idx)
+                .is_some_and(|capability| matches!(capability, ParamCapability::MutPlace))
+            {
+                format!("mut {text}")
+            } else {
+                text
+            }
+        })
+        .collect::<Vec<_>>();
     let label = format!(
         "fn({}) -> {}",
         param_labels.join(", "),
@@ -307,6 +326,24 @@ mod tests {
         let (label, _, active) = signature_labels(help);
 
         assert_eq!(label, "fn(f64, f64) -> f64");
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn signature_help_shows_mutable_place_parameter() {
+        let project = crate::analysis::tests::TestProject::new("signature-mut-param");
+        let source = concat!(
+            "fn bump(mut r: #{ x: f64 }) { r.x = r.x + 1; }\n",
+            "let mut r = #{ x: 1 };\n",
+            "bump(r)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let help = signature_help(&state, uri, Position::new(2, 5)).expect("signature help");
+        let (label, params, active) = signature_labels(help);
+
+        assert_eq!(label, "fn(mut #{ x: f64 }) -> ()");
+        assert_eq!(params, vec!["mut #{ x: f64 }"]);
         assert_eq!(active, 0);
     }
 

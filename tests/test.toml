@@ -17,6 +17,113 @@ path = "tests/hern/mut_error.hern"
 expect = "error"
 error_contains = "cannot assign to immutable variable"
 
+[tests.mut_alias_polymorphic_record]
+path = "tests/hern/mut_alias_polymorphic_record.hern"
+expect = "error"
+error_contains = "not an owned mutable place"
+
+[tests.mut_alias_immutable_record]
+path = "tests/hern/mut_alias_immutable_record.hern"
+expect = "error"
+error_contains = "not an owned mutable place"
+
+[tests.mut_temporary_field]
+path = "tests/hern/mut_temporary_field.hern"
+expect = "error"
+error_contains = "invalid assignment target"
+
+[tests.mut_spread_record_not_fresh]
+path = "tests/hern/mut_spread_record_not_fresh.hern"
+expect = "error"
+error_contains = "not an owned mutable place"
+
+[tests.mut_nested_alias_record_not_fresh]
+path = "tests/hern/mut_nested_alias_record_not_fresh.hern"
+expect = "error"
+error_contains = "not an owned mutable place"
+
+[tests.mut_fresh_record_place]
+path = "tests/hern/mut_fresh_record_place.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
+[tests.mut_nested_fresh_record_place]
+path = "tests/hern/mut_nested_fresh_record_place.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
+[tests.mut_binding_reassignment]
+path = "tests/hern/mut_binding_reassignment.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
+[tests.immutable_polymorphic_record_still_generalizes]
+path = "tests/hern/immutable_polymorphic_record_still_generalizes.hern"
+expect = "typecheck"
+output = """
+1
+x
+"""
+
+[tests.mut_param_call]
+path = "tests/hern/mut_param_call.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
+[tests.mut_param_fresh_literal]
+path = "tests/hern/mut_param_fresh_literal.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
+[tests.mut_param_immutable_arg]
+path = "tests/hern/mut_param_immutable_arg.hern"
+expect = "error"
+error_contains = "must be a mutable place"
+
+[tests.mut_param_alias_arg]
+path = "tests/hern/mut_param_alias_arg.hern"
+expect = "error"
+error_contains = "must be a mutable place"
+
+[tests.mut_param_call_result_arg]
+path = "tests/hern/mut_param_call_result_arg.hern"
+expect = "error"
+error_contains = "must be a mutable place"
+
+[tests.mut_param_higher_order_erasure]
+path = "tests/hern/mut_param_higher_order_erasure.hern"
+expect = "error"
+error_contains = "mutable function parameter requirements are incompatible"
+
+[tests.mut_param_record_field_call]
+path = "tests/hern/mut_param_record_field_call.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
+[tests.mut_param_module_import]
+path = "tests/hern/mut_param_module_import.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
+[tests.mut_param_module_import_immutable_arg]
+path = "tests/hern/mut_param_module_import_immutable_arg.hern"
+expect = "error"
+error_contains = "must be a mutable place"
+
 [tests.row_poly]
 path = "tests/hern/row_poly.hern"
 expect = "typecheck"

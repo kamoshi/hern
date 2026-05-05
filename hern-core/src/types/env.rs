@@ -5,7 +5,13 @@ use std::fmt;
 
 impl fmt::Display for EnvInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let prefix = if self.is_mutable { "mut " } else { "" };
+        let prefix = if self.place_mutable {
+            "mut place "
+        } else if self.binding_mutable {
+            "mut "
+        } else {
+            ""
+        };
         write!(f, "{}{}", prefix, self.scheme)
     }
 }

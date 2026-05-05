@@ -1,4 +1,4 @@
-use crate::ast::{Expr, ExprKind, Pattern, Program, SourcePosition, SourceSpan, Stmt};
+use crate::ast::{Expr, ExprKind, Param, Pattern, Program, SourcePosition, SourceSpan, Stmt};
 use std::collections::HashMap;
 
 // Used only to sort spans by approximate source size; source lines should never approach this width.
@@ -518,12 +518,7 @@ impl IndexBuilder {
         }
     }
 
-    fn index_callable_body(
-        &mut self,
-        params: &[(Pattern, Option<crate::ast::Type>)],
-        _span: SourceSpan,
-        body: &Expr,
-    ) {
+    fn index_callable_body(&mut self, params: &[Param], _span: SourceSpan, body: &Expr) {
         let scope_end = SourcePosition {
             line: body.span.end_line,
             col: body.span.end_col,
@@ -533,8 +528,8 @@ impl IndexBuilder {
             col: body.span.start_col,
         };
         self.push_scope_with_end(scope_end);
-        for (pat, _) in params {
-            self.define_param_pattern_bindings(pat, body_start);
+        for param in params {
+            self.define_param_pattern_bindings(&param.pat, body_start);
         }
         self.index_expr(body);
         self.pop_scope();
@@ -723,8 +718,8 @@ impl IndexBuilder {
                     col: body.span.start_col,
                 };
                 self.push_scope_with_end(scope_end);
-                for (pat, _) in params {
-                    self.define_param_pattern_bindings(pat, body_start);
+                for param in params {
+                    self.define_param_pattern_bindings(&param.pat, body_start);
                 }
                 self.index_expr(body);
                 self.pop_scope();

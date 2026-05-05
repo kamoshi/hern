@@ -1,0 +1,3 @@
+let dep = import "mut_param_module_dep";
+let r = #{ x: 1 };
+dep.bump(r);

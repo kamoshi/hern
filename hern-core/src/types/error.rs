@@ -8,6 +8,10 @@ pub enum TypeError {
     OccursCheck(crate::types::TyVar),
     UnboundVariable(String),
     ImmutableAssignment(String),
+    ImmutablePlace(String),
+    ExpectedMutablePlace(String),
+    MutableParamMustBindName,
+    MutableFunctionCapabilityMismatch,
     NotAFunction(Ty),
     ArityMismatch {
         expected: usize,
@@ -142,6 +146,21 @@ impl fmt::Display for TypeError {
             TypeError::ImmutableAssignment(name) => {
                 write!(f, "cannot assign to immutable variable `{}`", name)
             }
+            TypeError::ImmutablePlace(name) => {
+                write!(
+                    f,
+                    "cannot mutate fields of `{}`: it is not an owned mutable place",
+                    name
+                )
+            }
+            TypeError::ExpectedMutablePlace(message) => write!(f, "{}", message),
+            TypeError::MutableParamMustBindName => {
+                write!(f, "mutable place parameters must bind a single name")
+            }
+            TypeError::MutableFunctionCapabilityMismatch => write!(
+                f,
+                "mutable function parameter requirements are incompatible with this function type"
+            ),
             TypeError::NotAFunction(ty) => write!(f, "expected a function, got `{}`", ty),
             TypeError::ArityMismatch { expected, got } => {
                 write!(

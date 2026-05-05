@@ -3,7 +3,7 @@ use crate::lex::error::{ParseError, Span};
 use crate::lex::{Spanned, Token};
 use std::cell::{Cell, RefCell};
 
-type FnParamsBody = (usize, Vec<(Pattern, Option<Type>)>, Option<Type>, Expr);
+type FnParamsBody = (usize, Vec<Param>, Option<Type>, Expr);
 
 fn consumed_span(tokens: &[Spanned], consumed: usize) -> SourceSpan {
     let start = tokens.first().map(|token| token.span).unwrap_or(Span {
@@ -414,19 +414,9 @@ impl<'tokens> Parser<'tokens> {
         let mut params = Vec::new();
         if tokens.get(ptr).map(|t| &t.token) != Some(&Token::RParen) {
             loop {
-                let param_start = ptr;
-                let (c_pat, pat) = self.parse_for_pattern(&tokens[ptr..])?;
-                ptr += c_pat;
-                let param_span = consumed_span(&tokens[param_start..], c_pat);
-                let mut p_type = None;
-                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Colon) {
-                    ptr += 1;
-                    let (c_type, parsed_type) = self.parse_type(&tokens[ptr..])?;
-                    ptr += c_type;
-                    p_type = Some(parsed_type);
-                }
-                let pat = apply_span_to_pattern(pat, param_span);
-                params.push((pat, p_type));
+                let (consumed, param) = self.parse_param(&tokens[ptr..], true)?;
+                ptr += consumed;
+                params.push(param);
                 if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
                     ptr += 1;
                 } else {
@@ -445,6 +435,50 @@ impl<'tokens> Parser<'tokens> {
         let (consumed_body, body) = self.parse_expr(&tokens[ptr..], 0)?;
         ptr += consumed_body;
         Ok((ptr, params, ret_type, body))
+    }
+
+    fn parse_param(
+        &self,
+        tokens: &[Spanned],
+        allow_mut_place: bool,
+    ) -> Result<(usize, Param), ParseError> {
+        let mut ptr = 0;
+        let mut mut_place = false;
+        if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Mut) {
+            if !allow_mut_place {
+                return Err(ParseError::new(
+                    "`mut` parameters are not supported in this position",
+                    tokens[ptr].span,
+                ));
+            }
+            mut_place = true;
+            ptr += 1;
+        }
+
+        let param_start = ptr;
+        let (c_pat, pat) = self.parse_for_pattern(&tokens[ptr..])?;
+        ptr += c_pat;
+        let param_span = consumed_span(&tokens[param_start..], c_pat);
+        let mut p_type = None;
+        if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Colon) {
+            ptr += 1;
+            let (c_type, parsed_type) = self.parse_type(&tokens[ptr..])?;
+            ptr += c_type;
+            p_type = Some(parsed_type);
+        }
+        let pat = apply_span_to_pattern(pat, param_span);
+        if mut_place && !matches!(pat, Pattern::Variable(_, _)) {
+            return Err(ParseError::new(
+                "mutable place parameters must bind a single name",
+                tokens[param_start].span,
+            ));
+        }
+        let param = if mut_place {
+            Param::mutable_place(pat, p_type)
+        } else {
+            Param::new(pat, p_type)
+        };
+        Ok((ptr, param))
     }
 
     fn parse_type_def_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
@@ -697,21 +731,9 @@ impl<'tokens> Parser<'tokens> {
             let mut params = Vec::new();
             if tokens.get(ptr).map(|t| &t.token) != Some(&Token::RParen) {
                 loop {
-                    let param_start = ptr;
-                    let (c_pat, pat) = self.parse_for_pattern(&tokens[ptr..])?;
-                    ptr += c_pat;
-                    let param_span = consumed_span(&tokens[param_start..], c_pat);
-
-                    let mut p_type = None;
-                    if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Colon) {
-                        ptr += 1;
-                        let (c_ty, ty) = self.parse_type(&tokens[ptr..])?;
-                        ptr += c_ty;
-                        p_type = Some(ty);
-                    }
-
-                    let pat = apply_span_to_pattern(pat, param_span);
-                    params.push((pat, p_type));
+                    let (consumed, param) = self.parse_param(&tokens[ptr..], false)?;
+                    ptr += consumed;
+                    params.push(param);
                     if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
                         ptr += 1;
                     } else {
@@ -1961,19 +1983,9 @@ impl<'tokens> Parser<'tokens> {
         let mut params = Vec::new();
         if tokens.get(ptr).map(|t| &t.token) != Some(&Token::RParen) {
             loop {
-                let param_start = ptr;
-                let (c_pat, pat) = self.parse_for_pattern(&tokens[ptr..])?;
-                ptr += c_pat;
-                let param_span = consumed_span(&tokens[param_start..], c_pat);
-                let mut p_type = None;
-                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Colon) {
-                    ptr += 1;
-                    let (c_ty, ty) = self.parse_type(&tokens[ptr..])?;
-                    ptr += c_ty;
-                    p_type = Some(ty);
-                }
-                let pat = apply_span_to_pattern(pat, param_span);
-                params.push((pat, p_type));
+                let (consumed, param) = self.parse_param(&tokens[ptr..], true)?;
+                ptr += consumed;
+                params.push(param);
                 if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
                     ptr += 1;
                 } else {

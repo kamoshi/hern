@@ -3,15 +3,16 @@ use super::uri::uri_to_path;
 use super::workspace::load_workspace_graphs;
 use hern_core::analysis::hover_at;
 use hern_core::ast::{
-    BinOp, Expr, ExprKind, Fixity, ImplMethod, InherentMethod, Pattern, Program, SourcePosition,
-    SourceSpan, Stmt, TraitMethod,
+    BinOp, Expr, ExprKind, Fixity, ImplMethod, InherentMethod, Param, Pattern, Program,
+    SourcePosition, SourceSpan, Stmt, TraitMethod,
 };
 use hern_core::module::{GraphInference, ModuleEnv, ModuleGraph};
 use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
 use hern_core::types::infer::{TypeEnv, VariantEnv};
 use hern_core::types::{
-    Scheme, TraitConstraint, Ty, TyVar, display_ty_with_var_names, free_type_vars_in_display_order,
-    type_var_name,
+    BindingCapabilities, ParamCapability, Scheme, TraitConstraint, Ty, TyVar,
+    display_ty_with_var_names, display_ty_with_var_names_and_param_capabilities,
+    free_type_vars_in_display_order, type_var_name,
 };
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 use std::collections::HashMap;
@@ -28,6 +29,8 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
     let (module_name, program) = graph.module_for_path(&path)?;
     let expr_types = inference.expr_types_for_module(module_name)?;
     let symbol_types = inference.symbol_types_for_module(module_name)?;
+    let binding_capabilities = inference.binding_capabilities_for_module(module_name);
+    let callable_capabilities = inference.callable_capabilities_for_module(module_name);
     let position = SourcePosition {
         line: position.line as usize + 1,
         col: position.character as usize + 1,
@@ -48,7 +51,18 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
         return Some(type_hover(contents, markdown));
     }
     let info = hover_at(program, expr_types, symbol_types, position)?;
-    Some(type_hover(ty_to_display_string(&info.ty), markdown))
+    let place_mutable = binding_capabilities
+        .and_then(|capabilities| capabilities.get(&info.span))
+        .is_some_and(|capabilities| capabilities.place_mutable);
+    if let Some(capabilities) = callable_capabilities.and_then(|caps| caps.get(&info.node_id)) {
+        let scheme = Scheme::mono(info.ty.clone())
+            .with_param_capabilities(capabilities.param_capabilities.clone());
+        return Some(type_hover(hover_scheme_to_string(&scheme), markdown));
+    }
+    Some(type_hover(
+        ty_to_display_string_with_place_mutability(&info.ty, place_mutable),
+        markdown,
+    ))
 }
 
 /// Wrap a type string for display in a hover response.
@@ -98,6 +112,7 @@ fn symbol_hover(
         inference.expr_types_for_module(module_name),
         inference.binding_types_for_module(module_name),
         inference.definition_schemes_for_module(module_name),
+        inference.binding_capabilities_for_module(module_name),
         inference.variant_env_for_module(module_name),
         program,
     )
@@ -458,6 +473,7 @@ pub(super) fn ty_to_display_string(ty: &Ty) -> String {
             vars,
             constraints,
             ty: ty.clone(),
+            param_capabilities: vec![],
         },
         true,
     )
@@ -474,6 +490,7 @@ pub(super) fn completion_ty_to_display_string(ty: &Ty) -> String {
             vars,
             constraints,
             ty: ty.clone(),
+            param_capabilities: vec![],
         },
         false,
     )
@@ -489,7 +506,7 @@ pub(super) fn completion_scheme_to_string(scheme: &Scheme) -> String {
 
 fn scheme_to_display_string(scheme: &Scheme, include_constraints: bool) -> String {
     let names = type_var_names(scheme);
-    let mut out = display_ty_body_for_lsp(&scheme.ty, &names);
+    let mut out = display_ty_body_for_lsp(&scheme.ty, &names, &scheme.param_capabilities);
     if include_constraints {
         let constraints = constraints_by_var(scheme, &names);
         if !constraints.is_empty() {
@@ -502,10 +519,26 @@ fn scheme_to_display_string(scheme: &Scheme, include_constraints: bool) -> Strin
     out
 }
 
-fn display_ty_body_for_lsp(ty: &Ty, names: &HashMap<TyVar, String>) -> String {
+fn display_ty_body_for_lsp(
+    ty: &Ty,
+    names: &HashMap<TyVar, String>,
+    param_capabilities: &[ParamCapability],
+) -> String {
     match ty {
-        Ty::Qualified(_, inner) => display_ty_body_for_lsp(inner, names),
+        Ty::Qualified(_, inner) => display_ty_body_for_lsp(inner, names, param_capabilities),
+        Ty::Func(_, _) => {
+            display_ty_with_var_names_and_param_capabilities(ty, names, param_capabilities)
+        }
         _ => display_ty_with_var_names(ty, names),
+    }
+}
+
+fn ty_to_display_string_with_place_mutability(ty: &Ty, place_mutable: bool) -> String {
+    let text = ty_to_display_string(ty);
+    if place_mutable {
+        format!("mut {text}")
+    } else {
+        text
     }
 }
 
@@ -654,9 +687,9 @@ fn impl_method_signature(method: &ImplMethod) -> String {
     let params = method
         .params
         .iter()
-        .map(|(pat, ty)| {
-            let pat = pattern_to_string(pat);
-            match ty {
+        .map(|param| {
+            let pat = pattern_to_string(&param.pat);
+            match &param.ty {
                 Some(ty) => format!("{pat}: {}", ast_type_to_string(ty)),
                 None => pat,
             }
@@ -678,9 +711,9 @@ fn inherent_method_signature(method: &InherentMethod) -> String {
     let params = method
         .params
         .iter()
-        .map(|(pat, ty)| {
-            let pat = pattern_to_string(pat);
-            match ty {
+        .map(|param| {
+            let pat = pattern_to_string(&param.pat);
+            match &param.ty {
                 Some(ty) => format!("{pat}: {}", ast_type_to_string(ty)),
                 None => pat,
             }
@@ -808,6 +841,18 @@ fn imported_member_hover_text(
     reference: &ImportMemberReference,
     import_alias: Option<&str>,
 ) -> Option<String> {
+    if let Some(scheme) = inference
+        .import_schemes
+        .get(&reference.module_name)
+        .and_then(|members| members.get(&reference.member_name))
+    {
+        return Some(imported_member_display(
+            import_alias,
+            reference,
+            hover_scheme_to_string(scheme),
+        ));
+    }
+
     // Primary path: look up the field from the module's concrete export type.
     // This is correct for all export shapes, including aliased names.
     if let Some(Ty::Record(row)) = inference.import_types.get(&reference.module_name) {
@@ -830,6 +875,7 @@ fn imported_member_hover_text(
         inference.expr_types_for_module(&reference.module_name),
         inference.binding_types_for_module(&reference.module_name),
         inference.definition_schemes_for_module(&reference.module_name),
+        inference.binding_capabilities_for_module(&reference.module_name),
         inference.variant_env_for_module(&reference.module_name),
         target_program,
     )
@@ -851,12 +897,19 @@ fn definition_hover_text(
     expr_types: Option<&HashMap<hern_core::ast::NodeId, Ty>>,
     binding_types: Option<&HashMap<SourceSpan, Ty>>,
     definition_schemes: Option<&HashMap<SourceSpan, Scheme>>,
+    binding_capabilities: Option<&HashMap<SourceSpan, BindingCapabilities>>,
     variant_env: Option<&VariantEnv>,
     program: &Program,
 ) -> Option<String> {
     if let Some(scheme) =
         definition_schemes.and_then(|schemes| schemes.get(&definition.location.span))
     {
+        let env_scheme = env.and_then(|env| env.get(&definition.name)).map(|info| &info.scheme);
+        let scheme = if scheme.param_capabilities.is_empty() {
+            env_scheme.unwrap_or(scheme)
+        } else {
+            scheme
+        };
         let text = hover_scheme_to_string(scheme);
         return Some(
             operator_definition_fixity(program, definition.location.span)
@@ -870,7 +923,13 @@ fn definition_hover_text(
         DefinitionKind::Let | DefinitionKind::Parameter
     ) && let Some(ty) = binding_types.and_then(|types| types.get(&definition.location.span))
     {
-        return Some(ty_to_display_string(ty));
+        let place_mutable = binding_capabilities
+            .and_then(|capabilities| capabilities.get(&definition.location.span))
+            .is_some_and(|capabilities| capabilities.place_mutable);
+        return Some(ty_to_display_string_with_place_mutability(
+            ty,
+            place_mutable,
+        ));
     }
 
     // For parameter definitions, use ONLY the pattern-based type lookup.
@@ -988,7 +1047,7 @@ fn impl_target_name(target: &hern_core::ast::Type) -> String {
 /// For a `Record` param the binding type is the type of the matched field.
 fn param_type_from_fn_scheme(
     fn_name: &str,
-    params: &[(Pattern, Option<hern_core::ast::Type>)],
+    params: &[Param],
     param_name: &str,
     param_span: SourceSpan,
     env: Option<&TypeEnv>,
@@ -996,8 +1055,8 @@ fn param_type_from_fn_scheme(
 ) -> Option<String> {
     let param_idx = params
         .iter()
-        .position(|(pat, _)| pattern_has_binding_at(pat, param_name, param_span))?;
-    let param_pat = &params[param_idx].0;
+        .position(|param| pattern_has_binding_at(&param.pat, param_name, param_span))?;
+    let param_pat = &params[param_idx].pat;
 
     let scheme = env.and_then(|e| e.get(fn_name))?;
     let Ty::Func(param_tys, _) = &scheme.scheme.ty else {
@@ -1012,6 +1071,7 @@ fn param_type_from_fn_scheme(
         vars: scheme.scheme.vars.clone(),
         constraints: scheme.scheme.constraints.clone(),
         ty: binding_ty,
+        param_capabilities: vec![],
     };
     Some(hover_scheme_to_string(&display_scheme))
 }
@@ -1031,8 +1091,8 @@ fn param_type_from_impl_dict(
     let param_idx = method
         .params
         .iter()
-        .position(|(pat, _)| pattern_has_binding_at(pat, param_name, param_span))?;
-    let param_pat = &method.params[param_idx].0;
+        .position(|param| pattern_has_binding_at(&param.pat, param_name, param_span))?;
+    let param_pat = &method.params[param_idx].pat;
 
     let dict_scheme = env.and_then(|e| e.get(dict_key))?;
     // The dict is stored as Ty::Record where each field is the method's Func type.
@@ -1055,6 +1115,7 @@ fn param_type_from_impl_dict(
         vars: dict_scheme.scheme.vars.clone(),
         constraints: dict_scheme.scheme.constraints.clone(),
         ty: binding_ty,
+        param_capabilities: vec![],
     };
     Some(hover_scheme_to_string(&display_scheme))
 }
@@ -1281,7 +1342,7 @@ fn param_type_in_expr_stmts(
         ExprKind::Lambda { params, body, .. } => {
             if let Some(idx) = params
                 .iter()
-                .position(|(pat, _)| pattern_has_binding_at(pat, name, param_span))
+                .position(|param| pattern_has_binding_at(&param.pat, name, param_span))
             {
                 // Look up the lambda's Ty::Func from expr_types to get the param type.
                 let types = expr_types?;
@@ -1289,7 +1350,7 @@ fn param_type_in_expr_stmts(
                     return None;
                 };
                 let param_ty = param_tys.get(idx)?;
-                let pat = &params[idx].0;
+                let pat = &params[idx].pat;
                 return extract_binding_type(pat, name, param_span, param_ty, variant_env)
                     .map(|ty| ty_to_display_string(&ty));
             }

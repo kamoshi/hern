@@ -513,7 +513,7 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(1, 1)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "dep.value: fn() -> f64");
     }
 
     #[test]
@@ -529,13 +529,17 @@ pub(super) mod tests {
 
     #[test]
     fn display_names_type_vars_by_visible_type_order() {
-        use hern_core::types::Ty;
+        use hern_core::types::{ParamCapability, Scheme, Ty};
         let ty = Ty::Func(
             vec![Ty::Var(78), Ty::Tuple(vec![Ty::Var(12), Ty::Var(78)])],
             Box::new(Ty::Var(12)),
         );
 
         assert_eq!(hover::ty_to_display_string(&ty), "fn('a, ('b, 'a)) -> 'b");
+
+        let scheme = Scheme::mono(Ty::Func(vec![Ty::F64], Box::new(Ty::Unit)))
+            .with_param_capabilities(vec![ParamCapability::MutPlace]);
+        assert_eq!(hover::hover_scheme_to_string(&scheme), "fn(mut f64) -> ()");
     }
 
     #[test]
@@ -547,6 +551,50 @@ pub(super) mod tests {
         let info = hover(&state, uri, Position::new(1, 1)).expect("hover should resolve");
 
         assert_eq!(hover_text(info), "fn('a, 'b) -> 'a");
+    }
+
+    #[test]
+    fn hover_shows_mutable_place_for_owned_local_binding() {
+        let project = TestProject::new("mutable-place-hover");
+        let source = "let mut r = #{ x: 1 };\nr.x\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let binding = hover(&state, uri.clone(), Position::new(0, 8)).expect("binding hover");
+        let use_site = hover(&state, uri, Position::new(1, 0)).expect("use hover");
+
+        assert_eq!(hover_text(binding), "mut #{ x: f64 }");
+        assert_eq!(hover_text(use_site), "mut #{ x: f64 }");
+    }
+
+    #[test]
+    fn hover_does_not_mark_reassignable_alias_as_mutable_place() {
+        let project = TestProject::new("mutable-alias-hover");
+        let source = "let base = #{ x: 1 };\nlet mut alias = base;\nalias.x\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(1, 8)).expect("alias hover");
+
+        assert_eq!(hover_text(info), "#{ x: f64 }");
+    }
+
+    #[test]
+    fn hover_renders_mutable_function_parameters() {
+        let project = TestProject::new("mutable-param-hover");
+        let source = concat!(
+            "fn bump(mut r: #{ x: f64 }) {\n",
+            "  r.x = r.x + 1;\n",
+            "}\n",
+            "bump\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let fn_hover = hover(&state, uri.clone(), Position::new(0, 3)).expect("fn hover");
+        let param_hover = hover(&state, uri.clone(), Position::new(0, 12)).expect("param hover");
+        let callee_hover = hover(&state, uri, Position::new(3, 0)).expect("callee hover");
+
+        assert_eq!(hover_text(fn_hover), "fn(mut #{ x: f64 }) -> ()");
+        assert_eq!(hover_text(param_hover), "mut #{ x: f64 }");
+        assert_eq!(hover_text(callee_hover), "fn(mut #{ x: f64 }) -> ()");
     }
 
     #[test]
@@ -635,7 +683,7 @@ pub(super) mod tests {
             "fn value() { 1 }\n#{ value: value }\n",
         );
 
-        let info = hover(&state, entry_uri, Position::new(1, 10)).expect("hover should resolve");
+        let info = hover(&state, entry_uri, Position::new(1, 5)).expect("hover should resolve");
 
         assert_eq!(hover_text(info), "f64");
     }
@@ -714,7 +762,9 @@ pub(super) mod tests {
         );
         let (state, uri) = project.open("main.hern", source);
 
-        let use_hover = hover(&state, uri.clone(), Position::new(1, 5))
+        let use_hover = [4, 5, 6]
+            .into_iter()
+            .find_map(|col| hover(&state, uri.clone(), Position::new(1, col)))
             .expect("custom operator use hover should resolve");
         let def_hover = hover(&state, uri, Position::new(0, 12))
             .expect("custom operator definition hover should resolve");

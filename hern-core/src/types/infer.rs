@@ -10,12 +10,13 @@ use super::{
 use crate::ast::*;
 use crate::codegen::lua::mangle_op;
 use crate::types::{
-    EnvInfo, Row, Scheme, Subst, TraitConstraint, Ty, TyVar,
+    BindingCapabilities, CallableCapabilities, EnvInfo, ParamCapability, Row, Scheme, Subst,
+    TraitConstraint, Ty, TyVar,
     env::build_variant_env_from_stmts,
     error::{SpannedTypeError, TypeError},
     free_type_vars, unify,
 };
-pub use crate::types::{TypeEnv, VariantEnv, VariantInfo, is_value};
+pub use crate::types::{TypeEnv, VariantEnv, VariantInfo, is_fresh_mutable_place, is_value};
 use std::collections::{HashMap, HashSet};
 
 struct ResolvedTraitMethod {
@@ -41,6 +42,9 @@ pub struct Infer {
     inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
     scoped_inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
     import_types: HashMap<String, Ty>,
+    import_schemes: HashMap<String, HashMap<String, Scheme>>,
+    import_bindings: HashMap<String, String>,
+    record_field_callables: HashMap<String, HashMap<String, Vec<ParamCapability>>>,
     known_impl_dicts: HashSet<String>,
     loop_break_tys: Vec<Ty>,
     fn_return_tys: Vec<Ty>,
@@ -49,11 +53,14 @@ pub struct Infer {
     symbol_types: HashMap<NodeId, Ty>,
     binding_types: HashMap<SourceSpan, Ty>,
     definition_schemes: HashMap<SourceSpan, Scheme>,
+    binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
+    callable_capabilities: HashMap<NodeId, CallableCapabilities>,
 }
 
 struct InstantiatedScheme {
     ty: Ty,
     constraints: Vec<TraitConstraint>,
+    param_capabilities: Vec<ParamCapability>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +75,8 @@ struct FinalizedTypeMaps {
     symbol_types: HashMap<NodeId, Ty>,
     binding_types: HashMap<SourceSpan, Ty>,
     definition_schemes: HashMap<SourceSpan, Scheme>,
+    binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
+    callable_capabilities: HashMap<NodeId, CallableCapabilities>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +89,8 @@ pub struct InferenceResult {
     pub symbol_types: HashMap<NodeId, Ty>,
     pub binding_types: HashMap<SourceSpan, Ty>,
     pub definition_schemes: HashMap<SourceSpan, Scheme>,
+    pub binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
+    pub callable_capabilities: HashMap<NodeId, CallableCapabilities>,
 }
 
 /// Partial result returned by [`Infer::infer_program_collecting`].
@@ -100,6 +111,8 @@ pub struct ModuleInference {
     pub symbol_types: HashMap<NodeId, Ty>,
     pub binding_types: HashMap<SourceSpan, Ty>,
     pub definition_schemes: HashMap<SourceSpan, Scheme>,
+    pub binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
+    pub callable_capabilities: HashMap<NodeId, CallableCapabilities>,
 }
 
 impl Default for ModuleInference {
@@ -113,6 +126,8 @@ impl Default for ModuleInference {
             symbol_types: HashMap::new(),
             binding_types: HashMap::new(),
             definition_schemes: HashMap::new(),
+            binding_capabilities: HashMap::new(),
+            callable_capabilities: HashMap::new(),
         }
     }
 }
@@ -137,6 +152,9 @@ struct InferSnapshot {
     symbol_types: HashMap<NodeId, Ty>,
     binding_types: HashMap<SourceSpan, Ty>,
     definition_schemes: HashMap<SourceSpan, Scheme>,
+    binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
+    callable_capabilities: HashMap<NodeId, CallableCapabilities>,
+    record_field_callables: HashMap<String, HashMap<String, Vec<ParamCapability>>>,
     inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
     env: TypeEnv,
 }
@@ -186,6 +204,9 @@ impl Infer {
             inherent_methods: HashMap::new(),
             scoped_inherent_methods: HashMap::new(),
             import_types: HashMap::new(),
+            import_schemes: HashMap::new(),
+            import_bindings: HashMap::new(),
+            record_field_callables: HashMap::new(),
             known_impl_dicts: HashSet::new(),
             loop_break_tys: Vec::new(),
             fn_return_tys: Vec::new(),
@@ -194,6 +215,8 @@ impl Infer {
             symbol_types: HashMap::new(),
             binding_types: HashMap::new(),
             definition_schemes: HashMap::new(),
+            binding_capabilities: HashMap::new(),
+            callable_capabilities: HashMap::new(),
         }
     }
 
@@ -203,6 +226,10 @@ impl Infer {
 
     pub fn set_import_types(&mut self, import_types: HashMap<String, Ty>) {
         self.import_types = import_types;
+    }
+
+    pub fn set_import_schemes(&mut self, import_schemes: HashMap<String, HashMap<String, Scheme>>) {
+        self.import_schemes = import_schemes;
     }
 
     pub fn set_known_impl_dicts(&mut self, dicts: HashSet<String>) {
@@ -267,6 +294,7 @@ impl Infer {
         InstantiatedScheme {
             ty: self.apply_inst(&scheme.ty, &map),
             constraints,
+            param_capabilities: scheme.param_capabilities.clone(),
         }
     }
 
@@ -286,6 +314,113 @@ impl Infer {
     fn record_symbol_type(&mut self, node_id: NodeId, ty: Ty) {
         if node_id != 0 {
             self.symbol_types.insert(node_id, self.subst.apply(&ty));
+        }
+    }
+
+    fn record_callable_capabilities(
+        &mut self,
+        node_id: NodeId,
+        param_capabilities: Vec<ParamCapability>,
+    ) {
+        if node_id != 0 {
+            self.callable_capabilities
+                .insert(node_id, CallableCapabilities { param_capabilities });
+        }
+    }
+
+    fn callable_capabilities_for(&self, node_id: NodeId) -> Vec<ParamCapability> {
+        self.callable_capabilities
+            .get(&node_id)
+            .map(|capabilities| capabilities.param_capabilities.clone())
+            .unwrap_or_default()
+    }
+
+    fn check_mutable_place_args(
+        &self,
+        env: &TypeEnv,
+        args: &[Expr],
+        param_capabilities: &[ParamCapability],
+    ) -> Result<(), SpannedTypeError> {
+        self.check_mutable_place_args_from(env, args, param_capabilities, 0)
+    }
+
+    fn check_mutable_place_args_from(
+        &self,
+        env: &TypeEnv,
+        args: &[Expr],
+        param_capabilities: &[ParamCapability],
+        param_offset: usize,
+    ) -> Result<(), SpannedTypeError> {
+        for (arg_idx, capability) in param_capabilities.iter().enumerate().skip(param_offset) {
+            if !capability.is_mut_place() {
+                continue;
+            }
+            let Some(arg) = args.get(arg_idx - param_offset) else {
+                continue;
+            };
+            self.check_mutable_place_arg(env, arg, arg_idx)?;
+        }
+        Ok(())
+    }
+
+    fn check_mutable_place_arg(
+        &self,
+        env: &TypeEnv,
+        arg: &Expr,
+        idx: usize,
+    ) -> Result<(), SpannedTypeError> {
+        if is_fresh_mutable_place(arg) {
+            return Ok(());
+        }
+        let Some(name) = find_assignment_base_name(arg) else {
+            return Err(TypeError::ExpectedMutablePlace(format!(
+                "argument {} must be a mutable place",
+                idx + 1
+            ))
+            .at(arg.span));
+        };
+        let info = env
+            .get(&name)
+            .ok_or_else(|| TypeError::UnboundVariable(name.clone()).at(arg.span))?;
+        if info.is_place_mutable() {
+            Ok(())
+        } else {
+            Err(TypeError::ExpectedMutablePlace(format!(
+                "argument {} must be a mutable place, but `{}` is not mutable",
+                idx + 1,
+                name
+            ))
+            .at(arg.span))
+        }
+    }
+
+    fn record_literal_callable_fields(
+        &self,
+        value: &Expr,
+    ) -> Option<HashMap<String, Vec<ParamCapability>>> {
+        let ExprKind::Record(entries) = &value.kind else {
+            return None;
+        };
+        let mut fields = HashMap::new();
+        for entry in entries {
+            let RecordEntry::Field(name, expr) = entry else {
+                continue;
+            };
+            let Some(capabilities) = self.callable_capabilities.get(&expr.id) else {
+                continue;
+            };
+            if capabilities
+                .param_capabilities
+                .iter()
+                .any(|cap| cap.is_mut_place())
+            {
+                fields.insert(name.clone(), capabilities.param_capabilities.clone());
+            }
+        }
+        if fields.is_empty() {
+            None
+        } else {
+            Some(fields)
         }
     }
 
@@ -339,6 +474,7 @@ impl Infer {
             vars,
             constraints: vec![],
             ty,
+            param_capabilities: vec![],
         }
     }
 
@@ -431,7 +567,7 @@ impl Infer {
         env: &mut TypeEnv,
         name: &str,
         name_span: SourceSpan,
-        params: &[(Pattern, Option<Type>)],
+        params: &[Param],
         ret_type: &Option<Type>,
         body: &mut Expr,
         dict_params: &mut Vec<String>,
@@ -443,16 +579,17 @@ impl Infer {
         let mut body_env = env.clone();
         let initial_constraints = self.collect_type_bound_constraints(&mut param_vars, type_bounds);
 
-        for (pat, p_type) in params {
-            if !is_irrefutable_param(pat) {
+        let param_capabilities = param_capabilities(params);
+        for param in params {
+            if !is_irrefutable_param(&param.pat) {
                 return Err(TypeError::RefutableParamPattern.at(body.span));
             }
-            let p_ty = match p_type {
+            let p_ty = match &param.ty {
                 Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
                 None => self.subst.fresh_var(),
             };
             param_tys.push(p_ty.clone());
-            self.check_pattern(pat, p_ty, &mut body_env, false)?;
+            self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
         }
 
         let ret_ty = match ret_type {
@@ -468,10 +605,9 @@ impl Infer {
         if add_self_binding {
             body_env.insert(
                 name.to_string(),
-                EnvInfo {
-                    scheme: Scheme::mono(fn_ty.clone()),
-                    is_mutable: false,
-                },
+                EnvInfo::immutable(
+                    Scheme::mono(fn_ty.clone()).with_param_capabilities(param_capabilities.clone()),
+                ),
             );
         }
 
@@ -481,7 +617,10 @@ impl Infer {
         unify(&mut self.subst, body_ty, ret_ty).map_err(|err| err.at(body.span))?;
 
         let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
-        let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
+        let mut finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
+        finalized.scheme = finalized
+            .scheme
+            .with_param_capabilities(param_capabilities.clone());
         self.pending_constraints.extend(finalized.bubbled.clone());
 
         *dict_params = finalized.owned.iter().map(dict_param_name).collect();
@@ -492,10 +631,7 @@ impl Infer {
 
         env.insert(
             name.to_string(),
-            EnvInfo {
-                scheme: finalized.scheme.clone(),
-                is_mutable: false,
-            },
+            EnvInfo::immutable(finalized.scheme.clone()),
         );
         self.definition_schemes.insert(name_span, finalized.scheme);
         Ok(())
@@ -574,13 +710,7 @@ impl Infer {
                         .map_err(|err| err.at(span))?;
                     let scheme = self.generalize(env, t);
                     self.definition_schemes.insert(*name_span, scheme.clone());
-                    env.insert(
-                        name.clone(),
-                        EnvInfo {
-                            scheme,
-                            is_mutable: false,
-                        },
-                    );
+                    env.insert(name.clone(), EnvInfo::immutable(scheme));
                 }
                 _ => {}
             }
@@ -616,6 +746,8 @@ impl Infer {
                 .iter()
                 .map(|(span, scheme)| (*span, self.subst.apply_scheme(scheme)))
                 .collect(),
+            binding_capabilities: self.binding_capabilities.clone(),
+            callable_capabilities: self.callable_capabilities.clone(),
         }
     }
 
@@ -690,6 +822,8 @@ impl Infer {
             symbol_types: maps.symbol_types,
             binding_types: maps.binding_types,
             definition_schemes: maps.definition_schemes,
+            binding_capabilities: maps.binding_capabilities,
+            callable_capabilities: maps.callable_capabilities,
         })
     }
 
@@ -758,13 +892,7 @@ impl Infer {
                         Ok(t) => {
                             let scheme = self.generalize(&env, t);
                             self.definition_schemes.insert(*name_span, scheme.clone());
-                            env.insert(
-                                name.clone(),
-                                EnvInfo {
-                                    scheme,
-                                    is_mutable: false,
-                                },
-                            );
+                            env.insert(name.clone(), EnvInfo::immutable(scheme));
                         }
                         Err(err) => {
                             unavailable.extend(bound);
@@ -799,6 +927,9 @@ impl Infer {
                 symbol_types: self.symbol_types.clone(),
                 binding_types: self.binding_types.clone(),
                 definition_schemes: self.definition_schemes.clone(),
+                binding_capabilities: self.binding_capabilities.clone(),
+                callable_capabilities: self.callable_capabilities.clone(),
+                record_field_callables: self.record_field_callables.clone(),
                 inherent_methods: self.inherent_methods.clone(),
                 env: env.clone(),
             };
@@ -823,6 +954,9 @@ impl Infer {
                     self.symbol_types = snapshot.symbol_types;
                     self.binding_types = snapshot.binding_types;
                     self.definition_schemes = snapshot.definition_schemes;
+                    self.binding_capabilities = snapshot.binding_capabilities;
+                    self.callable_capabilities = snapshot.callable_capabilities;
+                    self.record_field_callables = snapshot.record_field_callables;
                     self.inherent_methods = snapshot.inherent_methods;
                     env = snapshot.env;
                     unavailable.extend(bound);
@@ -858,6 +992,8 @@ impl Infer {
                 symbol_types: maps.symbol_types,
                 binding_types: maps.binding_types,
                 definition_schemes: maps.definition_schemes,
+                binding_capabilities: maps.binding_capabilities,
+                callable_capabilities: maps.callable_capabilities,
             },
             diagnostics,
         )
@@ -876,6 +1012,10 @@ impl Infer {
         self.symbol_types.clear();
         self.binding_types.clear();
         self.definition_schemes.clear();
+        self.binding_capabilities.clear();
+        self.callable_capabilities.clear();
+        self.import_bindings.clear();
+        self.record_field_callables.clear();
     }
 
     fn register_impl_dict_names<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
@@ -935,16 +1075,36 @@ impl Infer {
                 // For a simple variable binding, support let-polymorphism.
                 if let Pattern::Variable(name, span) = pat {
                     self.binding_types.insert(*span, inferred_ty.clone());
+                    let rhs_callable_capabilities =
+                        self.callable_capabilities.get(&value.id).cloned();
                     let scheme = if *is_mutable || !is_value(&*value) {
                         Scheme::mono(inferred_ty)
                     } else {
                         self.generalize(env, inferred_ty)
                     };
+                    let scheme = if let Some(capabilities) = rhs_callable_capabilities {
+                        scheme.with_param_capabilities(capabilities.param_capabilities)
+                    } else {
+                        scheme
+                    };
+                    let place_mutable = *is_mutable && is_fresh_mutable_place(value);
+                    self.binding_capabilities
+                        .insert(*span, BindingCapabilities { place_mutable });
+                    if let ExprKind::Import(path) = &value.kind {
+                        self.import_bindings.insert(name.clone(), path.clone());
+                    } else if let Some(fields) = self.record_literal_callable_fields(value) {
+                        self.record_field_callables.insert(name.clone(), fields);
+                    } else if let ExprKind::Ident(source_name) = &value.kind
+                        && let Some(fields) = self.record_field_callables.get(source_name).cloned()
+                    {
+                        self.record_field_callables.insert(name.clone(), fields);
+                    }
                     env.insert(
                         name.clone(),
-                        EnvInfo {
-                            scheme,
-                            is_mutable: *is_mutable,
+                        if *is_mutable {
+                            EnvInfo::mutable_binding(scheme).with_place_mutable(place_mutable)
+                        } else {
+                            EnvInfo::immutable(scheme)
                         },
                     );
                 } else {
@@ -966,7 +1126,7 @@ impl Infer {
                             .iter()
                             .filter_map(|name| {
                                 env.get(name).map(|info| {
-                                    (name.clone(), info.scheme.ty.clone(), info.is_mutable)
+                                    (name.clone(), info.scheme.ty.clone(), info.binding_mutable)
                                 })
                             })
                             .collect();
@@ -980,12 +1140,14 @@ impl Infer {
                                 vars,
                                 constraints: vec![],
                                 ty: applied,
+                                param_capabilities: vec![],
                             };
                             env.insert(
                                 name,
-                                EnvInfo {
-                                    scheme,
-                                    is_mutable: is_mut,
+                                if is_mut {
+                                    EnvInfo::mutable_binding(scheme)
+                                } else {
+                                    EnvInfo::immutable(scheme)
                                 },
                             );
                         }
@@ -1088,14 +1250,12 @@ impl Infer {
             };
             entries.push((
                 variant.name.clone(),
-                EnvInfo {
-                    scheme: Scheme {
-                        vars: quantified.clone(),
-                        constraints: vec![],
-                        ty,
-                    },
-                    is_mutable: false,
-                },
+                EnvInfo::immutable(Scheme {
+                    vars: quantified.clone(),
+                    constraints: vec![],
+                    ty,
+                    param_capabilities: vec![],
+                }),
             ));
         }
         for (name, info) in entries {
@@ -1207,20 +1367,21 @@ impl Infer {
             let mut param_tys: Vec<Ty> = Vec::new();
             let mut body_env = env.clone();
 
-            for ((p_pat, p_type_opt), derived_ty) in
-                impl_method.params.iter().zip(derived_params.iter())
-            {
-                if !is_irrefutable_param(p_pat) {
+            for (param, derived_ty) in impl_method.params.iter().zip(derived_params.iter()) {
+                if param.mut_place {
+                    return Err(TypeError::MutableFunctionCapabilityMismatch.at(impl_method.span));
+                }
+                if !is_irrefutable_param(&param.pat) {
                     return Err(TypeError::RefutableParamPattern.at(impl_method.body.span));
                 }
                 let p_ty = self.ast_to_ty_with_vars(derived_ty, &mut param_vars)?;
-                if let Some(p_type) = p_type_opt {
+                if let Some(p_type) = &param.ty {
                     let explicit_ty = self.ast_to_ty_with_vars(p_type, &mut param_vars)?;
                     unify(&mut self.subst, p_ty.clone(), explicit_ty)
                         .map_err(|err| err.at(impl_method.body.span))?;
                 }
                 param_tys.push(p_ty.clone());
-                self.check_pattern(p_pat, p_ty, &mut body_env, false)?;
+                self.check_pattern(&param.pat, p_ty, &mut body_env, false)?;
             }
             let ret_ty = self.ast_to_ty_with_vars(&derived_ret, &mut param_vars)?;
 
@@ -1249,13 +1410,7 @@ impl Infer {
         });
         let dict_scheme = self.generalize(env, dict_ty);
         let dict_name = format!("__{}__{}", id.trait_name, impl_target);
-        env.insert(
-            dict_name,
-            EnvInfo {
-                scheme: dict_scheme,
-                is_mutable: false,
-            },
-        );
+        env.insert(dict_name, EnvInfo::immutable(dict_scheme));
         Ok(())
     }
 
@@ -1298,26 +1453,27 @@ impl Infer {
             let mut param_tys = Vec::new();
             let mut body_env = env.clone();
 
-            for (idx, (pat, p_type)) in method.params.iter().enumerate() {
-                if !is_irrefutable_param(pat) {
+            let param_capabilities = param_capabilities(&method.params);
+            for (idx, param) in method.params.iter().enumerate() {
+                if !is_irrefutable_param(&param.pat) {
                     return Err(TypeError::RefutableParamPattern.at(method.body.span));
                 }
                 let p_ty = if idx == 0 {
                     let receiver_ty = target_ty.clone();
-                    if let Some(explicit) = p_type {
+                    if let Some(explicit) = &param.ty {
                         let explicit_ty = self.ast_to_ty_with_vars(explicit, &mut param_vars)?;
                         unify(&mut self.subst, receiver_ty.clone(), explicit_ty)
                             .map_err(|err| err.at(method.body.span))?;
                     }
                     receiver_ty
                 } else {
-                    match p_type {
+                    match &param.ty {
                         Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
                         None => self.subst.fresh_var(),
                     }
                 };
                 param_tys.push(p_ty.clone());
-                self.check_pattern(pat, p_ty, &mut body_env, false)?;
+                self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
             }
 
             let ret_ty = match &method.ret_type {
@@ -1334,7 +1490,10 @@ impl Infer {
             unify(&mut self.subst, body_ty, ret_ty).map_err(|err| err.at(method.body.span))?;
 
             let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
-            let finalized = self.finalize_constraints(env, fn_ty.clone(), fn_constraints);
+            let mut finalized = self.finalize_constraints(env, fn_ty.clone(), fn_constraints);
+            finalized.scheme = finalized
+                .scheme
+                .with_param_capabilities(param_capabilities.clone());
             self.pending_constraints.extend(finalized.bubbled.clone());
             method.dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
@@ -1361,21 +1520,19 @@ impl Infer {
         dict_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
         env.insert(
             dict_name,
-            EnvInfo {
-                scheme: self.generalize(
-                    env,
-                    Ty::Record(Row {
-                        fields: dict_fields,
-                        tail: Box::new(Ty::Unit),
-                    }),
-                ),
-                is_mutable: false,
-            },
+            EnvInfo::immutable(self.generalize(
+                env,
+                Ty::Record(Row {
+                    fields: dict_fields,
+                    tail: Box::new(Ty::Unit),
+                }),
+            )),
         );
         Ok(())
     }
 
     fn infer_expr(&mut self, env: &TypeEnv, expr: &mut Expr) -> Result<Ty, SpannedTypeError> {
+        let expr_id = expr.id;
         let result: Result<Ty, SpannedTypeError> = match &mut expr.kind {
             ExprKind::Number(_) => Ok(Ty::F64),
             ExprKind::StringLit(_) => Ok(Ty::Con("string".to_string())),
@@ -1394,9 +1551,28 @@ impl Infer {
             ExprKind::Ident(name) => env
                 .get(name)
                 .map(|info| {
-                    let ty = self.instantiate_value(&info.scheme);
+                    let instantiated = self.instantiate_scheme(&info.scheme);
+                    let ty = if instantiated.constraints.is_empty() {
+                        instantiated.ty
+                    } else {
+                        Ty::Qualified(instantiated.constraints, Box::new(instantiated.ty))
+                    };
                     if expr.id != 0 {
                         self.symbol_types.insert(expr.id, self.subst.apply(&ty));
+                        self.binding_capabilities.insert(
+                            expr.span,
+                            BindingCapabilities {
+                                place_mutable: info.is_place_mutable(),
+                            },
+                        );
+                        if matches!(self.subst.apply(&info.scheme.ty), Ty::Func(_, _)) {
+                            self.callable_capabilities.insert(
+                                expr.id,
+                                CallableCapabilities {
+                                    param_capabilities: instantiated.param_capabilities,
+                                },
+                            );
+                        }
                     }
                     ty
                 })
@@ -1407,7 +1583,7 @@ impl Infer {
                         let info = env
                             .get(name)
                             .ok_or_else(|| TypeError::UnboundVariable(name.clone()))?;
-                        if !info.is_mutable {
+                        if !info.is_binding_mutable() {
                             return Err(TypeError::ImmutableAssignment(name.clone()).into());
                         }
                         let ty = self.instantiate(&info.scheme);
@@ -1417,13 +1593,14 @@ impl Infer {
                         ty
                     }
                     ExprKind::FieldAccess { .. } => {
-                        if let Some(name) = find_assignment_base_name(target) {
-                            let info = env
-                                .get(&name)
-                                .ok_or_else(|| TypeError::UnboundVariable(name.clone()))?;
-                            if !info.is_mutable {
-                                return Err(TypeError::ImmutableAssignment(name.clone()).into());
-                            }
+                        let Some(name) = find_assignment_base_name(target) else {
+                            return Err(TypeError::InvalidAssignmentTarget.into());
+                        };
+                        let info = env
+                            .get(&name)
+                            .ok_or_else(|| TypeError::UnboundVariable(name.clone()))?;
+                        if !info.is_place_mutable() {
+                            return Err(TypeError::ImmutablePlace(name).into());
                         }
                         self.infer_expr(env, target)?
                     }
@@ -1452,6 +1629,9 @@ impl Infer {
                             && let Some(info) = env.get(callee_name.as_str())
                         {
                             let scheme = info.scheme.clone();
+                            if scheme.param_capability(0).is_mut_place() {
+                                self.check_mutable_place_arg(env, lhs, 0)?;
+                            }
                             if !scheme.constraints.is_empty() {
                                 return self.infer_constrained_apply(
                                     &scheme,
@@ -1634,6 +1814,7 @@ impl Infer {
                             self.symbol_types
                                 .insert(callee.id, self.subst.apply(&instantiated));
                         }
+                        self.check_mutable_place_args(env, args, &scheme.param_capabilities)?;
                         let arg_tys = self.infer_args(env, args, arg_wrappers)?;
                         return self.infer_constrained_apply(
                             &scheme,
@@ -1653,6 +1834,8 @@ impl Infer {
                 } else {
                     Vec::new()
                 };
+                let param_capabilities = self.callable_capabilities_for(callee.id);
+                self.check_mutable_place_args(env, args, &param_capabilities)?;
                 let arg_tys = self.infer_args(env, args, arg_wrappers)?;
                 let ret_ty = Ty::Var(self.fresh_var());
                 unify(
@@ -1819,8 +2002,32 @@ impl Infer {
                     tail: Box::new(tail),
                 }))
             }
-            ExprKind::FieldAccess { expr, field, .. } => {
-                let expr_ty = self.infer_expr(env, expr)?;
+            ExprKind::FieldAccess {
+                expr: base, field, ..
+            } => {
+                let field_access_id = expr_id;
+                let imported_callable_capabilities = if let ExprKind::Ident(base_name) = &base.kind
+                    && let Some(module_name) = self.import_bindings.get(base_name)
+                    && let Some(scheme) = self
+                        .import_schemes
+                        .get(module_name)
+                        .and_then(|members| members.get(field))
+                    && matches!(scheme.ty, Ty::Func(_, _))
+                {
+                    Some(scheme.param_capabilities.clone())
+                } else {
+                    None
+                };
+                let local_field_callable_capabilities =
+                    if let ExprKind::Ident(base_name) = &base.kind {
+                        self.record_field_callables
+                            .get(base_name)
+                            .and_then(|fields| fields.get(field))
+                            .cloned()
+                    } else {
+                        None
+                    };
+                let expr_ty = self.infer_expr(env, base)?;
                 let field_ty = self.subst.fresh_var();
                 let tail = self.subst.fresh_var();
                 let expected = Ty::Record(Row {
@@ -1828,6 +2035,11 @@ impl Infer {
                     tail: Box::new(tail),
                 });
                 unify(&mut self.subst, expr_ty, expected)?;
+                if let Some(param_capabilities) =
+                    imported_callable_capabilities.or(local_field_callable_capabilities)
+                {
+                    self.record_callable_capabilities(field_access_id, param_capabilities);
+                }
                 Ok(field_ty)
             }
             ExprKind::Lambda {
@@ -1838,16 +2050,17 @@ impl Infer {
                 let mut param_vars: HashMap<String, TyVar> = HashMap::new();
                 let mut param_tys = Vec::new();
                 let mut body_env = env.clone();
-                for (pat, p_type) in params.iter() {
-                    if !is_irrefutable_param(pat) {
+                let param_capabilities = param_capabilities(params);
+                for param in params.iter() {
+                    if !is_irrefutable_param(&param.pat) {
                         return Err(TypeError::RefutableParamPattern.at(body.span));
                     }
-                    let p_ty = match p_type {
+                    let p_ty = match &param.ty {
                         Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
                         None => self.subst.fresh_var(),
                     };
                     param_tys.push(p_ty.clone());
-                    self.check_pattern(pat, p_ty, &mut body_env, false)?;
+                    self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
                 }
 
                 let saved_pending = std::mem::take(&mut self.pending_constraints);
@@ -1862,7 +2075,10 @@ impl Infer {
                 let fn_ty = Ty::Func(param_tys, Box::new(self.subst.apply(&ret_ty)));
                 let fn_constraints =
                     std::mem::replace(&mut self.pending_constraints, saved_pending);
-                let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
+                let mut finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
+                finalized.scheme = finalized
+                    .scheme
+                    .with_param_capabilities(param_capabilities.clone());
                 self.pending_constraints.extend(finalized.bubbled.clone());
                 *dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
@@ -1878,6 +2094,8 @@ impl Infer {
                     // enclosing resolver instead of reporting them as unresolved.
                     resolve_dict_uses_expr_lenient(body, &resolver, false)?;
                 }
+
+                self.record_callable_capabilities(expr_id, param_capabilities);
 
                 Ok(if finalized.owned.is_empty() {
                     finalized.scheme.ty
@@ -2054,6 +2272,24 @@ impl Infer {
     ) -> Result<Ty, SpannedTypeError> {
         let inferred_receiver_ty = self.infer_expr(env, receiver)?;
         let receiver_ty = self.subst.apply(&inferred_receiver_ty);
+        if let ExprKind::Ident(base_name) = &receiver.kind {
+            if let Some(module_name) = self.import_bindings.get(base_name)
+                && let Some(scheme) = self
+                    .import_schemes
+                    .get(module_name)
+                    .and_then(|members| members.get(method_name))
+                && matches!(scheme.ty, Ty::Func(_, _))
+            {
+                self.record_callable_capabilities(callee_id, scheme.param_capabilities.clone());
+            } else if let Some(param_capabilities) = self
+                .record_field_callables
+                .get(base_name)
+                .and_then(|fields| fields.get(method_name))
+                .cloned()
+            {
+                self.record_callable_capabilities(callee_id, param_capabilities);
+            }
+        }
 
         if let Some(mut field_ty) = record_field_ty(&receiver_ty, method_name) {
             if let Ty::Qualified(constraints, inner) = field_ty {
@@ -2066,6 +2302,8 @@ impl Infer {
                 );
                 field_ty = *inner;
             }
+            let param_capabilities = self.callable_capabilities_for(callee_id);
+            self.check_mutable_place_args(env, args, &param_capabilities)?;
             let arg_tys = self.infer_args(env, args, arg_wrappers)?;
             let ret_ty = Ty::Var(self.fresh_var());
             let call_ty = Ty::Func(arg_tys, Box::new(ret_ty.clone()));
@@ -2116,6 +2354,15 @@ impl Infer {
             .and_then(|methods| methods.get(method_name))
             .cloned()
         {
+            if method_info.scheme.param_capability(0).is_mut_place() {
+                self.check_mutable_place_arg(env, receiver, 0)?;
+            }
+            self.check_mutable_place_args_from(
+                env,
+                args,
+                &method_info.scheme.param_capabilities,
+                1,
+            )?;
             let mut arg_tys = Vec::with_capacity(args.len() + 1);
             arg_tys.push(receiver_ty);
             arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
@@ -2137,6 +2384,15 @@ impl Infer {
             .and_then(|methods| methods.get(method_name))
             .cloned()
         {
+            if method_info.scheme.param_capability(0).is_mut_place() {
+                self.check_mutable_place_arg(env, receiver, 0)?;
+            }
+            self.check_mutable_place_args_from(
+                env,
+                args,
+                &method_info.scheme.param_capabilities,
+                1,
+            )?;
             let mut arg_tys = Vec::with_capacity(args.len() + 1);
             arg_tys.push(receiver_ty);
             arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
@@ -2154,6 +2410,10 @@ impl Infer {
 
         if let Some(info) = env.get(method_name) {
             let scheme = info.scheme.clone();
+            if scheme.param_capability(0).is_mut_place() {
+                self.check_mutable_place_arg(env, receiver, 0)?;
+            }
+            self.check_mutable_place_args_from(env, args, &scheme.param_capabilities, 1)?;
             let mut arg_tys = Vec::with_capacity(args.len() + 1);
             arg_tys.push(receiver_ty);
             arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
@@ -2246,6 +2506,18 @@ impl Infer {
         let mut arg_tys = Vec::with_capacity(args.len());
         for arg in args {
             let inferred = self.infer_expr(env, arg)?;
+            if self
+                .callable_capabilities
+                .get(&arg.id)
+                .is_some_and(|capabilities| {
+                    capabilities
+                        .param_capabilities
+                        .iter()
+                        .any(|capability| capability.is_mut_place())
+                })
+            {
+                return Err(TypeError::MutableFunctionCapabilityMismatch.at(arg.span));
+            }
             let mut arg_ty = self.subst.apply(&inferred);
             let wrapper = if let Ty::Qualified(constraints, inner) = arg_ty {
                 let mut wrapper = ArgWrapper {
@@ -2299,8 +2571,15 @@ impl Infer {
         pat: &Pattern,
         scrutinee_ty: Ty,
         env: &mut TypeEnv,
-        is_mutable: bool,
+        binding_mutable: bool,
     ) -> Result<(), TypeError> {
+        let binding_info = |scheme| {
+            if binding_mutable {
+                EnvInfo::mutable_binding(scheme)
+            } else {
+                EnvInfo::immutable(scheme)
+            }
+        };
         match pat {
             Pattern::Wildcard => Ok(()),
             Pattern::StringLit(_) => {
@@ -2308,13 +2587,7 @@ impl Infer {
             }
             Pattern::Variable(name, span) => {
                 self.binding_types.insert(*span, scrutinee_ty.clone());
-                env.insert(
-                    name.clone(),
-                    EnvInfo {
-                        scheme: Scheme::mono(scrutinee_ty),
-                        is_mutable,
-                    },
-                );
+                env.insert(name.clone(), binding_info(Scheme::mono(scrutinee_ty)));
                 Ok(())
             }
             Pattern::Constructor { name, binding } => {
@@ -2354,13 +2627,7 @@ impl Infer {
                         }
                     };
                     self.binding_types.insert(*var_span, payload_ty.clone());
-                    env.insert(
-                        var_name.clone(),
-                        EnvInfo {
-                            scheme: Scheme::mono(payload_ty),
-                            is_mutable,
-                        },
-                    );
+                    env.insert(var_name.clone(), binding_info(Scheme::mono(payload_ty)));
                 }
                 Ok(())
             }
@@ -2399,10 +2666,7 @@ impl Infer {
                             .insert(*binding_span, self.subst.apply(field_ty));
                         env.insert(
                             binding_name.clone(),
-                            EnvInfo {
-                                scheme: Scheme::mono(self.subst.apply(field_ty)),
-                                is_mutable,
-                            },
+                            binding_info(Scheme::mono(self.subst.apply(field_ty))),
                         );
                     }
                 }
@@ -2410,13 +2674,7 @@ impl Infer {
                 if let Some(Some((rest_name, rest_span))) = rest {
                     let rest_ty = self.subst.apply(&Ty::Var(tail_var));
                     self.binding_types.insert(*rest_span, rest_ty.clone());
-                    env.insert(
-                        rest_name.clone(),
-                        EnvInfo {
-                            scheme: Scheme::mono(rest_ty),
-                            is_mutable,
-                        },
-                    );
+                    env.insert(rest_name.clone(), binding_info(Scheme::mono(rest_ty)));
                 }
                 Ok(())
             }
@@ -2426,17 +2684,11 @@ impl Infer {
                 unify(&mut self.subst, scrutinee_ty, arr_ty.clone())?;
 
                 for elem in elements {
-                    self.check_pattern(elem, elt_ty.clone(), env, is_mutable)?;
+                    self.check_pattern(elem, elt_ty.clone(), env, binding_mutable)?;
                 }
                 if let Some(Some((rest_name, rest_span))) = rest {
                     self.binding_types.insert(*rest_span, arr_ty.clone());
-                    env.insert(
-                        rest_name.clone(),
-                        EnvInfo {
-                            scheme: Scheme::mono(arr_ty),
-                            is_mutable,
-                        },
-                    );
+                    env.insert(rest_name.clone(), binding_info(Scheme::mono(arr_ty)));
                 }
                 Ok(())
             }
@@ -2445,11 +2697,38 @@ impl Infer {
                 unify(&mut self.subst, scrutinee_ty, Ty::Tuple(elem_tys.clone()))?;
                 for (p, t) in pats.iter().zip(elem_tys.iter()) {
                     let resolved = self.subst.apply(t);
-                    self.check_pattern(p, resolved, env, is_mutable)?;
+                    self.check_pattern(p, resolved, env, binding_mutable)?;
                 }
                 Ok(())
             }
         }
+    }
+
+    fn check_param_pattern(
+        &mut self,
+        pat: &Pattern,
+        scrutinee_ty: Ty,
+        env: &mut TypeEnv,
+        mut_place: bool,
+    ) -> Result<(), TypeError> {
+        if !mut_place {
+            return self.check_pattern(pat, scrutinee_ty, env, false);
+        }
+        let Pattern::Variable(name, span) = pat else {
+            return Err(TypeError::MutableParamMustBindName);
+        };
+        self.binding_types.insert(*span, scrutinee_ty.clone());
+        self.binding_capabilities.insert(
+            *span,
+            BindingCapabilities {
+                place_mutable: true,
+            },
+        );
+        env.insert(
+            name.clone(),
+            EnvInfo::immutable(Scheme::mono(scrutinee_ty)).with_place_mutable(true),
+        );
+        Ok(())
     }
 
     fn check_exhaustive(
@@ -2721,6 +3000,27 @@ fn dict_param_name(constraint: &TraitConstraint) -> String {
     format!("__dict_{}_{}", constraint.trait_name, constraint.var)
 }
 
+fn param_capabilities(params: &[Param]) -> Vec<ParamCapability> {
+    let capabilities: Vec<_> = params
+        .iter()
+        .map(|param| {
+            if param.mut_place {
+                ParamCapability::MutPlace
+            } else {
+                ParamCapability::Value
+            }
+        })
+        .collect();
+    if capabilities
+        .iter()
+        .any(|cap| matches!(cap, ParamCapability::MutPlace))
+    {
+        capabilities
+    } else {
+        Vec::new()
+    }
+}
+
 fn attach_dict_args(
     dict_args: &mut Vec<String>,
     pending_dict_args: &mut Vec<PendingDictArg>,
@@ -2806,11 +3106,11 @@ fn collect_stmt_referenced_names(
         } => {
             let mut body_scope = value_scope.clone();
             body_scope.insert(name.clone());
-            for (pat, param_ty) in params {
-                if let Some(param_ty) = param_ty {
+            for param in params {
+                if let Some(param_ty) = &param.ty {
                     collect_type_referenced_names(param_ty, refs, type_scope);
                 }
-                insert_pattern_bindings(&mut body_scope, pat);
+                insert_pattern_bindings(&mut body_scope, &param.pat);
             }
             if let Some(ret_type) = ret_type {
                 collect_type_referenced_names(ret_type, refs, type_scope);
@@ -2824,11 +3124,11 @@ fn collect_stmt_referenced_names(
             ..
         } => {
             let mut body_scope = value_scope.clone();
-            for (pat, param_ty) in params {
-                if let Some(param_ty) = param_ty {
+            for param in params {
+                if let Some(param_ty) = &param.ty {
                     collect_type_referenced_names(param_ty, refs, type_scope);
                 }
-                insert_pattern_bindings(&mut body_scope, pat);
+                insert_pattern_bindings(&mut body_scope, &param.pat);
             }
             if let Some(ret_type) = ret_type {
                 collect_type_referenced_names(ret_type, refs, type_scope);
@@ -2847,11 +3147,11 @@ fn collect_stmt_referenced_names(
             collect_type_referenced_names(&id.target, refs, type_scope);
             for method in &id.methods {
                 let mut method_scope = value_scope.clone();
-                for (pat, param_ty) in &method.params {
-                    if let Some(param_ty) = param_ty {
+                for param in &method.params {
+                    if let Some(param_ty) = &param.ty {
                         collect_type_referenced_names(param_ty, refs, type_scope);
                     }
-                    insert_pattern_bindings(&mut method_scope, pat);
+                    insert_pattern_bindings(&mut method_scope, &param.pat);
                 }
                 if let Some(ret_type) = &method.ret_type {
                     collect_type_referenced_names(ret_type, refs, type_scope);
@@ -2870,11 +3170,11 @@ fn collect_stmt_referenced_names(
                         }
                     }
                 }
-                for (pat, param_ty) in &method.params {
-                    if let Some(param_ty) = param_ty {
+                for param in &method.params {
+                    if let Some(param_ty) = &param.ty {
                         collect_type_referenced_names(param_ty, refs, type_scope);
                     }
-                    insert_pattern_bindings(&mut method_scope, pat);
+                    insert_pattern_bindings(&mut method_scope, &param.pat);
                 }
                 if let Some(ret_type) = &method.ret_type {
                     collect_type_referenced_names(ret_type, refs, type_scope);
@@ -2991,11 +3291,11 @@ fn collect_expr_referenced_names(
         }
         ExprKind::Lambda { params, body, .. } => {
             let mut lambda_scope = value_scope.clone();
-            for (pat, param_ty) in params {
-                if let Some(param_ty) = param_ty {
+            for param in params {
+                if let Some(param_ty) = &param.ty {
                     collect_type_referenced_names(param_ty, refs, type_scope);
                 }
-                insert_pattern_bindings(&mut lambda_scope, pat);
+                insert_pattern_bindings(&mut lambda_scope, &param.pat);
             }
             collect_expr_referenced_names(body, refs, &lambda_scope, type_scope);
         }
@@ -3558,10 +3858,7 @@ mod tests {
         let mut env = TypeEnv::new();
         env.insert(
             "outer".to_string(),
-            EnvInfo {
-                scheme: Scheme::mono(Ty::Var(0)),
-                is_mutable: false,
-            },
+            EnvInfo::immutable(Scheme::mono(Ty::Var(0))),
         );
 
         infer.subst.bind_ty(0, Ty::Var(1)).expect("valid alias");

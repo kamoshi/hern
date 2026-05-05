@@ -70,7 +70,7 @@ pub enum Stmt {
         span: SourceSpan,
         name: String,
         name_span: SourceSpan,
-        params: Vec<(Pattern, Option<Type>)>,
+        params: Vec<Param>,
         ret_type: Option<Type>,
         body: Expr,
         dict_params: Vec<String>,
@@ -82,7 +82,7 @@ pub enum Stmt {
         name_span: SourceSpan,
         fixity: Fixity,
         prec: u8,
-        params: Vec<(Pattern, Option<Type>)>,
+        params: Vec<Param>,
         ret_type: Option<Type>,
         body: Expr,
         dict_params: Vec<String>,
@@ -150,6 +150,31 @@ pub struct ArgWrapper {
     pub pending_dict_args: Vec<PendingDictArg>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub pat: Pattern,
+    pub ty: Option<Type>,
+    pub mut_place: bool,
+}
+
+impl Param {
+    pub fn new(pat: Pattern, ty: Option<Type>) -> Self {
+        Self {
+            pat,
+            ty,
+            mut_place: false,
+        }
+    }
+
+    pub fn mutable_place(pat: Pattern, ty: Option<Type>) -> Self {
+        Self {
+            pat,
+            ty,
+            mut_place: true,
+        }
+    }
+}
+
 // ── Trait / Impl ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -177,7 +202,7 @@ pub struct ImplMethod {
     pub span: SourceSpan,
     pub name: String,
     pub name_span: SourceSpan,
-    pub params: Vec<(Pattern, Option<Type>)>,
+    pub params: Vec<Param>,
     pub ret_type: Option<Type>,
     pub body: Expr,
     pub inline: bool,
@@ -196,7 +221,7 @@ pub struct InherentMethod {
     pub span: SourceSpan,
     pub name: String,
     pub name_span: SourceSpan,
-    pub params: Vec<(Pattern, Option<Type>)>,
+    pub params: Vec<Param>,
     pub ret_type: Option<Type>,
     pub body: Expr,
     pub dict_params: Vec<String>,
@@ -387,7 +412,7 @@ pub enum ExprKind {
     },
     Import(String),
     Lambda {
-        params: Vec<(Pattern, Option<Type>)>,
+        params: Vec<Param>,
         body: Box<Expr>,
         dict_params: Vec<String>,
     },

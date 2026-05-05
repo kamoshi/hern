@@ -1,0 +1,4 @@
+let r = #{ id: fn(x) { x } };
+let mut alias = r;
+alias.id = fn(x) { x + 1 };
+print(r.id("abc"));

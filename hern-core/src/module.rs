@@ -4,7 +4,7 @@ use crate::pipeline::{
     AnalysisOutput, parse_source, parse_source_recovering, reassociate_with_program,
 };
 use crate::types::infer::{Infer, TypeEnv, VariantEnv};
-use crate::types::{Scheme, Ty};
+use crate::types::{BindingCapabilities, CallableCapabilities, Scheme, Ty};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -26,6 +26,7 @@ pub struct ModuleGraph {
 #[derive(Clone, Default)]
 pub struct GraphInference {
     pub import_types: HashMap<String, Ty>,
+    pub import_schemes: HashMap<String, HashMap<String, Scheme>>,
     pub envs: HashMap<String, TypeEnv>,
     pub variant_envs: HashMap<String, VariantEnv>,
     pub module_envs: HashMap<String, ModuleEnv>,
@@ -33,6 +34,8 @@ pub struct GraphInference {
     pub symbol_types: HashMap<String, HashMap<NodeId, Ty>>,
     pub binding_types: HashMap<String, HashMap<SourceSpan, Ty>>,
     pub definition_schemes: HashMap<String, HashMap<SourceSpan, Scheme>>,
+    pub binding_capabilities: HashMap<String, HashMap<SourceSpan, BindingCapabilities>>,
+    pub callable_capabilities: HashMap<String, HashMap<NodeId, CallableCapabilities>>,
 }
 
 #[derive(Clone)]
@@ -397,6 +400,20 @@ impl GraphInference {
         self.definition_schemes.get(name)
     }
 
+    pub fn binding_capabilities_for_module(
+        &self,
+        name: &str,
+    ) -> Option<&HashMap<SourceSpan, BindingCapabilities>> {
+        self.binding_capabilities.get(name)
+    }
+
+    pub fn callable_capabilities_for_module(
+        &self,
+        name: &str,
+    ) -> Option<&HashMap<NodeId, CallableCapabilities>> {
+        self.callable_capabilities.get(name)
+    }
+
     pub fn env_for_module(&self, name: &str) -> Option<&TypeEnv> {
         self.envs.get(name)
     }
@@ -536,6 +553,7 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
         infer.set_inherent_scope(inherent_methods);
         infer.set_known_impl_dicts(module_env.all_dict_names());
         infer.set_import_types(result.import_types.clone());
+        infer.set_import_schemes(result.import_schemes.clone());
         let program = match graph.modules.get_mut(&name) {
             Some(program) => program,
             None => {
@@ -555,7 +573,13 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
         // Keep best-effort per-module state even when the module had its own diagnostics so LSP
         // features can still use surviving declarations. Importers are still blocked below by
         // marking the module unavailable, so partial state never becomes a valid dependency.
-        result.import_types.insert(name.clone(), inference.value_ty);
+        result
+            .import_types
+            .insert(name.clone(), inference.value_ty.clone());
+        result.import_schemes.insert(
+            name.clone(),
+            export_schemes_from_program(program, &inference.env),
+        );
         result.envs.insert(name.clone(), inference.env);
         result
             .variant_envs
@@ -573,6 +597,12 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
         result
             .definition_schemes
             .insert(name.clone(), inference.definition_schemes);
+        result
+            .binding_capabilities
+            .insert(name.clone(), inference.binding_capabilities);
+        result
+            .callable_capabilities
+            .insert(name.clone(), inference.callable_capabilities);
 
         if has_errors {
             diagnostics.extend(
@@ -603,6 +633,28 @@ fn module_type_diagnostic(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| name.to_string());
     CompilerDiagnostic::error_in(source, err.span, format!("type error in {}: {}", path, err))
+}
+
+fn export_schemes_from_program(program: &Program, env: &TypeEnv) -> HashMap<String, Scheme> {
+    let Some(Stmt::Expr(expr)) = program.stmts.last() else {
+        return HashMap::new();
+    };
+    let ExprKind::Record(entries) = &expr.kind else {
+        return HashMap::new();
+    };
+    let mut schemes = HashMap::new();
+    for entry in entries {
+        let crate::ast::RecordEntry::Field(field_name, value) = entry else {
+            continue;
+        };
+        let ExprKind::Ident(binding_name) = &value.kind else {
+            continue;
+        };
+        if let Some(info) = env.get(binding_name) {
+            schemes.insert(field_name.clone(), info.scheme.clone());
+        }
+    }
+    schemes
 }
 
 pub fn collect_imports_in_program(program: &Program) -> Vec<String> {

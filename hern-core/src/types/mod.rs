@@ -6,7 +6,7 @@ mod type_syntax;
 mod value;
 
 pub use env::{TypeEnv, VariantEnv, VariantInfo};
-pub use value::is_value;
+pub use value::{is_fresh_mutable_place, is_value};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -168,6 +168,51 @@ pub fn display_ty_with_var_names(ty: &Ty, names: &HashMap<TyVar, String>) -> Str
     DisplayTy(ty, names).to_string()
 }
 
+pub fn display_ty_with_var_names_and_param_capabilities(
+    ty: &Ty,
+    names: &HashMap<TyVar, String>,
+    capabilities: &[ParamCapability],
+) -> String {
+    DisplayTyWithParamCapabilities {
+        ty,
+        names,
+        capabilities,
+    }
+    .to_string()
+}
+
+struct DisplayTyWithParamCapabilities<'a> {
+    ty: &'a Ty,
+    names: &'a HashMap<TyVar, String>,
+    capabilities: &'a [ParamCapability],
+}
+
+impl fmt::Display for DisplayTyWithParamCapabilities<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.ty {
+            Ty::Qualified(_, inner) => write!(f, "{}", DisplayTy(inner, self.names)),
+            Ty::Func(params, ret) => {
+                write!(f, "fn(")?;
+                for (idx, param) in params.iter().enumerate() {
+                    if idx > 0 {
+                        write!(f, ", ")?;
+                    }
+                    if self
+                        .capabilities
+                        .get(idx)
+                        .is_some_and(|capability| capability.is_mut_place())
+                    {
+                        write!(f, "mut ")?;
+                    }
+                    write!(f, "{}", DisplayTy(param, self.names))?;
+                }
+                write!(f, ") -> {}", DisplayTy(ret, self.names))
+            }
+            ty => write!(f, "{}", DisplayTy(ty, self.names)),
+        }
+    }
+}
+
 pub fn free_type_vars_in_display_order(ty: &Ty) -> Vec<TyVar> {
     fn collect(ty: &Ty, vars: &mut Vec<TyVar>) {
         match ty {
@@ -221,6 +266,29 @@ pub struct Scheme {
     pub vars: Vec<TyVar>,
     pub constraints: Vec<TraitConstraint>,
     pub ty: Ty,
+    pub param_capabilities: Vec<ParamCapability>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamCapability {
+    Value,
+    MutPlace,
+}
+
+impl ParamCapability {
+    pub fn is_mut_place(self) -> bool {
+        matches!(self, ParamCapability::MutPlace)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BindingCapabilities {
+    pub place_mutable: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CallableCapabilities {
+    pub param_capabilities: Vec<ParamCapability>,
 }
 
 impl fmt::Display for Scheme {
@@ -264,14 +332,71 @@ impl Scheme {
             vars: vec![],
             constraints: vec![],
             ty,
+            param_capabilities: vec![],
         }
+    }
+
+    pub fn with_param_capabilities(mut self, param_capabilities: Vec<ParamCapability>) -> Self {
+        self.param_capabilities = param_capabilities;
+        self
+    }
+
+    pub fn param_capability(&self, idx: usize) -> ParamCapability {
+        self.param_capabilities
+            .get(idx)
+            .copied()
+            .unwrap_or(ParamCapability::Value)
+    }
+
+    pub fn has_mut_place_params(&self) -> bool {
+        self.param_capabilities.iter().any(|cap| cap.is_mut_place())
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct EnvInfo {
     pub scheme: Scheme,
-    pub is_mutable: bool,
+    pub binding_mutable: bool,
+    pub place_mutable: bool,
+}
+
+impl EnvInfo {
+    pub fn immutable(scheme: Scheme) -> Self {
+        Self {
+            scheme,
+            binding_mutable: false,
+            place_mutable: false,
+        }
+    }
+
+    pub fn mutable_binding(scheme: Scheme) -> Self {
+        Self {
+            scheme,
+            binding_mutable: true,
+            place_mutable: false,
+        }
+    }
+
+    pub fn mutable_place(scheme: Scheme) -> Self {
+        Self {
+            scheme,
+            binding_mutable: true,
+            place_mutable: true,
+        }
+    }
+
+    pub fn with_place_mutable(mut self, place_mutable: bool) -> Self {
+        self.place_mutable = place_mutable;
+        self
+    }
+
+    pub fn is_binding_mutable(&self) -> bool {
+        self.binding_mutable
+    }
+
+    pub fn is_place_mutable(&self) -> bool {
+        self.place_mutable
+    }
 }
 
 pub struct Subst {
@@ -378,6 +503,7 @@ impl Subst {
             vars: scheme.vars.clone(),
             constraints: scheme.constraints.clone(),
             ty: self.apply(&scheme.ty),
+            param_capabilities: scheme.param_capabilities.clone(),
         }
     }
 
@@ -644,6 +770,7 @@ mod tests {
             vars: vec![7],
             constraints: vec![],
             ty: Ty::Func(vec![Ty::Var(7)], Box::new(Ty::Var(7))),
+            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a. fn('a) -> 'a");
     }
@@ -661,6 +788,7 @@ mod tests {
                 vec![Ty::App(Box::new(Ty::Var(90)), vec![Ty::F64])],
                 Box::new(Ty::F64),
             ),
+            param_capabilities: vec![],
         };
         assert_eq!(
             scheme.to_string(),
@@ -675,6 +803,7 @@ mod tests {
             vars: vec![3, 5],
             constraints: vec![],
             ty: Ty::Func(vec![Ty::Var(3), Ty::Var(5)], Box::new(Ty::Var(5))),
+            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a 'b. fn('a, 'b) -> 'b");
     }
@@ -721,6 +850,7 @@ mod tests {
                 }],
                 Box::new(Ty::Var(1)),
             ),
+            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a. ['a: Add] 'a");
     }
@@ -735,6 +865,7 @@ mod tests {
                 fields: vec![("x".to_string(), Ty::F64)],
                 tail: Box::new(Ty::Var(2)),
             }),
+            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a. #{ x: f64, ..'a }");
     }
@@ -749,6 +880,7 @@ mod tests {
                 trait_name: "Debug".to_string(),
             }],
             ty: Ty::Var(0),
+            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a ['99: Debug]. 'a");
     }

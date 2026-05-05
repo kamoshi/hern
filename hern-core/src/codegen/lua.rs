@@ -233,8 +233,8 @@ impl LuaCodegen {
                 let params = method
                     .params
                     .iter()
-                    .filter_map(|(pat, _)| {
-                        if let Pattern::Variable(name, _) = pat {
+                    .filter_map(|param| {
+                        if let Pattern::Variable(name, _) = &param.pat {
                             Some(name.clone())
                         } else {
                             None
@@ -244,7 +244,7 @@ impl LuaCodegen {
                 if method
                     .params
                     .iter()
-                    .all(|(pat, _)| matches!(pat, Pattern::Variable(_, _)))
+                    .all(|param| matches!(param.pat, Pattern::Variable(_, _)))
                 {
                     self.inline_methods.insert(
                         key,
@@ -361,7 +361,7 @@ impl LuaCodegen {
     fn gen_function(
         &mut self,
         name: &str,
-        params: &[(Pattern, Option<Type>)],
+        params: &[Param],
         dict_params: &[String],
         body: &Expr,
     ) -> String {
@@ -369,8 +369,8 @@ impl LuaCodegen {
         let ind = self.ind();
         let mut all_params: Vec<String> = dict_params.iter().cloned().collect();
         let mut pattern_destructures = String::new();
-        for (i, (pat, _)) in params.iter().enumerate() {
-            match pat {
+        for (i, param) in params.iter().enumerate() {
+            match &param.pat {
                 Pattern::Variable(n, _) => all_params.push(n.clone()),
                 Pattern::Wildcard => all_params.push("_".to_string()),
                 _ => {
@@ -378,7 +378,7 @@ impl LuaCodegen {
                     all_params.push(placeholder.clone());
                     self.indent += 2;
                     pattern_destructures
-                        .push_str(&self.gen_for_pattern_bindings(pat, &placeholder));
+                        .push_str(&self.gen_for_pattern_bindings(&param.pat, &placeholder));
                     self.indent -= 2;
                 }
             }
@@ -702,8 +702,8 @@ impl LuaCodegen {
             } => {
                 let mut param_names: Vec<String> = dict_params.clone();
                 let mut pattern_destructures = String::new();
-                for (i, (pat, _)) in params.iter().enumerate() {
-                    match pat {
+                for (i, param) in params.iter().enumerate() {
+                    match &param.pat {
                         Pattern::Variable(n, _) => param_names.push(n.clone()),
                         Pattern::Wildcard => param_names.push("_".to_string()),
                         _ => {
@@ -711,7 +711,7 @@ impl LuaCodegen {
                             param_names.push(placeholder.clone());
                             self.indent += 2;
                             pattern_destructures
-                                .push_str(&self.gen_for_pattern_bindings(pat, &placeholder));
+                                .push_str(&self.gen_for_pattern_bindings(&param.pat, &placeholder));
                             self.indent -= 2;
                         }
                     }
@@ -1504,8 +1504,8 @@ impl LuaCodegen {
         for method in &id.methods {
             let mut param_names: Vec<String> = Vec::new();
             let mut pattern_destructures = String::new();
-            for (i, (pat, _)) in method.params.iter().enumerate() {
-                match pat {
+            for (i, param) in method.params.iter().enumerate() {
+                match &param.pat {
                     Pattern::Variable(n, _) => param_names.push(n.clone()),
                     Pattern::Wildcard => param_names.push("_".to_string()),
                     _ => {
@@ -1513,7 +1513,7 @@ impl LuaCodegen {
                         param_names.push(placeholder.clone());
                         self.indent += 2;
                         pattern_destructures
-                            .push_str(&self.gen_for_pattern_bindings(pat, &placeholder));
+                            .push_str(&self.gen_for_pattern_bindings(&param.pat, &placeholder));
                         self.indent -= 2;
                     }
                 }
@@ -1543,8 +1543,8 @@ impl LuaCodegen {
         for method in &id.methods {
             let mut param_names = method.dict_params.clone();
             let mut pattern_destructures = String::new();
-            for (i, (pat, _)) in method.params.iter().enumerate() {
-                match pat {
+            for (i, param) in method.params.iter().enumerate() {
+                match &param.pat {
                     Pattern::Variable(n, _) => param_names.push(n.clone()),
                     Pattern::Wildcard => param_names.push("_".to_string()),
                     _ => {
@@ -1552,7 +1552,7 @@ impl LuaCodegen {
                         param_names.push(placeholder.clone());
                         self.indent += 2;
                         pattern_destructures
-                            .push_str(&self.gen_for_pattern_bindings(pat, &placeholder));
+                            .push_str(&self.gen_for_pattern_bindings(&param.pat, &placeholder));
                         self.indent -= 2;
                     }
                 }

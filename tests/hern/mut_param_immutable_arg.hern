@@ -1,0 +1,6 @@
+fn bump(mut r: #{ x: f64 }) {
+  r.x = 2;
+}
+
+let r = #{ x: 1 };
+bump(r);

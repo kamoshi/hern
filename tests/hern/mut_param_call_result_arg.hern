@@ -1,0 +1,9 @@
+fn bump(mut r: #{ x: f64 }) {
+  r.x = 2;
+}
+
+fn make() {
+  #{ x: 1 }
+}
+
+bump(make());
