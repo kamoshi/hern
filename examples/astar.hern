@@ -1,0 +1,150 @@
+// --- Path reconstruction ---
+
+fn reconstruct(came_from: Map('a, 'b), current, key) {
+    let mut path = [current];
+    let mut k = key(current);
+
+    loop {
+        match came_from.get(k) {
+            None -> break (),
+            Some(parent) -> {
+                path.push(parent);
+                k = key(parent);
+            },
+        }
+    };
+
+    path.reverse()
+}
+
+// --- A* search ---
+//
+// start:     starting node
+// is_goal:   fn('node) -> bool
+// h:         admissible heuristic fn('node) -> f64
+// neighbors: fn('node) -> [('node, f64)]  (neighbor, edge_cost)
+// key:       fn('node) -> string  (unique string identity for a node)
+//
+// Returns Some(path) where path is [start, ..., goal], or None if unreachable.
+
+fn astar(start, is_goal, h, neighbors, key) {
+    let mut open = Heap::new();
+    let mut came_from = Map::new();
+    let mut visited = Map::new();
+    let mut g = Map::new();
+
+    let sk = key(start);
+    g.set(sk, 0);
+    open.push(h(start), start);
+
+    loop {
+        if open.is_empty() {
+            break None
+        };
+
+        let (_, current) = open.pop();
+        let ck = key(current);
+
+        if visited.has(ck) {
+            continue
+        };
+
+        visited.set(ck, true);
+
+        if is_goal(current) {
+            break Some(reconstruct(came_from, current, key))
+        };
+
+        let cg = match g.get(ck) {
+            Some(v) -> v,
+            None -> math.huge,
+        };
+
+        for (nb, cost) in neighbors(current) {
+            let nk = key(nb);
+            let ng = cg + cost;
+
+            let old_g = match g.get(nk) {
+                Some(v) -> v,
+                None -> math.huge,
+            };
+
+            if ng < old_g {
+                g.set(nk, ng);
+                came_from.set(nk, current);
+                open.push(ng + h(nb), nb)
+            }
+        }
+    }
+}
+
+// --- Demo: 2D grid pathfinding ---
+
+fn pos_key((r, c)) {
+    tostring(r) <> "," <> tostring(c)
+}
+
+fn manhattan((ar, ac), (br, bc)) {
+    math.abs(ar - br) + math.abs(ac - bc)
+}
+
+fn grid_neighbors(grid: [string], (r, c)) {
+    let rows = grid.len();
+    let cols = grid.get(r).len();
+    // cardinal directions: N S W E
+    let dirs = [(0 - 1, 0), (1, 0), (0, 0 - 1), (0, 1)];
+    let mut result = [];
+
+    for (dr, dc) in dirs {
+        let nr = r + dr;
+        let nc = c + dc;
+        if nr >= 1 && nr <= rows && nc >= 1 && nc <= cols {
+            if grid.get(nr).char_at(nc) != "#" {
+                result.push(((nr, nc), 1))
+            }
+        }
+    };
+
+    result
+}
+
+// Path forced through (r=1..5, c=5) corridor and bottom row:
+// (1,1)→(1,5)→(5,5)→(5,9)  — 12 moves optimal
+let grid = [
+    "S.#......",
+    ".##..##.#",
+    ".#....#..",
+    ".###.###.",
+    ".....#..E",
+];
+
+let mut start_pos = (1, 1);
+let mut goal_pos  = (1, 1);
+
+for r in range(1, grid.len()) {
+    let row = grid.get(r);
+    for c in range(1, row.len()) {
+        let ch = row.char_at(c);
+        if ch == "S" { start_pos = (r, c) };
+        if ch == "E" { goal_pos  = (r, c) };
+    }
+};
+
+let result = astar(
+    start_pos,
+    fn(pos) { pos_key(pos) == pos_key(goal_pos) },
+    fn(pos) { manhattan(pos, goal_pos) },
+    fn(pos) { grid_neighbors(grid, pos) },
+    pos_key
+);
+
+match result {
+    None -> print("no path found"),
+    Some(path) -> {
+        print("path length: " <> tostring(path.len() - 1));
+        for pos in path {
+            let (r, c) = pos;
+            print("  " <> tostring(r) <> "," <> tostring(c));
+        }
+    },
+}

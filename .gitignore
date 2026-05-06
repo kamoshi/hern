@@ -45,3 +45,6 @@
 !tests/run.py
 !tests/test.toml
 !tests/**/*.hern
+
+!examples/
+!examples/**

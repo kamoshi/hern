@@ -411,6 +411,14 @@ output = """
 30
 """
 
+[tests.closure_counter]
+path = "tests/hern/closure_counter.hern"
+expect = "typecheck"
+output = """
+2
+2
+"""
+
 [tests.custom_op]
 path = "tests/hern/custom_op.hern"
 expect = "typecheck"

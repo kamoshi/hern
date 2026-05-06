@@ -84,7 +84,7 @@ extern __concat: fn(string, string) -> string = #[template] "(($1) .. ($2))";
 
 // --- Map ---
 
-extern map_new: fn() -> mut Map('k, 'v) = "(function() return {} end)";
+extern __map_new: fn() -> mut Map('k, 'v) = "(function() return {} end)";
 
 extern __map_set: fn(Map('k, 'v), 'k, 'v) -> () = "(function(m, k, v) m[k] = v; return {} end)";
 extern __map_get: fn(Map('k, 'v), 'k) -> Option('v) = "(function(m, k) local v = m[k]; if v ~= nil then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end end)";
@@ -101,7 +101,7 @@ fn map_keys(m: Map('k, 'v)) -> ['k] { __map_keys(m) }
 fn map_size(m: Map('k, 'v)) -> f64 { __map_size(m) }
 
 impl Map('k, 'v) {
-    fn new() -> mut Self { map_new() }
+    fn new() -> mut Self { __map_new() }
     fn set(mut self, key: 'k, value: 'v) -> () { map_set(self, key, value) }
     fn get(self, key: 'k) -> Option('v) { map_get(self, key) }
     fn delete(mut self, key: 'k) -> () { map_delete(self, key) }
@@ -375,30 +375,21 @@ extern read_stdin: fn() -> string = "(function() return io.read(\"*a\") end)";
 
 // --- String utilities ---
 
-// Length of a string (O(1), uses Lua # operator).
-extern str_len: fn(string) -> f64 = #[template] "#($1)";
-
-// Single character at 1-based index i.
-extern char_at: fn(string, f64) -> string = #[template] "($1):sub(($2),($2))";
-
-// Split s into lines. Handles \r\n and \n; preserves empty lines; strips trailing newline.
-extern lines: fn(string) -> [string] = "(function(s)
+extern __str_len: fn(string) -> f64 = #[template] "#($1)";
+extern __char_at: fn(string, f64) -> string = #[template] "($1):sub(($2),($2))";
+extern __str_lines: fn(string) -> [string] = "(function(s)
   local r = {}
   s = s:gsub(\"\\r\\n\", \"\\n\")
   if s:sub(-1) == \"\\n\" then s = s:sub(1, -2) end
   for line in (s .. \"\\n\"):gmatch(\"([^\\n]*)\\n\") do r[#r+1] = line end
   return r
 end)";
-
-// Split s on runs of whitespace. Empty string returns [].
-extern words: fn(string) -> [string] = "(function(s)
+extern __str_words: fn(string) -> [string] = "(function(s)
   local r = {}
   for w in s:gmatch(\"%S+\") do r[#r+1] = w end
   return r
 end)";
-
-// Split s on the literal separator sep (not a Lua pattern). Multi-char separators ok.
-extern split: fn(string, string) -> [string] = "(function(s, sep)
+extern __str_split: fn(string, string) -> [string] = "(function(s, sep)
   local r, l, n = {}, 1, #sep
   while true do
     local f = s:find(sep, l, true)
@@ -409,128 +400,154 @@ extern split: fn(string, string) -> [string] = "(function(s, sep)
   r[#r+1] = s:sub(l)
   return r
 end)";
-
-// Explode a string into an array of single-character strings.
-extern chars: fn(string) -> [string] = "(function(s)
+extern __str_chars: fn(string) -> [string] = "(function(s)
   local r = {}
   for c in s:gmatch(\".\") do r[#r+1] = c end
   return r
 end)";
-
-// Strip leading and trailing whitespace.
-extern trim: fn(string) -> string = "(function(s) return s:match(\"^%s*(.-)%s*$\") end)";
-
-// True if s contains the literal substring sub.
-extern contains: fn(string, string) -> bool =
+extern __str_trim: fn(string) -> string = "(function(s) return s:match(\"^%s*(.-)%s*$\") end)";
+extern __str_contains: fn(string, string) -> bool =
   "(function(s, sub) return s:find(sub, 1, true) ~= nil and 1 or 0 end)";
-
-// True if s starts with the given prefix.
-extern starts_with: fn(string, string) -> bool =
+extern __str_starts_with: fn(string, string) -> bool =
   "(function(s, p) return s:sub(1, #p) == p and 1 or 0 end)";
-
-// True if s ends with the given suffix.
-extern ends_with: fn(string, string) -> bool =
+extern __str_ends_with: fn(string, string) -> bool =
   "(function(s, p) return #p == 0 or s:sub(-#p) == p and 1 or 0 end)";
-
-// Parse a string as a number, panicking on failure.
-extern int: fn(string) -> f64 = "(function(s)
+extern __str_to_int: fn(string) -> f64 = "(function(s)
   local n = _G.tonumber(s)
   if not n then _G.error(\"int: cannot parse \" .. _G.tostring(s)) end
   return n
 end)";
 
+impl string {
+    fn len(self) -> f64 { __str_len(self) }
+    fn char_at(self, i: f64) -> string { __char_at(self, i) }
+    fn lines(self) -> [string] { __str_lines(self) }
+    fn words(self) -> [string] { __str_words(self) }
+    fn split(self, sep: string) -> [string] { __str_split(self, sep) }
+    fn chars(self) -> [string] { __str_chars(self) }
+    fn trim(self) -> string { __str_trim(self) }
+    fn contains(self, sub: string) -> bool { __str_contains(self, sub) }
+    fn starts_with(self, prefix: string) -> bool { __str_starts_with(self, prefix) }
+    fn ends_with(self, suffix: string) -> bool { __str_ends_with(self, suffix) }
+    fn to_int(self) -> f64 { __str_to_int(self) }
+}
+
 // --- Array utilities ---
 
-// Length of an array (O(1), uses Lua # operator).
-extern array_len: fn(['a]) -> f64 = #[template] "#($1)";
+extern __array_len: fn(['a]) -> f64 = #[template] "#($1)";
+extern __array_get: fn(['a], f64) -> 'a = #[template] "($1)[($2)]";
+extern __array_set: fn(['a], f64, 'a) -> () = "(function(a, i, v) a[i] = v; return {} end)";
+extern __push: fn(['a], 'a) -> () = "(function(a, x) a[#a+1] = x; return {} end)";
+extern __pop: fn(['a]) -> 'a = "(function(a) return table.remove(a) end)";
 
-// Get element at 1-based index (no bounds check).
-extern array_get: fn(['a], f64) -> 'a = #[template] "($1)[($2)]";
-
-// Set element at 1-based index (mutates in place).
-extern array_set: fn(['a], f64, 'a) -> () = "(function(a, i, v) a[i] = v; return {} end)";
-
-// Append an element to an array (mutates in place).
-extern push: fn(['a], 'a) -> () = "(function(a, x) a[#a+1] = x; return {} end)";
-
-// Remove and return the last element (mutates in place).
-extern pop: fn(['a]) -> 'a = "(function(a) return table.remove(a) end)";
-
-// Map f over every element, returning a new array.
-extern array_map: fn(['a], fn('a) -> 'b) -> ['b] = "(function(a, f)
+extern __array_map: fn(['a], fn('a) -> 'b) -> ['b] = "(function(a, f)
   local r = {}
   for i, v in ipairs(a) do r[i] = f(v) end
   return r
 end)";
 
-// Keep only elements where f returns true, returning a new array.
-extern array_filter: fn(['a], fn('a) -> bool) -> ['a] = "(function(a, f)
+extern __array_filter: fn(['a], fn('a) -> bool) -> ['a] = "(function(a, f)
   local r = {}
   for _, v in ipairs(a) do if f(v) ~= 0 then r[#r+1] = v end end
   return r
 end)";
 
-// Left fold over an array.
-extern array_fold: fn(['a], 'b, fn('b, 'a) -> 'b) -> 'b = "(function(a, init, f)
+extern __array_fold: fn(['a], 'b, fn('b, 'a) -> 'b) -> 'b = "(function(a, init, f)
   local acc = init
   for _, v in ipairs(a) do acc = f(acc, v) end
   return acc
 end)";
 
-// Reverse an array, returning a new array.
-extern array_reverse: fn(['a]) -> ['a] = "(function(a)
+extern __array_reverse: fn(['a]) -> ['a] = "(function(a)
   local r = {}
   for i = #a, 1, -1 do r[#r+1] = a[i] end
   return r
 end)";
 
-// Sum of a numeric array.
-extern array_sum: fn([f64]) -> f64 = "(function(a)
-  local s = 0
-  for _, v in ipairs(a) do s = s + v end
-  return s
-end)";
-
-// Maximum of a numeric array (returns -math.huge for empty).
-extern array_max: fn([f64]) -> f64 = "(function(a)
-  local m = -math.huge
-  for _, v in ipairs(a) do if v > m then m = v end end
-  return m
-end)";
-
-// Minimum of a numeric array (returns math.huge for empty).
-extern array_min: fn([f64]) -> f64 = "(function(a)
-  local m = math.huge
-  for _, v in ipairs(a) do if v < m then m = v end end
-  return m
-end)";
-
-// Inclusive range [a, b] as an array. Step is always 1.
-extern array_range: fn(f64, f64) -> [f64] = "(function(a, b)
-  local r = {}
-  for i = a, b do r[#r+1] = i end
-  return r
-end)";
-
-// Concatenate two arrays, returning a new array.
-extern array_concat: fn(['a], ['a]) -> ['a] = "(function(a, b)
+extern __array_concat: fn(['a], ['a]) -> ['a] = "(function(a, b)
   local r = {}
   for _, v in ipairs(a) do r[#r+1] = v end
   for _, v in ipairs(b) do r[#r+1] = v end
   return r
 end)";
 
+extern __array_sum: fn([f64]) -> f64 = "(function(a)
+  local s = 0
+  for _, v in ipairs(a) do s = s + v end
+  return s
+end)";
+
+extern __array_max: fn([f64]) -> f64 = "(function(a)
+  local m = -math.huge
+  for _, v in ipairs(a) do if v > m then m = v end end
+  return m
+end)";
+
+extern __array_min: fn([f64]) -> f64 = "(function(a)
+  local m = math.huge
+  for _, v in ipairs(a) do if v < m then m = v end end
+  return m
+end)";
+
+extern __array_range: fn(f64, f64) -> [f64] = "(function(a, b)
+  local r = {}
+  for i = a, b do r[#r+1] = i end
+  return r
+end)";
+
+fn range(a: f64, b: f64) -> [f64] { __array_range(a, b) }
+fn array_sum(arr: [f64]) -> f64 { __array_sum(arr) }
+fn array_max(arr: [f64]) -> f64 { __array_max(arr) }
+fn array_min(arr: [f64]) -> f64 { __array_min(arr) }
+
+impl ['a] {
+    fn len(self) -> f64 {
+        __array_len(self)
+    }
+
+    fn get(self, i: f64) -> 'a {
+        __array_get(self, i)
+    }
+
+    fn set(mut self, i: f64, val: 'a) -> () {
+        __array_set(self, i, val)
+    }
+
+    fn push(mut self, val: 'a) -> () {
+        __push(self, val)
+    }
+
+    fn pop(mut self) -> 'a {
+        __pop(self)
+    }
+
+    fn map(self, f: fn('a) -> 'b) -> ['b] {
+        __array_map(self, f)
+    }
+
+    fn filter(self, f: fn('a) -> bool) -> ['a] {
+        __array_filter(self, f)
+    }
+
+    fn fold(self, init: 'b, f: fn('b, 'a) -> 'b) -> 'b {
+        __array_fold(self, init, f)
+    }
+
+    fn reverse(self) -> ['a] {
+        __array_reverse(self)
+    }
+}
+
 impl Semigroup for ['a] {
-    fn <>(lhs, rhs) { array_concat(lhs, rhs) }
+    fn <>(lhs, rhs) { __array_concat(lhs, rhs) }
 }
 
 // --- Priority queue (min-heap) ---
 // Heap('a) stores (priority: f64, value: 'a) pairs.
-// Create with `let mut h = heap_new()`.
 
 type Heap('a) = *
 
-extern heap_new: fn() -> mut Heap('a) = "(function() return {} end)";
+extern __heap_new: fn() -> mut Heap('a) = "(function() return {} end)";
 
 extern __heap_push: fn(Heap('a), f64, 'a) -> () = "(function(heap, priority, value)
   local item = {priority, value}
@@ -572,7 +589,7 @@ extern __heap_size: fn(Heap('a)) -> f64 = #[template] "#($1)";
 extern __heap_is_empty: fn(Heap('a)) -> bool = #[template] "(#($1) == 0 and 1 or 0)";
 
 impl Heap('a) {
-    fn new() -> mut Self { heap_new() }
+    fn new() -> mut Self { __heap_new() }
     fn push(mut self, priority: f64, value: 'a) -> () { __heap_push(self, priority, value) }
     fn pop(mut self) -> (f64, 'a) { __heap_pop(self) }
     fn size(self) -> f64 { __heap_size(self) }

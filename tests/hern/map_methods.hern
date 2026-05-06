@@ -19,4 +19,4 @@ print(m.has("b"));
 print(m.size());
 
 let keys = m.keys();
-print(array_len(keys));
+print(keys.len());

@@ -1,4 +1,4 @@
-use crate::ast::{ArrayEntry, Expr, ExprKind, RecordEntry};
+use crate::ast::{Expr, ExprKind};
 
 pub fn is_value(expr: &Expr) -> bool {
     match &expr.kind {
@@ -17,8 +17,19 @@ pub fn is_value(expr: &Expr) -> bool {
 }
 
 pub fn is_fresh_mutable_place(expr: &Expr) -> bool {
-    is_fresh_mutable_component(expr)
-        && matches!(expr.kind, ExprKind::Record(_) | ExprKind::Array(_))
+    match &expr.kind {
+        // Array elements are safe to alias: extraction via .get() returns 'a (not mut 'a),
+        // so callers cannot mutate elements through the array.
+        ExprKind::Array(entries) => entries.iter().all(|e| is_fresh_array_element(e.expr())),
+        // Record fields are NOT safe to alias via identifiers: field access on a mutable
+        // record reaches straight into the Lua table, allowing mutation of the original.
+        ExprKind::Record(entries) => entries.iter().all(|e| is_fresh_mutable_component(e.expr())),
+        _ => false,
+    }
+}
+
+fn is_fresh_array_element(expr: &Expr) -> bool {
+    matches!(expr.kind, ExprKind::Ident(_)) || is_fresh_mutable_component(expr)
 }
 
 fn is_fresh_mutable_component(expr: &Expr) -> bool {
@@ -31,10 +42,10 @@ fn is_fresh_mutable_component(expr: &Expr) -> bool {
         ExprKind::Tuple(exprs) => exprs.iter().all(is_fresh_mutable_component),
         ExprKind::Record(entries) => entries
             .iter()
-            .all(|entry| matches!(entry, RecordEntry::Field(_, value) if is_fresh_mutable_component(value))),
+            .all(|e| is_fresh_mutable_component(e.expr())),
         ExprKind::Array(entries) => entries
             .iter()
-            .all(|entry| matches!(entry, ArrayEntry::Elem(value) if is_fresh_mutable_component(value))),
+            .all(|e| is_fresh_array_element(e.expr())),
         _ => false,
     }
 }

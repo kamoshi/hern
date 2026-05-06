@@ -2496,21 +2496,9 @@ impl Infer {
         }
 
         if matches!(receiver_ty, Ty::Var(_)) {
-            if env.get(method_name).is_some()
-                || self
-                    .inherent_methods
-                    .values()
-                    .any(|methods| methods.contains_key(method_name))
-                || self
-                    .scoped_inherent_methods
-                    .values()
-                    .any(|methods| methods.contains_key(method_name))
-            {
-                return Err(TypeError::AmbiguousMethodReceiver {
-                    method: method_name.to_string(),
-                }
-                .into());
-            }
+            // Unconstrained receiver: default to row-polymorphic record field access.
+            // If the caller wants method dispatch on a specific type (Map, ['a], …),
+            // they must annotate the parameter; annotation drives type resolution.
             let field_ty = Ty::Var(self.fresh_var());
             let tail_ty = Ty::Var(self.fresh_var());
             unify(

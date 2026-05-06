@@ -1,0 +1,21 @@
+fn new_counter() {
+  let mut count = 0;
+
+  #{
+    inc: fn() { count = count + 1 },
+    get: fn() { count },
+  }
+}
+
+let counter = new_counter();
+
+counter.inc();
+counter.inc();
+print(counter.get());
+
+fn run_it(counter) {
+  let it = counter.get();
+  print(it);
+}
+
+run_it(counter);
