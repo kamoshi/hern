@@ -513,7 +513,7 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(1, 1)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "dep.value: fn() -> f64");
+        assert_eq!(hover_text(info), "f64");
     }
 
     #[test]
@@ -529,16 +529,19 @@ pub(super) mod tests {
 
     #[test]
     fn display_names_type_vars_by_visible_type_order() {
-        use hern_core::types::{ParamCapability, Scheme, Ty};
+        use hern_core::types::{ParamCapability, Scheme, Ty, value_func_params, value_func_return};
         let ty = Ty::Func(
-            vec![Ty::Var(78), Ty::Tuple(vec![Ty::Var(12), Ty::Var(78)])],
-            Box::new(Ty::Var(12)),
+            value_func_params(vec![Ty::Var(78), Ty::Tuple(vec![Ty::Var(12), Ty::Var(78)])]),
+            value_func_return(Ty::Var(12)),
         );
 
         assert_eq!(hover::ty_to_display_string(&ty), "fn('a, ('b, 'a)) -> 'b");
 
-        let scheme = Scheme::mono(Ty::Func(vec![Ty::F64], Box::new(Ty::Unit)))
-            .with_param_capabilities(vec![ParamCapability::MutPlace]);
+        let scheme = Scheme::mono(Ty::Func(
+            value_func_params(vec![Ty::F64]),
+            value_func_return(Ty::Unit),
+        ))
+        .with_param_capabilities(vec![ParamCapability::MutPlace]);
         assert_eq!(hover::hover_scheme_to_string(&scheme), "fn(mut f64) -> ()");
     }
 
@@ -685,7 +688,7 @@ pub(super) mod tests {
 
         let info = hover(&state, entry_uri, Position::new(1, 5)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "dep.value: fn() -> f64");
     }
 
     #[test]
@@ -757,7 +760,7 @@ pub(super) mod tests {
     fn hover_returns_custom_operator_definition_type_and_fixity() {
         let project = TestProject::new("operator-hover-custom");
         let source = concat!(
-            "fn infixr 5 <~>(lhs: string, rhs: string) -> string { lhs .. rhs }\n",
+            "fn infixr 5 <~>(lhs: string, rhs: string) -> string { lhs <> rhs }\n",
             "\"a\" <~> \"b\"\n",
         );
         let (state, uri) = project.open("main.hern", source);

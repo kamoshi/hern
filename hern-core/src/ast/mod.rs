@@ -157,6 +157,50 @@ pub struct Param {
     pub mut_place: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub ty: Type,
+    pub mut_place: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeReturn {
+    pub ty: Box<Type>,
+    pub mut_place: bool,
+}
+
+impl TypeReturn {
+    pub fn value(ty: Type) -> Self {
+        Self {
+            ty: Box::new(ty),
+            mut_place: false,
+        }
+    }
+
+    pub fn mutable_place(ty: Type) -> Self {
+        Self {
+            ty: Box::new(ty),
+            mut_place: true,
+        }
+    }
+}
+
+impl TypeParam {
+    pub fn value(ty: Type) -> Self {
+        Self {
+            ty,
+            mut_place: false,
+        }
+    }
+
+    pub fn mutable_place(ty: Type) -> Self {
+        Self {
+            ty,
+            mut_place: true,
+        }
+    }
+}
+
 impl Param {
     pub fn new(pat: Pattern, ty: Option<Type>) -> Self {
         Self {
@@ -439,7 +483,7 @@ pub enum Type {
     Ident(String),
     App(Box<Type>, Vec<Type>),
     Var(String),
-    Func(Vec<Type>, Box<Type>),
+    Func(Vec<TypeParam>, TypeReturn),
     Tuple(Vec<Type>),
     Record(Vec<(String, Type)>, bool),
     Unit,

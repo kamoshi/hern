@@ -233,7 +233,10 @@ fn find_hover_in_expr(
                     .get(&expr.id)
                     .or_else(|| symbol_types.get(&expr.id));
                 if let (Some(l), Some(r), Some(res)) = (lhs_ty, rhs_ty, result_ty) {
-                    let op_ty = Ty::Func(vec![l.clone(), r.clone()], Box::new(res.clone()));
+                    let op_ty = Ty::Func(
+                        crate::types::value_func_params(vec![l.clone(), r.clone()]),
+                        crate::types::value_func_return(res.clone()),
+                    );
                     if best
                         .as_ref()
                         .is_none_or(|cur| span_len(*op_span) <= span_len(cur.span))

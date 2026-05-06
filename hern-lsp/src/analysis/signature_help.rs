@@ -44,11 +44,12 @@ pub(crate) fn signature_help(
     let param_labels = params
         .iter()
         .enumerate()
-        .map(|(idx, ty)| {
-            let text = ty_to_display_string(ty);
-            if capabilities
-                .get(idx)
-                .is_some_and(|capability| matches!(capability, ParamCapability::MutPlace))
+        .map(|(idx, param)| {
+            let text = ty_to_display_string(&param.ty);
+            if param.capability.is_mut_place()
+                || capabilities
+                    .get(idx)
+                    .is_some_and(|capability| matches!(capability, ParamCapability::MutPlace))
             {
                 format!("mut {text}")
             } else {
@@ -57,9 +58,14 @@ pub(crate) fn signature_help(
         })
         .collect::<Vec<_>>();
     let label = format!(
-        "fn({}) -> {}",
+        "fn({}) -> {}{}",
         param_labels.join(", "),
-        ty_to_display_string(ret)
+        if ret.capability == hern_core::types::ReturnCapability::FreshPlace {
+            "mut "
+        } else {
+            ""
+        },
+        ty_to_display_string(&ret.ty)
     );
     let parameters = param_labels
         .into_iter()

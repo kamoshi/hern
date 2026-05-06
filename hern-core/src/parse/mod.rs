@@ -1158,9 +1158,18 @@ impl<'tokens> Parser<'tokens> {
                 let mut param_types = Vec::new();
                 if tokens.get(ptr).map(|t| &t.token) != Some(&Token::RParen) {
                     loop {
+                        let mut mut_place = false;
+                        if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Mut) {
+                            mut_place = true;
+                            ptr += 1;
+                        }
                         let (c_ty, ty) = self.parse_type(&tokens[ptr..])?;
                         ptr += c_ty;
-                        param_types.push(ty);
+                        param_types.push(if mut_place {
+                            TypeParam::mutable_place(ty)
+                        } else {
+                            TypeParam::value(ty)
+                        });
                         if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
                             ptr += 1;
                         } else {
@@ -1170,9 +1179,21 @@ impl<'tokens> Parser<'tokens> {
                 }
                 ptr += self.expect(&tokens[ptr..], Token::RParen)?;
                 ptr += self.expect(&tokens[ptr..], Token::Arrow)?;
+                let mut ret_mut_place = false;
+                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Mut) {
+                    ret_mut_place = true;
+                    ptr += 1;
+                }
                 let (c_ret, ret) = self.parse_type(&tokens[ptr..])?;
                 ptr += c_ret;
-                Type::Func(param_types, Box::new(ret))
+                Type::Func(
+                    param_types,
+                    if ret_mut_place {
+                        TypeReturn::mutable_place(ret)
+                    } else {
+                        TypeReturn::value(ret)
+                    },
+                )
             }
             Token::Ident(name) => {
                 ptr += 1;

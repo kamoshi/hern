@@ -1,0 +1,7 @@
+let mut m: Map(string, f64) = map_new();
+
+m.set("a", 1);
+m.set("b", 2);
+
+print(m.has("a"));
+print(m.size())

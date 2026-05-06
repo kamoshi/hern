@@ -21,9 +21,15 @@ pub(super) fn subst_hkt_param(ty: &Type, param: &str, target: &Type) -> Type {
         Type::Func(params, ret) => Type::Func(
             params
                 .iter()
-                .map(|p| subst_hkt_param(p, param, target))
+                .map(|p| crate::ast::TypeParam {
+                    ty: subst_hkt_param(&p.ty, param, target),
+                    mut_place: p.mut_place,
+                })
                 .collect(),
-            Box::new(subst_hkt_param(ret, param, target)),
+            crate::ast::TypeReturn {
+                ty: Box::new(subst_hkt_param(&ret.ty, param, target)),
+                mut_place: ret.mut_place,
+            },
         ),
         Type::Tuple(tys) => Type::Tuple(
             tys.iter()

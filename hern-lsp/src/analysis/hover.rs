@@ -751,15 +751,26 @@ pub(super) fn ast_type_to_string(ty: &hern_core::ast::Type) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Type::Func(params, ret) => format!(
-            "fn({}) -> {}",
-            params
-                .iter()
-                .map(ast_type_to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-            ast_type_to_string(ret)
-        ),
+        Type::Func(params, ret) => {
+            let ret_text = ast_type_to_string(&ret.ty);
+            format!(
+                "fn({}) -> {}{}",
+                params
+                    .iter()
+                    .map(|param| {
+                        let text = ast_type_to_string(&param.ty);
+                        if param.mut_place {
+                            format!("mut {text}")
+                        } else {
+                            text
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if ret.mut_place { "mut " } else { "" },
+                ret_text
+            )
+        }
         Type::Tuple(items) => format!(
             "({})",
             items
@@ -904,7 +915,9 @@ fn definition_hover_text(
     if let Some(scheme) =
         definition_schemes.and_then(|schemes| schemes.get(&definition.location.span))
     {
-        let env_scheme = env.and_then(|env| env.get(&definition.name)).map(|info| &info.scheme);
+        let env_scheme = env
+            .and_then(|env| env.get(&definition.name))
+            .map(|info| &info.scheme);
         let scheme = if scheme.param_capabilities.is_empty() {
             env_scheme.unwrap_or(scheme)
         } else {
@@ -1062,7 +1075,7 @@ fn param_type_from_fn_scheme(
     let Ty::Func(param_tys, _) = &scheme.scheme.ty else {
         return None;
     };
-    let param_ty = param_tys.get(param_idx)?;
+    let param_ty = &param_tys.get(param_idx)?.ty;
 
     // Navigate through the pattern structure to find the type of the specific binding.
     let binding_ty =
@@ -1107,7 +1120,7 @@ fn param_type_from_impl_dict(
     let Ty::Func(param_tys, _) = method_ty else {
         return None;
     };
-    let param_ty = param_tys.get(param_idx)?;
+    let param_ty = &param_tys.get(param_idx)?.ty;
 
     let binding_ty =
         extract_binding_type(param_pat, param_name, param_span, param_ty, variant_env)?;
@@ -1298,9 +1311,15 @@ fn instantiate_variant_template(
         Ty::Func(params, ret) => Ty::Func(
             params
                 .iter()
-                .map(|ty| instantiate_variant_template(ty, type_param_vars, args))
+                .map(|param| hern_core::types::FuncParam {
+                    ty: instantiate_variant_template(&param.ty, type_param_vars, args),
+                    capability: param.capability,
+                })
                 .collect(),
-            Box::new(instantiate_variant_template(ret, type_param_vars, args)),
+            hern_core::types::FuncReturn {
+                ty: Box::new(instantiate_variant_template(&ret.ty, type_param_vars, args)),
+                capability: ret.capability,
+            },
         ),
         Ty::App(con, params) => Ty::App(
             Box::new(instantiate_variant_template(con, type_param_vars, args)),
@@ -1349,7 +1368,7 @@ fn param_type_in_expr_stmts(
                 let Ty::Func(param_tys, _) = types.get(&expr.id)? else {
                     return None;
                 };
-                let param_ty = param_tys.get(idx)?;
+                let param_ty = &param_tys.get(idx)?.ty;
                 let pat = &params[idx].pat;
                 return extract_binding_type(pat, name, param_span, param_ty, variant_env)
                     .map(|ty| ty_to_display_string(&ty));

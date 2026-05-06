@@ -84,7 +84,7 @@ extern __concat: fn(string, string) -> string = #[template] "(($1) .. ($2))";
 
 // --- Map ---
 
-extern map_new: fn() -> Map('k, 'v) = "(function() return {} end)";
+extern map_new: fn() -> mut Map('k, 'v) = "(function() return {} end)";
 
 extern __map_set: fn(Map('k, 'v), 'k, 'v) -> Map('k, 'v) = "(function(m, k, v) m[k] = v; return m end)";
 extern __map_get: fn(Map('k, 'v), 'k) -> Option('v) = "(function(m, k) local v = m[k]; if v ~= nil then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end end)";
@@ -101,9 +101,9 @@ fn map_keys(m: Map('k, 'v)) -> ['k] { __map_keys(m) }
 fn map_size(m: Map('k, 'v)) -> f64 { __map_size(m) }
 
 impl Map('k, 'v) {
-    fn set(self, key: 'k, value: 'v) -> Map('k, 'v) { map_set(self, key, value) }
+    fn set(mut self, key: 'k, value: 'v) -> Map('k, 'v) { map_set(self, key, value) }
     fn get(self, key: 'k) -> Option('v) { map_get(self, key) }
-    fn delete(self, key: 'k) -> Map('k, 'v) { map_delete(self, key) }
+    fn delete(mut self, key: 'k) -> Map('k, 'v) { map_delete(self, key) }
     fn has(self, key: 'k) -> bool { map_has(self, key) }
     fn keys(self) -> ['k] { map_keys(self) }
     fn size(self) -> f64 { map_size(self) }

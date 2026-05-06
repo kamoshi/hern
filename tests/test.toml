@@ -112,6 +112,18 @@ output = """
 2
 """
 
+[tests.mut_param_record_annotation_erasure]
+path = "tests/hern/mut_param_record_annotation_erasure.hern"
+expect = "error"
+error_contains = "mutable function parameter requirements are incompatible"
+
+[tests.mut_param_record_annotation_ok]
+path = "tests/hern/mut_param_record_annotation_ok.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
 [tests.mut_param_module_import]
 path = "tests/hern/mut_param_module_import.hern"
 expect = "typecheck"
@@ -121,6 +133,24 @@ output = """
 
 [tests.mut_param_module_import_immutable_arg]
 path = "tests/hern/mut_param_module_import_immutable_arg.hern"
+expect = "error"
+error_contains = "must be a mutable place"
+
+[tests.mut_map_new_set]
+path = "tests/hern/mut_map_new_set.hern"
+expect = "typecheck"
+output = """
+1
+2
+"""
+
+[tests.mut_map_immutable_set]
+path = "tests/hern/mut_map_immutable_set.hern"
+expect = "error"
+error_contains = "must be a mutable place"
+
+[tests.mut_map_alias_set]
+path = "tests/hern/mut_map_alias_set.hern"
 expect = "error"
 error_contains = "must be a mutable place"
 

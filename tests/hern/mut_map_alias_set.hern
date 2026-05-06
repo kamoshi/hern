@@ -1,0 +1,4 @@
+let mut m: Map(string, f64) = map_new();
+let mut alias = m;
+
+alias.set("a", 1)

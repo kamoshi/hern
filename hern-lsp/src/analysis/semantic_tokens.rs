@@ -533,7 +533,10 @@ mod tests {
             Ty::Record(Row {
                 fields: vec![(
                     "add".to_string(),
-                    Ty::Func(vec![Ty::F64], Box::new(Ty::F64)),
+                    Ty::Func(
+                        hern_core::types::value_func_params(vec![Ty::F64]),
+                        hern_core::types::value_func_return(Ty::F64),
+                    ),
                 )],
                 tail: Box::new(Ty::Unit),
             }),

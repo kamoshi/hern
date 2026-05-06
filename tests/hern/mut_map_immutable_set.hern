@@ -1,0 +1,3 @@
+let m: Map(string, f64) = map_new();
+
+m.set("a", 1)

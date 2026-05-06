@@ -26,13 +26,65 @@ pub enum Ty {
     Unit,
     Qualified(Vec<TraitConstraint>, Box<Ty>),
     Tuple(Vec<Ty>),
-    Func(Vec<Ty>, Box<Ty>),
+    Func(Vec<FuncParam>, FuncReturn),
     Var(TyVar),
     /// A concrete type constructor: `bool`, `Array`, `Option`
     Con(String),
     /// Type application: `Array[f64]`, `Map[string, i32]`
     App(Box<Ty>, Vec<Ty>),
     Record(Row),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncParam {
+    pub ty: Ty,
+    pub capability: ParamCapability,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncReturn {
+    pub ty: Box<Ty>,
+    pub capability: ReturnCapability,
+}
+
+impl FuncParam {
+    pub fn value(ty: Ty) -> Self {
+        Self {
+            ty,
+            capability: ParamCapability::Value,
+        }
+    }
+
+    pub fn mut_place(ty: Ty) -> Self {
+        Self {
+            ty,
+            capability: ParamCapability::MutPlace,
+        }
+    }
+}
+
+impl FuncReturn {
+    pub fn value(ty: Ty) -> Self {
+        Self {
+            ty: Box::new(ty),
+            capability: ReturnCapability::Value,
+        }
+    }
+
+    pub fn fresh_place(ty: Ty) -> Self {
+        Self {
+            ty: Box::new(ty),
+            capability: ReturnCapability::FreshPlace,
+        }
+    }
+}
+
+pub fn value_func_params(params: Vec<Ty>) -> Vec<FuncParam> {
+    params.into_iter().map(FuncParam::value).collect()
+}
+
+pub fn value_func_return(ret: Ty) -> FuncReturn {
+    FuncReturn::value(ret)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,9 +190,16 @@ impl fmt::Display for DisplayTy<'_> {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", DisplayTy(p, names))?;
+                    if p.capability.is_mut_place() {
+                        write!(f, "mut ")?;
+                    }
+                    write!(f, "{}", DisplayTy(&p.ty, names))?;
                 }
-                write!(f, ") -> {}", DisplayTy(ret, names))
+                write!(f, ") -> ")?;
+                if ret.capability == ReturnCapability::FreshPlace {
+                    write!(f, "mut ")?;
+                }
+                write!(f, "{}", DisplayTy(&ret.ty, names))
             }
             Ty::Record(row) => {
                 write!(f, "#{{ ")?;
@@ -197,16 +256,21 @@ impl fmt::Display for DisplayTyWithParamCapabilities<'_> {
                     if idx > 0 {
                         write!(f, ", ")?;
                     }
-                    if self
-                        .capabilities
-                        .get(idx)
-                        .is_some_and(|capability| capability.is_mut_place())
+                    if param.capability.is_mut_place()
+                        || self
+                            .capabilities
+                            .get(idx)
+                            .is_some_and(|capability| capability.is_mut_place())
                     {
                         write!(f, "mut ")?;
                     }
-                    write!(f, "{}", DisplayTy(param, self.names))?;
+                    write!(f, "{}", DisplayTy(&param.ty, self.names))?;
                 }
-                write!(f, ") -> {}", DisplayTy(ret, self.names))
+                write!(f, ") -> ")?;
+                if ret.capability == ReturnCapability::FreshPlace {
+                    write!(f, "mut ")?;
+                }
+                write!(f, "{}", DisplayTy(&ret.ty, self.names))
             }
             ty => write!(f, "{}", DisplayTy(ty, self.names)),
         }
@@ -236,9 +300,9 @@ pub fn free_type_vars_in_display_order(ty: &Ty) -> Vec<TyVar> {
             }
             Ty::Func(params, ret) => {
                 for param in params {
-                    collect(param, vars);
+                    collect(&param.ty, vars);
                 }
-                collect(ret, vars);
+                collect(&ret.ty, vars);
             }
             Ty::App(con, args) => {
                 collect(con, vars);
@@ -273,6 +337,12 @@ pub struct Scheme {
 pub enum ParamCapability {
     Value,
     MutPlace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnCapability {
+    Value,
+    FreshPlace,
 }
 
 impl ParamCapability {
@@ -465,8 +535,17 @@ impl Subst {
                 Box::new(self.apply(ty)),
             ),
             Ty::Func(params, ret) => Ty::Func(
-                params.iter().map(|p| self.apply(p)).collect(),
-                Box::new(self.apply(ret)),
+                params
+                    .iter()
+                    .map(|p| FuncParam {
+                        ty: self.apply(&p.ty),
+                        capability: p.capability,
+                    })
+                    .collect(),
+                FuncReturn {
+                    ty: Box::new(self.apply(&ret.ty)),
+                    capability: ret.capability,
+                },
             ),
             Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| self.apply(t)).collect()),
             Ty::App(con, args) => Ty::App(
@@ -536,9 +615,9 @@ pub fn free_type_vars(ty: &Ty) -> HashSet<TyVar> {
         }
         Ty::Func(params, ret) => {
             for p in params {
-                vars.extend(free_type_vars(p));
+                vars.extend(free_type_vars(&p.ty));
             }
-            vars.extend(free_type_vars(ret));
+            vars.extend(free_type_vars(&ret.ty));
         }
         Ty::Tuple(tys) => {
             for t in tys {
@@ -581,9 +660,15 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
                 });
             }
             for (a, b) in p1.into_iter().zip(p2.into_iter()) {
-                unify(s, a, b)?;
+                if a.capability != b.capability {
+                    return Err(error::TypeError::MutableFunctionCapabilityMismatch);
+                }
+                unify(s, a.ty, b.ty)?;
             }
-            unify(s, *r1, *r2)
+            if r1.capability != r2.capability {
+                return Err(error::TypeError::MutableFunctionCapabilityMismatch);
+            }
+            unify(s, *r1.ty, *r2.ty)
         }
         (Ty::Tuple(t1s), Ty::Tuple(t2s)) => {
             if t1s.len() != t2s.len() {
@@ -769,7 +854,10 @@ mod tests {
         let scheme = Scheme {
             vars: vec![7],
             constraints: vec![],
-            ty: Ty::Func(vec![Ty::Var(7)], Box::new(Ty::Var(7))),
+            ty: Ty::Func(
+                value_func_params(vec![Ty::Var(7)]),
+                value_func_return(Ty::Var(7)),
+            ),
             param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a. fn('a) -> 'a");
@@ -785,8 +873,8 @@ mod tests {
                 trait_name: "Iterable".to_string(),
             }],
             ty: Ty::Func(
-                vec![Ty::App(Box::new(Ty::Var(90)), vec![Ty::F64])],
-                Box::new(Ty::F64),
+                value_func_params(vec![Ty::App(Box::new(Ty::Var(90)), vec![Ty::F64])]),
+                value_func_return(Ty::F64),
             ),
             param_capabilities: vec![],
         };
@@ -802,7 +890,10 @@ mod tests {
         let scheme = Scheme {
             vars: vec![3, 5],
             constraints: vec![],
-            ty: Ty::Func(vec![Ty::Var(3), Ty::Var(5)], Box::new(Ty::Var(5))),
+            ty: Ty::Func(
+                value_func_params(vec![Ty::Var(3), Ty::Var(5)]),
+                value_func_return(Ty::Var(5)),
+            ),
             param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a 'b. fn('a, 'b) -> 'b");
@@ -830,8 +921,8 @@ mod tests {
     #[test]
     fn free_type_vars_follow_display_order() {
         let ty = Ty::Func(
-            vec![Ty::Var(78), Ty::Tuple(vec![Ty::Var(12), Ty::Var(78)])],
-            Box::new(Ty::Var(12)),
+            value_func_params(vec![Ty::Var(78), Ty::Tuple(vec![Ty::Var(12), Ty::Var(78)])]),
+            value_func_return(Ty::Var(12)),
         );
 
         assert_eq!(free_type_vars_in_display_order(&ty), vec![78, 12]);

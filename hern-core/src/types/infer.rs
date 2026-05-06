@@ -10,11 +10,11 @@ use super::{
 use crate::ast::*;
 use crate::codegen::lua::mangle_op;
 use crate::types::{
-    BindingCapabilities, CallableCapabilities, EnvInfo, ParamCapability, Row, Scheme, Subst,
-    TraitConstraint, Ty, TyVar,
+    BindingCapabilities, CallableCapabilities, EnvInfo, FuncParam, FuncReturn, ParamCapability,
+    ReturnCapability, Row, Scheme, Subst, TraitConstraint, Ty, TyVar,
     env::build_variant_env_from_stmts,
     error::{SpannedTypeError, TypeError},
-    free_type_vars, unify,
+    free_type_vars, unify, value_func_params, value_func_return,
 };
 pub use crate::types::{TypeEnv, VariantEnv, VariantInfo, is_fresh_mutable_place, is_value};
 use std::collections::{HashMap, HashSet};
@@ -55,6 +55,7 @@ pub struct Infer {
     definition_schemes: HashMap<SourceSpan, Scheme>,
     binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     callable_capabilities: HashMap<NodeId, CallableCapabilities>,
+    fresh_place_exprs: HashSet<NodeId>,
 }
 
 struct InstantiatedScheme {
@@ -155,6 +156,7 @@ struct InferSnapshot {
     binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     callable_capabilities: HashMap<NodeId, CallableCapabilities>,
     record_field_callables: HashMap<String, HashMap<String, Vec<ParamCapability>>>,
+    fresh_place_exprs: HashSet<NodeId>,
     inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
     env: TypeEnv,
 }
@@ -217,6 +219,7 @@ impl Infer {
             definition_schemes: HashMap::new(),
             binding_capabilities: HashMap::new(),
             callable_capabilities: HashMap::new(),
+            fresh_place_exprs: HashSet::new(),
         }
     }
 
@@ -442,8 +445,17 @@ impl Infer {
                 Box::new(self.apply_inst(ty, map)),
             ),
             Ty::Func(params, ret) => Ty::Func(
-                params.iter().map(|p| self.apply_inst(p, map)).collect(),
-                Box::new(self.apply_inst(ret, map)),
+                params
+                    .iter()
+                    .map(|p| FuncParam {
+                        ty: self.apply_inst(&p.ty, map),
+                        capability: p.capability,
+                    })
+                    .collect(),
+                FuncReturn {
+                    ty: Box::new(self.apply_inst(&ret.ty, map)),
+                    capability: ret.capability,
+                },
             ),
             Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| self.apply_inst(t, map)).collect()),
             Ty::App(con, args) => Ty::App(
@@ -597,7 +609,10 @@ impl Infer {
             None => self.subst.fresh_var(),
         };
 
-        let fn_ty = Ty::Func(param_tys, Box::new(ret_ty.clone()));
+        let fn_ty = Ty::Func(
+            func_params_from_params(params, param_tys),
+            value_func_return(ret_ty.clone()),
+        );
 
         let saved_pending = std::mem::take(&mut self.pending_constraints);
         self.pending_constraints.extend(initial_constraints);
@@ -930,6 +945,7 @@ impl Infer {
                 binding_capabilities: self.binding_capabilities.clone(),
                 callable_capabilities: self.callable_capabilities.clone(),
                 record_field_callables: self.record_field_callables.clone(),
+                fresh_place_exprs: self.fresh_place_exprs.clone(),
                 inherent_methods: self.inherent_methods.clone(),
                 env: env.clone(),
             };
@@ -957,6 +973,7 @@ impl Infer {
                     self.binding_capabilities = snapshot.binding_capabilities;
                     self.callable_capabilities = snapshot.callable_capabilities;
                     self.record_field_callables = snapshot.record_field_callables;
+                    self.fresh_place_exprs = snapshot.fresh_place_exprs;
                     self.inherent_methods = snapshot.inherent_methods;
                     env = snapshot.env;
                     unavailable.extend(bound);
@@ -1014,6 +1031,7 @@ impl Infer {
         self.definition_schemes.clear();
         self.binding_capabilities.clear();
         self.callable_capabilities.clear();
+        self.fresh_place_exprs.clear();
         self.import_bindings.clear();
         self.record_field_callables.clear();
     }
@@ -1087,7 +1105,9 @@ impl Infer {
                     } else {
                         scheme
                     };
-                    let place_mutable = *is_mutable && is_fresh_mutable_place(value);
+                    let place_mutable = *is_mutable
+                        && (is_fresh_mutable_place(value)
+                            || self.fresh_place_exprs.contains(&value.id));
                     self.binding_capabilities
                         .insert(*span, BindingCapabilities { place_mutable });
                     if let ExprKind::Import(path) = &value.kind {
@@ -1245,7 +1265,10 @@ impl Infer {
                 Some(payload_ast) => {
                     let mut pm = param_map.clone();
                     let payload_ty = self.ast_to_ty_with_vars(payload_ast, &mut pm)?;
-                    Ty::Func(vec![payload_ty], Box::new(result_ty.clone()))
+                    Ty::Func(
+                        value_func_params(vec![payload_ty]),
+                        value_func_return(result_ty.clone()),
+                    )
                 }
             };
             entries.push((
@@ -1397,7 +1420,7 @@ impl Infer {
             unify(&mut self.subst, body_ty, ret_ty.clone())
                 .map_err(|err| err.at(impl_method.body.span))?;
 
-            let method_ty = Ty::Func(param_tys, Box::new(ret_ty));
+            let method_ty = Ty::Func(value_func_params(param_tys), value_func_return(ret_ty));
             self.definition_schemes
                 .insert(impl_method.name_span, Scheme::mono(method_ty.clone()));
             dict_fields.push((impl_method.name.clone(), method_ty));
@@ -1480,7 +1503,10 @@ impl Infer {
                 Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
                 None => self.subst.fresh_var(),
             };
-            let fn_ty = Ty::Func(param_tys.clone(), Box::new(ret_ty.clone()));
+            let fn_ty = Ty::Func(
+                func_params_from_params(&method.params, param_tys.clone()),
+                value_func_return(ret_ty.clone()),
+            );
 
             let saved_pending = std::mem::take(&mut self.pending_constraints);
             self.pending_constraints.extend(initial_constraints);
@@ -1629,7 +1655,7 @@ impl Infer {
                             && let Some(info) = env.get(callee_name.as_str())
                         {
                             let scheme = info.scheme.clone();
-                            if scheme.param_capability(0).is_mut_place() {
+                            if scheme_param_capability(&scheme, 0).is_mut_place() {
                                 self.check_mutable_place_arg(env, lhs, 0)?;
                             }
                             if !scheme.constraints.is_empty() {
@@ -1642,7 +1668,10 @@ impl Infer {
                             }
                         }
                         let ret_var = self.fresh_var();
-                        let expected_r_ty = Ty::Func(vec![l_ty], Box::new(Ty::Var(ret_var)));
+                        let expected_r_ty = Ty::Func(
+                            value_func_params(vec![l_ty]),
+                            value_func_return(Ty::Var(ret_var)),
+                        );
                         unify(&mut self.subst, r_ty, expected_r_ty)?;
                         Ok(self.subst.apply(&Ty::Var(ret_var)))
                     }
@@ -1722,7 +1751,10 @@ impl Infer {
                                 .map(|info| self.instantiate(&info.scheme))
                                 .ok_or_else(|| TypeError::UnboundVariable(op.clone()))?;
                             let ret_var = self.fresh_var();
-                            let expected = Ty::Func(vec![l_ty, r_ty], Box::new(Ty::Var(ret_var)));
+                            let expected = Ty::Func(
+                                value_func_params(vec![l_ty, r_ty]),
+                                value_func_return(Ty::Var(ret_var)),
+                            );
                             unify(&mut self.subst, fn_ty, expected)?;
                             Ok(self.subst.apply(&Ty::Var(ret_var)))
                         }
@@ -1768,6 +1800,7 @@ impl Infer {
                     let callee_id = callee.id;
                     return self.resolve_receiver_call(
                         env,
+                        expr_id,
                         callee_id,
                         expr,
                         field,
@@ -1814,7 +1847,11 @@ impl Infer {
                             self.symbol_types
                                 .insert(callee.id, self.subst.apply(&instantiated));
                         }
-                        self.check_mutable_place_args(env, args, &scheme.param_capabilities)?;
+                        self.check_mutable_place_args(
+                            env,
+                            args,
+                            &scheme_param_capabilities(&scheme),
+                        )?;
                         let arg_tys = self.infer_args(env, args, arg_wrappers)?;
                         return self.infer_constrained_apply(
                             &scheme,
@@ -1834,14 +1871,21 @@ impl Infer {
                 } else {
                     Vec::new()
                 };
-                let param_capabilities = self.callable_capabilities_for(callee.id);
+                let param_capabilities = match &callee_ty {
+                    Ty::Func(params, _) => func_param_capabilities(params),
+                    _ => self.callable_capabilities_for(callee.id),
+                };
+                let fresh_return =
+                    func_return_capability(&callee_ty) == ReturnCapability::FreshPlace;
                 self.check_mutable_place_args(env, args, &param_capabilities)?;
                 let arg_tys = self.infer_args(env, args, arg_wrappers)?;
                 let ret_ty = Ty::Var(self.fresh_var());
+                let expected_params = expected_func_params(&callee_ty, arg_tys);
+                let expected_ret = expected_func_return(&callee_ty, ret_ty.clone());
                 unify(
                     &mut self.subst,
                     callee_ty,
-                    Ty::Func(arg_tys, Box::new(ret_ty.clone())),
+                    Ty::Func(expected_params, expected_ret),
                 )?;
                 attach_dict_args(
                     dict_args,
@@ -1850,6 +1894,9 @@ impl Infer {
                     &callee_constraints,
                     &self.subst,
                 );
+                if fresh_return && expr_id != 0 {
+                    self.fresh_place_exprs.insert(expr_id);
+                }
                 Ok(self.subst.apply(&ret_ty))
             }
             ExprKind::If {
@@ -2072,7 +2119,10 @@ impl Infer {
                 self.fn_return_tys.pop();
                 unify(&mut self.subst, body_ty, ret_ty.clone())?;
 
-                let fn_ty = Ty::Func(param_tys, Box::new(self.subst.apply(&ret_ty)));
+                let fn_ty = Ty::Func(
+                    func_params_from_params(params, param_tys),
+                    value_func_return(self.subst.apply(&ret_ty)),
+                );
                 let fn_constraints =
                     std::mem::replace(&mut self.pending_constraints, saved_pending);
                 let mut finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
@@ -2234,7 +2284,10 @@ impl Infer {
                 unify(
                     &mut self.subst,
                     method_ty,
-                    Ty::Func(arg_tys, Box::new(ret_ty.clone())),
+                    Ty::Func(
+                        value_func_params(arg_tys),
+                        value_func_return(ret_ty.clone()),
+                    ),
                 )?;
                 ret_ty
             } else if self.known_impl_dicts.contains(&dict_name) {
@@ -2260,6 +2313,7 @@ impl Infer {
     fn resolve_receiver_call(
         &mut self,
         env: &TypeEnv,
+        call_expr_id: NodeId,
         callee_id: NodeId,
         receiver: &mut Box<Expr>,
         method_name: &str,
@@ -2302,13 +2356,23 @@ impl Infer {
                 );
                 field_ty = *inner;
             }
-            let param_capabilities = self.callable_capabilities_for(callee_id);
+            let fresh_return = func_return_capability(&field_ty) == ReturnCapability::FreshPlace;
+            let param_capabilities = match &field_ty {
+                Ty::Func(params, _) => func_param_capabilities(params),
+                _ => self.callable_capabilities_for(callee_id),
+            };
             self.check_mutable_place_args(env, args, &param_capabilities)?;
             let arg_tys = self.infer_args(env, args, arg_wrappers)?;
             let ret_ty = Ty::Var(self.fresh_var());
-            let call_ty = Ty::Func(arg_tys, Box::new(ret_ty.clone()));
+            let call_ty = Ty::Func(
+                expected_func_params(&field_ty, arg_tys),
+                expected_func_return(&field_ty, ret_ty.clone()),
+            );
             unify(&mut self.subst, field_ty, call_ty.clone())?;
             self.record_symbol_type(callee_id, call_ty);
+            if fresh_return && call_expr_id != 0 {
+                self.fresh_place_exprs.insert(call_expr_id);
+            }
             return Ok(self.subst.apply(&ret_ty));
         }
 
@@ -2340,7 +2404,10 @@ impl Infer {
             )?;
             let arg_tys = self.infer_args(env, args, arg_wrappers)?;
             let ret_ty = Ty::Var(self.fresh_var());
-            let call_ty = Ty::Func(arg_tys, Box::new(ret_ty.clone()));
+            let call_ty = Ty::Func(
+                value_func_params(arg_tys),
+                value_func_return(ret_ty.clone()),
+            );
             unify(&mut self.subst, field_ty, call_ty.clone())?;
             self.record_symbol_type(callee_id, call_ty);
             return Ok(self.subst.apply(&ret_ty));
@@ -2354,15 +2421,11 @@ impl Infer {
             .and_then(|methods| methods.get(method_name))
             .cloned()
         {
-            if method_info.scheme.param_capability(0).is_mut_place() {
+            if scheme_param_capability(&method_info.scheme, 0).is_mut_place() {
                 self.check_mutable_place_arg(env, receiver, 0)?;
             }
-            self.check_mutable_place_args_from(
-                env,
-                args,
-                &method_info.scheme.param_capabilities,
-                1,
-            )?;
+            let param_capabilities = scheme_param_capabilities(&method_info.scheme);
+            self.check_mutable_place_args_from(env, args, &param_capabilities, 1)?;
             let mut arg_tys = Vec::with_capacity(args.len() + 1);
             arg_tys.push(receiver_ty);
             arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
@@ -2372,7 +2435,13 @@ impl Infer {
                 dict_args,
                 pending_dict_args,
             )?;
-            self.record_symbol_type(callee_id, Ty::Func(arg_tys, Box::new(ret_ty.clone())));
+            self.record_symbol_type(
+                callee_id,
+                Ty::Func(
+                    value_func_params(arg_tys),
+                    value_func_return(ret_ty.clone()),
+                ),
+            );
             *is_method_call = true;
             *resolved_callee = Some(method_info.resolved_callee);
             return Ok(ret_ty);
@@ -2384,15 +2453,11 @@ impl Infer {
             .and_then(|methods| methods.get(method_name))
             .cloned()
         {
-            if method_info.scheme.param_capability(0).is_mut_place() {
+            if scheme_param_capability(&method_info.scheme, 0).is_mut_place() {
                 self.check_mutable_place_arg(env, receiver, 0)?;
             }
-            self.check_mutable_place_args_from(
-                env,
-                args,
-                &method_info.scheme.param_capabilities,
-                1,
-            )?;
+            let param_capabilities = scheme_param_capabilities(&method_info.scheme);
+            self.check_mutable_place_args_from(env, args, &param_capabilities, 1)?;
             let mut arg_tys = Vec::with_capacity(args.len() + 1);
             arg_tys.push(receiver_ty);
             arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
@@ -2402,7 +2467,13 @@ impl Infer {
                 dict_args,
                 pending_dict_args,
             )?;
-            self.record_symbol_type(callee_id, Ty::Func(arg_tys, Box::new(ret_ty.clone())));
+            self.record_symbol_type(
+                callee_id,
+                Ty::Func(
+                    value_func_params(arg_tys),
+                    value_func_return(ret_ty.clone()),
+                ),
+            );
             *is_method_call = true;
             *resolved_callee = Some(method_info.resolved_callee);
             return Ok(ret_ty);
@@ -2410,10 +2481,10 @@ impl Infer {
 
         if let Some(info) = env.get(method_name) {
             let scheme = info.scheme.clone();
-            if scheme.param_capability(0).is_mut_place() {
+            if scheme_param_capability(&scheme, 0).is_mut_place() {
                 self.check_mutable_place_arg(env, receiver, 0)?;
             }
-            self.check_mutable_place_args_from(env, args, &scheme.param_capabilities, 1)?;
+            self.check_mutable_place_args_from(env, args, &scheme_param_capabilities(&scheme), 1)?;
             let mut arg_tys = Vec::with_capacity(args.len() + 1);
             arg_tys.push(receiver_ty);
             arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
@@ -2423,7 +2494,13 @@ impl Infer {
                 dict_args,
                 pending_dict_args,
             )?;
-            self.record_symbol_type(callee_id, Ty::Func(arg_tys, Box::new(ret_ty.clone())));
+            self.record_symbol_type(
+                callee_id,
+                Ty::Func(
+                    value_func_params(arg_tys),
+                    value_func_return(ret_ty.clone()),
+                ),
+            );
             *is_method_call = true;
             *resolved_callee = Some(method_name.to_string());
             return Ok(ret_ty);
@@ -2506,15 +2583,16 @@ impl Infer {
         let mut arg_tys = Vec::with_capacity(args.len());
         for arg in args {
             let inferred = self.infer_expr(env, arg)?;
-            if self
-                .callable_capabilities
-                .get(&arg.id)
-                .is_some_and(|capabilities| {
-                    capabilities
-                        .param_capabilities
-                        .iter()
-                        .any(|capability| capability.is_mut_place())
-                })
+            if has_mut_place_func_params(&self.subst.apply(&inferred))
+                || self
+                    .callable_capabilities
+                    .get(&arg.id)
+                    .is_some_and(|capabilities| {
+                        capabilities
+                            .param_capabilities
+                            .iter()
+                            .any(|capability| capability.is_mut_place())
+                    })
             {
                 return Err(TypeError::MutableFunctionCapabilityMismatch.at(arg.span));
             }
@@ -2551,10 +2629,12 @@ impl Infer {
     ) -> Result<Ty, SpannedTypeError> {
         let instantiated = self.instantiate_scheme(scheme);
         let ret_ty = Ty::Var(self.fresh_var());
+        let expected_params = expected_func_params(&instantiated.ty, arg_tys);
+        let expected_ret = expected_func_return(&instantiated.ty, ret_ty.clone());
         unify(
             &mut self.subst,
             instantiated.ty,
-            Ty::Func(arg_tys, Box::new(ret_ty.clone())),
+            Ty::Func(expected_params, expected_ret),
         )?;
         attach_dict_args(
             dict_args,
@@ -2911,11 +2991,32 @@ impl Infer {
             Type::Func(params, ret) => {
                 let param_tys = params
                     .iter()
-                    .map(|p| self.ast_to_ty_with_vars_inner(p, param_vars, alias_stack))
+                    .map(|p| {
+                        self.ast_to_ty_with_vars_inner(&p.ty, param_vars, alias_stack)
+                            .map(|ty| {
+                                if p.mut_place {
+                                    FuncParam::mut_place(ty)
+                                } else {
+                                    FuncParam::value(ty)
+                                }
+                            })
+                    })
                     .collect::<Result<_, _>>()?;
                 Ty::Func(
                     param_tys,
-                    Box::new(self.ast_to_ty_with_vars_inner(ret, param_vars, alias_stack)?),
+                    if ret.mut_place {
+                        FuncReturn::fresh_place(self.ast_to_ty_with_vars_inner(
+                            &ret.ty,
+                            param_vars,
+                            alias_stack,
+                        )?)
+                    } else {
+                        value_func_return(self.ast_to_ty_with_vars_inner(
+                            &ret.ty,
+                            param_vars,
+                            alias_stack,
+                        )?)
+                    },
                 )
             }
             Type::App(con, args) => {
@@ -3019,6 +3120,78 @@ fn param_capabilities(params: &[Param]) -> Vec<ParamCapability> {
     } else {
         Vec::new()
     }
+}
+
+fn func_params_from_params(params: &[Param], param_tys: Vec<Ty>) -> Vec<FuncParam> {
+    params
+        .iter()
+        .zip(param_tys)
+        .map(|(param, ty)| {
+            if param.mut_place {
+                FuncParam::mut_place(ty)
+            } else {
+                FuncParam::value(ty)
+            }
+        })
+        .collect()
+}
+
+fn func_param_capabilities(params: &[FuncParam]) -> Vec<ParamCapability> {
+    let capabilities: Vec<_> = params.iter().map(|param| param.capability).collect();
+    if capabilities.iter().any(|cap| cap.is_mut_place()) {
+        capabilities
+    } else {
+        Vec::new()
+    }
+}
+
+fn func_return_capability(ty: &Ty) -> ReturnCapability {
+    match ty {
+        Ty::Func(_, ret) => ret.capability,
+        _ => ReturnCapability::Value,
+    }
+}
+
+fn scheme_param_capabilities(scheme: &Scheme) -> Vec<ParamCapability> {
+    match &scheme.ty {
+        Ty::Func(params, _) => func_param_capabilities(params),
+        _ => scheme.param_capabilities.clone(),
+    }
+}
+
+fn scheme_param_capability(scheme: &Scheme, idx: usize) -> ParamCapability {
+    scheme_param_capabilities(scheme)
+        .get(idx)
+        .copied()
+        .unwrap_or(ParamCapability::Value)
+}
+
+fn expected_func_params(callee_ty: &Ty, arg_tys: Vec<Ty>) -> Vec<FuncParam> {
+    match callee_ty {
+        Ty::Func(params, _) if params.len() == arg_tys.len() => params
+            .iter()
+            .zip(arg_tys)
+            .map(|(param, ty)| FuncParam {
+                ty,
+                capability: param.capability,
+            })
+            .collect(),
+        _ => value_func_params(arg_tys),
+    }
+}
+
+fn expected_func_return(callee_ty: &Ty, ret_ty: Ty) -> FuncReturn {
+    match callee_ty {
+        Ty::Func(_, ret) => FuncReturn {
+            ty: Box::new(ret_ty),
+            capability: ret.capability,
+        },
+        _ => value_func_return(ret_ty),
+    }
+}
+
+fn has_mut_place_func_params(ty: &Ty) -> bool {
+    matches!(ty, Ty::Func(params, _) if params.iter().any(|param| param.capability.is_mut_place()))
 }
 
 fn attach_dict_args(
@@ -3333,9 +3506,9 @@ fn collect_type_referenced_names(
         }
         Type::Func(params, ret) => {
             for param in params {
-                collect_type_referenced_names(param, refs, type_scope);
+                collect_type_referenced_names(&param.ty, refs, type_scope);
             }
-            collect_type_referenced_names(ret, refs, type_scope);
+            collect_type_referenced_names(&ret.ty, refs, type_scope);
         }
         Type::Tuple(items) => {
             for item in items {
@@ -3879,7 +4052,7 @@ mod tests {
 
         let finalized = infer.finalize_constraints(
             &TypeEnv::new(),
-            Ty::Func(vec![Ty::F64], Box::new(Ty::F64)),
+            Ty::Func(value_func_params(vec![Ty::F64]), value_func_return(Ty::F64)),
             vec![TraitConstraint {
                 var: 0,
                 trait_name: "Add".to_string(),

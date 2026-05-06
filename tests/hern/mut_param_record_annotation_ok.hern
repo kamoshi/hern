@@ -1,0 +1,12 @@
+fn bump(mut r: #{ x: f64 }) {
+  r.x = 2;
+}
+
+fn use_ops(ops: #{ bump: fn(mut #{ x: f64 }) -> Unit }, mut r: #{ x: f64 }) {
+  ops.bump(r);
+}
+
+let ops = #{ bump: bump };
+let mut r = #{ x: 1 };
+use_ops(ops, r);
+print(r.x)
