@@ -1,8 +1,8 @@
 # Hern
 
 Hern is **Highly Expressive Rusty Notation**: a small statically typed language
-with Hindley-Milner-style inference, structural data, traits, modules, and Lua
-code generation.
+with Hindley-Milner-style inference, structural data, higher-kinded traits,
+modules, and Lua code generation.
 
 Source files use the `.hern` extension. Extensionless imports resolve to `.hern` files.
 
@@ -28,7 +28,8 @@ The type system has:
 - Parametric polymorphism: functions can quantify over unconstrained type
   variables like `'a` and `'b`.
 - Trait constraints: generic functions can require capabilities without fixing a
-  concrete type.
+  concrete type. The trait parameter can itself be a type constructor, enabling
+  higher-kinded abstractions like `Functor`.
 - Row-polymorphic records: functions can ask for fields they use while
   preserving the rest of the record.
 - Algebraic data types: sum types with constructors and payloads.
@@ -37,6 +38,13 @@ The type system has:
   `for`.
 - Typed mutation: `let mut` is explicit, and assignment checks the existing
   binding type.
+- Mutable place tracking: `mut self` methods may only be called on *fresh
+  mutable places* - bindings whose value is a newly allocated array or record,
+  or the return of a `mut T`-annotated function. This prevents aliased mutation
+  without a borrow checker.
+- Inherent impl blocks: types can have methods and associated functions.
+  `Self` refers to the implementing type; associated functions are called as
+  `Type::function()`.
 - Modules: files can import other `.hern` modules and export values through
   record-shaped module results.
 
