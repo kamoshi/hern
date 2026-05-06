@@ -71,7 +71,7 @@ pub enum Stmt {
         name: String,
         name_span: SourceSpan,
         params: Vec<Param>,
-        ret_type: Option<Type>,
+        ret_type: Option<TypeReturn>,
         body: Expr,
         dict_params: Vec<String>,
         type_bounds: Vec<TypeBound>,
@@ -83,7 +83,7 @@ pub enum Stmt {
         fixity: Fixity,
         prec: u8,
         params: Vec<Param>,
-        ret_type: Option<Type>,
+        ret_type: Option<TypeReturn>,
         body: Expr,
         dict_params: Vec<String>,
         type_bounds: Vec<TypeBound>,
@@ -177,7 +177,7 @@ impl TypeReturn {
         }
     }
 
-    pub fn mutable_place(ty: Type) -> Self {
+    pub fn mut_place(ty: Type) -> Self {
         Self {
             ty: Box::new(ty),
             mut_place: true,
@@ -193,7 +193,7 @@ impl TypeParam {
         }
     }
 
-    pub fn mutable_place(ty: Type) -> Self {
+    pub fn mut_place(ty: Type) -> Self {
         Self {
             ty,
             mut_place: true,
@@ -210,7 +210,7 @@ impl Param {
         }
     }
 
-    pub fn mutable_place(pat: Pattern, ty: Option<Type>) -> Self {
+    pub fn mut_place(pat: Pattern, ty: Option<Type>) -> Self {
         Self {
             pat,
             ty,
@@ -247,7 +247,7 @@ pub struct ImplMethod {
     pub name: String,
     pub name_span: SourceSpan,
     pub params: Vec<Param>,
-    pub ret_type: Option<Type>,
+    pub ret_type: Option<TypeReturn>,
     pub body: Expr,
     pub inline: bool,
 }
@@ -266,7 +266,7 @@ pub struct InherentMethod {
     pub name: String,
     pub name_span: SourceSpan,
     pub params: Vec<Param>,
-    pub ret_type: Option<Type>,
+    pub ret_type: Option<TypeReturn>,
     pub body: Expr,
     pub dict_params: Vec<String>,
     pub type_bounds: Vec<TypeBound>,
@@ -453,6 +453,12 @@ pub enum ExprKind {
         expr: Box<Expr>,
         field: String,
         field_span: SourceSpan,
+    },
+    AssociatedAccess {
+        target: Type,
+        target_span: SourceSpan,
+        member: String,
+        member_span: SourceSpan,
     },
     Import(String),
     Lambda {

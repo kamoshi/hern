@@ -1,0 +1,7 @@
+let mut h: Heap(string) = Heap::new();
+
+h.push(2, "b");
+h.push(1, "a");
+
+let first = h.pop();
+print(first);

@@ -1,4 +1,6 @@
 let mut m: Map(string, f64) = map_new();
+// Rebinding an existing mutable place does not create a second mutable owner.
+// `alias` is reassignable, but it is not a fresh mutable place for `mut self`.
 let mut alias = m;
 
 alias.set("a", 1)

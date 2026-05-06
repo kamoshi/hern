@@ -3,7 +3,7 @@ use crate::lex::error::{ParseError, Span};
 use crate::lex::{Spanned, Token};
 use std::cell::{Cell, RefCell};
 
-type FnParamsBody = (usize, Vec<Param>, Option<Type>, Expr);
+type FnParamsBody = (usize, Vec<Param>, Option<TypeReturn>, Expr);
 
 fn consumed_span(tokens: &[Spanned], consumed: usize) -> SourceSpan {
     let start = tokens.first().map(|token| token.span).unwrap_or(Span {
@@ -428,9 +428,18 @@ impl<'tokens> Parser<'tokens> {
         let mut ret_type = None;
         if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Arrow) {
             ptr += 1;
+            let mut ret_mut_place = false;
+            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Mut) {
+                ret_mut_place = true;
+                ptr += 1;
+            }
             let (consumed_ret, parsed_ret) = self.parse_type(&tokens[ptr..])?;
             ptr += consumed_ret;
-            ret_type = Some(parsed_ret);
+            ret_type = Some(if ret_mut_place {
+                TypeReturn::mut_place(parsed_ret)
+            } else {
+                TypeReturn::value(parsed_ret)
+            });
         }
         let (consumed_body, body) = self.parse_expr(&tokens[ptr..], 0)?;
         ptr += consumed_body;
@@ -474,7 +483,7 @@ impl<'tokens> Parser<'tokens> {
             ));
         }
         let param = if mut_place {
-            Param::mutable_place(pat, p_type)
+            Param::mut_place(pat, p_type)
         } else {
             Param::new(pat, p_type)
         };
@@ -748,7 +757,7 @@ impl<'tokens> Parser<'tokens> {
                 ptr += 1;
                 let (c_ret, parsed_ret) = self.parse_type(&tokens[ptr..])?;
                 ptr += c_ret;
-                ret_type = Some(parsed_ret);
+                ret_type = Some(TypeReturn::value(parsed_ret));
             }
 
             let (c_body, body) = self.parse_expr(&tokens[ptr..], 0)?;
@@ -1166,7 +1175,7 @@ impl<'tokens> Parser<'tokens> {
                         let (c_ty, ty) = self.parse_type(&tokens[ptr..])?;
                         ptr += c_ty;
                         param_types.push(if mut_place {
-                            TypeParam::mutable_place(ty)
+                            TypeParam::mut_place(ty)
                         } else {
                             TypeParam::value(ty)
                         });
@@ -1189,7 +1198,7 @@ impl<'tokens> Parser<'tokens> {
                 Type::Func(
                     param_types,
                     if ret_mut_place {
-                        TypeReturn::mutable_place(ret)
+                        TypeReturn::mut_place(ret)
                     } else {
                         TypeReturn::value(ret)
                     },
@@ -1460,6 +1469,37 @@ impl<'tokens> Parser<'tokens> {
                             expr: Box::new(lhs),
                             field,
                             field_span,
+                        },
+                    );
+                }
+                Token::ColonColon => {
+                    let (l_bp, _r_bp) = (11, 12);
+                    if l_bp < min_bp {
+                        break;
+                    }
+                    let ExprKind::Ident(target_name) = &lhs.kind else {
+                        return Err(ParseError::new(
+                            "`::` expects a type name on the left",
+                            op_tok.span,
+                        ));
+                    };
+                    let target = if target_name == "Self" {
+                        Type::Ident("Self".to_string())
+                    } else {
+                        Type::Ident(target_name.clone())
+                    };
+                    ptr += 1;
+                    let (c_name, member, member_span) =
+                        self.expect_ident_with_span(&tokens[ptr..])?;
+                    ptr += c_name;
+                    lhs = self.expr_from_tokens(
+                        tokens,
+                        ptr,
+                        ExprKind::AssociatedAccess {
+                            target,
+                            target_span: lhs.span,
+                            member,
+                            member_span,
                         },
                     );
                 }

@@ -49,11 +49,12 @@ pub enum Token {
     In,         // in
 
     // Punctuation
-    Colon,     // :
-    Semicolon, // ;
-    Comma,     // ,
-    DotDot,    // ..
-    Dot,       // .
+    Colon,      // :
+    ColonColon, // ::
+    Semicolon,  // ;
+    Comma,      // ,
+    DotDot,     // ..
+    Dot,        // .
 
     // Delimiters
     LParen,   // (
@@ -198,7 +199,12 @@ impl<'src> Lexer<'src> {
             }
             b':' => {
                 self.advance();
-                Token::Colon
+                if self.peek() == Some(b':') {
+                    self.advance();
+                    Token::ColonColon
+                } else {
+                    Token::Colon
+                }
             }
             b';' => {
                 self.advance();

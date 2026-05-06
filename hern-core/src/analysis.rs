@@ -3,8 +3,8 @@ use crate::pipeline::{
     infer_program, infer_program_with_seed, parse_source, reassociate_standalone,
     reassociate_with_program,
 };
-use crate::types::Ty;
 use crate::types::infer::{InferenceResult, TypeEnv, VariantEnv};
+use crate::types::{InherentMethodScheme, Ty};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -25,6 +25,7 @@ pub struct PreludeAnalysis {
     pub program: Program,
     pub env: TypeEnv,
     pub variant_env: VariantEnv,
+    pub inherent_method_schemes: HashMap<String, HashMap<String, InherentMethodScheme>>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +122,7 @@ pub fn analyze_prelude() -> Result<PreludeAnalysis, CompilerDiagnostic> {
         program,
         env,
         variant_env,
+        inherent_method_schemes: inference.inherent_method_schemes,
     })
 }
 
@@ -212,6 +214,26 @@ fn find_hover_in_expr(
         | ExprKind::FieldAccess { expr: e, .. }
         | ExprKind::Lambda { body: e, .. } => {
             find_hover_in_expr(e, expr_types, symbol_types, pos, best)
+        }
+        ExprKind::AssociatedAccess { member_span, .. } => {
+            if contains(*member_span, pos)
+                && let Some(ty) = symbol_types
+                    .get(&expr.id)
+                    .or_else(|| expr_types.get(&expr.id))
+                    .cloned()
+            {
+                let candidate = HoverInfo {
+                    node_id: expr.id,
+                    span: *member_span,
+                    ty,
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|current| span_len(candidate.span) < span_len(current.span))
+                {
+                    *best = Some(candidate);
+                }
+            }
         }
         ExprKind::Assign { target, value } => {
             find_hover_in_expr(target, expr_types, symbol_types, pos, best);
@@ -346,6 +368,7 @@ mod tests {
                 | ExprKind::Loop(expr)
                 | ExprKind::Break(Some(expr))
                 | ExprKind::Return(Some(expr)) => find_in_expr(expr, method_name),
+                ExprKind::AssociatedAccess { .. } => None,
                 ExprKind::Assign { target, value }
                 | ExprKind::Binary {
                     lhs: target,
@@ -441,6 +464,23 @@ mod tests {
         let span = err.span.expect("declaration error should carry a span");
         assert_eq!(span.start_line, 1);
         assert_eq!(span.start_col, 1);
+        assert!(span.end_col > span.start_col);
+    }
+
+    #[test]
+    fn unknown_associated_function_error_points_at_member() {
+        let prelude = analyze_prelude().expect("prelude should analyze");
+        let err = analyze_source(
+            "type Counter = Counter(f64)\nlet x = Counter::missing();",
+            &prelude,
+        )
+        .expect_err("unknown associated function should be rejected");
+
+        let span = err
+            .span
+            .expect("associated function error should carry a source span");
+        assert_eq!(span.start_line, 2);
+        assert_eq!(span.start_col, 18);
         assert!(span.end_col > span.start_col);
     }
 

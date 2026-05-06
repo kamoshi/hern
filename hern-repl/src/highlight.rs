@@ -93,6 +93,7 @@ fn token_style(token: &Token) -> Style {
         | Token::BangEq
         | Token::Op(_)
         | Token::Colon
+        | Token::ColonColon
         | Token::Semicolon
         | Token::DotDot
         | Token::Dot

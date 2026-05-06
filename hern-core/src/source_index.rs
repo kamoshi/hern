@@ -692,6 +692,7 @@ impl IndexBuilder {
                         });
                 }
             }
+            ExprKind::AssociatedAccess { .. } => {}
             ExprKind::For {
                 pat,
                 iterable,

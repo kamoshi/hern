@@ -227,56 +227,6 @@ pub fn display_ty_with_var_names(ty: &Ty, names: &HashMap<TyVar, String>) -> Str
     DisplayTy(ty, names).to_string()
 }
 
-pub fn display_ty_with_var_names_and_param_capabilities(
-    ty: &Ty,
-    names: &HashMap<TyVar, String>,
-    capabilities: &[ParamCapability],
-) -> String {
-    DisplayTyWithParamCapabilities {
-        ty,
-        names,
-        capabilities,
-    }
-    .to_string()
-}
-
-struct DisplayTyWithParamCapabilities<'a> {
-    ty: &'a Ty,
-    names: &'a HashMap<TyVar, String>,
-    capabilities: &'a [ParamCapability],
-}
-
-impl fmt::Display for DisplayTyWithParamCapabilities<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.ty {
-            Ty::Qualified(_, inner) => write!(f, "{}", DisplayTy(inner, self.names)),
-            Ty::Func(params, ret) => {
-                write!(f, "fn(")?;
-                for (idx, param) in params.iter().enumerate() {
-                    if idx > 0 {
-                        write!(f, ", ")?;
-                    }
-                    if param.capability.is_mut_place()
-                        || self
-                            .capabilities
-                            .get(idx)
-                            .is_some_and(|capability| capability.is_mut_place())
-                    {
-                        write!(f, "mut ")?;
-                    }
-                    write!(f, "{}", DisplayTy(&param.ty, self.names))?;
-                }
-                write!(f, ") -> ")?;
-                if ret.capability == ReturnCapability::FreshPlace {
-                    write!(f, "mut ")?;
-                }
-                write!(f, "{}", DisplayTy(&ret.ty, self.names))
-            }
-            ty => write!(f, "{}", DisplayTy(ty, self.names)),
-        }
-    }
-}
-
 pub fn free_type_vars_in_display_order(ty: &Ty) -> Vec<TyVar> {
     fn collect(ty: &Ty, vars: &mut Vec<TyVar>) {
         match ty {
@@ -330,7 +280,6 @@ pub struct Scheme {
     pub vars: Vec<TyVar>,
     pub constraints: Vec<TraitConstraint>,
     pub ty: Ty,
-    pub param_capabilities: Vec<ParamCapability>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,6 +308,12 @@ pub struct BindingCapabilities {
 #[derive(Debug, Clone, Default)]
 pub struct CallableCapabilities {
     pub param_capabilities: Vec<ParamCapability>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InherentMethodScheme {
+    pub scheme: Scheme,
+    pub has_receiver: bool,
 }
 
 impl fmt::Display for Scheme {
@@ -402,24 +357,7 @@ impl Scheme {
             vars: vec![],
             constraints: vec![],
             ty,
-            param_capabilities: vec![],
         }
-    }
-
-    pub fn with_param_capabilities(mut self, param_capabilities: Vec<ParamCapability>) -> Self {
-        self.param_capabilities = param_capabilities;
-        self
-    }
-
-    pub fn param_capability(&self, idx: usize) -> ParamCapability {
-        self.param_capabilities
-            .get(idx)
-            .copied()
-            .unwrap_or(ParamCapability::Value)
-    }
-
-    pub fn has_mut_place_params(&self) -> bool {
-        self.param_capabilities.iter().any(|cap| cap.is_mut_place())
     }
 }
 
@@ -582,7 +520,6 @@ impl Subst {
             vars: scheme.vars.clone(),
             constraints: scheme.constraints.clone(),
             ty: self.apply(&scheme.ty),
-            param_capabilities: scheme.param_capabilities.clone(),
         }
     }
 
@@ -858,7 +795,6 @@ mod tests {
                 value_func_params(vec![Ty::Var(7)]),
                 value_func_return(Ty::Var(7)),
             ),
-            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a. fn('a) -> 'a");
     }
@@ -876,7 +812,6 @@ mod tests {
                 value_func_params(vec![Ty::App(Box::new(Ty::Var(90)), vec![Ty::F64])]),
                 value_func_return(Ty::F64),
             ),
-            param_capabilities: vec![],
         };
         assert_eq!(
             scheme.to_string(),
@@ -894,7 +829,6 @@ mod tests {
                 value_func_params(vec![Ty::Var(3), Ty::Var(5)]),
                 value_func_return(Ty::Var(5)),
             ),
-            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a 'b. fn('a, 'b) -> 'b");
     }
@@ -941,7 +875,6 @@ mod tests {
                 }],
                 Box::new(Ty::Var(1)),
             ),
-            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a. ['a: Add] 'a");
     }
@@ -956,7 +889,6 @@ mod tests {
                 fields: vec![("x".to_string(), Ty::F64)],
                 tail: Box::new(Ty::Var(2)),
             }),
-            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a. #{ x: f64, ..'a }");
     }
@@ -971,7 +903,6 @@ mod tests {
                 trait_name: "Debug".to_string(),
             }],
             ty: Ty::Var(0),
-            param_capabilities: vec![],
         };
         assert_eq!(scheme.to_string(), "∀ 'a ['99: Debug]. 'a");
     }

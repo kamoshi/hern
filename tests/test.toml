@@ -154,6 +154,56 @@ path = "tests/hern/mut_map_alias_set.hern"
 expect = "error"
 error_contains = "must be a mutable place"
 
+[tests.associated_new_heap]
+path = "tests/hern/associated_new_heap.hern"
+expect = "typecheck"
+output = """
+{1=1, 2=a, }
+"""
+
+[tests.associated_new_infers_from_use]
+path = "tests/hern/associated_new_infers_from_use.hern"
+expect = "typecheck"
+output = """
+1
+1
+"""
+
+[tests.associated_function_with_args]
+path = "tests/hern/associated_function_with_args.hern"
+expect = "typecheck"
+output = """
+41
+"""
+
+[tests.associated_function_no_receiver_error]
+path = "tests/hern/associated_function_no_receiver_error.hern"
+expect = "error"
+error_contains = "must be called with `Map::new`"
+
+[tests.receiver_method_coloncolon_error]
+path = "tests/hern/receiver_method_coloncolon_error.hern"
+expect = "error"
+error_contains = "requires a receiver"
+
+[tests.unknown_associated_function_error]
+path = "tests/hern/unknown_associated_function_error.hern"
+expect = "error"
+error_contains = "no associated function"
+
+[tests.inherent_self_constructor]
+path = "tests/hern/inherent_self_constructor.hern"
+expect = "typecheck"
+output = """
+1
+1
+"""
+
+[tests.self_outside_inherent_impl_error]
+path = "tests/hern/self_outside_inherent_impl_error.hern"
+expect = "error"
+error_contains = "unknown type: `Self`"
+
 [tests.row_poly]
 path = "tests/hern/row_poly.hern"
 expect = "typecheck"
@@ -286,6 +336,13 @@ expect = "typecheck"
 output = """
 11
 11
+"""
+
+[tests.module_associated_function_import]
+path = "tests/hern/module_associated_function_import.hern"
+expect = "typecheck"
+output = """
+42
 """
 
 [tests.duplicate_inherent_method]

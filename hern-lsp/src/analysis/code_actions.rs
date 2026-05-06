@@ -165,6 +165,7 @@ fn collect_code_actions_for_expr(
             collect_code_actions_for_expr(iterable, uri, range, binding_types, actions);
             collect_code_actions_for_expr(body, uri, range, binding_types, actions);
         }
+        ExprKind::AssociatedAccess { .. } => {}
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)

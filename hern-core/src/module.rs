@@ -1,10 +1,12 @@
 use crate::analysis::{CompilerDiagnostic, DiagnosticSource, analyze_prelude};
-use crate::ast::{Expr, ExprKind, NodeId, Program, SourceSpan, Stmt, TraitDef, Type};
+use crate::ast::{
+    Expr, ExprKind, NodeId, Param, Pattern, Program, SourceSpan, Stmt, TraitDef, Type,
+};
 use crate::pipeline::{
     AnalysisOutput, parse_source, parse_source_recovering, reassociate_with_program,
 };
 use crate::types::infer::{Infer, TypeEnv, VariantEnv};
-use crate::types::{BindingCapabilities, CallableCapabilities, Scheme, Ty};
+use crate::types::{BindingCapabilities, CallableCapabilities, InherentMethodScheme, Scheme, Ty};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -72,7 +74,7 @@ struct EnvImpl {
 
 #[derive(Clone)]
 struct EnvInherentImpl {
-    methods: HashMap<String, Scheme>,
+    methods: HashMap<String, InherentMethodScheme>,
     dict_name: String,
     owner: String,
 }
@@ -673,7 +675,7 @@ impl ModuleEnv {
     ) -> (
         HashMap<String, TraitDef>,
         HashMap<String, String>,
-        HashMap<String, HashMap<String, Scheme>>,
+        HashMap<String, HashMap<String, InherentMethodScheme>>,
     ) {
         let traits = self
             .traits
@@ -712,19 +714,29 @@ impl ModuleEnv {
         self.traits.iter().map(|(k, v)| (k.as_str(), &v.def))
     }
 
+    /// Iterate over all in-scope inherent methods by target type.
+    pub fn all_inherent_methods(
+        &self,
+    ) -> impl Iterator<Item = (&str, &HashMap<String, InherentMethodScheme>)> + '_ {
+        self.inherent_impls
+            .iter()
+            .map(|(target, entry)| (target.as_str(), &entry.methods))
+    }
+
     pub fn exported_dict_names(&self) -> Vec<String> {
         self.dict_names_excluding_owner(PRELUDE_OWNER)
     }
 
     fn attach_inherent_method_schemes(
         &mut self,
-        schemes: &HashMap<String, HashMap<String, Scheme>>,
+        schemes: &HashMap<String, HashMap<String, InherentMethodScheme>>,
     ) {
         for (target, methods) in schemes {
             if let Some(entry) = self.inherent_impls.get_mut(target) {
-                for (name, scheme) in methods {
+                for (name, method) in methods {
                     if let Some(existing) = entry.methods.get_mut(name) {
-                        *existing = scheme.clone();
+                        existing.scheme = method.scheme.clone();
+                        existing.has_receiver = method.has_receiver;
                     }
                 }
             }
@@ -897,6 +909,7 @@ fn resolve_imports_in_expr(
         | ExprKind::Break(Some(e))
         | ExprKind::Return(Some(e))
         | ExprKind::FieldAccess { expr: e, .. } => resolve_imports_in_expr(e, base_dir, graph),
+        ExprKind::AssociatedAccess { .. } => Ok(()),
         ExprKind::Assign { target, value }
         | ExprKind::Binary {
             lhs: target,
@@ -999,6 +1012,7 @@ fn resolve_imports_in_expr_recovering(
         | ExprKind::FieldAccess { expr: e, .. } => {
             resolve_imports_in_expr_recovering(e, base_dir, graph, source, diagnostics);
         }
+        ExprKind::AssociatedAccess { .. } => {}
         ExprKind::Assign { target, value }
         | ExprKind::Binary {
             lhs: target,
@@ -1162,6 +1176,7 @@ fn collect_imports_in_expr(expr: &Expr, imports: &mut Vec<String>) {
         | ExprKind::Break(Some(e))
         | ExprKind::Return(Some(e))
         | ExprKind::FieldAccess { expr: e, .. } => collect_imports_in_expr(e, imports),
+        ExprKind::AssociatedAccess { .. } => {}
         ExprKind::Assign { target, value }
         | ExprKind::Binary {
             lhs: target,
@@ -1347,7 +1362,18 @@ fn add_own_module_env(
                         methods: id
                             .methods
                             .iter()
-                            .map(|method| (method.name.clone(), Scheme::mono(Ty::Unit)))
+                            .map(|method| {
+                                (
+                                    method.name.clone(),
+                                    InherentMethodScheme {
+                                        scheme: Scheme::mono(Ty::Unit),
+                                        has_receiver: method
+                                            .params
+                                            .first()
+                                            .is_some_and(is_self_param),
+                                    },
+                                )
+                            })
                             .collect(),
                         dict_name: format!("__impl__{}", target),
                         owner: owner.to_string(),
@@ -1456,6 +1482,10 @@ fn impl_target_name(target: &Type) -> String {
         Type::App(con, _) => impl_target_name(con),
         _ => "Unknown".to_string(),
     }
+}
+
+fn is_self_param(param: &Param) -> bool {
+    matches!(&param.pat, Pattern::Variable(name, _) if name == "self")
 }
 
 #[cfg(test)]

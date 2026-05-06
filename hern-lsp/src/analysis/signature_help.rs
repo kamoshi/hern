@@ -3,7 +3,7 @@ use super::state::{ServerState, cached_analysis};
 use super::uri::uri_to_path;
 use super::workspace::load_workspace_graphs;
 use hern_core::ast::{Expr, ExprKind, Program, SourcePosition, SourceSpan, Stmt};
-use hern_core::types::{ParamCapability, Ty};
+use hern_core::types::Ty;
 use lsp_types::{
     ParameterInformation, ParameterLabel, Position, SignatureHelp, SignatureInformation, Uri,
 };
@@ -24,7 +24,6 @@ pub(crate) fn signature_help(
     let (module_name, program) = graph.module_for_path(&path)?;
     let expr_types = inference.expr_types_for_module(module_name)?;
     let symbol_types = inference.symbol_types_for_module(module_name)?;
-    let callable_capabilities = inference.callable_capabilities_for_module(module_name);
     let source_position = SourcePosition {
         line: position.line as usize + 1,
         col: position.character as usize + 1,
@@ -37,20 +36,11 @@ pub(crate) fn signature_help(
         return None;
     };
 
-    let capabilities = callable_capabilities
-        .and_then(|capabilities| capabilities.get(&call.callee.id))
-        .map(|capabilities| capabilities.param_capabilities.as_slice())
-        .unwrap_or(&[]);
     let param_labels = params
         .iter()
-        .enumerate()
-        .map(|(idx, param)| {
+        .map(|param| {
             let text = ty_to_display_string(&param.ty);
-            if param.capability.is_mut_place()
-                || capabilities
-                    .get(idx)
-                    .is_some_and(|capability| matches!(capability, ParamCapability::MutPlace))
-            {
+            if param.capability.is_mut_place() {
                 format!("mut {text}")
             } else {
                 text
@@ -208,6 +198,7 @@ fn find_call_in_expr<'a>(
             find_call_in_expr(iterable, position, best);
             find_call_in_expr(body, position, best);
         }
+        ExprKind::AssociatedAccess { .. } => {}
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
@@ -350,6 +341,20 @@ mod tests {
 
         assert_eq!(label, "fn(mut #{ x: f64 }) -> ()");
         assert_eq!(params, vec!["mut #{ x: f64 }"]);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn signature_help_for_associated_function_shows_fresh_return() {
+        let project = crate::analysis::tests::TestProject::new("signature-associated");
+        let source = "let mut g = Map::new();\ng\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let help = signature_help(&state, uri, Position::new(0, 21)).expect("signature help");
+        let (label, params, active) = signature_labels(help);
+
+        assert!(label.starts_with("fn() -> mut Map("), "{label}");
+        assert!(params.is_empty());
         assert_eq!(active, 0);
     }
 

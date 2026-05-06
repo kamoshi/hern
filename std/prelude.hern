@@ -86,24 +86,25 @@ extern __concat: fn(string, string) -> string = #[template] "(($1) .. ($2))";
 
 extern map_new: fn() -> mut Map('k, 'v) = "(function() return {} end)";
 
-extern __map_set: fn(Map('k, 'v), 'k, 'v) -> Map('k, 'v) = "(function(m, k, v) m[k] = v; return m end)";
+extern __map_set: fn(Map('k, 'v), 'k, 'v) -> () = "(function(m, k, v) m[k] = v; return {} end)";
 extern __map_get: fn(Map('k, 'v), 'k) -> Option('v) = "(function(m, k) local v = m[k]; if v ~= nil then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end end)";
-extern __map_delete: fn(Map('k, 'v), 'k) -> Map('k, 'v) = "(function(m, k) m[k] = nil; return m end)";
+extern __map_delete: fn(Map('k, 'v), 'k) -> () = "(function(m, k) m[k] = nil; return {} end)";
 extern __map_has: fn(Map('k, 'v), 'k) -> bool = "(function(m, k) return m[k] ~= nil and 1 or 0 end)";
 extern __map_keys: fn(Map('k, 'v)) -> ['k] = "(function(m) local ks = {}; for k in pairs(m) do ks[#ks + 1] = k end; return ks end)";
 extern __map_size: fn(Map('k, 'v)) -> f64 = "(function(m) local n = 0; for _ in pairs(m) do n = n + 1 end; return n end)";
 
-fn map_set(m: Map('k, 'v), key: 'k, value: 'v) -> Map('k, 'v) { __map_set(m, key, value) }
+fn map_set(mut m: Map('k, 'v), key: 'k, value: 'v) -> () { __map_set(m, key, value) }
 fn map_get(m: Map('k, 'v), key: 'k) -> Option('v) { __map_get(m, key) }
-fn map_delete(m: Map('k, 'v), key: 'k) -> Map('k, 'v) { __map_delete(m, key) }
+fn map_delete(mut m: Map('k, 'v), key: 'k) -> () { __map_delete(m, key) }
 fn map_has(m: Map('k, 'v), key: 'k) -> bool { __map_has(m, key) }
 fn map_keys(m: Map('k, 'v)) -> ['k] { __map_keys(m) }
 fn map_size(m: Map('k, 'v)) -> f64 { __map_size(m) }
 
 impl Map('k, 'v) {
-    fn set(mut self, key: 'k, value: 'v) -> Map('k, 'v) { map_set(self, key, value) }
+    fn new() -> mut Self { map_new() }
+    fn set(mut self, key: 'k, value: 'v) -> () { map_set(self, key, value) }
     fn get(self, key: 'k) -> Option('v) { map_get(self, key) }
-    fn delete(mut self, key: 'k) -> Map('k, 'v) { map_delete(self, key) }
+    fn delete(mut self, key: 'k) -> () { map_delete(self, key) }
     fn has(self, key: 'k) -> bool { map_has(self, key) }
     fn keys(self) -> ['k] { map_keys(self) }
     fn size(self) -> f64 { map_size(self) }
@@ -524,67 +525,56 @@ impl Semigroup for ['a] {
 }
 
 // --- Priority queue (min-heap) ---
-// Each entry is a (priority: f64, value: 'a) pair, stored in a 1-based array.
+// Heap('a) stores (priority: f64, value: 'a) pairs.
+// Create with `let mut h = heap_new()`.
 
-fn heap_sift_up(heap: [(f64, 'a)], i: f64) -> () {
-    if i <= 1 {
-        ()
-    } else {
-        let parent = math.floor(i / 2);
-        let (pi, _) = array_get(heap, i);
-        let (pp, _) = array_get(heap, parent);
-        if pi < pp {
-            let a = array_get(heap, i);
-            let b = array_get(heap, parent);
-            array_set(heap, i, b);
-            array_set(heap, parent, a);
-            heap_sift_up(heap, parent)
-        }
-    }
-}
+type Heap('a) = *
 
-fn heap_sift_down(heap: [(f64, 'a)], i: f64, n: f64) -> () {
-    let left = i * 2;
-    let right = left + 1;
-    let mut smallest = i;
-    let (pi, _) = array_get(heap, i);
-    let mut best = pi;
-    if left <= n {
-        let (pl, _) = array_get(heap, left);
-        if pl < best {
-            smallest = left;
-            best = pl;
-        }
-    };
-    if right <= n {
-        let (pr, _) = array_get(heap, right);
-        if pr < best {
-            smallest = right;
-        }
-    };
-    if smallest != i {
-        let a = array_get(heap, i);
-        let b = array_get(heap, smallest);
-        array_set(heap, i, b);
-        array_set(heap, smallest, a);
-        heap_sift_down(heap, smallest, n)
-    }
-}
+extern heap_new: fn() -> mut Heap('a) = "(function() return {} end)";
 
-// Push an item onto the heap.
-fn heap_push(heap: [(f64, 'a)], item: (f64, 'a)) -> () {
-    push(heap, item);
-    heap_sift_up(heap, array_len(heap))
-}
+extern __heap_push: fn(Heap('a), f64, 'a) -> () = "(function(heap, priority, value)
+  local item = {priority, value}
+  heap[#heap + 1] = item
+  local i = #heap
+  while i > 1 do
+    local p = math.floor(i / 2)
+    if heap[i][1] < heap[p][1] then
+      heap[i], heap[p] = heap[p], heap[i]
+      i = p
+    else
+      break
+    end
+  end
+  return {}
+end)";
 
-// Pop and return the item with the lowest priority.
-fn heap_pop(heap: [(f64, 'a)]) -> (f64, 'a) {
-    let n = array_len(heap);
-    let top = array_get(heap, 1);
-    array_set(heap, 1, array_get(heap, n));
-    pop(heap);
-    if n > 1 {
-        heap_sift_down(heap, 1, n - 1)
-    };
-    top
+extern __heap_pop: fn(Heap('a)) -> (f64, 'a) = "(function(heap)
+  local n = #heap
+  local top = heap[1]
+  heap[1] = heap[n]
+  heap[n] = nil
+  n = n - 1
+  local i = 1
+  while true do
+    local left = i * 2
+    local right = left + 1
+    local smallest = i
+    if left <= n and heap[left][1] < heap[smallest][1] then smallest = left end
+    if right <= n and heap[right][1] < heap[smallest][1] then smallest = right end
+    if smallest == i then break end
+    heap[i], heap[smallest] = heap[smallest], heap[i]
+    i = smallest
+  end
+  return top
+end)";
+
+extern __heap_size: fn(Heap('a)) -> f64 = #[template] "#($1)";
+extern __heap_is_empty: fn(Heap('a)) -> bool = #[template] "(#($1) == 0 and 1 or 0)";
+
+impl Heap('a) {
+    fn new() -> mut Self { heap_new() }
+    fn push(mut self, priority: f64, value: 'a) -> () { __heap_push(self, priority, value) }
+    fn pop(mut self) -> (f64, 'a) { __heap_pop(self) }
+    fn size(self) -> f64 { __heap_size(self) }
+    fn is_empty(self) -> bool { __heap_is_empty(self) }
 }

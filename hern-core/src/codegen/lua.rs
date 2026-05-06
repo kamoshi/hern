@@ -616,6 +616,9 @@ impl LuaCodegen {
                 let e = self.gen_expr_with_subst(expr, subst, pre)?;
                 Some(format!("{}.{}", e, field))
             }
+            ExprKind::AssociatedAccess { target, member, .. } => {
+                Some(associated_access_lua(target, member))
+            }
             ExprKind::Block { stmts, final_expr } if stmts.is_empty() => final_expr
                 .as_ref()
                 .map(|expr| self.gen_expr_with_subst(expr, subst, pre))
@@ -837,6 +840,9 @@ impl LuaCodegen {
             ExprKind::FieldAccess { expr, field, .. } => {
                 let e = self.gen_expr(expr, pre);
                 format!("{}.{}", e, field)
+            }
+            ExprKind::AssociatedAccess { target, member, .. } => {
+                associated_access_lua(target, member)
             }
 
             // Loops use a temp variable (not an IIFE) so `return` inside the body
@@ -1658,6 +1664,7 @@ fn expr_flow(expr: &Expr, include_bc: bool) -> Flow {
             expr_flow(scrutinee, include_bc).seq(arm_flow)
         }
         ExprKind::Not(e) | ExprKind::FieldAccess { expr: e, .. } => expr_flow(e, include_bc),
+        ExprKind::AssociatedAccess { .. } => Flow::FallsThrough,
         ExprKind::Binary { lhs, rhs, .. } => {
             expr_flow(lhs, include_bc).seq(expr_flow(rhs, include_bc))
         }
@@ -1714,6 +1721,22 @@ fn method_receiver(callee: &Expr, is_method_call: bool) -> Option<&Expr> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn associated_access_lua(target: &Type, member: &str) -> String {
+    format!(
+        "__impl__{}.{}",
+        impl_target_name_lua(target),
+        mangle_op(member)
+    )
+}
+
+fn impl_target_name_lua(target: &Type) -> String {
+    match target {
+        Type::Ident(name) => name.clone(),
+        Type::App(con, _) => impl_target_name_lua(con),
+        other => unreachable!("invalid inherent impl target reached codegen: {other:?}"),
+    }
+}
 
 pub(crate) fn mangle_op(name: &str) -> String {
     if name.chars().all(|c| c.is_alphanumeric() || c == '_') {

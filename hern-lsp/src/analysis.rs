@@ -529,7 +529,7 @@ pub(super) mod tests {
 
     #[test]
     fn display_names_type_vars_by_visible_type_order() {
-        use hern_core::types::{ParamCapability, Scheme, Ty, value_func_params, value_func_return};
+        use hern_core::types::{FuncParam, Scheme, Ty, value_func_params, value_func_return};
         let ty = Ty::Func(
             value_func_params(vec![Ty::Var(78), Ty::Tuple(vec![Ty::Var(12), Ty::Var(78)])]),
             value_func_return(Ty::Var(12)),
@@ -538,10 +538,9 @@ pub(super) mod tests {
         assert_eq!(hover::ty_to_display_string(&ty), "fn('a, ('b, 'a)) -> 'b");
 
         let scheme = Scheme::mono(Ty::Func(
-            value_func_params(vec![Ty::F64]),
+            vec![FuncParam::mut_place(Ty::F64)],
             value_func_return(Ty::Unit),
-        ))
-        .with_param_capabilities(vec![ParamCapability::MutPlace]);
+        ));
         assert_eq!(hover::hover_scheme_to_string(&scheme), "fn(mut f64) -> ()");
     }
 
@@ -703,6 +702,43 @@ pub(super) mod tests {
 
         assert_eq!(hover_text(callee), "fn(f64) -> f64");
         assert_eq!(hover_text(call), "f64");
+    }
+
+    #[test]
+    fn hover_shows_receiver_method_signature_when_call_has_wrong_arity() {
+        let project = TestProject::new("method-hover-wrong-arity");
+        let source = "let mut g = Map::new();\ng.get();\ng\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(1, 3)).expect("method hover should resolve");
+        let text = hover_text(info);
+
+        assert!(text.starts_with("fn(Map("), "{text}");
+        assert!(text.contains(") -> Option("), "{text}");
+    }
+
+    #[test]
+    fn hover_shows_plain_function_signature_when_call_has_wrong_arity() {
+        let project = TestProject::new("function-hover-wrong-arity");
+        let source = "fn add(x: f64, y: f64) -> f64 { x + y }\nadd(1)\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(1, 1)).expect("function hover should resolve");
+
+        assert_eq!(hover_text(info), "fn(f64, f64) -> f64");
+    }
+
+    #[test]
+    fn hover_shows_associated_function_signature_when_call_has_wrong_arity() {
+        let project = TestProject::new("associated-hover-wrong-arity");
+        let source = "let mut g = Map::new(1);\ng\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let info =
+            hover(&state, uri, Position::new(0, 18)).expect("associated hover should resolve");
+        let text = hover_text(info);
+
+        assert!(text.starts_with("fn() -> mut Map("), "{text}");
     }
 
     #[test]

@@ -133,6 +133,7 @@ fn reassoc_expr(expr: &mut Expr, table: &FixityTable) {
             }
         }
         ExprKind::FieldAccess { expr, .. } => reassoc_expr(expr, table),
+        ExprKind::AssociatedAccess { .. } => {}
         ExprKind::Lambda { body, .. } => reassoc_expr(body, table),
         ExprKind::For { iterable, body, .. } => {
             reassoc_expr(iterable, table);

@@ -1,0 +1,17 @@
+type Counter = Counter(f64)
+
+impl Counter {
+  fn make(value: f64) -> Self {
+    Counter(value)
+  }
+
+  fn value(self) -> f64 {
+    match self {
+      Counter(value) -> value,
+    }
+  }
+}
+
+let counter = Counter::make(41);
+
+print(counter.value());

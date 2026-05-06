@@ -1,0 +1,10 @@
+impl Map('k, 'v) {
+    fn empty() -> mut Self { map_new() }
+}
+
+let mut m: Map(string, f64) = Map::empty();
+
+m.set("x", 1);
+
+print(m.has("x"));
+print(m.size());

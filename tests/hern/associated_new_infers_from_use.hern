@@ -1,0 +1,6 @@
+let mut m = Map::new();
+
+m.set("x", 1);
+
+print(m.has("x"));
+print(m.size());

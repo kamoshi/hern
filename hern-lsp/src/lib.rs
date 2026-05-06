@@ -46,40 +46,8 @@ macro_rules! decode_params {
 pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let (connection, io_threads) = Connection::stdio();
 
-    let capabilities = serde_json::to_value(ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
-        hover_provider: Some(HoverProviderCapability::Simple(true)),
-        definition_provider: Some(OneOf::Left(true)),
-        references_provider: Some(OneOf::Left(true)),
-        document_highlight_provider: Some(OneOf::Left(true)),
-        document_symbol_provider: Some(OneOf::Left(true)),
-        code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(true)),
-        rename_provider: Some(OneOf::Right(RenameOptions {
-            prepare_provider: Some(true),
-            work_done_progress_options: Default::default(),
-        })),
-        completion_provider: Some(CompletionOptions {
-            resolve_provider: Some(false),
-            trigger_characters: Some(vec![".".to_string(), "\"".to_string(), "/".to_string()]),
-            ..Default::default()
-        }),
-        signature_help_provider: Some(SignatureHelpOptions {
-            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
-            retrigger_characters: None,
-            work_done_progress_options: Default::default(),
-        }),
-        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
-            SemanticTokensOptions {
-                legend: semantic_tokens_legend(),
-                full: Some(SemanticTokensFullOptions::Bool(true)),
-                range: Some(true),
-                ..Default::default()
-            },
-        )),
-        ..Default::default()
-    })?;
     let init_params: InitializeParams =
-        serde_json::from_value(connection.initialize(capabilities)?)?;
+        serde_json::from_value(connection.initialize(server_capabilities()?)?)?;
 
     let supports_markdown_hover = init_params
         .capabilities
@@ -96,6 +64,46 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
 
     io_threads.join()?;
     Ok(())
+}
+
+fn server_capabilities() -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        completion_provider: Some(CompletionOptions {
+            resolve_provider: Some(false),
+            trigger_characters: Some(vec![
+                ".".to_string(),
+                ":".to_string(),
+                "\"".to_string(),
+                "/".to_string(),
+            ]),
+            ..Default::default()
+        }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: None,
+            work_done_progress_options: Default::default(),
+        }),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: semantic_tokens_legend(),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                range: Some(true),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    })
 }
 
 fn main_loop(
@@ -552,6 +560,21 @@ mod tests {
 
         assert!(pending.contains(&entry));
         assert!(!pending.contains(&dep));
+    }
+
+    #[test]
+    fn completion_capabilities_trigger_on_dot_and_colon() {
+        let capabilities: ServerCapabilities =
+            serde_json::from_value(server_capabilities().expect("capabilities should encode"))
+                .expect("capabilities should decode");
+        let triggers = capabilities
+            .completion_provider
+            .expect("completion provider")
+            .trigger_characters
+            .expect("trigger characters");
+
+        assert!(triggers.iter().any(|trigger| trigger == "."));
+        assert!(triggers.iter().any(|trigger| trigger == ":"));
     }
 
     #[test]

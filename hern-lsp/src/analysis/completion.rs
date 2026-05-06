@@ -1,19 +1,21 @@
 use super::hover::{
     ast_type_to_string, completion_scheme_to_string, completion_ty_to_display_string,
 };
-use super::state::{ServerState, cached_analysis};
+use super::state::{ServerState, cached_analysis, document_overlays};
 use super::uri::uri_to_path;
 use super::workspace::{
     WorkspaceAnalysis, analyze_document_graph, load_document_graph_recovering,
     load_workspace_graphs,
 };
 use hern_core::ast::{Program, RecordEntry, SourcePosition, TraitDef};
-use hern_core::module::{GraphInference, ModuleGraph, infer_graph_collecting};
+use hern_core::module::{
+    GraphInference, ModuleGraph, infer_graph_collecting, normalize_overlay_path,
+};
 use hern_core::source_index::{
     CompletionCandidate, Definition, DefinitionKind, SourceIndex, index_program,
 };
-use hern_core::types::Ty;
 use hern_core::types::infer::TypeEnv;
+use hern_core::types::{ParamCapability, Scheme, Ty};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit, Position,
     Range, TextEdit, Uri,
@@ -24,8 +26,17 @@ use std::fs;
 /// Acquires the module graph and inference for completion, trying four strategies
 /// in order: cached analysis, full re-analysis, partial analysis (type errors ok),
 /// parse-only recovery with empty inference.
-fn acquire_completion_graphs(state: &ServerState, uri: &Uri) -> Option<WorkspaceAnalysis> {
+fn acquire_completion_graphs(
+    state: &ServerState,
+    uri: &Uri,
+    recovery_source: Option<String>,
+) -> Option<WorkspaceAnalysis> {
     if let Ok(wa) = analyze_document_graph(state, uri) {
+        return Some(wa);
+    }
+    if let Some(source) = recovery_source
+        && let Some(wa) = analyze_completion_recovery_source(state, uri, source)
+    {
         return Some(wa);
     }
     // Partial: graph loaded but type errors prevented full inference.
@@ -35,6 +46,24 @@ fn acquire_completion_graphs(state: &ServerState, uri: &Uri) -> Option<Workspace
     // Parse-only: syntax errors but we can still suggest names from scope.
     let mut graph = load_document_graph_recovering(state, uri)?;
     let inference = infer_graph_collecting(&mut graph).value.unwrap_or_default();
+    Some(WorkspaceAnalysis { graph, inference })
+}
+
+fn analyze_completion_recovery_source(
+    state: &ServerState,
+    uri: &Uri,
+    source: String,
+) -> Option<WorkspaceAnalysis> {
+    let path = uri_to_path(uri)?;
+    let mut overlays = document_overlays(state);
+    overlays.insert(normalize_overlay_path(&path), source);
+    let (mut graph, _) = ModuleGraph::load_entry_with_prelude_and_overlays(
+        &path,
+        state.prelude.program.clone(),
+        overlays,
+    )
+    .ok()?;
+    let inference = infer_graph_collecting(&mut graph).value?;
     Some(WorkspaceAnalysis { graph, inference })
 }
 
@@ -56,7 +85,8 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
         if let Some(cached) = cached_analysis(state, &uri) {
             (&cached.graph, &cached.inference)
         } else {
-            let Some(wa) = acquire_completion_graphs(state, &uri) else {
+            let recovery_source = member_completion_recovery_source(state, &uri, position);
+            let Some(wa) = acquire_completion_graphs(state, &uri, recovery_source) else {
                 return Vec::new();
             };
             owned = wa;
@@ -83,6 +113,10 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
     let binding_types = inference.binding_types_for_module(module_name);
     let definition_schemes = inference.definition_schemes_for_module(module_name);
     let replacement_range = completion_replacement_range(state, &uri, lsp_position);
+
+    if let Some(items) = associated_completion(state, &uri, inference, module_name, lsp_position) {
+        return items;
+    }
 
     if let Some(items) = member_completion(
         state,
@@ -156,7 +190,9 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
                 items.iter().map(|i| i.label.as_str()).collect();
             module_env
                 .all_trait_defs()
-                .filter(|(trait_name, _)| !existing.contains(trait_name))
+                .filter(|(trait_name, _)| {
+                    !is_internal_completion_name(trait_name) && !existing.contains(trait_name)
+                })
                 .map(|(trait_name, trait_def)| {
                     let detail = Some(format!("trait {} {}", trait_name, trait_def.param));
                     CompletionItem {
@@ -270,6 +306,180 @@ fn path_completion_item(
     }
 }
 
+struct MemberCompletionContext {
+    receiver: String,
+    replacement_range: Range,
+}
+
+struct AssociatedCompletionContext {
+    target: String,
+    replacement_range: Range,
+}
+
+fn member_completion_context(
+    state: &ServerState,
+    uri: &Uri,
+    lsp_position: Position,
+) -> Option<MemberCompletionContext> {
+    let source = state.documents.get(uri)?;
+    let line = source.lines().nth(lsp_position.line as usize)?;
+    let cursor_byte = utf16_col_to_byte(line, lsp_position.character).min(line.len());
+    let (dot_byte, partial_start, replacement_end) = member_access_bounds(line, cursor_byte)?;
+    let before_dot = &line[..dot_byte];
+    let receiver_start = before_dot
+        .rfind(|c: char| !is_completion_identifier_char(c))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let receiver = &before_dot[receiver_start..];
+    if receiver.is_empty() {
+        return None;
+    }
+    Some(MemberCompletionContext {
+        receiver: receiver.to_string(),
+        replacement_range: Range::new(
+            Position::new(lsp_position.line, byte_to_utf16_col(line, partial_start)),
+            Position::new(lsp_position.line, byte_to_utf16_col(line, replacement_end)),
+        ),
+    })
+}
+
+fn member_completion_recovery_source(
+    state: &ServerState,
+    uri: &Uri,
+    lsp_position: Position,
+) -> Option<String> {
+    let source = state.documents.get(uri)?;
+    let (line_start, line_end) = line_byte_range(source, lsp_position.line as usize)?;
+    let line = &source[line_start..line_end];
+    let cursor_byte = utf16_col_to_byte(line, lsp_position.character).min(line.len());
+    let (dot_byte, _, _) = member_access_bounds(line, cursor_byte)?;
+    let mut recovered = source[..line_start + dot_byte].to_string();
+    terminate_completion_recovery_statement(&mut recovered);
+    close_unmatched_braces_for_completion(&mut recovered);
+    Some(recovered)
+}
+
+fn terminate_completion_recovery_statement(source: &mut String) {
+    let trimmed = source.trim_end();
+    if trimmed.is_empty()
+        || trimmed.ends_with(';')
+        || trimmed.ends_with('{')
+        || trimmed.ends_with('}')
+        || trimmed.ends_with(',')
+    {
+        return;
+    }
+    source.push(';');
+}
+
+fn close_unmatched_braces_for_completion(source: &mut String) {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut chars = source.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => in_string = !in_string,
+            '\\' if in_string => {
+                chars.next();
+            }
+            '/' if !in_string && chars.peek() == Some(&'/') => {
+                for ch in chars.by_ref() {
+                    if ch == '\n' {
+                        break;
+                    }
+                }
+            }
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    source.extend(std::iter::repeat_n('}', depth));
+}
+
+fn line_byte_range(source: &str, target_line: usize) -> Option<(usize, usize)> {
+    let mut line = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in source.char_indices() {
+        if line == target_line && ch == '\n' {
+            return Some((start, idx));
+        }
+        if ch == '\n' {
+            line += 1;
+            start = idx + ch.len_utf8();
+        }
+    }
+    (line == target_line).then_some((start, source.len()))
+}
+
+fn member_access_bounds(line: &str, cursor_byte: usize) -> Option<(usize, usize, usize)> {
+    let cursor_byte = cursor_byte.min(line.len());
+    let before = &line[..cursor_byte];
+    let partial_start = before
+        .rfind(|c: char| !is_completion_identifier_char(c))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    if partial_start > 0 && before.as_bytes().get(partial_start - 1) == Some(&b'.') {
+        return Some((partial_start - 1, partial_start, cursor_byte));
+    }
+    if line.as_bytes().get(cursor_byte) == Some(&b'.') {
+        return Some((cursor_byte, cursor_byte + 1, cursor_byte + 1));
+    }
+    None
+}
+
+fn associated_completion_context(
+    state: &ServerState,
+    uri: &Uri,
+    lsp_position: Position,
+) -> Option<AssociatedCompletionContext> {
+    let source = state.documents.get(uri)?;
+    let line = source.lines().nth(lsp_position.line as usize)?;
+    let cursor_byte = utf16_col_to_byte(line, lsp_position.character).min(line.len());
+    let (colon_start, member_start, replacement_end) = associated_access_bounds(line, cursor_byte)?;
+    let target_end = colon_start;
+    let target_start = line[..target_end]
+        .rfind(|c: char| !is_completion_identifier_char(c))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let target = &line[target_start..target_end];
+    if target.is_empty() {
+        return None;
+    }
+    Some(AssociatedCompletionContext {
+        target: target.to_string(),
+        replacement_range: Range::new(
+            Position::new(lsp_position.line, byte_to_utf16_col(line, member_start)),
+            Position::new(lsp_position.line, byte_to_utf16_col(line, replacement_end)),
+        ),
+    })
+}
+
+fn associated_access_bounds(line: &str, cursor_byte: usize) -> Option<(usize, usize, usize)> {
+    let cursor_byte = cursor_byte.min(line.len());
+    let before = &line[..cursor_byte];
+    if let Some(colon_start) = before.rfind("::") {
+        let member_start = colon_start + 2;
+        let partial = &before[member_start..];
+        if partial.chars().all(is_completion_identifier_char) {
+            return Some((colon_start, member_start, cursor_byte));
+        }
+    }
+    if cursor_byte > 0
+        && line.as_bytes().get(cursor_byte - 1) == Some(&b':')
+        && line.as_bytes().get(cursor_byte) == Some(&b':')
+    {
+        return Some((cursor_byte - 1, cursor_byte + 1, cursor_byte + 1));
+    }
+    if cursor_byte + 1 < line.len()
+        && line.as_bytes().get(cursor_byte) == Some(&b':')
+        && line.as_bytes().get(cursor_byte + 1) == Some(&b':')
+    {
+        return Some((cursor_byte, cursor_byte + 2, cursor_byte + 2));
+    }
+    None
+}
+
 fn member_completion(
     state: &ServerState,
     uri: &Uri,
@@ -281,43 +491,38 @@ fn member_completion(
     position: SourcePosition,
     lsp_position: Position,
 ) -> Option<Vec<CompletionItem>> {
-    let source = state.documents.get(uri)?;
-    let line = source.lines().nth(lsp_position.line as usize)?;
-    let cursor_byte = utf16_col_to_byte(line, lsp_position.character).min(line.len());
-    let before = &line[..cursor_byte];
-    let partial_start = before
-        .rfind(|c: char| !is_completion_identifier_char(c))
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
-    if partial_start == 0 || before.as_bytes().get(partial_start - 1) != Some(&b'.') {
-        return None;
-    }
-    let before_dot = &before[..partial_start - 1];
-    let receiver_start = before_dot
-        .rfind(|c: char| !is_completion_identifier_char(c))
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
-    let receiver = &before_dot[receiver_start..];
-    if receiver.is_empty() {
-        return None;
-    }
-    let replacement_range = completion_replacement_range(state, uri, lsp_position)?;
+    let context = member_completion_context(state, uri, lsp_position)?;
+    let receiver = context.receiver.as_str();
+    let replacement_range = context.replacement_range;
 
     // Definition-based completions: import module members and record fields.
     if let Some(definition) = visible_definition_named(index, receiver, position)
         .or_else(|| visible_definition_named(prelude_index, receiver, position))
     {
-        let items = if let Some(mod_name) = definition.import_module.as_ref() {
-            imported_member_completion_items(graph, inference, mod_name, replacement_range)
-        } else if let Some(ty) =
-            completion_type_for_definition(inference, current_module, definition)
-        {
-            record_field_completion_items(&ty, replacement_range)
-        } else {
-            Vec::new()
-        };
-        if !items.is_empty() {
-            return Some(items);
+        if let Some(mod_name) = definition.import_module.as_ref() {
+            let items =
+                imported_member_completion_items(graph, inference, mod_name, replacement_range);
+            if !items.is_empty() {
+                return Some(items);
+            }
+        }
+
+        if let Some(ty) = completion_type_for_definition(inference, current_module, definition) {
+            let mut items = record_field_completion_items(&ty, replacement_range);
+            let receiver_place_mutable =
+                completion_place_mutable_for_definition(inference, current_module, definition);
+            items.extend(receiver_method_completion_items(
+                inference,
+                current_module,
+                &ty,
+                receiver_place_mutable,
+                replacement_range,
+            ));
+            items.sort_by(|a, b| a.label.cmp(&b.label));
+            items.dedup_by(|a, b| a.label == b.label);
+            if !items.is_empty() {
+                return Some(items);
+            }
         }
     }
 
@@ -332,6 +537,119 @@ fn member_completion(
     None
 }
 
+fn associated_completion(
+    state: &ServerState,
+    uri: &Uri,
+    inference: &GraphInference,
+    current_module: &str,
+    lsp_position: Position,
+) -> Option<Vec<CompletionItem>> {
+    let context = associated_completion_context(state, uri, lsp_position)?;
+    let target = context.target.as_str();
+    let replacement_range = context.replacement_range;
+    let mut items = Vec::new();
+    if let Some(module_env) = inference.module_env_for_module(current_module) {
+        for (method_target, methods) in module_env.all_inherent_methods() {
+            if method_target == target {
+                items.extend(associated_method_completion_items(
+                    methods,
+                    replacement_range,
+                ));
+            }
+        }
+    }
+    if items.is_empty()
+        && let Some(methods) = state.prelude.inherent_method_schemes.get(target)
+    {
+        items.extend(associated_method_completion_items(
+            methods,
+            replacement_range,
+        ));
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items.dedup_by(|a, b| a.label == b.label);
+    // A recognized `Type::` context suppresses general scope completion even when
+    // the type has no associated functions; the user explicitly requested members.
+    Some(items)
+}
+
+fn associated_method_completion_items(
+    methods: &HashMap<String, hern_core::types::InherentMethodScheme>,
+    replacement_range: Range,
+) -> Vec<CompletionItem> {
+    methods
+        .iter()
+        .filter(|(name, method)| !is_internal_completion_name(name) && !method.has_receiver)
+        .map(|(name, method)| {
+            method_completion_item(
+                name,
+                &method.scheme,
+                CompletionItemKind::FUNCTION,
+                replacement_range,
+            )
+        })
+        .collect()
+}
+
+fn receiver_method_completion_items(
+    inference: &GraphInference,
+    current_module: &str,
+    receiver_ty: &Ty,
+    receiver_place_mutable: bool,
+    replacement_range: Range,
+) -> Vec<CompletionItem> {
+    let Some(target) = completion_ty_target_name(receiver_ty) else {
+        return Vec::new();
+    };
+    let Some(module_env) = inference.module_env_for_module(current_module) else {
+        return Vec::new();
+    };
+    module_env
+        .all_inherent_methods()
+        .filter(|(method_target, _)| *method_target == target)
+        .flat_map(|(_, methods)| methods.iter())
+        .filter(|(name, method)| {
+            !is_internal_completion_name(name)
+                && method.has_receiver
+                && (receiver_place_mutable
+                    || !scheme_param_capability(&method.scheme, 0).is_mut_place())
+        })
+        .map(|(name, method)| {
+            method_completion_item(
+                name,
+                &method.scheme,
+                CompletionItemKind::METHOD,
+                replacement_range,
+            )
+        })
+        .collect()
+}
+
+fn method_completion_item(
+    name: &str,
+    scheme: &Scheme,
+    kind: CompletionItemKind,
+    replacement_range: Range,
+) -> CompletionItem {
+    let detail = Some(completion_scheme_to_string(scheme));
+    CompletionItem {
+        label: name.to_string(),
+        kind: Some(kind),
+        detail: detail.clone(),
+        filter_text: Some(name.to_string()),
+        insert_text: Some(name.to_string()),
+        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+            range: replacement_range,
+            new_text: name.to_string(),
+        })),
+        label_details: detail.map(|d| CompletionItemLabelDetails {
+            detail: Some(format!(": {d}")),
+            description: None,
+        }),
+        ..Default::default()
+    }
+}
+
 fn imported_member_completion_items(
     graph: &ModuleGraph,
     inference: &GraphInference,
@@ -341,6 +659,9 @@ fn imported_member_completion_items(
     let mut items = Vec::new();
     if let Some(Ty::Record(row)) = inference.import_types.get(module_name) {
         for (name, ty) in &row.fields {
+            if is_internal_completion_name(name) {
+                continue;
+            }
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::FIELD),
@@ -357,6 +678,9 @@ fn imported_member_completion_items(
     } else if let Some(program) = graph.module(module_name) {
         if let Some(fields) = exported_record_fields(program) {
             for name in fields {
+                if is_internal_completion_name(&name) {
+                    continue;
+                }
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::FIELD),
@@ -378,7 +702,8 @@ fn imported_member_completion_items(
             if !matches!(
                 definition.kind,
                 DefinitionKind::Function | DefinitionKind::Let | DefinitionKind::Extern
-            ) {
+            ) || is_internal_completion_name(&definition.name)
+            {
                 continue;
             }
             items.push(CompletionItem {
@@ -415,6 +740,7 @@ fn record_field_completion_items(ty: &Ty, replacement_range: Range) -> Vec<Compl
     let mut items = row
         .fields
         .iter()
+        .filter(|(name, _)| !is_internal_completion_name(name))
         .map(|(name, ty)| CompletionItem {
             label: name.clone(),
             kind: Some(CompletionItemKind::FIELD),
@@ -439,6 +765,7 @@ fn trait_method_completion_items(
     let mut items: Vec<CompletionItem> = trait_def
         .methods
         .iter()
+        .filter(|method| !is_internal_completion_name(&method.name))
         .map(|method| {
             let params = method
                 .params
@@ -500,6 +827,7 @@ fn type_position_completion(
                 .filter(|definition| !current_type_names.contains(&definition.name)),
         )
         .filter(|definition| is_type_completion_kind(definition.kind))
+        .filter(|definition| !is_internal_completion_name(&definition.name))
         .map(|definition| {
             let kind = match definition.kind {
                 DefinitionKind::Trait => CompletionItemKind::INTERFACE,
@@ -692,7 +1020,11 @@ fn visible_completion_candidates(
     prelude_index: &SourceIndex,
     position: SourcePosition,
 ) -> Vec<CompletionCandidate> {
-    let mut candidates = index.visible_names_at(position);
+    let mut candidates = index
+        .visible_names_at(position)
+        .into_iter()
+        .filter(|candidate| !is_internal_completion_name(&candidate.name))
+        .collect::<Vec<_>>();
     let local_names = candidates
         .iter()
         .map(|candidate| candidate.name.clone())
@@ -702,11 +1034,50 @@ fn visible_completion_candidates(
         prelude_index
             .visible_names_at(position)
             .into_iter()
-            .filter(|candidate| !candidate.name.starts_with("__"))
+            .filter(|candidate| !is_internal_completion_name(&candidate.name))
             .filter(|candidate| !local_names.contains(&candidate.name)),
     );
     candidates.sort_by(|a, b| a.name.cmp(&b.name));
     candidates
+}
+
+fn scheme_param_capability(scheme: &Scheme, idx: usize) -> ParamCapability {
+    match &scheme.ty {
+        Ty::Func(params, _) => params
+            .get(idx)
+            .map(|param| param.capability)
+            .unwrap_or(ParamCapability::Value),
+        _ => ParamCapability::Value,
+    }
+}
+
+fn completion_ty_target_name(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::F64 => Some("f64".to_string()),
+        Ty::Con(name) => Some(name.clone()),
+        Ty::App(con, _) => completion_ty_target_name(con),
+        Ty::Qualified(_, inner) => completion_ty_target_name(inner),
+        _ => None,
+    }
+}
+
+fn completion_place_mutable_for_definition(
+    inference: &GraphInference,
+    current_module: &str,
+    definition: &Definition,
+) -> bool {
+    inference
+        .binding_capabilities_for_module(current_module)
+        .and_then(|capabilities| capabilities.get(&definition.location.span))
+        .is_some_and(|capabilities| capabilities.place_mutable)
+        || inference
+            .env_for_module(current_module)
+            .and_then(|env| env.get(&definition.name))
+            .is_some_and(|info| info.is_place_mutable())
+}
+
+fn is_internal_completion_name(name: &str) -> bool {
+    name.starts_with("__")
 }
 
 fn visible_definition_named<'a>(
@@ -746,4 +1117,211 @@ fn visible_definition_named<'a>(
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::tests::{ImportFixture, TestProject, import_fixture};
+
+    fn labels(items: Vec<CompletionItem>) -> Vec<String> {
+        items.into_iter().map(|item| item.label).collect()
+    }
+
+    #[test]
+    fn associated_completion_lists_static_functions_only() {
+        let project = TestProject::new("completion-associated");
+        let source = "let mut g = Map::new();\ng\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(0, 17)));
+
+        assert!(labels.iter().any(|label| label == "new"));
+        assert!(!labels.iter().any(|label| label == "set"));
+        assert!(!labels.iter().any(|label| label == "get"));
+        assert!(!labels.iter().any(|label| label.starts_with("__")));
+    }
+
+    #[test]
+    fn associated_completion_lists_static_functions_with_parameters() {
+        let project = TestProject::new("completion-associated-parameterized");
+        let source = concat!(
+            "type Counter = Counter(f64)\n",
+            "impl Counter {\n",
+            "  fn make(value: f64) -> Self { Counter(value) }\n",
+            "  fn value(self) -> f64 { match self { Counter(value) -> value } }\n",
+            "}\n",
+            "let c = Counter::\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(5, 17)));
+
+        assert!(labels.iter().any(|label| label == "make"));
+        assert!(!labels.iter().any(|label| label == "value"));
+    }
+
+    #[test]
+    fn associated_completion_works_after_bare_coloncolon() {
+        let project = TestProject::new("completion-associated-incomplete");
+        let source = "let mut g = Map::\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(0, 17)));
+
+        assert!(labels.iter().any(|label| label == "new"));
+        assert!(!labels.iter().any(|label| label == "set"));
+        assert!(!labels.iter().any(|label| label.starts_with("__")));
+    }
+
+    #[test]
+    fn associated_completion_works_when_cursor_is_on_coloncolon() {
+        let project = TestProject::new("completion-associated-on-trigger");
+        let source = "let mut g = Map::\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(0, 16)));
+
+        assert!(labels.iter().any(|label| label == "new"));
+        assert!(!labels.iter().any(|label| label == "set"));
+    }
+
+    #[test]
+    fn receiver_completion_lists_methods_for_mutable_map_place() {
+        let project = TestProject::new("completion-map-mut-methods");
+        let source = "let mut g = Map::new();\ng.\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(1, 2)));
+
+        assert!(labels.iter().any(|label| label == "set"));
+        assert!(labels.iter().any(|label| label == "delete"));
+        assert!(labels.iter().any(|label| label == "get"));
+        assert!(labels.iter().any(|label| label == "keys"));
+        assert!(!labels.iter().any(|label| label == "new"));
+        assert!(!labels.iter().any(|label| label.starts_with("__")));
+    }
+
+    #[test]
+    fn receiver_completion_works_when_cursor_is_on_dot() {
+        let project = TestProject::new("completion-map-dot-trigger");
+        let source = "let mut g = Map::new();\ng.\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(1, 1)));
+
+        assert!(labels.iter().any(|label| label == "set"));
+        assert!(labels.iter().any(|label| label == "get"));
+        assert!(!labels.iter().any(|label| label == "g"));
+    }
+
+    #[test]
+    fn receiver_completion_works_for_incomplete_dot_inside_block() {
+        let project = TestProject::new("completion-map-dot-in-block");
+        let source = "fn main() {\n    let mut g = Map::new();\n    g.\n}\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(2, 6)));
+
+        assert!(labels.iter().any(|label| label == "set"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "get"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "main"));
+    }
+
+    #[test]
+    fn receiver_completion_works_inside_unclosed_function_body() {
+        let project = TestProject::new("completion-map-dot-unclosed-function");
+        let source = "fn main() {\n    let mut g = Map::new();\n    g.\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(2, 6)));
+
+        assert!(labels.iter().any(|label| label == "set"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "get"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "main"));
+    }
+
+    #[test]
+    fn receiver_completion_ignores_following_let_after_incomplete_dot() {
+        let project = TestProject::new("completion-map-dot-before-let");
+        let source = concat!(
+            "fn main() {\n",
+            "    let mut g = Map::new();\n",
+            "    g.\n",
+            "    let x = 1;\n",
+            "    x\n",
+            "}\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(2, 6)));
+
+        assert!(labels.iter().any(|label| label == "set"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "get"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "main"));
+    }
+
+    #[test]
+    fn receiver_completion_ignores_following_control_flow_after_incomplete_dot() {
+        let project = TestProject::new("completion-map-dot-before-if-loop");
+        let source = concat!(
+            "fn main() {\n",
+            "    let mut g = Map::new();\n",
+            "    g.\n",
+            "    if true { 1 } else { 2 };\n",
+            "    loop { break 0; }\n",
+            "}\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(2, 6)));
+
+        assert!(labels.iter().any(|label| label == "set"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "get"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "main"));
+    }
+
+    #[test]
+    fn receiver_completion_hides_mut_self_methods_for_immutable_map_place() {
+        let project = TestProject::new("completion-map-immutable-methods");
+        let source = "let g = Map::new();\ng.\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(1, 2)));
+
+        assert!(!labels.iter().any(|label| label == "set"));
+        assert!(!labels.iter().any(|label| label == "delete"));
+        assert!(labels.iter().any(|label| label == "get"));
+        assert!(labels.iter().any(|label| label == "has"));
+        assert!(labels.iter().any(|label| label == "size"));
+    }
+
+    #[test]
+    fn default_completion_hides_internal_names() {
+        let project = TestProject::new("completion-hides-internals");
+        let source = "let mut g = Map::new();\ng\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(1, 0)));
+
+        assert!(labels.iter().any(|label| label == "g"));
+        assert!(!labels.iter().any(|label| label.starts_with("__")));
+    }
+
+    #[test]
+    fn imported_member_completion_hides_internal_names() {
+        let ImportFixture {
+            state, entry_uri, ..
+        } = import_fixture(
+            "completion-import-internals",
+            "let dep = import \"dep\";\ndep.\n",
+            "fn public() -> f64 { 1 }\nfn __hidden() -> f64 { 2 }\n#{ public: public, __hidden: __hidden }\n",
+        );
+
+        let labels = labels(completion(&state, entry_uri, Position::new(1, 4)));
+
+        assert!(labels.iter().any(|label| label == "public"));
+        assert!(!labels.iter().any(|label| label == "__hidden"));
+        assert!(!labels.iter().any(|label| label.starts_with("__")));
+    }
 }

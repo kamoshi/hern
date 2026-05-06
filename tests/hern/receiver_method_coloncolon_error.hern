@@ -1,0 +1,3 @@
+let mut m: Map(string, f64) = Map::new();
+
+Map::set(m, "x", 1);

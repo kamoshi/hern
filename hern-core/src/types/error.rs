@@ -68,6 +68,18 @@ pub enum TypeError {
         receiver: String,
         method: String,
     },
+    UnknownAssociatedFunction {
+        target: String,
+        function: String,
+    },
+    AssociatedFunctionAsMethod {
+        target: String,
+        function: String,
+    },
+    MethodRequiresReceiver {
+        target: String,
+        method: String,
+    },
     AmbiguousMethodReceiver {
         method: String,
     },
@@ -248,6 +260,23 @@ impl fmt::Display for TypeError {
             TypeError::UnknownMethod { receiver, method } => {
                 write!(f, "type `{}` has no method `{}`", receiver, method)
             }
+            TypeError::UnknownAssociatedFunction { target, function } => {
+                write!(
+                    f,
+                    "type `{}` has no associated function `{}`",
+                    target, function
+                )
+            }
+            TypeError::AssociatedFunctionAsMethod { target, function } => write!(
+                f,
+                "associated function `{}` for `{}` must be called with `{}::{}`",
+                function, target, target, function
+            ),
+            TypeError::MethodRequiresReceiver { target, method } => write!(
+                f,
+                "method `{}` for `{}` requires a receiver; call it with `value.{}`",
+                method, target, method
+            ),
             TypeError::AmbiguousMethodReceiver { method } => write!(
                 f,
                 "cannot resolve method `{}` because the receiver type is unconstrained; add a type annotation",

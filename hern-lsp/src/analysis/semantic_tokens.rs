@@ -1,4 +1,4 @@
-use hern_core::ast::{Program, SourceSpan};
+use hern_core::ast::{Expr, ExprKind, Program, SourceSpan, Stmt};
 use hern_core::lex::{Lexer, Token};
 use hern_core::module::GraphInference;
 use hern_core::source_index::{DefinitionKind, SourceIndex, index_program};
@@ -97,7 +97,7 @@ pub(crate) fn semantic_tokens_for_source(
 ) -> SemanticTokensResult {
     let mut raw = lex_tokens(source);
     if let Some(program) = program {
-        apply_semantic_overrides(&mut raw, &index_program(program), source, context);
+        apply_semantic_overrides(&mut raw, program, &index_program(program), source, context);
     }
     raw.sort_by_key(|token| (token.line, token.col, token.len));
     raw.dedup_by_key(|token| (token.line, token.col, token.len));
@@ -186,7 +186,8 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
         | Token::Op(_)
         | Token::Pipe
         | Token::DotDot
-        | Token::Dot => TY_OPERATOR,
+        | Token::Dot
+        | Token::ColonColon => TY_OPERATOR,
         Token::Eof
         | Token::Colon
         | Token::Semicolon
@@ -203,6 +204,7 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
 
 fn apply_semantic_overrides(
     raw: &mut Vec<RawToken>,
+    program: &Program,
     index: &SourceIndex,
     source: &str,
     context: Option<SemanticContext<'_>>,
@@ -256,6 +258,129 @@ fn apply_semantic_overrides(
             ),
             0,
         );
+    }
+    for stmt in &program.stmts {
+        push_associated_access_tokens(raw, &mut pos_to_idx, source, stmt);
+    }
+}
+
+fn push_associated_access_tokens(
+    raw: &mut Vec<RawToken>,
+    pos_to_idx: &mut HashMap<(u32, u32), usize>,
+    source: &str,
+    stmt: &Stmt,
+) {
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Expr(value) => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, value)
+        }
+        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, body)
+        }
+        Stmt::Impl(impl_def) => {
+            for method in &impl_def.methods {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, &method.body);
+            }
+        }
+        Stmt::InherentImpl(impl_def) => {
+            for method in &impl_def.methods {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, &method.body);
+            }
+        }
+        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
+    }
+}
+
+fn push_associated_access_tokens_expr(
+    raw: &mut Vec<RawToken>,
+    pos_to_idx: &mut HashMap<(u32, u32), usize>,
+    source: &str,
+    expr: &Expr,
+) {
+    match &expr.kind {
+        ExprKind::AssociatedAccess {
+            target_span,
+            member_span,
+            ..
+        } => {
+            push_semantic_span(raw, pos_to_idx, source, *target_span, TY_TYPE, 0);
+            push_semantic_span(raw, pos_to_idx, source, *member_span, TY_METHOD, 0);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, callee);
+            for arg in args {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, arg);
+            }
+        }
+        ExprKind::Not(inner)
+        | ExprKind::Loop(inner)
+        | ExprKind::Break(Some(inner))
+        | ExprKind::Return(Some(inner))
+        | ExprKind::FieldAccess { expr: inner, .. } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, inner)
+        }
+        ExprKind::Assign { target, value } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, target);
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, value);
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, lhs);
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, rhs);
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, cond);
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, then_branch);
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, else_branch);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, scrutinee);
+            for (_, body) in arms {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, body);
+            }
+        }
+        ExprKind::Block { stmts, final_expr } => {
+            for stmt in stmts {
+                push_associated_access_tokens(raw, pos_to_idx, source, stmt);
+            }
+            if let Some(expr) = final_expr {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, expr);
+            }
+        }
+        ExprKind::Tuple(items) => {
+            for item in items {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, item);
+            }
+        }
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, entry.expr());
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, entry.expr());
+            }
+        }
+        ExprKind::Lambda { body, .. } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, body)
+        }
+        ExprKind::For { iterable, body, .. } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, iterable);
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, body);
+        }
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Import(_)
+        | ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None)
+        | ExprKind::Unit => {}
     }
 }
 
@@ -553,6 +678,23 @@ mod tests {
                 .iter()
                 .any(|token| { token.0 == 1 && token.1 == 4 && token.3 == TY_METHOD })
         );
+    }
+
+    #[test]
+    fn semantic_tokens_classify_associated_access_target_and_member() {
+        let source = "let mut g = Map::new();\ng\n";
+        let program = parse_source(source).expect("source should parse");
+
+        let tokens = token_tuples(semantic_tokens_for_source(source, Some(&program), None));
+
+        assert!(
+            tokens.iter().any(|token| {
+                token.0 == 0 && token.1 == 12 && token.2 == 3 && token.3 == TY_TYPE
+            })
+        );
+        assert!(tokens.iter().any(|token| {
+            token.0 == 0 && token.1 == 17 && token.2 == 3 && token.3 == TY_METHOD
+        }));
     }
 
     fn graph_inference_for_test(

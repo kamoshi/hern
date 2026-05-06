@@ -10,8 +10,7 @@ use hern_core::module::{GraphInference, ModuleEnv, ModuleGraph};
 use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
 use hern_core::types::infer::{TypeEnv, VariantEnv};
 use hern_core::types::{
-    BindingCapabilities, ParamCapability, Scheme, TraitConstraint, Ty, TyVar,
-    display_ty_with_var_names, display_ty_with_var_names_and_param_capabilities,
+    BindingCapabilities, Scheme, TraitConstraint, Ty, TyVar, display_ty_with_var_names,
     free_type_vars_in_display_order, type_var_name,
 };
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
@@ -54,9 +53,11 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
     let place_mutable = binding_capabilities
         .and_then(|capabilities| capabilities.get(&info.span))
         .is_some_and(|capabilities| capabilities.place_mutable);
-    if let Some(capabilities) = callable_capabilities.and_then(|caps| caps.get(&info.node_id)) {
-        let scheme = Scheme::mono(info.ty.clone())
-            .with_param_capabilities(capabilities.param_capabilities.clone());
+    if callable_capabilities
+        .and_then(|caps| caps.get(&info.node_id))
+        .is_some()
+    {
+        let scheme = Scheme::mono(info.ty.clone());
         return Some(type_hover(hover_scheme_to_string(&scheme), markdown));
     }
     Some(type_hover(
@@ -246,6 +247,7 @@ fn trait_access_hover_in_expr(
                 .or_else(|| trait_access_hover_in_expr(body, module_env, position))
         }
         ExprKind::FieldAccess { .. } => unreachable!("handled above"),
+        ExprKind::AssociatedAccess { .. } => None,
         ExprKind::Ident(_)
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
@@ -371,6 +373,7 @@ fn operator_use_in_expr(expr: &Expr, position: SourcePosition) -> Option<Operato
             .find_map(|e| operator_use_in_expr(e.expr(), position)),
         ExprKind::For { iterable, body, .. } => operator_use_in_expr(iterable, position)
             .or_else(|| operator_use_in_expr(body, position)),
+        ExprKind::AssociatedAccess { .. } => None,
         ExprKind::Break(None)
         | ExprKind::Continue
         | ExprKind::Return(None)
@@ -473,7 +476,6 @@ pub(super) fn ty_to_display_string(ty: &Ty) -> String {
             vars,
             constraints,
             ty: ty.clone(),
-            param_capabilities: vec![],
         },
         true,
     )
@@ -490,7 +492,6 @@ pub(super) fn completion_ty_to_display_string(ty: &Ty) -> String {
             vars,
             constraints,
             ty: ty.clone(),
-            param_capabilities: vec![],
         },
         false,
     )
@@ -506,7 +507,7 @@ pub(super) fn completion_scheme_to_string(scheme: &Scheme) -> String {
 
 fn scheme_to_display_string(scheme: &Scheme, include_constraints: bool) -> String {
     let names = type_var_names(scheme);
-    let mut out = display_ty_body_for_lsp(&scheme.ty, &names, &scheme.param_capabilities);
+    let mut out = display_ty_body_for_lsp(&scheme.ty, &names);
     if include_constraints {
         let constraints = constraints_by_var(scheme, &names);
         if !constraints.is_empty() {
@@ -519,16 +520,10 @@ fn scheme_to_display_string(scheme: &Scheme, include_constraints: bool) -> Strin
     out
 }
 
-fn display_ty_body_for_lsp(
-    ty: &Ty,
-    names: &HashMap<TyVar, String>,
-    param_capabilities: &[ParamCapability],
-) -> String {
+fn display_ty_body_for_lsp(ty: &Ty, names: &HashMap<TyVar, String>) -> String {
     match ty {
-        Ty::Qualified(_, inner) => display_ty_body_for_lsp(inner, names, param_capabilities),
-        Ty::Func(_, _) => {
-            display_ty_with_var_names_and_param_capabilities(ty, names, param_capabilities)
-        }
+        Ty::Qualified(_, inner) => display_ty_body_for_lsp(inner, names),
+        Ty::Func(_, _) => display_ty_with_var_names(ty, names),
         _ => display_ty_with_var_names(ty, names),
     }
 }
@@ -701,7 +696,7 @@ fn impl_method_signature(method: &ImplMethod) -> String {
             "fn {}({}) -> {}",
             method.name,
             params,
-            ast_type_to_string(ret)
+            ast_type_return_to_string(ret)
         ),
         None => format!("fn {}({})", method.name, params),
     }
@@ -725,7 +720,7 @@ fn inherent_method_signature(method: &InherentMethod) -> String {
             "fn {}({}) -> {}",
             method.name,
             params,
-            ast_type_to_string(ret)
+            ast_type_return_to_string(ret)
         ),
         None => format!("fn {}({})", method.name, params),
     }
@@ -791,6 +786,15 @@ pub(super) fn ast_type_to_string(ty: &hern_core::ast::Type) -> String {
         }
         Type::Unit => "()".to_string(),
         Type::Hole => "*".to_string(),
+    }
+}
+
+fn ast_type_return_to_string(ret: &hern_core::ast::TypeReturn) -> String {
+    let ty = ast_type_to_string(&ret.ty);
+    if ret.mut_place {
+        format!("mut {ty}")
+    } else {
+        ty
     }
 }
 
@@ -915,14 +919,10 @@ fn definition_hover_text(
     if let Some(scheme) =
         definition_schemes.and_then(|schemes| schemes.get(&definition.location.span))
     {
-        let env_scheme = env
+        let scheme = env
             .and_then(|env| env.get(&definition.name))
-            .map(|info| &info.scheme);
-        let scheme = if scheme.param_capabilities.is_empty() {
-            env_scheme.unwrap_or(scheme)
-        } else {
-            scheme
-        };
+            .map(|info| &info.scheme)
+            .unwrap_or(scheme);
         let text = hover_scheme_to_string(scheme);
         return Some(
             operator_definition_fixity(program, definition.location.span)
@@ -1084,7 +1084,6 @@ fn param_type_from_fn_scheme(
         vars: scheme.scheme.vars.clone(),
         constraints: scheme.scheme.constraints.clone(),
         ty: binding_ty,
-        param_capabilities: vec![],
     };
     Some(hover_scheme_to_string(&display_scheme))
 }
@@ -1128,7 +1127,6 @@ fn param_type_from_impl_dict(
         vars: dict_scheme.scheme.vars.clone(),
         constraints: dict_scheme.scheme.constraints.clone(),
         ty: binding_ty,
-        param_capabilities: vec![],
     };
     Some(hover_scheme_to_string(&display_scheme))
 }
@@ -1466,6 +1464,7 @@ fn param_type_in_expr_stmts(
                     param_type_in_expr_stmts(body, name, param_span, env, expr_types, variant_env)
                 })
         }
+        ExprKind::AssociatedAccess { .. } => None,
         ExprKind::Break(None)
         | ExprKind::Return(None)
         | ExprKind::Continue
@@ -1765,6 +1764,7 @@ fn local_pattern_binding_type_in_expr(
                 variant_env,
             )
         }),
+        ExprKind::AssociatedAccess { .. } => None,
         ExprKind::Break(None)
         | ExprKind::Return(None)
         | ExprKind::Continue
@@ -1898,6 +1898,7 @@ fn declaration_value_type_in_expr<'a>(
             declaration_value_type_in_expr(iterable, span, expr_types)
                 .or_else(|| declaration_value_type_in_expr(body, span, expr_types))
         }
+        ExprKind::AssociatedAccess { .. } => None,
         ExprKind::Break(None)
         | ExprKind::Return(None)
         | ExprKind::Continue
@@ -1907,5 +1908,22 @@ fn declaration_value_type_in_expr<'a>(
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::tests::{TestProject, hover_text};
+
+    #[test]
+    fn hover_for_associated_function_member_shows_fresh_return() {
+        let project = TestProject::new("hover-associated");
+        let source = "let mut g = Map::new();\ng\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let text = hover_text(hover(&state, uri, Position::new(0, 18)).expect("hover"));
+
+        assert!(text.starts_with("fn() -> mut Map("), "{text}");
     }
 }
