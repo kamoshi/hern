@@ -1,0 +1,2 @@
+#!/usr/bin/env hern
+print(42)

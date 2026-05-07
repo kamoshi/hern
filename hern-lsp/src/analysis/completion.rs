@@ -7,7 +7,7 @@ use super::workspace::{
     WorkspaceAnalysis, analyze_document_graph, load_document_graph_recovering,
     load_workspace_graphs,
 };
-use hern_core::ast::{Program, RecordEntry, SourcePosition, TraitDef};
+use hern_core::ast::{Expr, ExprKind, NodeId, Program, RecordEntry, SourcePosition, TraitDef};
 use hern_core::module::{
     GraphInference, ModuleGraph, infer_graph_collecting, normalize_overlay_path,
 };
@@ -124,6 +124,7 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
         graph,
         inference,
         module_name,
+        program,
         &index,
         &prelude_index,
         position,
@@ -307,7 +308,8 @@ fn path_completion_item(
 }
 
 struct MemberCompletionContext {
-    receiver: String,
+    receiver: Option<String>,
+    receiver_end: SourcePosition,
     replacement_range: Range,
 }
 
@@ -326,16 +328,23 @@ fn member_completion_context(
     let cursor_byte = utf16_col_to_byte(line, lsp_position.character).min(line.len());
     let (dot_byte, partial_start, replacement_end) = member_access_bounds(line, cursor_byte)?;
     let before_dot = &line[..dot_byte];
-    let receiver_start = before_dot
+    let receiver_end_byte = before_dot.trim_end().len();
+    if receiver_end_byte == 0 {
+        return None;
+    }
+    let receiver_start = before_dot[..receiver_end_byte]
         .rfind(|c: char| !is_completion_identifier_char(c))
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    let receiver = &before_dot[receiver_start..];
-    if receiver.is_empty() {
-        return None;
-    }
+    let receiver = &before_dot[receiver_start..receiver_end_byte];
+    let receiver = (!receiver.is_empty() && receiver.chars().all(is_completion_identifier_char))
+        .then(|| receiver.to_string());
     Some(MemberCompletionContext {
-        receiver: receiver.to_string(),
+        receiver,
+        receiver_end: SourcePosition {
+            line: lsp_position.line as usize + 1,
+            col: byte_to_utf16_col(line, receiver_end_byte) as usize + 1,
+        },
         replacement_range: Range::new(
             Position::new(lsp_position.line, byte_to_utf16_col(line, partial_start)),
             Position::new(lsp_position.line, byte_to_utf16_col(line, replacement_end)),
@@ -486,18 +495,19 @@ fn member_completion(
     graph: &ModuleGraph,
     inference: &GraphInference,
     current_module: &str,
+    program: &Program,
     index: &SourceIndex,
     prelude_index: &SourceIndex,
     position: SourcePosition,
     lsp_position: Position,
 ) -> Option<Vec<CompletionItem>> {
     let context = member_completion_context(state, uri, lsp_position)?;
-    let receiver = context.receiver.as_str();
     let replacement_range = context.replacement_range;
 
     // Definition-based completions: import module members and record fields.
-    if let Some(definition) = visible_definition_named(index, receiver, position)
-        .or_else(|| visible_definition_named(prelude_index, receiver, position))
+    if let Some(receiver) = context.receiver.as_deref()
+        && let Some(definition) = visible_definition_named(index, receiver, position)
+            .or_else(|| visible_definition_named(prelude_index, receiver, position))
     {
         if let Some(mod_name) = definition.import_module.as_ref() {
             let items =
@@ -526,15 +536,37 @@ fn member_completion(
         }
     }
 
+    if let Some((receiver_id, ty)) =
+        completion_type_for_receiver_expr(program, inference, current_module, context.receiver_end)
+    {
+        let mut items = record_field_completion_items(&ty, replacement_range);
+        let receiver_place_mutable = inference
+            .fresh_place_exprs_for_module(current_module)
+            .is_some_and(|fresh| fresh.contains(&receiver_id));
+        items.extend(receiver_method_completion_items(
+            inference,
+            current_module,
+            &ty,
+            receiver_place_mutable,
+            replacement_range,
+        ));
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items.dedup_by(|a, b| a.label == b.label);
+        if !items.is_empty() {
+            return Some(items);
+        }
+    }
+
     // Trait method completions: `TraitName.` triggers suggestions of the trait's methods.
-    if let Some(module_env) = inference.module_env_for_module(current_module)
+    if let Some(receiver) = context.receiver.as_deref()
+        && let Some(module_env) = inference.module_env_for_module(current_module)
         && let Some(trait_def) = module_env.trait_def(receiver)
     {
         let items = trait_method_completion_items(trait_def, replacement_range);
         return (!items.is_empty()).then_some(items);
     }
 
-    None
+    Some(Vec::new())
 }
 
 fn associated_completion(
@@ -917,6 +949,115 @@ fn completion_type_for_definition(
         })
 }
 
+fn completion_type_for_receiver_expr(
+    program: &Program,
+    inference: &GraphInference,
+    current_module: &str,
+    receiver_end: SourcePosition,
+) -> Option<(NodeId, Ty)> {
+    let expr = find_expr_ending_at(program, receiver_end)?;
+    inference
+        .expr_types_for_module(current_module)
+        .and_then(|types| types.get(&expr.id))
+        .or_else(|| {
+            inference
+                .symbol_types_for_module(current_module)
+                .and_then(|types| types.get(&expr.id))
+        })
+        .cloned()
+        .map(|ty| (expr.id, ty))
+}
+
+fn find_expr_ending_at(program: &Program, end: SourcePosition) -> Option<&Expr> {
+    program
+        .stmts
+        .iter()
+        .filter_map(|stmt| find_expr_ending_at_in_stmt(stmt, end))
+        .max_by_key(|expr| (expr.span.start_line, expr.span.start_col))
+}
+
+fn find_expr_ending_at_in_stmt(stmt: &hern_core::ast::Stmt, end: SourcePosition) -> Option<&Expr> {
+    match stmt {
+        hern_core::ast::Stmt::Let { value, .. } | hern_core::ast::Stmt::Expr(value) => {
+            find_expr_ending_at_in_expr(value, end)
+        }
+        hern_core::ast::Stmt::Fn { body, .. } | hern_core::ast::Stmt::Op { body, .. } => {
+            find_expr_ending_at_in_expr(body, end)
+        }
+        hern_core::ast::Stmt::Impl(def) => def
+            .methods
+            .iter()
+            .find_map(|method| find_expr_ending_at_in_expr(&method.body, end)),
+        hern_core::ast::Stmt::InherentImpl(def) => def
+            .methods
+            .iter()
+            .find_map(|method| find_expr_ending_at_in_expr(&method.body, end)),
+        hern_core::ast::Stmt::Trait(_)
+        | hern_core::ast::Stmt::Type(_)
+        | hern_core::ast::Stmt::TypeAlias { .. }
+        | hern_core::ast::Stmt::Extern { .. } => None,
+    }
+}
+
+fn find_expr_ending_at_in_expr(expr: &Expr, end: SourcePosition) -> Option<&Expr> {
+    let mut best = (expr.span.end_line == end.line && expr.span.end_col == end.col).then_some(expr);
+    for child in expr_children(expr) {
+        if let Some(candidate) = find_expr_ending_at_in_expr(child, end) {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+fn expr_children(expr: &Expr) -> Vec<&Expr> {
+    match &expr.kind {
+        ExprKind::Not(expr) | ExprKind::Loop(expr) => vec![expr],
+        ExprKind::Assign { target, value } => vec![target, value],
+        ExprKind::Binary { lhs, rhs, .. } => vec![lhs, rhs],
+        ExprKind::Call { callee, args, .. } => std::iter::once(callee.as_ref())
+            .chain(args.iter())
+            .collect(),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => vec![cond, then_branch, else_branch],
+        ExprKind::Match { scrutinee, arms } => std::iter::once(scrutinee.as_ref())
+            .chain(arms.iter().map(|(_, body)| body))
+            .collect(),
+        ExprKind::Break(Some(expr)) => vec![expr],
+        ExprKind::Break(None) | ExprKind::Continue => Vec::new(),
+        ExprKind::Return(Some(expr)) => vec![expr],
+        ExprKind::Return(None) => Vec::new(),
+        ExprKind::Block { stmts, final_expr } => stmts
+            .iter()
+            .filter_map(|stmt| first_expr_in_stmt(stmt))
+            .chain(final_expr.iter().map(|expr| expr.as_ref()))
+            .collect(),
+        ExprKind::Tuple(items) => items.iter().collect(),
+        ExprKind::Array(items) => items.iter().map(|item| item.expr()).collect(),
+        ExprKind::Record(entries) => entries.iter().map(|entry| entry.expr()).collect(),
+        ExprKind::FieldAccess { expr, .. } => vec![expr],
+        ExprKind::Lambda { body, .. } => vec![body],
+        ExprKind::For { iterable, body, .. } => vec![iterable, body],
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::AssociatedAccess { .. }
+        | ExprKind::Import(_)
+        | ExprKind::Unit => Vec::new(),
+    }
+}
+
+fn first_expr_in_stmt(stmt: &hern_core::ast::Stmt) -> Option<&Expr> {
+    match stmt {
+        hern_core::ast::Stmt::Let { value, .. } | hern_core::ast::Stmt::Expr(value) => Some(value),
+        hern_core::ast::Stmt::Fn { body, .. } | hern_core::ast::Stmt::Op { body, .. } => Some(body),
+        _ => None,
+    }
+}
+
 fn exported_record_fields(program: &Program) -> Option<Vec<String>> {
     use hern_core::ast::{ExprKind, Stmt};
     let Some(Stmt::Expr(expr)) = program.stmts.last() else {
@@ -1294,6 +1435,20 @@ mod tests {
         assert!(labels.iter().any(|label| label == "get"));
         assert!(labels.iter().any(|label| label == "has"));
         assert!(labels.iter().any(|label| label == "size"));
+    }
+
+    #[test]
+    fn receiver_completion_works_for_call_result() {
+        let project = TestProject::new("completion-call-result-dot");
+        let source = "read_file(\"input.txt\").\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let labels = labels(completion(&state, uri, Position::new(0, 23)));
+
+        assert!(labels.iter().any(|label| label == "len"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "lines"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "trim"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "read_file"));
     }
 
     #[test]

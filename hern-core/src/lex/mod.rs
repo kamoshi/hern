@@ -141,6 +141,15 @@ impl<'src> Lexer<'src> {
 
     fn next_token(&mut self) -> Result<Spanned, LexError> {
         loop {
+            if self.pos == 0 && self.peek() == Some(b'#') && self.peek2() == Some(b'!') {
+                while let Some(ch) = self.peek() {
+                    if ch == b'\n' {
+                        break;
+                    }
+                    self.advance();
+                }
+                continue;
+            }
             self.skip_whitespace();
             if self.peek() == Some(b'/') && self.peek2() == Some(b'/') {
                 while let Some(ch) = self.peek() {

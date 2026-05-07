@@ -5,6 +5,13 @@ output = """
 12
 """
 
+[tests.hashbang]
+path = "tests/hern/hashbang.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
 [tests.mut_reassign]
 path = "tests/hern/mut_reassign.hern"
 expect = "typecheck"

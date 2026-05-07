@@ -38,6 +38,7 @@ pub struct GraphInference {
     pub definition_schemes: HashMap<String, HashMap<SourceSpan, Scheme>>,
     pub binding_capabilities: HashMap<String, HashMap<SourceSpan, BindingCapabilities>>,
     pub callable_capabilities: HashMap<String, HashMap<NodeId, CallableCapabilities>>,
+    pub fresh_place_exprs: HashMap<String, HashSet<NodeId>>,
 }
 
 #[derive(Clone)]
@@ -416,6 +417,10 @@ impl GraphInference {
         self.callable_capabilities.get(name)
     }
 
+    pub fn fresh_place_exprs_for_module(&self, name: &str) -> Option<&HashSet<NodeId>> {
+        self.fresh_place_exprs.get(name)
+    }
+
     pub fn env_for_module(&self, name: &str) -> Option<&TypeEnv> {
         self.envs.get(name)
     }
@@ -605,6 +610,9 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
         result
             .callable_capabilities
             .insert(name.clone(), inference.callable_capabilities);
+        result
+            .fresh_place_exprs
+            .insert(name.clone(), inference.fresh_place_exprs);
 
         if has_errors {
             diagnostics.extend(

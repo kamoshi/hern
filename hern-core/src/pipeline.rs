@@ -200,6 +200,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_source_ignores_initial_hashbang() {
+        let program =
+            parse_source("#!/usr/bin/env hern\nlet x = 1;\n").expect("source should parse");
+        let span = program.stmts[0].span();
+
+        assert_eq!(span.start_line, 2);
+        assert_eq!(span.start_col, 1);
+    }
+
+    #[test]
     fn parse_source_records_declaration_spans() {
         let program = parse_source("fn answer() { 42 }\n").expect("source should parse");
         let span = program.stmts[0].span();

@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 #[command(about = "Hern language CLI", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+    /// Path to a Hern file to run. Equivalent to `hern run <path>`.
+    path: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -65,6 +67,7 @@ fn main() {
 enum CliError {
     Single(CompilerDiagnostic),
     Diagnostics(Vec<CompilerDiagnostic>),
+    Usage(String),
 }
 
 impl From<CompilerDiagnostic> for CliError {
@@ -92,6 +95,7 @@ impl fmt::Display for CliError {
                 }
                 Ok(())
             }
+            CliError::Usage(message) => write!(f, "{message}"),
         }
     }
 }
@@ -101,12 +105,20 @@ impl std::error::Error for CliError {}
 fn run_cli() -> Result<(), CliError> {
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Parse { path } => {
+    match (cli.command, cli.path) {
+        (Some(_), Some(path)) => Err(CliError::Usage(format!(
+            "unexpected path argument `{}`; use either `hern <path>` or a subcommand",
+            path.display()
+        )))?,
+        (None, Some(path)) => run_file(path)?,
+        (None, None) => Err(CliError::Usage(
+            "missing command or path; try `hern --help`".to_string(),
+        ))?,
+        (Some(Commands::Parse { path }), None) => {
             let program = parse_file_for_cli(&path)?;
             println!("{:#?}", program);
         }
-        Commands::Typecheck { path, dump } => {
+        (Some(Commands::Typecheck { path, dump }), None) => {
             let (_graph, inference, entry) = analyze_workspace_for_cli(path)?;
             if dump {
                 println!("Resolved types:");
@@ -117,24 +129,19 @@ fn run_cli() -> Result<(), CliError> {
                 println!("Typecheck successful!");
             }
         }
-        Commands::Lua { path } => {
+        (Some(Commands::Lua { path }), None) => {
             let (graph, inference, entry) = analyze_workspace_for_cli(path)?;
             println!("{}", gen_lua_bundle(&graph, &inference.module_envs, &entry));
         }
-        Commands::Run { path } => {
-            let (graph, inference, entry) = analyze_workspace_for_cli(path)?;
-            let lua_code = gen_lua_iife_bundle(&graph, &inference.module_envs, &entry);
-            hern_repl::exec_lua(&lua_code)
-                .map_err(|e| CliError::Single(CompilerDiagnostic::error(None, &e.to_string())))?;
-        }
-        Commands::Bundle { path } => {
+        (Some(Commands::Run { path }), None) => run_file(path)?,
+        (Some(Commands::Bundle { path }), None) => {
             let (graph, inference, entry) = analyze_workspace_for_cli(path)?;
             print!(
                 "{}",
                 gen_lua_iife_bundle(&graph, &inference.module_envs, &entry)
             );
         }
-        Commands::Repl { path } => {
+        (Some(Commands::Repl { path }), None) => {
             let result = match path {
                 Some(path) => hern_repl::run_with_path(path),
                 None => hern_repl::run(),
@@ -144,7 +151,7 @@ fn run_cli() -> Result<(), CliError> {
                 std::process::exit(1);
             }
         }
-        Commands::Lsp => {
+        (Some(Commands::Lsp), None) => {
             if let Err(err) = hern_lsp::run() {
                 eprintln!("LSP error: {}", err);
                 std::process::exit(1);
@@ -159,6 +166,13 @@ fn parse_file_for_cli(path: &Path) -> Result<hern_core::ast::Program, CliError> 
     parse_file_recovering(path, &graph.prelude)?
         .into_result()
         .map_err(CliError::from)
+}
+
+fn run_file(path: PathBuf) -> Result<(), CliError> {
+    let (graph, inference, entry) = analyze_workspace_for_cli(path)?;
+    let lua_code = gen_lua_iife_bundle(&graph, &inference.module_envs, &entry);
+    hern_repl::exec_lua(&lua_code)
+        .map_err(|e| CliError::Single(CompilerDiagnostic::error(None, &e.to_string())))
 }
 
 fn analyze_workspace_for_cli(
@@ -191,4 +205,28 @@ fn analyze_workspace_for_cli(
         ))
     })?;
     Ok((graph, inference, entry))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_level_path_is_run_shorthand() {
+        let cli = Cli::try_parse_from(["hern", "script.hern"]).expect("path should parse");
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.path, Some(PathBuf::from("script.hern")));
+    }
+
+    #[test]
+    fn run_subcommand_still_parses_normally() {
+        let cli = Cli::try_parse_from(["hern", "run", "script.hern"]).expect("run should parse");
+
+        match cli.command {
+            Some(Commands::Run { path }) => assert_eq!(path, PathBuf::from("script.hern")),
+            _ => panic!("expected run command"),
+        }
+        assert_eq!(cli.path, None);
+    }
 }

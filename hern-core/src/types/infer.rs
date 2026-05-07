@@ -81,6 +81,7 @@ struct FinalizedTypeMaps {
     definition_schemes: HashMap<SourceSpan, Scheme>,
     binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     callable_capabilities: HashMap<NodeId, CallableCapabilities>,
+    fresh_place_exprs: HashSet<NodeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +96,7 @@ pub struct InferenceResult {
     pub definition_schemes: HashMap<SourceSpan, Scheme>,
     pub binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     pub callable_capabilities: HashMap<NodeId, CallableCapabilities>,
+    pub fresh_place_exprs: HashSet<NodeId>,
 }
 
 /// Partial result returned by [`Infer::infer_program_collecting`].
@@ -117,6 +119,7 @@ pub struct ModuleInference {
     pub definition_schemes: HashMap<SourceSpan, Scheme>,
     pub binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     pub callable_capabilities: HashMap<NodeId, CallableCapabilities>,
+    pub fresh_place_exprs: HashSet<NodeId>,
 }
 
 impl Default for ModuleInference {
@@ -132,6 +135,7 @@ impl Default for ModuleInference {
             definition_schemes: HashMap::new(),
             binding_capabilities: HashMap::new(),
             callable_capabilities: HashMap::new(),
+            fresh_place_exprs: HashSet::new(),
         }
     }
 }
@@ -759,6 +763,7 @@ impl Infer {
                 .collect(),
             binding_capabilities: self.binding_capabilities.clone(),
             callable_capabilities: self.callable_capabilities.clone(),
+            fresh_place_exprs: self.fresh_place_exprs.clone(),
         }
     }
 
@@ -835,6 +840,7 @@ impl Infer {
             definition_schemes: maps.definition_schemes,
             binding_capabilities: maps.binding_capabilities,
             callable_capabilities: maps.callable_capabilities,
+            fresh_place_exprs: maps.fresh_place_exprs,
         })
     }
 
@@ -1014,6 +1020,7 @@ impl Infer {
                 definition_schemes: maps.definition_schemes,
                 binding_capabilities: maps.binding_capabilities,
                 callable_capabilities: maps.callable_capabilities,
+                fresh_place_exprs: maps.fresh_place_exprs,
             },
             diagnostics,
         )

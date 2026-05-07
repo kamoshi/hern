@@ -40,12 +40,8 @@ fn is_fresh_mutable_component(expr: &Expr) -> bool {
         | ExprKind::Lambda { .. }
         | ExprKind::Unit => true,
         ExprKind::Tuple(exprs) => exprs.iter().all(is_fresh_mutable_component),
-        ExprKind::Record(entries) => entries
-            .iter()
-            .all(|e| is_fresh_mutable_component(e.expr())),
-        ExprKind::Array(entries) => entries
-            .iter()
-            .all(|e| is_fresh_array_element(e.expr())),
+        ExprKind::Record(entries) => entries.iter().all(|e| is_fresh_mutable_component(e.expr())),
+        ExprKind::Array(entries) => entries.iter().all(|e| is_fresh_array_element(e.expr())),
         _ => false,
     }
 }

@@ -2113,27 +2113,28 @@ for x in xs {
     #[test]
     fn discarded_call_codegen_emits_bare_call() {
         let source = r#"
-let xs = [1];
-push(xs, 2);
+fn touch(x) { () }
+touch(1);
 "#;
         let lua = lua_for_source("hern_codegen_discarded_call.hern", source);
 
         assert!(
-            lua.contains("push(xs, 2)\n"),
+            lua.contains("touch(1)\n"),
             "discarded call should be emitted as a bare call:\n{lua}"
         );
         assert!(
-            !lua.contains("local _ = push(xs, 2)"),
+            !lua.contains("local _ = touch(1)"),
             "discarded call should not bind the return value:\n{lua}"
         );
     }
 
     #[test]
     fn discarded_template_call_codegen_keeps_expression_statement_valid() {
-        let source = r#"
+        let source = r##"
+extern len_raw: fn([f64]) -> f64 = #[template] "#($1)";
 let xs = [1, 2];
-array_len(xs);
-"#;
+len_raw(xs);
+"##;
         let lua = lua_for_source("hern_codegen_discarded_template_call.hern", source);
 
         assert!(
