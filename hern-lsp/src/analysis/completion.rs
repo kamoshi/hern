@@ -363,8 +363,8 @@ fn member_completion_recovery_source(
     let cursor_byte = utf16_col_to_byte(line, lsp_position.character).min(line.len());
     let (dot_byte, _, _) = member_access_bounds(line, cursor_byte)?;
     let mut recovered = source[..line_start + dot_byte].to_string();
-    terminate_completion_recovery_statement(&mut recovered);
     close_unmatched_braces_for_completion(&mut recovered);
+    terminate_completion_recovery_statement(&mut recovered);
     Some(recovered)
 }
 
@@ -382,7 +382,8 @@ fn terminate_completion_recovery_statement(source: &mut String) {
 }
 
 fn close_unmatched_braces_for_completion(source: &mut String) {
-    let mut depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut paren_depth = 0usize;
     let mut in_string = false;
     let mut chars = source.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -398,12 +399,15 @@ fn close_unmatched_braces_for_completion(source: &mut String) {
                     }
                 }
             }
-            '{' if !in_string => depth += 1,
-            '}' if !in_string => depth = depth.saturating_sub(1),
+            '(' if !in_string => paren_depth += 1,
+            ')' if !in_string => paren_depth = paren_depth.saturating_sub(1),
+            '{' if !in_string => brace_depth += 1,
+            '}' if !in_string => brace_depth = brace_depth.saturating_sub(1),
             _ => {}
         }
     }
-    source.extend(std::iter::repeat_n('}', depth));
+    source.extend(std::iter::repeat_n(')', paren_depth));
+    source.extend(std::iter::repeat_n('}', brace_depth));
 }
 
 fn line_byte_range(source: &str, target_line: usize) -> Option<(usize, usize)> {
@@ -1003,7 +1007,15 @@ fn find_expr_ending_at_in_expr(expr: &Expr, end: SourcePosition) -> Option<&Expr
     let mut best = (expr.span.end_line == end.line && expr.span.end_col == end.col).then_some(expr);
     for child in expr_children(expr) {
         if let Some(candidate) = find_expr_ending_at_in_expr(child, end) {
-            best = Some(candidate);
+            best = Some(match best {
+                Some(current)
+                    if (current.span.start_line, current.span.start_col)
+                        <= (candidate.span.start_line, candidate.span.start_col) =>
+                {
+                    current
+                }
+                _ => candidate,
+            });
         }
     }
     best

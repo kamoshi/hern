@@ -4,7 +4,7 @@ use super::workspace::load_workspace_graphs;
 use hern_core::analysis::hover_at;
 use hern_core::ast::{
     BinOp, Expr, ExprKind, Fixity, ImplMethod, InherentMethod, Param, Pattern, Program,
-    SourcePosition, SourceSpan, Stmt, TraitMethod,
+    SourcePosition, SourceSpan, Stmt, TraitDef, TraitMethod,
 };
 use hern_core::module::{GraphInference, ModuleEnv, ModuleGraph};
 use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
@@ -413,7 +413,7 @@ fn operator_definition_hover_text(
             .methods
             .iter()
             .find(|method| method.name == operator)
-            .and_then(trait_operator_hover_text),
+            .and_then(|method| trait_operator_hover_text(trait_def, method)),
         _ => None,
     })
 }
@@ -430,7 +430,7 @@ fn operator_definition_fixity(program: &Program, span: SourceSpan) -> Option<(Fi
     })
 }
 
-fn trait_operator_hover_text(method: &TraitMethod) -> Option<String> {
+fn trait_operator_hover_text(trait_def: &TraitDef, method: &TraitMethod) -> Option<String> {
     let (fixity, prec) = method.fixity?;
     let params = method
         .params
@@ -439,7 +439,9 @@ fn trait_operator_hover_text(method: &TraitMethod) -> Option<String> {
         .collect::<Vec<_>>()
         .join(", ");
     let ty = format!("fn({}) -> {}", params, ast_type_to_string(&method.ret_type));
-    Some(with_fixity_line(ty, fixity, prec))
+    let mut result = with_fixity_line(ty, fixity, prec);
+    result.push_str(&format!("\n\n{}: {}", trait_def.param, trait_def.name));
+    Some(result)
 }
 
 fn with_fixity_line(ty: String, fixity: Fixity, prec: u8) -> String {
