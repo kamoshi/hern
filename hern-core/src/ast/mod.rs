@@ -313,11 +313,10 @@ pub enum Pattern {
     /// A simple variable binding, e.g. `x` in `for x in arr`.
     /// The `SourceSpan` is the span of the binding name in source.
     Variable(String, SourceSpan),
-    /// `Some(x)` or `None`.
-    /// When a binding is present, its `SourceSpan` covers the bound name.
+    /// `Some(x)`, `Ok((next, value))`, or `None`.
     Constructor {
         name: String,
-        binding: Option<(String, SourceSpan)>,
+        binding: Option<Box<Pattern>>,
     },
     /// `#{ field }`, `#{ field, .. }`, `#{ x: alias, ..rest }`.
     /// Each entry is `(field_name, binding_name, binding_span)`.

@@ -806,7 +806,7 @@ fn pattern_to_string(pat: &Pattern) -> String {
         Pattern::StringLit(value) => format!("{value:?}"),
         Pattern::Variable(name, _) => name.clone(),
         Pattern::Constructor { name, binding } => match binding {
-            Some((binding, _)) => format!("{name}({binding})"),
+            Some(binding) => format!("{name}({})", pattern_to_string(binding)),
             None => name.clone(),
         },
         Pattern::Record { fields, rest } => {
@@ -1218,10 +1218,15 @@ fn extract_binding_type(
             None
         }
         Pattern::Constructor { name, binding } => {
-            if let Some((bind_name, bind_span)) = binding {
-                if bind_name == target_name && *bind_span == target_span {
-                    return constructor_payload_type(name, param_ty, variant_env);
-                }
+            if let Some(binding) = binding {
+                let payload_ty = constructor_payload_type(name, param_ty, variant_env)?;
+                return extract_binding_type(
+                    binding,
+                    target_name,
+                    target_span,
+                    &payload_ty,
+                    variant_env,
+                );
             }
             None
         }
@@ -1483,9 +1488,9 @@ fn pattern_has_binding_at(pat: &Pattern, name: &str, span: SourceSpan) -> bool {
     match pat {
         Pattern::Variable(n, s) => n == name && *s == span,
         Pattern::Constructor {
-            binding: Some((n, s)),
+            binding: Some(binding),
             ..
-        } => n == name && *s == span,
+        } => pattern_has_binding_at(binding, name, span),
         Pattern::Record { fields, rest } => {
             fields.iter().any(|(_, b, s)| b == name && *s == span)
                 || matches!(rest, Some(Some((n, s))) if n == name && *s == span)
@@ -1506,9 +1511,9 @@ fn pattern_has_span_at(pat: &Pattern, span: SourceSpan) -> bool {
     match pat {
         Pattern::Variable(_, s) => *s == span,
         Pattern::Constructor {
-            binding: Some((_, s)),
+            binding: Some(binding),
             ..
-        } => *s == span,
+        } => pattern_has_span_at(binding, span),
         Pattern::Record { fields, rest } => {
             fields.iter().any(|(_, _, s)| *s == span)
                 || matches!(rest, Some(Some((_, s))) if *s == span)

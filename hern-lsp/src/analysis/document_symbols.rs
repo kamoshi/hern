@@ -194,15 +194,9 @@ fn collect_pattern_bindings(
             None,
         )),
         Pattern::Constructor {
-            binding: Some((name, span)),
+            binding: Some(binding),
             ..
-        } => bindings.push(symbol(
-            name.clone(),
-            SymbolKind::VARIABLE,
-            declaration_span,
-            *span,
-            None,
-        )),
+        } => collect_pattern_bindings(binding, declaration_span, bindings),
         Pattern::Record { fields, rest } => {
             for (_, name, span) in fields {
                 bindings.push(symbol(

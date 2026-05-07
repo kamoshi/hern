@@ -1194,9 +1194,10 @@ impl LuaCodegen {
 
     fn gen_for_pattern_bindings(&mut self, pat: &Pattern, var: &str) -> String {
         match pat {
-            Pattern::Wildcard | Pattern::StringLit(_) | Pattern::Variable(_, _) => String::new(),
+            Pattern::Wildcard | Pattern::StringLit(_) => String::new(),
+            Pattern::Variable(name, _) => format!("{}local {} = {}\n", self.ind(), name, var),
             Pattern::Constructor { binding, .. } => match binding {
-                Some((v, _)) => format!("{}local {} = {}._0\n", self.ind(), v, var),
+                Some(binding) => self.gen_for_pattern_bindings(binding, &format!("{}._0", var)),
                 None => String::new(),
             },
             Pattern::Record { fields, rest } => {
@@ -1357,7 +1358,16 @@ impl LuaCodegen {
         match pat {
             Pattern::Wildcard | Pattern::Variable(_, _) | Pattern::Record { .. } => None,
             Pattern::StringLit(s) => Some(format!("{} == {}", var, lua_string(s))),
-            Pattern::Constructor { name, .. } => Some(format!("{}._tag == \"{}\"", var, name)),
+            Pattern::Constructor { name, binding } => {
+                let tag_cond = format!("{}._tag == \"{}\"", var, name);
+                match binding
+                    .as_deref()
+                    .and_then(|binding| self.gen_pattern_cond_for(binding, &format!("{}._0", var)))
+                {
+                    Some(payload_cond) => Some(format!("{} and {}", tag_cond, payload_cond)),
+                    None => Some(tag_cond),
+                }
+            }
             Pattern::List { elements, rest } => {
                 let n = elements.len();
                 let len_cond = match (n, rest.is_none()) {
@@ -1398,9 +1408,10 @@ impl LuaCodegen {
 
     fn gen_pattern_bindings(&mut self, pat: &Pattern, var: &str) -> String {
         match pat {
-            Pattern::Wildcard | Pattern::StringLit(_) | Pattern::Variable(_, _) => String::new(),
+            Pattern::Wildcard | Pattern::StringLit(_) => String::new(),
+            Pattern::Variable(name, _) => format!("{}local {} = {}\n", self.ind(), name, var),
             Pattern::Constructor { binding, .. } => match binding {
-                Some((v, _)) => format!("{}local {} = {}._0\n", self.ind(), v, var),
+                Some(binding) => self.gen_for_pattern_bindings(binding, &format!("{}._0", var)),
                 None => String::new(),
             },
             Pattern::Record { fields, rest } => {
@@ -1811,9 +1822,9 @@ fn collect_pattern_names(pat: &Pattern, names: &mut Vec<String>) {
         Pattern::Variable(name, _) => names.push(name.clone()),
         Pattern::Wildcard | Pattern::StringLit(_) | Pattern::Constructor { binding: None, .. } => {}
         Pattern::Constructor {
-            binding: Some((name, _)),
+            binding: Some(binding),
             ..
-        } => names.push(name.clone()),
+        } => collect_pattern_names(binding, names),
         Pattern::Record { fields, rest } => {
             for (_, binding, _) in fields {
                 names.push(binding.clone());

@@ -365,7 +365,7 @@ end)";
 // --- I/O ---
 
 extern read_file: fn(string) -> string = "(function(path)
-  local f = assert(io.open(path, \"r\"))
+  local f = _G.assert(io.open(path, \"r\"))
   local s = f:read(\"*a\")
   f:close()
   return s

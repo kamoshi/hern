@@ -1,0 +1,102 @@
+let p = import "hern:parser";
+
+// --- Basic character parsers ---
+
+let r1 = p.run(p.char_p("h"), "hello");
+print(r1);  // Ok(("ello", "h"))
+
+let r2 = p.run(p.char_p("x"), "hello");
+print(r2);  // Err("unexpected character")
+
+// --- tag ---
+
+let r3 = p.run(p.tag("hello"), "hello world");
+print(r3);  // Ok((" world", "hello"))
+
+// --- many / many1 ---
+
+let r4 = p.run(p.many(p.digit()), "123abc");
+print(r4);  // Ok(("abc", ["1","2","3"]))
+
+let r5 = p.run(p.many(p.digit()), "abc");
+print(r5);  // Ok(("abc", []))
+
+// --- integer ---
+
+let r6 = p.run(p.integer(), "42rest");
+print(r6);  // Ok(("rest", 42))
+
+// --- seq and map ---
+
+let pair_p = p.seq(p.integer(), p.keep_right(p.char_p(","), p.integer()));
+let r7 = p.run(pair_p, "10,20end");
+print(r7);  // Ok(("end", (10, 20)))
+
+// --- choice ---
+
+let ab_p = p.choice(p.char_p("a"), p.char_p("b"));
+let r8 = p.run(p.many(ab_p), "aabba!");
+print(r8);  // Ok(("!", ["a","a","b","b","a"]))
+
+// --- between ---
+
+let paren_int = p.between(p.char_p("("), p.char_p(")"), p.integer());
+let r9 = p.run(paren_int, "(123)rest");
+print(r9);  // Ok(("rest", 123))
+
+// --- sep_by ---
+
+let csv_p = p.sep_by(p.integer(), p.char_p(","));
+let r10 = p.run(csv_p, "1,2,3,4");
+print(r10);  // Ok(("", [1,2,3,4]))
+
+// --- optional ---
+
+let r11 = p.run(p.optional(p.char_p("-")), "-42");
+print(r11);  // Ok(("42", Some("-")))
+
+let r12 = p.run(p.optional(p.char_p("-")), "42");
+print(r12);  // Ok(("42", None))
+
+// --- spaces ---
+
+let r13 = p.run(p.spaces(), "   abc");
+print(r13);  // Ok(("abc", "   "))
+
+// --- eof ---
+
+let r14 = p.run(p.eof(), "");
+print(r14);  // Ok(("", ()))
+
+let r15 = p.run(p.eof(), "x");
+print(r15);  // Err("expected end of input")
+
+// --- alpha / alphanumeric ---
+
+let ident_p = p.map(
+    p.seq(p.alpha(), p.many(p.alphanumeric())),
+    fn(pair: (string, [string])) {
+        let (head, tail) = pair;
+        tail.fold(head, fn(acc, c) { acc <> c })
+    }
+);
+let r16 = p.run(ident_p, "foo123 bar");
+print(r16);  // Ok((" bar", "foo123"))
+
+// --- lazy (recursive grammar): nested parens depth counter ---
+
+fn depth_p() {
+    p.choice(
+        p.map(
+            p.between(p.char_p("("), p.char_p(")"), p.lazy(fn() { depth_p() })),
+            fn(inner) { inner + 1 }
+        ),
+        p.pure(0)
+    )
+}
+
+let r17 = p.run(depth_p(), "((()))rest");
+print(r17);  // Ok(("rest", 3))
+
+let r18 = p.run(depth_p(), "rest");
+print(r18);  // Ok(("rest", 0))

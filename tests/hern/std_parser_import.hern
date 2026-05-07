@@ -1,0 +1,21 @@
+let p = import "hern:parser";
+
+let parsed = p.run(p.many1(p.digit()), "123abc");
+
+match parsed {
+  Ok((next, value)) -> {
+    print(next);
+    print(value.len());
+  },
+  Err(message) -> print(message),
+}
+
+let parsed_int = p.run(p.integer(), "42rest");
+
+match parsed_int {
+  Ok((next, value)) -> {
+    print(next);
+    print(value);
+  },
+  Err(message) -> print(message),
+}

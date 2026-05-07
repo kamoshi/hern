@@ -691,6 +691,16 @@ path = "tests/hern/refutable_let_error.hern"
 expect = "error"
 error_contains = "refutable pattern in let binding"
 
+[tests.std_parser_import]
+path = "tests/hern/std_parser_import.hern"
+expect = "typecheck"
+output = """
+abc
+3
+rest
+42
+"""
+
 [tests.lua_std_tests]
 path = "tests/hern/lua_std_tests.hern"
 expect = "typecheck"

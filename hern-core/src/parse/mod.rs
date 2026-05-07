@@ -1035,11 +1035,10 @@ impl<'tokens> Parser<'tokens> {
                 ptr += 1;
                 let binding = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::LParen) {
                     ptr += 1;
-                    let (c_bind, bind_name, bind_span) =
-                        self.expect_ident_with_span(&tokens[ptr..])?;
+                    let (c_bind, bind_pat) = self.parse_for_pattern(&tokens[ptr..])?;
                     ptr += c_bind;
                     ptr += self.expect(&tokens[ptr..], Token::RParen)?;
-                    Some((bind_name, bind_span))
+                    Some(Box::new(bind_pat))
                 } else {
                     None
                 };
@@ -1346,6 +1345,26 @@ impl<'tokens> Parser<'tokens> {
                 let (consumed, operand) = self.parse_expr(&tokens[ptr..], 8)?;
                 ptr += consumed;
                 self.expr_from_tokens(tokens, ptr, ExprKind::Not(Box::new(operand)))
+            }
+            Token::Minus => {
+                ptr += 1;
+                let (consumed, operand) = self.parse_expr(&tokens[ptr..], 11)?;
+                ptr += consumed;
+                let op_span = SourceSpan::from_lex_span(tok.span);
+                self.expr_from_tokens(
+                    tokens,
+                    ptr,
+                    ExprKind::Binary {
+                        lhs: Box::new(Expr::synthetic(ExprKind::Number(0.0))),
+                        op: BinOp::Custom("-".to_string()),
+                        op_span,
+                        rhs: Box::new(operand),
+                        resolved_op: None,
+                        pending_op: None,
+                        dict_args: vec![],
+                        pending_dict_args: vec![],
+                    },
+                )
             }
             Token::Ident(name) => {
                 ptr += 1;

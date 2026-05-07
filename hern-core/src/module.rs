@@ -14,6 +14,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 const PRELUDE_OWNER: &str = "<prelude>";
+const HERN_IMPORT_PREFIX: &str = "hern:";
 
 #[derive(Clone)]
 pub struct ModuleGraph {
@@ -362,12 +363,31 @@ impl ModuleGraph {
         base_dir: &Path,
         spec: &str,
     ) -> Result<PathBuf, CompilerDiagnostic> {
-        let mut path = base_dir.join(spec);
+        let mut path = if let Some(std_spec) = spec.strip_prefix(HERN_IMPORT_PREFIX) {
+            resolve_std_import_path(std_spec)?
+        } else {
+            base_dir.join(spec)
+        };
         if path.extension().is_none() {
             path.set_extension("hern");
         }
+        let std_root = if spec.starts_with(HERN_IMPORT_PREFIX) {
+            Some(std_root()?)
+        } else {
+            None
+        };
         match fs::canonicalize(&path) {
-            Ok(path) => Ok(path),
+            Ok(path) => {
+                if let Some(std_root) = std_root
+                    && !path.starts_with(std_root)
+                {
+                    return Err(CompilerDiagnostic::error(
+                        None,
+                        format!("invalid Hern std import `{}`", spec),
+                    ));
+                }
+                Ok(path)
+            }
             Err(err) => {
                 let overlay_path = normalize_overlay_path(&path);
                 if self.overlays.contains_key(&overlay_path) {
@@ -381,6 +401,40 @@ impl ModuleGraph {
             }
         }
     }
+}
+
+fn resolve_std_import_path(spec: &str) -> Result<PathBuf, CompilerDiagnostic> {
+    if spec.is_empty() || spec.starts_with('/') || spec.contains('\\') {
+        return Err(CompilerDiagnostic::error(
+            None,
+            format!("invalid Hern std import `{}{}`", HERN_IMPORT_PREFIX, spec),
+        ));
+    }
+    let path = Path::new(spec);
+    if path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(CompilerDiagnostic::error(
+            None,
+            format!("invalid Hern std import `{}{}`", HERN_IMPORT_PREFIX, spec),
+        ));
+    }
+    Ok(std_root()?.join(path))
+}
+
+fn std_root() -> Result<PathBuf, CompilerDiagnostic> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../std");
+    fs::canonicalize(&root).map_err(|err| {
+        CompilerDiagnostic::error(
+            None,
+            format!(
+                "error resolving Hern std directory {}: {}",
+                root.display(),
+                err
+            ),
+        )
+    })
 }
 
 impl GraphInference {

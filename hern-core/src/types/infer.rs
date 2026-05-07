@@ -598,7 +598,7 @@ impl Infer {
         let initial_constraints = self.collect_type_bound_constraints(&mut param_vars, type_bounds);
 
         for param in params {
-            if !is_irrefutable_param(&param.pat) {
+            if !is_irrefutable_param(&param.pat, &self.variant_env) {
                 return Err(TypeError::RefutableParamPattern.at(body.span));
             }
             let p_ty = match &param.ty {
@@ -1106,7 +1106,7 @@ impl Infer {
                 };
 
                 // Reject refutable patterns in let position.
-                if !is_irrefutable_let(pat) {
+                if !is_irrefutable_let(pat, &self.variant_env) {
                     return Err(TypeError::RefutableLetPattern.at(value.span));
                 }
 
@@ -1405,7 +1405,7 @@ impl Infer {
                 if param.mut_place {
                     return Err(TypeError::MutableFunctionCapabilityMismatch.at(impl_method.span));
                 }
-                if !is_irrefutable_param(&param.pat) {
+                if !is_irrefutable_param(&param.pat, &self.variant_env) {
                     return Err(TypeError::RefutableParamPattern.at(impl_method.body.span));
                 }
                 let p_ty = self.ast_to_ty_with_vars(derived_ty, &mut param_vars)?;
@@ -1483,7 +1483,7 @@ impl Infer {
             let mut body_env = env.clone();
 
             for (idx, param) in method.params.iter().enumerate() {
-                if !is_irrefutable_param(&param.pat) {
+                if !is_irrefutable_param(&param.pat, &self.variant_env) {
                     return Err(TypeError::RefutableParamPattern.at(method.body.span));
                 }
                 let p_ty = if has_receiver && idx == 0 {
@@ -2154,7 +2154,7 @@ impl Infer {
                 let mut param_tys = Vec::new();
                 let mut body_env = env.clone();
                 for param in params.iter() {
-                    if !is_irrefutable_param(&param.pat) {
+                    if !is_irrefutable_param(&param.pat, &self.variant_env) {
                         return Err(TypeError::RefutableParamPattern.at(body.span));
                     }
                     let p_ty = match &param.ty {
@@ -2830,7 +2830,7 @@ impl Infer {
                 };
                 unify(&mut self.subst, scrutinee_ty, con_ty)?;
 
-                if let Some((var_name, var_span)) = binding {
+                if let Some(binding) = binding {
                     let payload_ty = match &info.payload {
                         Some(ast_ty) => self.ast_to_ty_with_vars(ast_ty, &mut param_map)?,
                         None => {
@@ -2840,8 +2840,7 @@ impl Infer {
                             )));
                         }
                     };
-                    self.binding_types.insert(*var_span, payload_ty.clone());
-                    env.insert(var_name.clone(), binding_info(Scheme::mono(payload_ty)));
+                    self.check_pattern(binding, payload_ty, env, binding_mutable)?;
                 }
                 Ok(())
             }

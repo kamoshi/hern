@@ -541,10 +541,10 @@ impl IndexBuilder {
                 self.define_core(name, *span, DefinitionKind::Parameter, None, visible_from);
             }
             Pattern::Constructor {
-                binding: Some((name, span)),
+                binding: Some(binding),
                 ..
             } => {
-                self.define_core(name, *span, DefinitionKind::Parameter, None, visible_from);
+                self.define_param_pattern_bindings(binding, visible_from);
             }
             Pattern::Record { fields, rest } => {
                 for (_, binding, span) in fields {
@@ -743,10 +743,10 @@ impl IndexBuilder {
                 self.define(name, *span, DefinitionKind::Let);
             }
             Pattern::Constructor {
-                binding: Some((name, span)),
+                binding: Some(binding),
                 ..
             } => {
-                self.define(name, *span, DefinitionKind::Let);
+                self.define_pattern_bindings(binding);
             }
             Pattern::Constructor { binding: None, .. } => {}
             Pattern::Record { fields, rest } => {
@@ -784,10 +784,10 @@ impl IndexBuilder {
             | Pattern::StringLit(_)
             | Pattern::Constructor { binding: None, .. } => {}
             Pattern::Constructor {
-                binding: Some((name, span)),
+                binding: Some(binding),
                 ..
             } => {
-                self.define_with_import(name, *span, DefinitionKind::Let, module_name);
+                self.define_let_pattern_top_level(binding, module_name);
             }
             Pattern::Record { fields, rest } => {
                 for (_, binding, span) in fields {
@@ -844,10 +844,10 @@ impl IndexBuilder {
             | Pattern::StringLit(_)
             | Pattern::Constructor { binding: None, .. } => {}
             Pattern::Constructor {
-                binding: Some((name, span)),
+                binding: Some(binding),
                 ..
             } => {
-                self.define_core(name, *span, DefinitionKind::Let, module_name, visible_from);
+                self.define_let_pattern_local(binding, module_name, visible_from);
             }
             Pattern::Record { fields, rest } => {
                 for (_, binding, span) in fields {
