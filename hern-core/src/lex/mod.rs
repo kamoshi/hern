@@ -65,6 +65,8 @@ pub enum Token {
     RBracket, // ]
     Hash,     // #
 
+    InnerAttr(String), // #![name]
+
     Eof,
 }
 
@@ -141,7 +143,9 @@ impl<'src> Lexer<'src> {
 
     fn next_token(&mut self) -> Result<Spanned, LexError> {
         loop {
-            if self.pos == 0 && self.peek() == Some(b'#') && self.peek2() == Some(b'!') {
+            if self.pos == 0 && self.peek() == Some(b'#') && self.peek2() == Some(b'!')
+                && self.src.get(2) != Some(&b'[')
+            {
                 while let Some(ch) = self.peek() {
                     if ch == b'\n' {
                         break;
@@ -204,7 +208,28 @@ impl<'src> Lexer<'src> {
             }
             b'#' => {
                 self.advance();
-                Token::Hash
+                if self.peek() == Some(b'!') && self.peek2() == Some(b'[') {
+                    self.advance(); // !
+                    self.advance(); // [
+                    let attr_start = self.pos;
+                    while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == b'_') {
+                        self.advance();
+                    }
+                    let name = std::str::from_utf8(&self.src[attr_start..self.pos])
+                        .unwrap()
+                        .to_string();
+                    if self.peek() != Some(b']') {
+                        let bad = self.peek().unwrap_or(b'?');
+                        return Err(LexError {
+                            kind: LexErrorKind::UnexpectedChar(bad),
+                            span: self.span_at(self.line, self.col, 1),
+                        });
+                    }
+                    self.advance(); // ]
+                    Token::InnerAttr(name)
+                } else {
+                    Token::Hash
+                }
             }
             b':' => {
                 self.advance();

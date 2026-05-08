@@ -788,8 +788,8 @@ pub(super) mod tests {
         let star =
             hover(&state, uri, Position::new(1, 16)).expect("star operator hover should resolve");
 
-        assert_eq!(hover_text(plus), "fn('a, 'a) -> 'a\ninfixl 6");
-        assert_eq!(hover_text(star), "fn('a, 'a) -> 'a\ninfixl 7");
+        assert_eq!(hover_text(plus), "fn('a, 'a) -> 'a\ninfixl 6\n\n'a: Add");
+        assert_eq!(hover_text(star), "fn('a, 'a) -> 'a\ninfixl 7\n\n'a: Mul");
     }
 
     #[test]

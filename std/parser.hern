@@ -109,6 +109,17 @@ fn and_then(p: Parser('a), f: fn('a) -> Parser('b)) -> Parser('b) {
     })
 }
 
+impl Monad for Parser {
+    fn >>=(fa: Parser('a), f: fn('a) -> Parser('b)) -> Parser('b) {
+        Parser(fn(input: string) {
+            match run(fa, input) {
+                Ok((rest, value)) -> run(f(value), rest),
+                Err(e) -> Err(e),
+            }
+        })
+    }
+}
+
 // --- Sequential combinators ---
 
 // Run p then q, returning both results as a tuple.
@@ -262,32 +273,32 @@ fn integer() -> Parser(f64) {
 }
 
 #{
-    run: run,
-    pure: pure,
-    fail: fail,
-    eof: eof,
-    any_char: any_char,
-    satisfy: satisfy,
-    char_p: char_p,
-    tag: tag,
-    map: map,
-    and_then: and_then,
-    seq: seq,
-    keep_left: keep_left,
-    keep_right: keep_right,
-    choice: choice,
-    between: between,
-    optional: optional,
-    many: many,
-    many1: many1,
-    sep_by: sep_by,
-    sep_by1: sep_by1,
-    lazy: lazy,
-    digit: digit,
-    alpha: alpha,
-    alphanumeric: alphanumeric,
-    whitespace: whitespace,
-    spaces: spaces,
-    spaces1: spaces1,
-    integer: integer,
+    run,
+    pure,
+    fail,
+    eof,
+    any_char,
+    satisfy,
+    char_p,
+    tag,
+    map,
+    and_then,
+    seq,
+    keep_left,
+    keep_right,
+    choice,
+    between,
+    optional,
+    many,
+    many1,
+    sep_by,
+    sep_by1,
+    lazy,
+    digit,
+    alpha,
+    alphanumeric,
+    whitespace,
+    spaces,
+    spaces1,
+    integer,
 }

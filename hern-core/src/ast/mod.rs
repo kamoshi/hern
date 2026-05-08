@@ -48,6 +48,7 @@ impl SourceSpan {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub stmts: Vec<Stmt>,
+    pub inner_attrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

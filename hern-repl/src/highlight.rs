@@ -72,7 +72,8 @@ fn token_style(token: &Token) -> Style {
         | Token::Return
         | Token::Extern
         | Token::Import
-        | Token::In => Style::default()
+        | Token::In
+        | Token::InnerAttr(_) => Style::default()
             .fg(Color::Blue)
             .add_modifier(Modifier::BOLD),
         Token::True | Token::False | Token::Number(_) => Style::default().fg(Color::Cyan),

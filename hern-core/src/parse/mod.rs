@@ -192,7 +192,13 @@ impl<'tokens> Parser<'tokens> {
 
     pub fn parse_program(&self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
+        let mut inner_attrs = Vec::new();
         let mut ptr = 0;
+
+        while let Some(Token::InnerAttr(name)) = self.tokens.get(ptr).map(|t| &t.token) {
+            inner_attrs.push(name.clone());
+            ptr += 1;
+        }
 
         while ptr < self.tokens.len() && self.tokens[ptr].token != Token::Eof {
             let (consumed, stmt) = self.parse_stmt(&self.tokens[ptr..])?;
@@ -200,13 +206,19 @@ impl<'tokens> Parser<'tokens> {
             ptr += consumed;
         }
 
-        Ok(Program { stmts })
+        Ok(Program { stmts, inner_attrs })
     }
 
     pub fn parse_program_recovering(&self) -> (Program, Vec<ParseError>) {
         let mut stmts = Vec::new();
+        let mut inner_attrs = Vec::new();
         let mut diagnostics = Vec::new();
         let mut ptr = 0;
+
+        while let Some(Token::InnerAttr(name)) = self.tokens.get(ptr).map(|t| &t.token) {
+            inner_attrs.push(name.clone());
+            ptr += 1;
+        }
 
         while ptr < self.tokens.len() && self.tokens[ptr].token != Token::Eof {
             match self.parse_stmt(&self.tokens[ptr..]) {
@@ -227,7 +239,7 @@ impl<'tokens> Parser<'tokens> {
             diagnostics.append(&mut self.inner_diagnostics.borrow_mut());
         }
 
-        (Program { stmts }, diagnostics)
+        (Program { stmts, inner_attrs }, diagnostics)
     }
 
     fn parse_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
@@ -1872,10 +1884,20 @@ impl<'tokens> Parser<'tokens> {
                 } else {
                     let (c_name, name) = self.expect_ident(&tokens[ptr..])?;
                     ptr += c_name;
-                    ptr += self.expect(&tokens[ptr..], Token::Colon)?;
-                    let (c_expr, expr) = self.parse_expr(&tokens[ptr..], 0)?;
-                    ptr += c_expr;
-                    RecordEntry::Field(name, expr)
+                    if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Colon) {
+                        ptr += 1;
+                        let (c_expr, expr) = self.parse_expr(&tokens[ptr..], 0)?;
+                        ptr += c_expr;
+                        RecordEntry::Field(name, expr)
+                    } else {
+                        let name_span = tokens[ptr - 1].span;
+                        let ident_expr = self.expr_from_bounds(
+                            name_span,
+                            name_span,
+                            ExprKind::Ident(name.clone()),
+                        );
+                        RecordEntry::Field(name, ident_expr)
+                    }
                 };
                 entries.push(entry);
                 if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {

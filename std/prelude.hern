@@ -1,3 +1,61 @@
+#![no_implicit_prelude]
+
+// Extern Array
+
+extern __array_len: fn(['a]) -> f64 = #[template] "#($1)";
+extern __array_get: fn(['a], f64) -> 'a = #[template] "($1)[($2)]";
+extern __array_set: fn(['a], f64, 'a) -> () = "(function(a, i, v) a[i] = v; return {} end)";
+extern __push: fn(['a], 'a) -> () = "(function(a, x) a[#a+1] = x; return {} end)";
+extern __pop: fn(['a]) -> 'a = "(function(a) return table.remove(a) end)";
+extern __array_map: fn(['a], fn('a) -> 'b) -> ['b] = "(function(a, f)
+  local r = {}
+  for i, v in ipairs(a) do r[i] = f(v) end
+  return r
+end)";
+extern __array_filter: fn(['a], fn('a) -> bool) -> ['a] = "(function(a, f)
+  local r = {}
+  for _, v in ipairs(a) do if f(v) ~= 0 then r[#r+1] = v end end
+  return r
+end)";
+extern __array_fold: fn(['a], 'b, fn('b, 'a) -> 'b) -> 'b = "(function(a, init, f)
+  local acc = init
+  for _, v in ipairs(a) do acc = f(acc, v) end
+  return acc
+end)";
+extern __array_reverse: fn(['a]) -> ['a] = "(function(a)
+  local r = {}
+  for i = #a, 1, -1 do r[#r+1] = a[i] end
+  return r
+end)";
+extern __array_concat: fn(['a], ['a]) -> ['a] = "(function(a, b)
+  local r = {}
+  for _, v in ipairs(a) do r[#r+1] = v end
+  for _, v in ipairs(b) do r[#r+1] = v end
+  return r
+end)";
+extern __array_sum: fn([f64]) -> f64 = "(function(a)
+  local s = 0
+  for _, v in ipairs(a) do s = s + v end
+  return s
+end)";
+extern __array_max: fn([f64]) -> f64 = "(function(a)
+  local m = -math.huge
+  for _, v in ipairs(a) do if v > m then m = v end end
+  return m
+end)";
+extern __array_min: fn([f64]) -> f64 = "(function(a)
+  local m = math.huge
+  for _, v in ipairs(a) do if v < m then m = v end end
+  return m
+end)";
+extern __array_range: fn(f64, f64) -> [f64] = "(function(a, b)
+  local r = {}
+  for i = a, b do r[#r+1] = i end
+  return r
+end)";
+
+// other
+
 extern _unpack: fn(['a], f64) -> ['a] = "table.unpack or unpack";
 extern print: fn('a) -> () = "(function(x)
   if type(x) == \"table\" then
@@ -36,26 +94,102 @@ type Result('a, 'e) = Ok('a) | Err('e)
 type Map('k, 'v) = *
 
 trait Functor 'f {
-    fn map(fa: 'f('a), f: fn('a) -> 'b) -> 'f('b)
+  fn map(fa: 'f('a), f: fn('a) -> 'b) -> 'f('b)
 }
 
 impl Functor for Option {
-    fn map(fa: Option('a), f: fn('a) -> 'b) -> Option('b) {
-        match fa {
-            Some(v) -> Some(f(v)),
-            None -> None,
-        }
+  fn map(fa: Option('a), f: fn('a) -> 'b) -> Option('b) {
+    match fa {
+      Some(v) -> Some(f(v)),
+      None -> None,
     }
+  }
+}
+
+impl Functor for Array {
+  fn map(fa: ['a], f: fn('a) -> 'b) -> ['b] {
+    __array_map(fa, f)
+  }
 }
 
 // Result(*, 'e) maps over the Ok side, leaving the error type fixed.
 impl Functor for Result(*, 'e) {
-    fn map(fa: Result('a, 'e), f: fn('a) -> 'b) -> Result('b, 'e) {
-        match fa {
-            Ok(v) -> Ok(f(v)),
-            Err(e) -> Err(e),
-        }
+  fn map(fa: Result('a, 'e), f: fn('a) -> 'b) -> Result('b, 'e) {
+    match fa {
+      Ok(v) -> Ok(f(v)),
+      Err(e) -> Err(e),
     }
+  }
+}
+
+trait Applicative 'f {
+  fn pure(a: 'a) -> 'f('a)
+
+  fn infixl 4 <*>(ff: 'f(fn('a) -> 'b), fa: 'f('a)) -> 'f('b)
+}
+
+impl Applicative for Option {
+  fn pure(a: 'a) -> Option('a) { Some(a) }
+
+  fn <*>(ff: Option(fn('a) -> 'b), fa: Option('a)) -> Option('b) {
+    match ff {
+      Some(f) -> match fa {
+        Some(a) -> Some(f(a)),
+        None -> None,
+      },
+      None -> None,
+    }
+  }
+}
+
+impl Applicative for Array {
+  fn pure(a: 'a) -> ['a] { [a] }
+
+  fn <*>(ff: [fn('a) -> 'b], fa: ['a]) -> ['b] {
+    __array_fold(ff, [], fn(acc, f) { __array_concat(acc, __array_map(fa, f)) })
+  }
+}
+
+impl Applicative for Result(*, 'e) {
+  fn pure(a: 'a) -> Result('a, 'e) { Ok(a) }
+
+  fn <*>(ff: Result(fn('a) -> 'b, 'e), fa: Result('a, 'e)) -> Result('b, 'e) {
+    match ff {
+      Ok(f) -> match fa {
+        Ok(a) -> Ok(f(a)),
+        Err(e) -> Err(e),
+      },
+      Err(e) -> Err(e),
+    }
+  }
+}
+
+trait Monad 'f {
+  fn infixl 1 >>=(fa: 'f('a), f: fn('a) -> 'f('b)) -> 'f('b)
+}
+
+impl Monad for Option {
+  fn >>=(fa: Option('a), f: fn('a) -> Option('b)) -> Option('b) {
+    match fa {
+      Some(a) -> f(a),
+      None -> None,
+    }
+  }
+}
+
+impl Monad for Array {
+  fn >>=(fa: ['a], f: fn('a) -> ['b]) -> ['b] {
+    __array_fold(fa, [], fn(acc, a) { __array_concat(acc, f(a)) })
+  }
+}
+
+impl Monad for Result(*, 'e) {
+  fn >>=(fa: Result('a, 'e), f: fn('a) -> Result('b, 'e)) -> Result('b, 'e) {
+    match fa {
+      Ok(a) -> f(a),
+      Err(e) -> Err(e),
+    }
+  }
 }
 
 // --- Primitives ---
@@ -434,67 +568,6 @@ impl string {
 
 // --- Array utilities ---
 
-extern __array_len: fn(['a]) -> f64 = #[template] "#($1)";
-extern __array_get: fn(['a], f64) -> 'a = #[template] "($1)[($2)]";
-extern __array_set: fn(['a], f64, 'a) -> () = "(function(a, i, v) a[i] = v; return {} end)";
-extern __push: fn(['a], 'a) -> () = "(function(a, x) a[#a+1] = x; return {} end)";
-extern __pop: fn(['a]) -> 'a = "(function(a) return table.remove(a) end)";
-
-extern __array_map: fn(['a], fn('a) -> 'b) -> ['b] = "(function(a, f)
-  local r = {}
-  for i, v in ipairs(a) do r[i] = f(v) end
-  return r
-end)";
-
-extern __array_filter: fn(['a], fn('a) -> bool) -> ['a] = "(function(a, f)
-  local r = {}
-  for _, v in ipairs(a) do if f(v) ~= 0 then r[#r+1] = v end end
-  return r
-end)";
-
-extern __array_fold: fn(['a], 'b, fn('b, 'a) -> 'b) -> 'b = "(function(a, init, f)
-  local acc = init
-  for _, v in ipairs(a) do acc = f(acc, v) end
-  return acc
-end)";
-
-extern __array_reverse: fn(['a]) -> ['a] = "(function(a)
-  local r = {}
-  for i = #a, 1, -1 do r[#r+1] = a[i] end
-  return r
-end)";
-
-extern __array_concat: fn(['a], ['a]) -> ['a] = "(function(a, b)
-  local r = {}
-  for _, v in ipairs(a) do r[#r+1] = v end
-  for _, v in ipairs(b) do r[#r+1] = v end
-  return r
-end)";
-
-extern __array_sum: fn([f64]) -> f64 = "(function(a)
-  local s = 0
-  for _, v in ipairs(a) do s = s + v end
-  return s
-end)";
-
-extern __array_max: fn([f64]) -> f64 = "(function(a)
-  local m = -math.huge
-  for _, v in ipairs(a) do if v > m then m = v end end
-  return m
-end)";
-
-extern __array_min: fn([f64]) -> f64 = "(function(a)
-  local m = math.huge
-  for _, v in ipairs(a) do if v < m then m = v end end
-  return m
-end)";
-
-extern __array_range: fn(f64, f64) -> [f64] = "(function(a, b)
-  local r = {}
-  for i = a, b do r[#r+1] = i end
-  return r
-end)";
-
 fn range(a: f64, b: f64) -> [f64] { __array_range(a, b) }
 fn array_sum(arr: [f64]) -> f64 { __array_sum(arr) }
 fn array_max(arr: [f64]) -> f64 { __array_max(arr) }
@@ -595,3 +668,48 @@ impl Heap('a) {
     fn size(self) -> f64 { __heap_size(self) }
     fn is_empty(self) -> bool { __heap_is_empty(self) }
 }
+
+// --- JSON serialization ---
+
+extern json: fn('a) -> string = "(function(v)
+  local dq = string.char(34)
+  local nl = string.char(10)
+  local tab = string.char(9)
+  local bs = string.char(92)
+  local function ser(val)
+    local t = type(val)
+    if val == nil then
+      return 'null'
+    elseif t == 'string' then
+      return dq .. val:gsub(bs, bs..bs):gsub(dq, bs..dq):gsub(nl, bs..'n'):gsub(tab, bs..'t') .. dq
+    elseif t == 'number' or t == 'boolean' then
+      return tostring(val)
+    elseif t == 'table' then
+      if val._tag ~= nil then
+        local parts = {}
+        for k, v2 in pairs(val) do
+          if k ~= '_tag' then parts[#parts+1] = ser(v2) end
+        end
+        if #parts == 0 then return val._tag end
+        if #parts == 1 then return val._tag .. '(' .. parts[1] .. ')' end
+        return val._tag .. '(' .. table.concat(parts, ', ') .. ')'
+      end
+      local n = #val
+      local size = 0
+      for _ in pairs(val) do size = size + 1 end
+      if size == n then
+        local items = {}
+        for i = 1, n do items[i] = ser(val[i]) end
+        return '[' .. table.concat(items, ', ') .. ']'
+      end
+      local kvs = {}
+      for k, v2 in pairs(val) do
+        kvs[#kvs+1] = dq .. tostring(k) .. dq .. ': ' .. ser(v2)
+      end
+      return '{' .. table.concat(kvs, ', ') .. '}'
+    else
+      return dq .. '<' .. t .. '>' .. dq
+    end
+  end
+  return ser(v)
+end)";

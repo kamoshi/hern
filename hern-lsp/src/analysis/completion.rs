@@ -7,7 +7,9 @@ use super::workspace::{
     WorkspaceAnalysis, analyze_document_graph, load_document_graph_recovering,
     load_workspace_graphs,
 };
-use hern_core::ast::{Expr, ExprKind, NodeId, Program, RecordEntry, SourcePosition, TraitDef};
+use hern_core::ast::{
+    Expr, ExprKind, NodeId, Program, RecordEntry, SourcePosition, SourceSpan, TraitDef,
+};
 use hern_core::module::{
     GraphInference, ModuleGraph, infer_graph_collecting, normalize_overlay_path,
 };
@@ -540,13 +542,17 @@ fn member_completion(
         }
     }
 
-    if let Some((receiver_id, ty)) =
+    if let Some((receiver_id, receiver_span, ty)) =
         completion_type_for_receiver_expr(program, inference, current_module, context.receiver_end)
     {
         let mut items = record_field_completion_items(&ty, replacement_range);
         let receiver_place_mutable = inference
             .fresh_place_exprs_for_module(current_module)
-            .is_some_and(|fresh| fresh.contains(&receiver_id));
+            .is_some_and(|fresh| fresh.contains(&receiver_id))
+            || inference
+                .binding_capabilities_for_module(current_module)
+                .and_then(|caps| caps.get(&receiver_span))
+                .is_some_and(|caps| caps.place_mutable);
         items.extend(receiver_method_completion_items(
             inference,
             current_module,
@@ -958,8 +964,9 @@ fn completion_type_for_receiver_expr(
     inference: &GraphInference,
     current_module: &str,
     receiver_end: SourcePosition,
-) -> Option<(NodeId, Ty)> {
+) -> Option<(NodeId, SourceSpan, Ty)> {
     let expr = find_expr_ending_at(program, receiver_end)?;
+    let span = expr.span;
     inference
         .expr_types_for_module(current_module)
         .and_then(|types| types.get(&expr.id))
@@ -969,7 +976,7 @@ fn completion_type_for_receiver_expr(
                 .and_then(|types| types.get(&expr.id))
         })
         .cloned()
-        .map(|ty| (expr.id, ty))
+        .map(|ty| (expr.id, span, ty))
 }
 
 fn find_expr_ending_at(program: &Program, end: SourcePosition) -> Option<&Expr> {

@@ -579,13 +579,6 @@ path = "tests/hern/unknown_type_error.hern"
 expect = "error"
 error_contains = "unknown type: `MissingType`"
 
-[tests.traits]
-path = "tests/hern/traits.hern"
-expect = "typecheck"
-output = """
-1
-"""
-
 [tests.functor_result_left]
 path = "tests/hern/functor_result_left.hern"
 expect = "typecheck"

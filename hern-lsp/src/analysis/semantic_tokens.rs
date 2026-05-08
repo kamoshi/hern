@@ -188,6 +188,7 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
         | Token::DotDot
         | Token::Dot
         | Token::ColonColon => TY_OPERATOR,
+        Token::InnerAttr(_) => TY_KEYWORD,
         Token::Eof
         | Token::Colon
         | Token::Semicolon

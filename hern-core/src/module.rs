@@ -22,6 +22,7 @@ pub struct ModuleGraph {
     pub modules: HashMap<String, Program>,
     pub paths: HashMap<String, PathBuf>,
     pub order: Vec<String>,
+    pub no_prelude_modules: HashSet<String>,
     loading: HashSet<PathBuf>,
     overlays: HashMap<PathBuf, String>,
 }
@@ -116,6 +117,7 @@ impl ModuleGraph {
             modules: HashMap::new(),
             paths: HashMap::new(),
             order: Vec::new(),
+            no_prelude_modules: HashSet::new(),
             loading: HashSet::new(),
             overlays,
         }
@@ -255,12 +257,19 @@ impl ModuleGraph {
                 .to_path_buf();
             resolve_imports_in_program(&mut program, &base_dir, self)
                 .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
-            reassociate_with_program(&mut program, &self.prelude);
+            if program.inner_attrs.iter().any(|a| a == "no_implicit_prelude") {
+                reassociate_with_program(&mut program, &Program { stmts: vec![], inner_attrs: vec![] });
+            } else {
+                reassociate_with_program(&mut program, &self.prelude);
+            }
             Ok(program)
         })();
         self.loading.remove(&path);
 
         let program = loaded?;
+        if program.inner_attrs.iter().any(|a| a == "no_implicit_prelude") {
+            self.no_prelude_modules.insert(name.clone());
+        }
         self.paths.insert(name.clone(), path);
         self.modules.insert(name.clone(), program);
         self.order.push(name.clone());
@@ -311,7 +320,11 @@ impl ModuleGraph {
                 self,
                 DiagnosticSource::Path(path.clone()),
             ));
-            reassociate_with_program(&mut parsed.program, &self.prelude);
+            if parsed.program.inner_attrs.iter().any(|a| a == "no_implicit_prelude") {
+                reassociate_with_program(&mut parsed.program, &Program { stmts: vec![], inner_attrs: vec![] });
+            } else {
+                reassociate_with_program(&mut parsed.program, &self.prelude);
+            }
             Ok((parsed.program, diagnostics))
         })();
 
@@ -321,6 +334,9 @@ impl ModuleGraph {
             Ok(loaded) => loaded,
             Err(diagnostic) => return (name, vec![diagnostic]),
         };
+        if program.inner_attrs.iter().any(|a| a == "no_implicit_prelude") {
+            self.no_prelude_modules.insert(name.clone());
+        }
         self.paths.insert(name.clone(), path);
         self.modules.insert(name.clone(), program);
         self.order.push(name.clone());
@@ -580,6 +596,7 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
     };
     prelude_module_env.attach_inherent_method_schemes(&prelude_inference.inherent_method_schemes);
 
+    let empty_module_env = ModuleEnv::default();
     let mut diagnostics = Vec::new();
     let mut unavailable_modules = HashSet::new();
     let mut result = GraphInference::default();
@@ -598,8 +615,10 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
             continue;
         }
 
+        let is_no_prelude = graph.no_prelude_modules.contains(&name);
+        let effective_prelude_env = if is_no_prelude { &empty_module_env } else { &prelude_module_env };
         let module_env =
-            match build_module_env(graph, &result.module_envs, &prelude_module_env, &name)
+            match build_module_env(graph, &result.module_envs, effective_prelude_env, &name)
                 .map_err(|err| err.with_source_if_absent(source.clone()))
             {
                 Ok(env) => env,
@@ -627,8 +646,13 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
                 continue;
             }
         };
+        let (prelude_stmts, prelude_type_env): (&[_], _) = if is_no_prelude {
+            (&[], None)
+        } else {
+            (&graph.prelude.stmts, Some(&prelude_env))
+        };
         let (inference, module_errors) =
-            infer.infer_program_collecting(program, &graph.prelude.stmts, Some(&prelude_env));
+            infer.infer_program_collecting(program, prelude_stmts, prelude_type_env);
         let has_errors = !module_errors.is_empty();
 
         // Keep best-effort per-module state even when the module had its own diagnostics so LSP

@@ -115,6 +115,7 @@ impl LuaCodegen {
     pub fn gen_prelude_module(&mut self, prelude_stmts: &[Stmt]) -> String {
         let program = Program {
             stmts: prelude_stmts.to_vec(),
+            inner_attrs: vec![],
         };
         self.collect_codegen_metadata(&[&program]);
         let mut out = String::from("-- Hern generated Lua prelude\n");
