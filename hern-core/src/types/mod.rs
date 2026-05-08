@@ -202,22 +202,60 @@ impl fmt::Display for DisplayTy<'_> {
                 write!(f, "{}", DisplayTy(&ret.ty, names))
             }
             Ty::Record(row) => {
-                write!(f, "#{{ ")?;
-                for (i, (name, ty)) in row.fields.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
+                // Pre-render each field value so we can decide on layout before
+                // writing anything.  Multiline layout is used when:
+                //   • there are 4+ fields, OR
+                //   • any field value is itself multiline (nested large record), OR
+                //   • the inline rendering would exceed ~80 characters.
+                let rendered: Vec<(&str, String)> = row
+                    .fields
+                    .iter()
+                    .map(|(name, ty)| (name.as_str(), DisplayTy(ty, names).to_string()))
+                    .collect();
+
+                let inline_len: usize = rendered
+                    .iter()
+                    .map(|(k, v)| k.len() + 2 + v.len()) // "key: value"
+                    .sum::<usize>()
+                    + rendered.len().saturating_sub(1) * 2 // ", " separators
+                    + 4; // "#{ " + " }"
+
+                let multiline = rendered.len() >= 4
+                    || rendered.iter().any(|(_, v)| v.contains('\n'))
+                    || inline_len > 80;
+
+                if multiline {
+                    writeln!(f, "#{{ ")?;
+                    for (name, rendered_ty) in &rendered {
+                        writeln!(f, "  {}: {},", name, rendered_ty)?;
                     }
-                    write!(f, "{}: {}", name, DisplayTy(ty, names))?;
+                    match &*row.tail {
+                        Ty::Unit => {}
+                        Ty::Var(v) => match names.get(v) {
+                            Some(name) => writeln!(f, "  ..'{},", name)?,
+                            None => writeln!(f, "  ..'{},", v)?,
+                        },
+                        _ => writeln!(f, "  ..{},", DisplayTy(&row.tail, names))?,
+                    }
+                    write!(f, "}}")
+                } else {
+                    write!(f, "#{{ ")?;
+                    for (i, (name, rendered_ty)) in rendered.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}: {}", name, rendered_ty)?;
+                    }
+                    match &*row.tail {
+                        Ty::Unit => {}
+                        Ty::Var(v) => match names.get(v) {
+                            Some(name) => write!(f, ", ..'{}", name)?,
+                            None => write!(f, ", ..'{}", v)?,
+                        },
+                        _ => write!(f, ", ..{}", DisplayTy(&row.tail, names))?,
+                    }
+                    write!(f, " }}")
                 }
-                match &*row.tail {
-                    Ty::Unit => {}
-                    Ty::Var(v) => match names.get(v) {
-                        Some(name) => write!(f, ", ..'{}", name)?,
-                        None => write!(f, ", ..'{}", v)?,
-                    },
-                    _ => write!(f, ", ..{}", DisplayTy(&row.tail, names))?,
-                }
-                write!(f, " }}")
             }
         }
     }

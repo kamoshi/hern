@@ -16,289 +16,300 @@ extern __str_drop: fn(string, f64) -> string = #[template] "($1):sub(($2))";
 
 type Parser('a) = Parser(fn(string) -> Result((string, 'a), string))
 
-fn run(p: Parser('a), input: string) -> Result((string, 'a), string) {
-    let Parser(f) = p;
-    f(input)
+fn run(Parser(f), input) {
+  f(input)
+}
+
+// --- Functor / Applicative / Monad ---
+
+impl Functor for Parser {
+  fn map(p: Parser('a), f: fn('a) -> 'b) -> Parser('b) {
+    Parser(fn(input) {
+      match run(p, input) {
+        Ok((rest, value)) -> Ok((rest, f(value))),
+        Err(e) -> Err(e),
+      }
+    })
+  }
+}
+
+impl Applicative for Parser {
+  fn pure(value: 'a) -> Parser('a) {
+    Parser(fn(input) { Ok((input, value)) })
+  }
+
+  fn <*>(ff: Parser(fn('a) -> 'b), fa: Parser('a)) -> Parser('b) {
+    Parser(fn(input: string) {
+      match run(ff, input) {
+        Ok((rest, f)) -> match run(fa, rest) {
+          Ok((rest2, a)) -> Ok((rest2, f(a))),
+          Err(e) -> Err(e),
+        },
+        Err(e) -> Err(e),
+      }
+    })
+  }
+}
+
+impl Monad for Parser {
+  fn >>=(fa: Parser('a), f: fn('a) -> Parser('b)) -> Parser('b) {
+    Parser(fn(input: string) {
+      match run(fa, input) {
+        Ok((rest, value)) -> run(f(value), rest),
+        Err(e) -> Err(e),
+      }
+    })
+  }
 }
 
 // --- Primitives ---
 
-// Succeed without consuming any input.
-fn pure(value: 'a) -> Parser('a) {
-    Parser(fn(input: string) { Ok((input, value)) })
-}
-
 // Always fail with the given message.
 fn fail(msg: string) -> Parser('a) {
-    Parser(fn(_) { Err(msg) })
+  Parser(fn(_) { Err(msg) })
 }
 
 // Succeed only at end of input.
 fn eof() -> Parser(()) {
-    Parser(fn(input: string) {
-        if input.len() == 0 {
-            Ok((input, ()))
-        } else {
-            Err("expected end of input")
-        }
-    })
+  Parser(fn(input: string) {
+    if input.len() == 0 {
+      Ok((input, ()))
+    } else {
+      Err("expected end of input")
+    }
+  })
 }
 
 // Match any single character.
 fn any_char() -> Parser(string) {
-    Parser(fn(input: string) {
-        if input.len() == 0 {
-            Err("unexpected end of input")
-        } else {
-            Ok((__str_drop(input, 2), input.char_at(1)))
-        }
-    })
+  Parser(fn(input: string) {
+    if input.len() == 0 {
+      Err("unexpected end of input")
+    } else {
+      Ok((__str_drop(input, 2), input.char_at(1)))
+    }
+  })
 }
 
 // Match a single character satisfying the predicate.
 fn satisfy(pred: fn(string) -> bool) -> Parser(string) {
-    Parser(fn(input: string) {
-        if input.len() == 0 {
-            Err("unexpected end of input")
-        } else {
-            let c = input.char_at(1);
-            if pred(c) {
-                Ok((__str_drop(input, 2), c))
-            } else {
-                Err("unexpected character")
-            }
-        }
-    })
+  Parser(fn(input: string) {
+    if input.len() == 0 {
+      Err("unexpected end of input")
+    } else {
+      let c = input.char_at(1);
+      if pred(c) {
+        Ok((__str_drop(input, 2), c))
+      } else {
+        Err("unexpected character")
+      }
+    }
+  })
 }
 
 // Match a specific single character.
 fn char_p(c: string) -> Parser(string) {
-    satisfy(fn(x) { x == c })
+  satisfy(fn(x) { x == c })
 }
 
 // Match a specific string literal.
 fn tag(s: string) -> Parser(string) {
-    Parser(fn(input: string) {
-        if input.starts_with(s) {
-            Ok((__str_drop(input, s.len() + 1), s))
-        } else {
-            Err("expected \"" <> s <> "\"")
-        }
-    })
-}
-
-// --- Functor / Monad ---
-
-// Transform the parsed value.
-fn map(p: Parser('a), f: fn('a) -> 'b) -> Parser('b) {
-    Parser(fn(input: string) {
-        match run(p, input) {
-            Ok((rest, value)) -> Ok((rest, f(value))),
-            Err(e) -> Err(e),
-        }
-    })
-}
-
-// Run p, then use its result to choose the next parser (monadic bind).
-fn and_then(p: Parser('a), f: fn('a) -> Parser('b)) -> Parser('b) {
-    Parser(fn(input: string) {
-        match run(p, input) {
-            Ok((rest, value)) -> run(f(value), rest),
-            Err(e) -> Err(e),
-        }
-    })
-}
-
-impl Monad for Parser {
-    fn >>=(fa: Parser('a), f: fn('a) -> Parser('b)) -> Parser('b) {
-        Parser(fn(input: string) {
-            match run(fa, input) {
-                Ok((rest, value)) -> run(f(value), rest),
-                Err(e) -> Err(e),
-            }
-        })
+  Parser(fn(input: string) {
+    if input.starts_with(s) {
+      Ok((__str_drop(input, s.len() + 1), s))
+    } else {
+      Err("expected \"" <> s <> "\"")
     }
+  })
 }
 
 // --- Sequential combinators ---
 
 // Run p then q, returning both results as a tuple.
 fn seq(p: Parser('a), q: Parser('b)) -> Parser(('a, 'b)) {
-    and_then(p, fn(a) {
-        map(q, fn(b) { (a, b) })
-    })
+  do {
+    let a <- p;
+    let b <- q;
+    pure((a, b))
+  }
 }
 
 // Run p then q, returning only p's result.
 fn keep_left(p: Parser('a), q: Parser('b)) -> Parser('a) {
-    and_then(p, fn(a) {
-        map(q, fn(_) { a })
-    })
+  do {
+    let a <- p;
+    q;
+    pure(a)
+  }
 }
 
 // Run p then q, returning only q's result.
 fn keep_right(p: Parser('a), q: Parser('b)) -> Parser('b) {
-    and_then(p, fn(_) { q })
+  do { p; q }
 }
 
 // --- Choice ---
 
 // Try p; if it fails (without consuming), try q on the same input.
 fn choice(p: Parser('a), q: Parser('a)) -> Parser('a) {
-    Parser(fn(input: string) {
-        match run(p, input) {
-            Ok(r) -> Ok(r),
-            Err(_) -> run(q, input),
-        }
-    })
+  Parser(fn(input: string) {
+    match run(p, input) {
+      Ok(r) -> Ok(r),
+      Err(_) -> run(q, input),
+    }
+  })
 }
 
 // --- Repetition ---
 
 // Zero or more repetitions of p.
 fn many(p: Parser('a)) -> Parser(['a]) {
-    Parser(fn(input: string) {
-        let mut rest = input;
-        let mut results = [];
-        let mut going = true;
-        loop {
-            if going {
-                match run(p, rest) {
-                    Ok((next, value)) -> {
-                        results.push(value);
-                        rest = next;
-                    },
-                    Err(_) -> { going = false; },
-                }
-            } else {
-                break;
-            }
-        };
-        Ok((rest, results))
-    })
+  Parser(fn(input: string) {
+    let mut rest = input;
+    let mut results = [];
+    let mut going = true;
+
+    loop {
+      if going {
+        match run(p, rest) {
+          Ok((next, value)) -> {
+            results.push(value);
+            rest = next;
+          },
+          Err(_) -> { going = false; },
+        }
+      } else {
+        break;
+      }
+    };
+
+    Ok((rest, results))
+  })
 }
 
 // One or more repetitions of p.
 fn many1(p: Parser('a)) -> Parser(['a]) {
-    and_then(p, fn(first) {
-        map(many(p), fn(rest) { [first, ..rest] })
-    })
+  do {
+    let first <- p;
+    let rest <- many(p);
+    pure([first, ..rest])
+  }
 }
 
 // --- Structure combinators ---
 
 // Parse p surrounded by open and close, returning p's result.
 fn between(open: Parser('a), close: Parser('b), p: Parser('c)) -> Parser('c) {
-    and_then(open, fn(_) {
-        and_then(p, fn(v) {
-            map(close, fn(_) { v })
-        })
-    })
+  do {
+    open;
+    let v <- p;
+    close;
+    pure(v)
+  }
 }
 
 // p optionally present; returns Some(value) or None without consuming on absence.
 fn optional(p: Parser('a)) -> Parser(Option('a)) {
-    choice(map(p, fn(v) { Some(v) }), pure(None))
+  choice(map(p, fn(v) { Some(v) }), pure(None))
 }
 
 // One or more occurrences of p separated by sep.
 fn sep_by1(p: Parser('a), sep: Parser('b)) -> Parser(['a]) {
-    and_then(p, fn(first) {
-        map(many(keep_right(sep, p)), fn(rest) { [first, ..rest] })
-    })
+  do {
+    let first <- p;
+    let rest <- many(keep_right(sep, p));
+    pure([first, ..rest])
+  }
 }
 
 // Zero or more occurrences of p separated by sep.
 fn sep_by(p: Parser('a), sep: Parser('b)) -> Parser(['a]) {
-    choice(sep_by1(p, sep), pure([]))
+  choice(sep_by1(p, sep), pure([]))
 }
 
 // Wrap a self-referential parser in a thunk to allow recursive grammars.
 fn lazy(thunk: fn() -> Parser('a)) -> Parser('a) {
-    Parser(fn(input: string) { run(thunk(), input) })
+  Parser(fn(input: string) { run(thunk(), input) })
 }
 
 // --- Character classes ---
 
 fn digit() -> Parser(string) {
-    satisfy(fn(c) {
-        let b = string.byte(c, 1);
-        b >= 48 && b <= 57
-    })
+  satisfy(fn(c) {
+    let b = string.byte(c, 1);
+    b >= 48 && b <= 57
+  })
 }
 
 fn alpha() -> Parser(string) {
-    satisfy(fn(c) {
-        let b = string.byte(c, 1);
-        (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
-    })
+  satisfy(fn(c) {
+    let b = string.byte(c, 1);
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+  })
 }
 
 fn alphanumeric() -> Parser(string) {
-    satisfy(fn(c) {
-        let b = string.byte(c, 1);
-        (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
-    })
+  satisfy(fn(c) {
+    let b = string.byte(c, 1);
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+  })
 }
 
 // Matches space (32), newline (10), tab (9), or carriage return (13).
 fn whitespace() -> Parser(string) {
-    satisfy(fn(c) {
-        let b = string.byte(c, 1);
-        b == 32 || b == 10 || b == 9 || b == 13
-    })
+  satisfy(fn(c) {
+    let b = string.byte(c, 1);
+    b == 32 || b == 10 || b == 9 || b == 13
+  })
 }
 
 // Zero or more whitespace characters; returns the consumed whitespace as a string.
 fn spaces() -> Parser(string) {
-    map(many(whitespace()), fn(cs: [string]) {
-        cs.fold("", fn(acc, c) { acc <> c })
-    })
+  map(many(whitespace()), fn(cs: [string]) {
+    cs.fold("", fn(acc, c) { acc <> c })
+  })
 }
 
 // One or more whitespace characters; returns the consumed whitespace as a string.
 fn spaces1() -> Parser(string) {
-    map(many1(whitespace()), fn(cs: [string]) {
-        cs.fold("", fn(acc, c) { acc <> c })
-    })
+  map(many1(whitespace()), fn(cs: [string]) {
+    cs.fold("", fn(acc, c) { acc <> c })
+  })
 }
 
 // --- Number parsers ---
 
 // Parse a non-negative integer.
 fn integer() -> Parser(f64) {
-    map(many1(digit()), fn(digits: [string]) {
-        digits.fold("", fn(acc, c) { acc <> c }).to_int()
-    })
+  map(many1(digit()), fn(digits: [string]) {
+    digits.fold("", fn(acc, c) { acc <> c }).to_int()
+  })
 }
 
 #{
-    run,
-    pure,
-    fail,
-    eof,
-    any_char,
-    satisfy,
-    char_p,
-    tag,
-    map,
-    and_then,
-    seq,
-    keep_left,
-    keep_right,
-    choice,
-    between,
-    optional,
-    many,
-    many1,
-    sep_by,
-    sep_by1,
-    lazy,
-    digit,
-    alpha,
-    alphanumeric,
-    whitespace,
-    spaces,
-    spaces1,
-    integer,
+  run,
+  fail,
+  eof,
+  any_char,
+  satisfy,
+  char_p,
+  tag,
+  seq,
+  keep_left,
+  keep_right,
+  choice,
+  between,
+  optional,
+  many,
+  many1,
+  sep_by,
+  sep_by1,
+  lazy,
+  digit,
+  alpha,
+  alphanumeric,
+  whitespace,
+  spaces,
+  spaces1,
+  integer,
 }

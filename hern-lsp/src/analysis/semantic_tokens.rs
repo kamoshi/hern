@@ -167,7 +167,8 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
         | Token::Import
         | Token::True
         | Token::False
-        | Token::In => TY_KEYWORD,
+        | Token::In
+        | Token::Do => TY_KEYWORD,
         Token::Ident(name) if name.starts_with('\'') => TY_TYPE_PARAMETER,
         Token::Ident(_) => TY_VARIABLE,
         Token::Number(_) => TY_NUMBER,

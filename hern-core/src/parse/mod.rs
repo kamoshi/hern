@@ -65,6 +65,135 @@ fn recover_stmt_tokens(tokens: &[Spanned]) -> usize {
     tokens.len()
 }
 
+/// Internal representation of a single line inside a `do { }` block.
+/// Never escapes the parser — `desugar_do` converts these into ordinary AST nodes.
+enum DoStmt {
+    /// `let [mut] pat [: ty] <- expr ;`  — monadic bind
+    /// Fields: (pat, is_mutable, ty, arrow_span, monad_expr)
+    Bind(Pattern, bool, Option<Type>, SourceSpan, Expr),
+    /// `let [mut] pat [: ty] = expr ;`   — plain let binding
+    /// Fields: (pat, is_mutable, ty, stmt_span, value)
+    Let(Pattern, bool, Option<Type>, SourceSpan, Expr),
+    /// `expr ;`                           — sequencing (result discarded)
+    Bare(Expr),
+}
+
+/// Recursively checks that `expr` contains no control-flow that would silently
+/// misbehave across the hidden lambda boundary introduced by `do` desugaring.
+///
+/// * `return` is always forbidden — loops compile without an IIFE, so `return`
+///   inside any loop body still reaches the hidden lambda, not the real function.
+/// * `break` / `continue` are forbidden unless we are already inside an explicit
+///   `loop { }` or `for … in … { }` (whose `goto` targets are inside the lambda).
+///
+/// Recursion stops at `ExprKind::Lambda` for all three keywords (user-written
+/// functions are a real boundary), and additionally at loop bodies for
+/// `break`/`continue`.
+fn check_do_control_flow(expr: &Expr, in_explicit_loop: bool) -> Result<(), ParseError> {
+    match &expr.kind {
+        ExprKind::Return(_) => Err(ParseError::new(
+            "`return` is not allowed inside a `do` block",
+            Span { line: expr.span.start_line, col: expr.span.start_col, len: 6 },
+        )),
+        ExprKind::Break(_) if !in_explicit_loop => Err(ParseError::new(
+            "`break` is not allowed inside a `do` block",
+            Span { line: expr.span.start_line, col: expr.span.start_col, len: 5 },
+        )),
+        ExprKind::Continue if !in_explicit_loop => Err(ParseError::new(
+            "`continue` is not allowed inside a `do` block",
+            Span { line: expr.span.start_line, col: expr.span.start_col, len: 8 },
+        )),
+
+        // Explicit function boundary — stop all checks.
+        ExprKind::Lambda { .. } => Ok(()),
+
+        // Explicit loop boundary — break/continue are now safe inside; return still propagates.
+        ExprKind::Loop(body) => check_do_control_flow(body, true),
+        ExprKind::For { iterable, body, .. } => {
+            check_do_control_flow(iterable, in_explicit_loop)?;
+            check_do_control_flow(body, true)
+        }
+
+        // Blocks: visit statement values and the tail expression.
+        // Fn / Op bodies open new function scopes — do not descend into them.
+        ExprKind::Block { stmts, final_expr } => {
+            for stmt in stmts {
+                match stmt {
+                    Stmt::Let { value, .. } => check_do_control_flow(value, in_explicit_loop)?,
+                    Stmt::Expr(e) => check_do_control_flow(e, in_explicit_loop)?,
+                    _ => {}
+                }
+            }
+            if let Some(e) = final_expr {
+                check_do_control_flow(e, in_explicit_loop)?;
+            }
+            Ok(())
+        }
+
+        // All other expression forms: recurse with the same loop context.
+        ExprKind::Not(e) => check_do_control_flow(e, in_explicit_loop),
+        ExprKind::Assign { target, value } => {
+            check_do_control_flow(target, in_explicit_loop)?;
+            check_do_control_flow(value, in_explicit_loop)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            check_do_control_flow(lhs, in_explicit_loop)?;
+            check_do_control_flow(rhs, in_explicit_loop)
+        }
+        ExprKind::Call { callee, args, .. } => {
+            check_do_control_flow(callee, in_explicit_loop)?;
+            for arg in args {
+                check_do_control_flow(arg, in_explicit_loop)?;
+            }
+            Ok(())
+        }
+        ExprKind::If { cond, then_branch, else_branch } => {
+            check_do_control_flow(cond, in_explicit_loop)?;
+            check_do_control_flow(then_branch, in_explicit_loop)?;
+            check_do_control_flow(else_branch, in_explicit_loop)
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            check_do_control_flow(scrutinee, in_explicit_loop)?;
+            for (_, body) in arms {
+                check_do_control_flow(body, in_explicit_loop)?;
+            }
+            Ok(())
+        }
+        ExprKind::Tuple(es) => {
+            for e in es {
+                check_do_control_flow(e, in_explicit_loop)?;
+            }
+            Ok(())
+        }
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                check_do_control_flow(entry.expr(), in_explicit_loop)?;
+            }
+            Ok(())
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                check_do_control_flow(entry.expr(), in_explicit_loop)?;
+            }
+            Ok(())
+        }
+        ExprKind::FieldAccess { expr, .. } => check_do_control_flow(expr, in_explicit_loop),
+        // Leaves — no sub-expressions to visit.
+        // in_explicit_loop == true (already accepted above); recurse into value
+        ExprKind::Break(Some(e)) => check_do_control_flow(e, in_explicit_loop),
+        ExprKind::Break(None) => Ok(()),
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Import(_)
+        | ExprKind::Unit
+        | ExprKind::AssociatedAccess { .. }
+        | ExprKind::Continue   // in_explicit_loop == true (already accepted above)
+        => Ok(()),
+    }
+}
+
 pub struct Parser<'tokens> {
     tokens: &'tokens [Spanned],
     next_node_id: Cell<NodeId>,
@@ -1465,6 +1594,11 @@ impl<'tokens> Parser<'tokens> {
                 ptr += consumed;
                 lambda
             }
+            Token::Do => {
+                let (consumed, do_expr) = self.parse_do_expr(tokens)?;
+                ptr += consumed;
+                do_expr
+            }
             _ => {
                 return Err(ParseError::new(
                     format!("Unexpected token in expression: {:?}", tok.token),
@@ -1869,6 +2003,169 @@ impl<'tokens> Parser<'tokens> {
         ))
     }
 
+    fn parse_do_expr(&self, tokens: &[Spanned]) -> Result<(usize, Expr), ParseError> {
+        let mut ptr = 0;
+        ptr += self.expect(&tokens[ptr..], Token::Do)?;
+        ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
+        let open_brace_span = tokens[ptr - 1].span; // used for EOF error inside the block
+
+        let mut stmts: Vec<DoStmt> = Vec::new();
+        let mut final_expr: Option<Expr> = None;
+
+        while tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
+            let tok = tokens.get(ptr).ok_or_else(|| {
+                ParseError::new("unexpected end of `do` block", open_brace_span)
+            })?;
+
+            if matches!(tok.token, Token::Let) {
+                let let_start = ptr;
+                ptr += 1; // consume `let`
+                let is_mutable = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Mut) {
+                    ptr += 1;
+                    true
+                } else {
+                    false
+                };
+                let (c_pat, pat) = self.parse_for_pattern(&tokens[ptr..])?;
+                ptr += c_pat;
+
+                let mut ty = None;
+                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Colon) {
+                    ptr += 1;
+                    let (c_ty, parsed_ty) = self.parse_type(&tokens[ptr..])?;
+                    ptr += c_ty;
+                    ty = Some(parsed_ty);
+                }
+
+                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Equal) {
+                    // Plain let: `let [mut] pat [: ty] = expr ;`
+                    ptr += 1;
+                    let (c_expr, expr) = self.parse_expr(&tokens[ptr..], 0)?;
+                    ptr += c_expr;
+                    ptr += self.expect(&tokens[ptr..], Token::Semicolon)?;
+                    check_do_control_flow(&expr, false)?;
+                    let stmt_span = consumed_span(&tokens[let_start..], ptr - let_start);
+                    stmts.push(DoStmt::Let(pat, is_mutable, ty, stmt_span, expr));
+                } else if matches!(tokens.get(ptr).map(|t| &t.token), Some(Token::Op(op)) if op == "<-") {
+                    // Monadic bind: `let [mut] pat [: ty] <- expr ;`
+                    let arrow_span = SourceSpan::from_lex_span(tokens[ptr].span);
+                    ptr += 1;
+                    let (c_expr, expr) = self.parse_expr(&tokens[ptr..], 0)?;
+                    ptr += c_expr;
+                    ptr += self.expect(&tokens[ptr..], Token::Semicolon)?;
+                    check_do_control_flow(&expr, false)?;
+                    stmts.push(DoStmt::Bind(pat, is_mutable, ty, arrow_span, expr));
+                } else {
+                    let bad = tokens.get(ptr).map(|t| t.span).unwrap_or(tok.span);
+                    return Err(ParseError::new(
+                        "expected `=` or `<-` after pattern in `do` block",
+                        bad,
+                    ));
+                }
+            } else {
+                // Bare expression: either a sequenced statement (`expr ;`) or the final value.
+                let (c_expr, expr) = self.parse_expr(&tokens[ptr..], 0)?;
+                ptr += c_expr;
+                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Semicolon) {
+                    ptr += 1;
+                    check_do_control_flow(&expr, false)?;
+                    stmts.push(DoStmt::Bare(expr));
+                } else {
+                    // No semicolon — this is the final expression.
+                    check_do_control_flow(&expr, false)?;
+                    final_expr = Some(expr);
+                    break;
+                }
+            }
+        }
+
+        ptr += self.expect(&tokens[ptr..], Token::RBrace)?;
+
+        let final_expr = final_expr.ok_or_else(|| {
+            ParseError::new("`do` block must end with an expression", open_brace_span)
+        })?;
+
+        let desugared = self.desugar_do(stmts, final_expr);
+        Ok((ptr, desugared))
+    }
+
+    /// Right-fold the list of `DoStmt`s into a chain of `>>=` calls.
+    ///
+    /// `Bind`  → `monad_expr >>= fn(pat) { rest }`
+    /// `Let`   → `Block { let pat = value; rest }`
+    /// `Bare`  → `expr >>= fn(_) { rest }`
+    fn desugar_do(&self, stmts: Vec<DoStmt>, final_expr: Expr) -> Expr {
+        stmts.into_iter().rev().fold(final_expr, |rest, stmt| match stmt {
+            DoStmt::Bind(pat, is_mutable, ty, arrow_span, monad_expr) => {
+                let lambda = Expr::new(
+                    self.next_node_id(),
+                    SourceSpan::synthetic(),
+                    ExprKind::Lambda {
+                        params: vec![Param { pat, ty, mut_place: is_mutable }],
+                        body: Box::new(rest),
+                        dict_params: vec![],
+                    },
+                );
+                Expr::new(
+                    self.next_node_id(),
+                    SourceSpan::synthetic(),
+                    ExprKind::Binary {
+                        lhs: Box::new(monad_expr),
+                        op: BinOp::Custom(">>=".to_string()),
+                        op_span: arrow_span,
+                        rhs: Box::new(lambda),
+                        resolved_op: None,
+                        pending_op: None,
+                        dict_args: vec![],
+                        pending_dict_args: vec![],
+                    },
+                )
+            }
+            DoStmt::Let(pat, is_mutable, ty, stmt_span, value) => Expr::new(
+                self.next_node_id(),
+                SourceSpan::synthetic(),
+                ExprKind::Block {
+                    stmts: vec![Stmt::Let {
+                        span: stmt_span,
+                        pat,
+                        is_mutable,
+                        ty,
+                        value,
+                    }],
+                    final_expr: Some(Box::new(rest)),
+                },
+            ),
+            DoStmt::Bare(expr) => {
+                // No written operator — use the sequenced expression's span as the best
+                // fallback so type-error diagnostics have a location to point to.
+                let op_span = expr.span;
+                let lambda = Expr::new(
+                    self.next_node_id(),
+                    SourceSpan::synthetic(),
+                    ExprKind::Lambda {
+                        params: vec![Param { pat: Pattern::Wildcard, ty: None, mut_place: false }],
+                        body: Box::new(rest),
+                        dict_params: vec![],
+                    },
+                );
+                Expr::new(
+                    self.next_node_id(),
+                    SourceSpan::synthetic(),
+                    ExprKind::Binary {
+                        lhs: Box::new(expr),
+                        op: BinOp::Custom(">>=".to_string()),
+                        op_span,
+                        rhs: Box::new(lambda),
+                        resolved_op: None,
+                        pending_op: None,
+                        dict_args: vec![],
+                        pending_dict_args: vec![],
+                    },
+                )
+            }
+        })
+    }
+
     fn parse_record(&self, tokens: &[Spanned]) -> Result<(usize, Expr), ParseError> {
         let mut ptr = 0;
         ptr += self.expect(&tokens[ptr..], Token::Hash)?;
@@ -2050,6 +2347,7 @@ impl<'tokens> Parser<'tokens> {
                     is_method_call: false,
                     arg_wrappers: Vec::new(),
                     resolved_callee: None,
+                    pending_trait_method: None,
                     dict_args: vec![],
                     pending_dict_args: vec![],
                 },

@@ -20,6 +20,7 @@ pub enum Token {
     Return,
     Extern,
     Import,
+    Do,
 
     // Punctuation (operators continued)
     Pipe, // |
@@ -427,6 +428,7 @@ impl<'src> Lexer<'src> {
             "true" => Token::True,
             "false" => Token::False,
             "in" => Token::In,
+            "do" => Token::Do,
             _ => Token::Ident(word.to_string()),
         }
     }

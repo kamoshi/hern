@@ -426,6 +426,7 @@ pub enum ExprKind {
         arg_wrappers: Vec<Option<ArgWrapper>>,
         /// Resolved callee for trait methods, e.g. `__Functor__Option.map`
         resolved_callee: Option<String>,
+        pending_trait_method: Option<(PendingDictArg, String)>,
         dict_args: Vec<String>,
         pending_dict_args: Vec<PendingDictArg>,
     },

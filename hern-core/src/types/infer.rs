@@ -1770,6 +1770,7 @@ impl Infer {
                 is_method_call,
                 arg_wrappers,
                 resolved_callee,
+                pending_trait_method,
                 dict_args,
                 pending_dict_args,
             } => {
@@ -1816,6 +1817,7 @@ impl Infer {
                         args,
                         arg_wrappers,
                         resolved_callee,
+                        pending_trait_method,
                         trait_def,
                         method,
                         "trait method call",
@@ -1852,6 +1854,7 @@ impl Infer {
                             args,
                             arg_wrappers,
                             resolved_callee,
+                            pending_trait_method,
                             resolved.trait_def,
                             resolved.method,
                             "bare trait method call",
@@ -2187,15 +2190,12 @@ impl Infer {
                 let resolver = |p: &PendingDictArg| {
                     resolve_local_or_concrete(p, &finalized.owned, &self.subst)
                 };
-                if finalized.bubbled.is_empty() {
-                    resolve_dict_uses_expr(body, &resolver, false)?;
-                } else {
-                    // Bubbled constraints belong to an enclosing callable. They
-                    // are deliberately absent from this lambda's owned dict
-                    // params, so this pass must leave those pending uses for the
-                    // enclosing resolver instead of reporting them as unresolved.
-                    resolve_dict_uses_expr_lenient(body, &resolver, false)?;
-                }
+                // Always use lenient mode: the inner lambda's resolver runs while
+                // outer `>>=` chains haven't yet unified types (e.g. `pure`'s
+                // target), so any unresolved pending_trait_method nodes must be
+                // left for the enclosing function's hard-mode resolver to finish.
+                // Bubbled-constraint uses similarly need the outer resolver.
+                resolve_dict_uses_expr_lenient(body, &resolver, false)?;
 
                 self.record_callable_capabilities(expr_id, param_capabilities(params));
 
@@ -2294,21 +2294,26 @@ impl Infer {
         args: &mut [Expr],
         arg_wrappers: &mut Vec<Option<ArgWrapper>>,
         resolved_callee: &mut Option<String>,
+        pending_trait_method: &mut Option<(PendingDictArg, String)>,
         trait_def: TraitDef,
         method: TraitMethod,
         context: &str,
     ) -> Result<Ty, SpannedTypeError> {
         let trait_name = trait_def.name.clone();
         let method_name = method.name.clone();
-        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
 
-        let Some(first_arg_ty) = arg_tys.first() else {
-            return Err(TypeError::ArityMismatch {
-                expected: method.params.len(),
-                got: 0,
-            }
-            .into());
-        };
+        // Decide dispatch strategy based on whether the first parameter's type
+        // contains the trait's HKT variable (e.g. `'f` in `map(fa: 'f('a), ...)`).
+        // If it does, we can read the impl target directly from the first argument's
+        // concrete type.  If not (e.g. `pure(a: 'a)`), the target is only known from
+        // context, so we fall back to abstract unification and a pending marker.
+        let first_param_has_trait_var = method
+            .params
+            .first()
+            .map(|(_, ty)| type_contains_var(ty, &trait_def.param))
+            .unwrap_or(false);
+
+        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
         if arg_tys.len() != method.params.len() {
             return Err(TypeError::ArityMismatch {
                 expected: method.params.len(),
@@ -2316,16 +2321,22 @@ impl Infer {
             }
             .into());
         }
-        let resolved_target = self.subst.apply(first_arg_ty);
-        let target_name =
-            ty_target_name(&resolved_target).ok_or_else(|| TypeError::UnresolvedTrait {
-                context: context.to_string(),
-                trait_name: trait_name.clone(),
-            })?;
-        let dict_name = format!("__{}__{}", trait_name, target_name);
 
-        let ret_ty =
-            if let Some(dict_info) = env.get(&dict_name) {
+        if first_param_has_trait_var {
+            // ── First-arg dispatch ────────────────────────────────────────────
+            // Extract the impl target from the first argument's concrete type,
+            // then look up the concrete dict and unify against its method type.
+            // This avoids abstract HKT unification, which breaks for multi-arg
+            // type constructors like `Result('a, 'e)` vs `'f('a)`.
+            let resolved_target = self.subst.apply(&arg_tys[0]);
+            let target_name =
+                ty_target_name(&resolved_target).ok_or_else(|| TypeError::UnresolvedTrait {
+                    context: context.to_string(),
+                    trait_name: trait_name.clone(),
+                })?;
+            let dict_name = format!("__{}__{}", trait_name, target_name);
+
+            let ret_ty = if let Some(dict_info) = env.get(&dict_name) {
                 let dict_ty = self.instantiate(&dict_info.scheme);
                 let method_ty = record_field_ty(&self.subst.apply(&dict_ty), &method_name)
                     .ok_or_else(|| TypeError::UnknownTraitMethod {
@@ -2352,13 +2363,97 @@ impl Infer {
                 .into());
             };
 
-        *resolved_callee = Some(format!(
-            "__{}__{}.{}",
-            trait_name,
-            target_name,
-            mangle_op(&method_name)
-        ));
-        Ok(self.subst.apply(&ret_ty))
+            *resolved_callee = Some(format!(
+                "__{}__{}.{}",
+                trait_name,
+                target_name,
+                mangle_op(&method_name)
+            ));
+            Ok(self.subst.apply(&ret_ty))
+        } else {
+            // ── Abstract unification + pending dispatch ───────────────────────
+            // Used for methods like `pure(a: 'a) -> 'f('a)` where the first
+            // parameter doesn't reveal the impl target.  We unify the value
+            // arguments against the abstract method signature, then defer target
+            // resolution to `resolve_dict_uses_expr` once the outer context has
+            // pinned the type variable.
+            let mut param_vars: HashMap<String, TyVar> = HashMap::new();
+            let target_var = self.fresh_var();
+            param_vars.insert(trait_def.param.clone(), target_var);
+
+            let method_param_tys: Vec<Ty> = method
+                .params
+                .iter()
+                .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
+                .collect::<Result<_, _>>()?;
+            let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
+
+            for (arg_ty, param_ty) in arg_tys.into_iter().zip(method_param_tys) {
+                unify(&mut self.subst, arg_ty, param_ty)?;
+            }
+
+            let resolved_target = self.subst.apply(&Ty::Var(target_var));
+            match ty_target_name(&resolved_target) {
+                None => {
+                    if let Ty::Var(v) = resolved_target {
+                        *pending_trait_method = Some((
+                            PendingDictArg {
+                                var: v,
+                                trait_name: trait_name.clone(),
+                            },
+                            method_name,
+                        ));
+                    }
+                    Ok(self.subst.apply(&ret_ty))
+                }
+                Some(target_name) => {
+                    let dict_name = format!("__{}__{}", trait_name, target_name);
+                    if env.get(&dict_name).is_none()
+                        && !self.known_impl_dicts.contains(&dict_name)
+                    {
+                        return Err(TypeError::MissingTraitImpl {
+                            trait_name: trait_name.clone(),
+                            impl_target: target_name.to_string(),
+                        }
+                        .into());
+                    }
+                    *resolved_callee = Some(format!(
+                        "__{}__{}.{}",
+                        trait_name,
+                        target_name,
+                        mangle_op(&method_name)
+                    ));
+                    Ok(self.subst.apply(&ret_ty))
+                }
+            }
+        }
+    }
+
+    fn check_trait_method_signature(
+        &mut self,
+        trait_def: &TraitDef,
+        method: &TraitMethod,
+        arg_tys: Vec<Ty>,
+        context: &str,
+    ) -> Result<Ty, SpannedTypeError> {
+        let mut param_vars = HashMap::new();
+        let target_var = self.fresh_var();
+        param_vars.insert(trait_def.param.clone(), target_var);
+        let method_param_tys: Vec<Ty> = method
+            .params
+            .iter()
+            .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
+            .collect::<Result<_, _>>()?;
+        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
+        for (arg_ty, expected_ty) in arg_tys.into_iter().zip(method_param_tys) {
+            unify(&mut self.subst, expected_ty, arg_ty)?;
+        }
+        let resolved_target = self.subst.apply(&Ty::Var(target_var));
+        ty_target_name(&resolved_target).ok_or_else(|| TypeError::UnresolvedTrait {
+            context: context.to_string(),
+            trait_name: trait_def.name.clone(),
+        })?;
+        Ok(ret_ty)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2645,33 +2740,6 @@ impl Infer {
             method: method_name.to_string(),
         }
         .into())
-    }
-
-    fn check_trait_method_signature(
-        &mut self,
-        trait_def: &TraitDef,
-        method: &TraitMethod,
-        arg_tys: Vec<Ty>,
-        context: &str,
-    ) -> Result<Ty, SpannedTypeError> {
-        let mut param_vars = HashMap::new();
-        let target_var = self.fresh_var();
-        param_vars.insert(trait_def.param.clone(), target_var);
-        let method_param_tys: Vec<Ty> = method
-            .params
-            .iter()
-            .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
-            .collect::<Result<_, _>>()?;
-        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-        for (arg_ty, expected_ty) in arg_tys.into_iter().zip(method_param_tys) {
-            unify(&mut self.subst, expected_ty, arg_ty)?;
-        }
-        let resolved_target = self.subst.apply(&Ty::Var(target_var));
-        ty_target_name(&resolved_target).ok_or_else(|| TypeError::UnresolvedTrait {
-            context: context.to_string(),
-            trait_name: trait_def.name.clone(),
-        })?;
-        Ok(ret_ty)
     }
 
     fn bare_trait_method(
@@ -3528,6 +3596,26 @@ fn attach_dict_args(
     }
 }
 
+/// Returns true if the AST `Type` mentions `var_name` as a type variable.
+/// Used to decide whether a trait method's first parameter contains the HKT
+/// trait parameter (e.g. `'f` in `'f('a)`), which determines the dispatch
+/// strategy in `resolve_trait_method_call`.
+fn type_contains_var(ty: &Type, var_name: &str) -> bool {
+    match ty {
+        Type::Var(name) => name == var_name,
+        Type::App(con, args) => {
+            type_contains_var(con, var_name) || args.iter().any(|a| type_contains_var(a, var_name))
+        }
+        Type::Func(params, ret) => {
+            params.iter().any(|p| type_contains_var(&p.ty, var_name))
+                || type_contains_var(&ret.ty, var_name)
+        }
+        Type::Tuple(tys) => tys.iter().any(|t| type_contains_var(t, var_name)),
+        Type::Record(fields, _) => fields.iter().any(|(_, t)| type_contains_var(t, var_name)),
+        Type::Ident(_) | Type::Unit | Type::Hole => false,
+    }
+}
+
 fn find_assignment_base_name(expr: &Expr) -> Option<String> {
     match &expr.kind {
         ExprKind::FieldAccess { expr, .. } => find_assignment_base_name(expr),
@@ -3959,10 +4047,25 @@ fn resolve_dict_uses_expr_with_mode(
             callee,
             args,
             arg_wrappers,
+            resolved_callee,
+            pending_trait_method,
             dict_args,
             pending_dict_args,
             ..
         } => {
+            if let Some((pending, method_name)) = pending_trait_method.take() {
+                if let Some(dict_name) = resolve(&pending) {
+                    *resolved_callee = Some(format!("{}.{}", dict_name, mangle_op(&method_name)));
+                } else {
+                    if hard_unresolved {
+                        return Err(TypeError::UnresolvedTrait {
+                            context: "method call".to_string(),
+                            trait_name: pending.trait_name.clone(),
+                        });
+                    }
+                    *pending_trait_method = Some((pending, method_name));
+                }
+            }
             if hard_unresolved {
                 drain_pending(pending_dict_args, dict_args, "call", resolve)?;
             } else {

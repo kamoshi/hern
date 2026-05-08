@@ -73,7 +73,7 @@ print(r15);  // Err("expected end of input")
 
 // --- alpha / alphanumeric ---
 
-let ident_p = p.map(
+let ident_p = map(
     p.seq(p.alpha(), p.many(p.alphanumeric())),
     fn(pair: (string, [string])) {
         let (head, tail) = pair;
@@ -87,11 +87,11 @@ print(r16);  // Ok((" bar", "foo123"))
 
 fn depth_p() {
     p.choice(
-        p.map(
+        map(
             p.between(p.char_p("("), p.char_p(")"), p.lazy(fn() { depth_p() })),
             fn(inner) { inner + 1 }
         ),
-        p.pure(0)
+        pure(0)
     )
 }
 
