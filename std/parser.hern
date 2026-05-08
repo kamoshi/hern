@@ -2,6 +2,10 @@
 // A Parser('a) consumes a prefix of the input string and yields a value.
 // Returns Ok((remaining_input, value)) on success, Err(message) on failure.
 //
+// Note: all character-level parsers (any_char, satisfy, char_p, digit, …)
+// operate on bytes, not Unicode code points. Multi-byte UTF-8 sequences are
+// not supported; inputs are assumed to be ASCII.
+//
 // Usage:
 //   let p = import "hern:parser"
 //   let digits = p.many1(p.digit())
@@ -86,6 +90,7 @@ fn any_char() -> Parser(string) {
     if input.len() == 0 {
       Err("unexpected end of input")
     } else {
+      // __str_drop wraps Lua's :sub(n), which is 1-based, so +1 skips one byte.
       Ok((__str_drop(input, 2), input.char_at(1)))
     }
   })
@@ -116,6 +121,8 @@ fn char_p(c: string) -> Parser(string) {
 fn tag(s: string) -> Parser(string) {
   Parser(fn(input: string) {
     if input.starts_with(s) {
+      // __str_drop wraps Lua's :sub(n), which is 1-based, so +1 converts
+      // the 0-based byte length into a 1-based start position.
       Ok((__str_drop(input, s.len() + 1), s))
     } else {
       Err("expected \"" <> s <> "\"")
@@ -150,7 +157,8 @@ fn keep_right(p: Parser('a), q: Parser('b)) -> Parser('b) {
 
 // --- Choice ---
 
-// Try p; if it fails (without consuming), try q on the same input.
+// Try p first; if it fails, try q on the same input.
+// Always backtracks fully on failure — p cannot partially commit.
 fn choice(p: Parser('a), q: Parser('a)) -> Parser('a) {
   Parser(fn(input: string) {
     match run(p, input) {
@@ -167,19 +175,16 @@ fn many(p: Parser('a)) -> Parser(['a]) {
   Parser(fn(input: string) {
     let mut rest = input;
     let mut results = [];
-    let mut going = true;
 
     loop {
-      if going {
-        match run(p, rest) {
-          Ok((next, value)) -> {
-            results.push(value);
-            rest = next;
-          },
-          Err(_) -> { going = false; },
-        }
-      } else {
-        break;
+      match run(p, rest) {
+        Ok((next, value)) -> {
+          // Guard against zero-width matches to prevent an infinite loop.
+          if next == rest { break; };
+          results.push(value);
+          rest = next;
+        },
+        Err(_) -> break,
       }
     };
 
@@ -279,37 +284,50 @@ fn spaces1() -> Parser(string) {
 
 // --- Number parsers ---
 
-// Parse a non-negative integer.
-fn integer() -> Parser(f64) {
+// Parse a non-negative integer (digits only, no sign).
+fn natural() -> Parser(f64) {
   map(many1(digit()), fn(digits: [string]) {
     digits.fold("", fn(acc, c) { acc <> c }).to_int()
   })
 }
 
+// Parse an optionally-signed integer.
+fn integer() -> Parser(f64) {
+  do {
+    let sign <- optional(char_p("-"));
+    let n <- natural();
+    pure(match sign {
+      Some(_) -> 0 - n,
+      None -> n,
+    })
+  }
+}
+
 #{
-  run,
-  fail,
-  eof,
-  any_char,
-  satisfy,
-  char_p,
-  tag,
-  seq,
-  keep_left,
-  keep_right,
-  choice,
-  between,
-  optional,
-  many,
-  many1,
-  sep_by,
-  sep_by1,
-  lazy,
-  digit,
   alpha,
   alphanumeric,
-  whitespace,
+  any_char,
+  between,
+  char_p,
+  choice,
+  digit,
+  eof,
+  fail,
+  integer,
+  keep_left,
+  keep_right,
+  lazy,
+  many,
+  many1,
+  natural,
+  optional,
+  run,
+  satisfy,
+  sep_by,
+  sep_by1,
+  seq,
   spaces,
   spaces1,
-  integer,
+  tag,
+  whitespace,
 }
