@@ -48,3 +48,8 @@
 
 !examples/
 !examples/**
+
+# Performance harness
+!bench/
+!bench/run.sh
+!bench/README.md
