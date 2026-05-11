@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
 
+use error::TypeMismatchContext;
+
 pub type TyVar = u32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -634,23 +636,28 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
                     got: p2.len(),
                 });
             }
-            for (a, b) in p1.into_iter().zip(p2.into_iter()) {
+            for (index, (a, b)) in p1.into_iter().zip(p2.into_iter()).enumerate() {
                 if a.capability != b.capability {
                     return Err(error::TypeError::MutableFunctionCapabilityMismatch);
                 }
-                unify(s, a.ty, b.ty)?;
+                unify(s, a.ty, b.ty).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::FunctionParam(index))
+                })?;
             }
             if r1.capability != r2.capability {
                 return Err(error::TypeError::MutableFunctionCapabilityMismatch);
             }
             unify(s, *r1.ty, *r2.ty)
+                .map_err(|err| err.with_mismatch_context(TypeMismatchContext::FunctionReturn))
         }
         (Ty::Tuple(t1s), Ty::Tuple(t2s)) => {
             if t1s.len() != t2s.len() {
                 return Err(error::TypeError::Mismatch(Ty::Tuple(t1s), Ty::Tuple(t2s)));
             }
-            for (a, b) in t1s.into_iter().zip(t2s.into_iter()) {
-                unify(s, a, b)?;
+            for (index, (a, b)) in t1s.into_iter().zip(t2s.into_iter()).enumerate() {
+                unify(s, a, b).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::TupleElement(index))
+                })?;
             }
             Ok(())
         }
@@ -659,8 +666,10 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
             if a1.len() != a2.len() {
                 return Err(error::TypeError::Mismatch(Ty::App(c1, a1), Ty::App(c2, a2)));
             }
-            for (v1, v2) in a1.into_iter().zip(a2.into_iter()) {
-                unify(s, v1, v2)?;
+            for (index, (v1, v2)) in a1.into_iter().zip(a2.into_iter()).enumerate() {
+                unify(s, v1, v2).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::TypeArgument(index))
+                })?;
             }
             Ok(())
         }
@@ -682,7 +691,11 @@ fn unify_rows(s: &mut Subst, r1: Row, r2: Row) -> Result<(), error::TypeError> {
     while i < fields1.len() && j < fields2.len() {
         match fields1[i].0.cmp(&fields2[j].0) {
             std::cmp::Ordering::Equal => {
-                common.push((fields1[i].1.clone(), fields2[j].1.clone()));
+                common.push((
+                    fields1[i].0.clone(),
+                    fields1[i].1.clone(),
+                    fields2[j].1.clone(),
+                ));
                 i += 1;
                 j += 1;
             }
@@ -699,8 +712,10 @@ fn unify_rows(s: &mut Subst, r1: Row, r2: Row) -> Result<(), error::TypeError> {
     extras1.extend_from_slice(&fields1[i..]);
     extras2.extend_from_slice(&fields2[j..]);
 
-    for (t1, t2) in common {
-        unify(s, t1, t2)?;
+    for (field, t1, t2) in common {
+        unify(s, t1, t2).map_err(|err| {
+            err.with_mismatch_context(TypeMismatchContext::RecordField(field.clone()))
+        })?;
     }
 
     let tail1 = s.apply(&r1.tail);
@@ -977,6 +992,96 @@ mod tests {
                     vec![Ty::F64, Ty::Con("string".to_string())],
                 ),
             )
+        );
+    }
+
+    #[test]
+    fn tuple_mismatch_reports_element_context() {
+        let mut subst = Subst::new();
+
+        let err = unify(
+            &mut subst,
+            Ty::Tuple(vec![Ty::F64, Ty::Con("bool".to_string())]),
+            Ty::Tuple(vec![Ty::F64, Ty::Con("string".to_string())]),
+        )
+        .expect_err("tuple element mismatch should fail");
+
+        assert_eq!(
+            err,
+            error::TypeError::MismatchWithContext {
+                context: vec![TypeMismatchContext::TupleElement(1)],
+                expected: Ty::Con("string".to_string()),
+                got: Ty::Con("bool".to_string()),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "type mismatch in tuple element 2: expected `string`, got `bool`"
+        );
+    }
+
+    #[test]
+    fn record_mismatch_reports_field_context() {
+        let mut subst = Subst::new();
+
+        let err = unify(
+            &mut subst,
+            Ty::Record(Row {
+                fields: vec![("name".to_string(), Ty::Con("string".to_string()))],
+                tail: Box::new(Ty::Unit),
+            }),
+            Ty::Record(Row {
+                fields: vec![("name".to_string(), Ty::F64)],
+                tail: Box::new(Ty::Unit),
+            }),
+        )
+        .expect_err("record field mismatch should fail");
+
+        assert_eq!(
+            err,
+            error::TypeError::MismatchWithContext {
+                context: vec![TypeMismatchContext::RecordField("name".to_string())],
+                expected: Ty::F64,
+                got: Ty::Con("string".to_string()),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "type mismatch in record field `name`: expected `f64`, got `string`"
+        );
+    }
+
+    #[test]
+    fn nested_mismatch_reports_outer_to_inner_context() {
+        let mut subst = Subst::new();
+
+        let err = unify(
+            &mut subst,
+            Ty::Tuple(vec![Ty::Record(Row {
+                fields: vec![("ok".to_string(), Ty::Con("bool".to_string()))],
+                tail: Box::new(Ty::Unit),
+            })]),
+            Ty::Tuple(vec![Ty::Record(Row {
+                fields: vec![("ok".to_string(), Ty::F64)],
+                tail: Box::new(Ty::Unit),
+            })]),
+        )
+        .expect_err("nested mismatch should fail");
+
+        assert_eq!(
+            err,
+            error::TypeError::MismatchWithContext {
+                context: vec![
+                    TypeMismatchContext::TupleElement(0),
+                    TypeMismatchContext::RecordField("ok".to_string()),
+                ],
+                expected: Ty::F64,
+                got: Ty::Con("bool".to_string()),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "type mismatch in tuple element 1, record field `ok`: expected `f64`, got `bool`"
         );
     }
 }

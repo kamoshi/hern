@@ -5,6 +5,11 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeError {
     Mismatch(Ty, Ty),
+    MismatchWithContext {
+        context: Vec<TypeMismatchContext>,
+        expected: Ty,
+        got: Ty,
+    },
     OccursCheck(crate::types::TyVar),
     UnboundVariable(String),
     ImmutableAssignment(String),
@@ -100,6 +105,15 @@ pub enum TypeError {
     RefutableLetPattern,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeMismatchContext {
+    FunctionParam(usize),
+    FunctionReturn,
+    TupleElement(usize),
+    TypeArgument(usize),
+    RecordField(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpannedTypeError {
     pub span: Option<SourceSpan>,
@@ -118,6 +132,43 @@ impl TypeError {
         SpannedTypeError {
             span: None,
             error: self,
+        }
+    }
+
+    pub fn with_mismatch_context(self, context: TypeMismatchContext) -> Self {
+        match self {
+            TypeError::Mismatch(expected, got) => TypeError::MismatchWithContext {
+                context: vec![context],
+                expected,
+                got,
+            },
+            TypeError::MismatchWithContext {
+                context: mut inner,
+                expected,
+                got,
+            } => {
+                inner.insert(0, context);
+                TypeError::MismatchWithContext {
+                    context: inner,
+                    expected,
+                    got,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+impl fmt::Display for TypeMismatchContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TypeMismatchContext::FunctionParam(index) => {
+                write!(f, "function parameter {}", index + 1)
+            }
+            TypeMismatchContext::FunctionReturn => write!(f, "function return"),
+            TypeMismatchContext::TupleElement(index) => write!(f, "tuple element {}", index + 1),
+            TypeMismatchContext::TypeArgument(index) => write!(f, "type argument {}", index + 1),
+            TypeMismatchContext::RecordField(name) => write!(f, "record field `{}`", name),
         }
     }
 }
@@ -150,6 +201,23 @@ impl fmt::Display for TypeError {
         match self {
             TypeError::Mismatch(t1, t2) => {
                 write!(f, "type mismatch: expected `{}`, got `{}`", t1, t2)
+            }
+            TypeError::MismatchWithContext {
+                context,
+                expected,
+                got,
+            } => {
+                write!(f, "type mismatch")?;
+                if !context.is_empty() {
+                    write!(f, " in ")?;
+                    for (idx, item) in context.iter().enumerate() {
+                        if idx > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", item)?;
+                    }
+                }
+                write!(f, ": expected `{}`, got `{}`", expected, got)
             }
             TypeError::OccursCheck(v) => {
                 write!(f, "infinite type: '{}  occurs in its own definition", v)
