@@ -15,6 +15,9 @@ CORPUS=(
     "bench/corpus/growing_env_polymorphic.hern"
     "bench/corpus/many_functions.hern"
     "bench/corpus/large_records.hern"
+    "bench/corpus/alias_chain.hern"
+    "bench/corpus/many_large_record_binds.hern"
+    "bench/corpus/many_modules/main.hern"
 )
 
 ERROR_CORPUS=(

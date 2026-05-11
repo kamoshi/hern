@@ -1099,6 +1099,7 @@ impl Infer {
     }
 
     fn reset_program_state(&mut self) {
+        self.subst.clear_map_keep_counter();
         self.type_aliases.clear();
         self.declared_types.clear();
         self.declared_types

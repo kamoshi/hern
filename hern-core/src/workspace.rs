@@ -120,6 +120,28 @@ mod tests {
     }
 
     #[test]
+    fn workspace_analysis_keeps_imported_polymorphic_schemes_after_module_reset() {
+        let test_dir = temp_dir("import-polymorphic-reset");
+        let entry = test_dir.join("main.hern");
+        let dep = test_dir.join("dep.hern");
+        fs::write(&dep, "fn id(value) { value }\n#{ id: id }\n").unwrap();
+        fs::write(
+            &entry,
+            "let dep = import \"dep\";\n#{ a: dep.id(1), b: dep.id(\"text\") }\n",
+        )
+        .unwrap();
+
+        let analysis = analyze_workspace(WorkspaceInputs {
+            entry,
+            overlays: HashMap::new(),
+            prelude: None,
+        });
+
+        assert!(analysis.diagnostics.is_empty(), "expected no diagnostics");
+        assert!(analysis.inference.is_some());
+    }
+
+    #[test]
     fn workspace_analysis_returns_successful_graph_and_inference() {
         let test_dir = temp_dir("success");
         let entry = test_dir.join("main.hern");

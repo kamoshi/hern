@@ -485,6 +485,15 @@ impl Subst {
         self.map = map;
     }
 
+    /// Clears solved substitutions while preserving the fresh-variable counter.
+    ///
+    /// Graph inference calls this between finalized modules. Exported environments and editor
+    /// metadata are fully substituted before they leave a module, but keeping `next_var` monotonic
+    /// avoids reusing IDs that may still appear in exported polymorphic schemes.
+    pub fn clear_map_keep_counter(&mut self) {
+        self.map.clear();
+    }
+
     /// Allocate a fresh type variable wrapped as `Ty::Var`.
     pub fn fresh_var(&mut self) -> Ty {
         Ty::Var(self.fresh_tyvar())
@@ -538,13 +547,13 @@ impl Subst {
                 let tail = self.apply(&row.tail);
                 if let Ty::Record(inner_row) = tail {
                     fields.extend(inner_row.fields);
-                    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    sort_record_fields(&mut fields);
                     Ty::Record(Row {
                         fields,
                         tail: inner_row.tail,
                     })
                 } else {
-                    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    sort_record_fields(&mut fields);
                     Ty::Record(Row {
                         fields,
                         tail: Box::new(tail),
@@ -570,11 +579,50 @@ impl Subst {
         {
             return Ok(());
         }
-        if free_type_vars(&t).contains(&v) {
+        if type_contains_var(&t, v) {
             return Err(error::TypeError::OccursCheck(v));
         }
         self.map.insert(v, t);
         Ok(())
+    }
+}
+
+fn record_fields_sorted(fields: &[(String, Ty)]) -> bool {
+    fields.windows(2).all(|pair| pair[0].0 <= pair[1].0)
+}
+
+fn sort_record_fields(fields: &mut [(String, Ty)]) {
+    if !record_fields_sorted(fields) {
+        fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+    }
+}
+
+fn type_contains_var(ty: &Ty, needle: TyVar) -> bool {
+    match ty {
+        Ty::Var(v) => *v == needle,
+        Ty::Qualified(constraints, ty) => {
+            constraints
+                .iter()
+                .any(|constraint| constraint.var == needle)
+                || type_contains_var(ty, needle)
+        }
+        Ty::Func(params, ret) => {
+            params
+                .iter()
+                .any(|param| type_contains_var(&param.ty, needle))
+                || type_contains_var(&ret.ty, needle)
+        }
+        Ty::Tuple(tys) => tys.iter().any(|ty| type_contains_var(ty, needle)),
+        Ty::App(con, args) => {
+            type_contains_var(con, needle) || args.iter().any(|arg| type_contains_var(arg, needle))
+        }
+        Ty::Record(row) => {
+            row.fields
+                .iter()
+                .any(|(_, ty)| type_contains_var(ty, needle))
+                || type_contains_var(&row.tail, needle)
+        }
+        Ty::F64 | Ty::Unit | Ty::Con(_) => false,
     }
 }
 
@@ -967,6 +1015,95 @@ mod tests {
 
         subst.restore_map(snapshot);
         assert_eq!(subst.fresh_tyvar(), 2);
+    }
+
+    #[test]
+    fn subst_clear_map_keeps_fresh_var_counter_advancing() {
+        let mut subst = Subst::new();
+        assert_eq!(subst.fresh_tyvar(), 0);
+        subst.bind_ty(0, Ty::F64).expect("binding should succeed");
+
+        subst.clear_map_keep_counter();
+
+        assert_eq!(subst.apply(&Ty::Var(0)), Ty::Var(0));
+        assert_eq!(subst.fresh_tyvar(), 1);
+    }
+
+    #[test]
+    fn bind_ty_rejects_recursive_function_type() {
+        let mut subst = Subst::new();
+
+        let err = subst
+            .bind_ty(
+                0,
+                Ty::Func(
+                    value_func_params(vec![Ty::F64]),
+                    value_func_return(Ty::Var(0)),
+                ),
+            )
+            .expect_err("function result refers to the bound variable");
+
+        assert_eq!(err, error::TypeError::OccursCheck(0));
+    }
+
+    #[test]
+    fn bind_ty_rejects_recursive_record_type() {
+        let mut subst = Subst::new();
+
+        let err = subst
+            .bind_ty(
+                0,
+                Ty::Record(Row {
+                    fields: vec![("next".to_string(), Ty::Var(0))],
+                    tail: Box::new(Ty::Unit),
+                }),
+            )
+            .expect_err("record field refers to the bound variable");
+
+        assert_eq!(err, error::TypeError::OccursCheck(0));
+    }
+
+    #[test]
+    fn apply_still_sorts_record_fields_without_substitution() {
+        let subst = Subst::new();
+
+        let applied = subst.apply(&Ty::Record(Row {
+            fields: vec![("z".to_string(), Ty::F64), ("a".to_string(), Ty::Unit)],
+            tail: Box::new(Ty::Unit),
+        }));
+
+        assert_eq!(
+            applied,
+            Ty::Record(Row {
+                fields: vec![("a".to_string(), Ty::Unit), ("z".to_string(), Ty::F64)],
+                tail: Box::new(Ty::Unit),
+            })
+        );
+    }
+
+    #[test]
+    fn apply_flattens_record_tail_resolved_by_substitution() {
+        let mut subst = Subst::new();
+        subst.map.insert(
+            0,
+            Ty::Record(Row {
+                fields: vec![("b".to_string(), Ty::F64)],
+                tail: Box::new(Ty::Unit),
+            }),
+        );
+
+        let applied = subst.apply(&Ty::Record(Row {
+            fields: vec![("a".to_string(), Ty::Unit)],
+            tail: Box::new(Ty::Var(0)),
+        }));
+
+        assert_eq!(
+            applied,
+            Ty::Record(Row {
+                fields: vec![("a".to_string(), Ty::Unit), ("b".to_string(), Ty::F64)],
+                tail: Box::new(Ty::Unit),
+            })
+        );
     }
 
     #[test]
