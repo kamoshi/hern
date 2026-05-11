@@ -1,5 +1,5 @@
 use crate::ast::Pattern;
-use crate::types::VariantEnv;
+use crate::types::{Ty, VariantEnv, error::TypeError};
 use std::collections::HashSet;
 
 /// Returns `true` if `pat` is irrefutable, i.e. always matches regardless of
@@ -100,4 +100,140 @@ pub(super) fn insert_pattern_bindings(scope: &mut HashSet<String>, pat: &Pattern
         }
         Pattern::Wildcard | Pattern::StringLit(_) => {}
     }
+}
+
+pub(super) fn check_exhaustive_match(
+    patterns: &[&Pattern],
+    scrutinee_ty: &Ty,
+    variant_env: &VariantEnv,
+) -> Result<(), TypeError> {
+    if patterns.iter().any(|p| pattern_is_catch_all(p)) {
+        return Ok(());
+    }
+
+    match scrutinee_ty {
+        Ty::Con(_) | Ty::App(_, _) => {
+            let type_name = match scrutinee_ty {
+                Ty::Con(n) => n.clone(),
+                Ty::App(con, _) => match con.as_ref() {
+                    Ty::Con(n) => n.clone(),
+                    _ => {
+                        return Err(TypeError::NonExhaustiveMatch {
+                            missing: "non-exhaustive match — add a wildcard (_) arm".to_string(),
+                        });
+                    }
+                },
+                _ => unreachable!(),
+            };
+
+            if type_name == "Array" {
+                return check_array_exhaustive(patterns);
+            }
+
+            let type_variants: Vec<String> = variant_env
+                .0
+                .iter()
+                .filter(|(_, vi)| vi.type_name == type_name)
+                .map(|(vname, _)| vname.clone())
+                .collect();
+
+            if type_variants.is_empty() {
+                return Err(TypeError::NonExhaustiveMatch {
+                    missing: "non-exhaustive match — add a wildcard (_) arm".to_string(),
+                });
+            }
+
+            let covered: HashSet<String> = patterns
+                .iter()
+                .filter_map(|p| {
+                    if let Pattern::Constructor { name, .. } = p {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let mut missing: Vec<_> = type_variants
+                .iter()
+                .filter(|v| !covered.contains(*v))
+                .collect();
+            missing.sort();
+
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(TypeError::NonExhaustiveMatch {
+                    missing: format!(
+                        "missing constructors: {}",
+                        missing
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                })
+            }
+        }
+        _ => Err(TypeError::NonExhaustiveMatch {
+            missing: "non-exhaustive match — add a wildcard (_) arm".to_string(),
+        }),
+    }
+}
+
+fn check_array_exhaustive(patterns: &[&Pattern]) -> Result<(), TypeError> {
+    let open_lens: Vec<usize> = patterns
+        .iter()
+        .filter_map(|p| {
+            if let Pattern::List {
+                elements,
+                rest: Some(_),
+            } = p
+            {
+                Some(elements.len())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let exact_lens: HashSet<usize> = patterns
+        .iter()
+        .filter_map(|p| {
+            if let Pattern::List {
+                elements,
+                rest: None,
+            } = p
+            {
+                Some(elements.len())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if open_lens.is_empty() {
+        return Err(TypeError::NonExhaustiveMatch {
+            missing: "non-exhaustive: arrays longer than the matched lengths are not covered \
+                     — add [head, ..] or _ arm"
+                .to_string(),
+        });
+    }
+
+    // open_lens.is_empty() returns early above, so min() always finds an element.
+    let min_open = *open_lens.iter().min().unwrap();
+    for len in 0..min_open {
+        if !exact_lens.contains(&len) {
+            let pat = if len == 0 {
+                "[]".to_string()
+            } else {
+                format!("[{}]", (0..len).map(|_| "_").collect::<Vec<_>>().join(", "))
+            };
+            return Err(TypeError::NonExhaustiveMatch {
+                missing: format!("missing arm for arrays of length {} — add {}", len, pat),
+            });
+        }
+    }
+
+    Ok(())
 }

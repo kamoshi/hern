@@ -333,7 +333,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![5, 8]
         );
-        assert!(inference.env.get("via_trait").is_some());
+        assert!(inference.env.get("via_trait").is_none());
         assert!(inference.env.get("other").is_none());
     }
 

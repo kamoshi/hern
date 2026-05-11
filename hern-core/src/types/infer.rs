@@ -1,10 +1,19 @@
+mod calls;
+mod dicts;
+mod recovery;
+
+use self::dicts::has_trait_impl;
+use self::dicts::{
+    attach_dict_args, dict_param_name, final_pass_stmt, resolve_concrete, resolve_dict_uses_expr,
+    resolve_dict_uses_expr_lenient, resolve_local_or_concrete,
+};
 use super::{
     patterns::{
-        insert_pattern_bindings, is_irrefutable_let, is_irrefutable_param, pattern_is_catch_all,
+        check_exhaustive_match, insert_pattern_bindings, is_irrefutable_let, is_irrefutable_param,
     },
     type_syntax::{
-        impl_target_name, inherent_impl_dict_name, record_field_ty, subst_hkt_param,
-        ty_target_name, validate_inherent_impl_target,
+        impl_target_name, inherent_impl_dict_name, is_self_param, record_field_ty, subst_hkt_param,
+        substitute_self_in_inherent_method, ty_target_name, validate_inherent_impl_target,
     },
 };
 use crate::ast::*;
@@ -18,6 +27,7 @@ use crate::types::{
     free_type_vars, unify, value_func_params, value_func_return,
 };
 pub use crate::types::{TypeEnv, VariantEnv, VariantInfo, is_fresh_mutable_place, is_value};
+use recovery::{CollectedNames, stmt_bound_names, stmt_referenced_names};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
@@ -179,30 +189,72 @@ struct InferSnapshot {
     env: TypeEnv,
 }
 
-/// Top-level names tracked for recovery decisions.
-///
-/// Value and type namespaces are kept separate so a failed type declaration does not suppress an
-/// unrelated value with the same spelling, and vice versa.
-#[derive(Debug, Clone, Default)]
-struct CollectedNames {
-    values: HashSet<String>,
-    types: HashSet<String>,
+struct FailedStatementMetadata {
+    symbol_types: HashMap<NodeId, Ty>,
+    callable_capabilities: HashMap<NodeId, CallableCapabilities>,
 }
 
-impl CollectedNames {
-    fn extend(&mut self, other: Self) {
-        self.values.extend(other.values);
-        self.types.extend(other.types);
+impl InferSnapshot {
+    fn capture(infer: &Infer, env: &TypeEnv) -> Self {
+        Self {
+            subst_map: infer.subst.snapshot_map(),
+            pending_constraints: infer.pending_constraints.clone(),
+            loop_break_tys: infer.loop_break_tys.clone(),
+            fn_return_tys: infer.fn_return_tys.clone(),
+            expr_type_keys: infer.expr_types.keys().copied().collect(),
+            symbol_type_keys: infer.symbol_types.keys().copied().collect(),
+            binding_type_keys: infer.binding_types.keys().copied().collect(),
+            definition_scheme_keys: infer.definition_schemes.keys().copied().collect(),
+            binding_capability_keys: infer.binding_capabilities.keys().copied().collect(),
+            callable_capability_keys: infer.callable_capabilities.keys().copied().collect(),
+            record_field_callables: infer.record_field_callables.clone(),
+            fresh_place_expr_keys: infer.fresh_place_exprs.iter().copied().collect(),
+            inherent_methods: infer.inherent_methods.clone(),
+            env: env.clone(),
+        }
     }
 
-    fn overlaps(&self, other: &Self) -> bool {
-        self.values.iter().any(|name| other.values.contains(name))
-            || self.types.iter().any(|name| other.types.contains(name))
+    fn metadata_added_before_failure(&self, infer: &Infer) -> FailedStatementMetadata {
+        let symbol_type_keys: HashSet<_> = self.symbol_type_keys.iter().copied().collect();
+        let callable_capability_keys: HashSet<_> =
+            self.callable_capability_keys.iter().copied().collect();
+        FailedStatementMetadata {
+            symbol_types: infer
+                .symbol_types
+                .iter()
+                .filter(|(id, _)| !symbol_type_keys.contains(id))
+                .map(|(id, ty)| (*id, infer.subst.apply(ty)))
+                .collect(),
+            callable_capabilities: infer
+                .callable_capabilities
+                .iter()
+                .filter(|(id, _)| !callable_capability_keys.contains(id))
+                .map(|(id, capabilities)| (*id, capabilities.clone()))
+                .collect(),
+        }
     }
 
-    fn remove_all(&mut self, other: &Self) {
-        self.values.retain(|name| !other.values.contains(name));
-        self.types.retain(|name| !other.types.contains(name));
+    fn restore(self, infer: &mut Infer, env: &mut TypeEnv) {
+        infer.subst.restore_map(self.subst_map);
+        infer.pending_constraints = self.pending_constraints;
+        infer.loop_break_tys = self.loop_break_tys;
+        infer.fn_return_tys = self.fn_return_tys;
+        retain_map_keys(&mut infer.expr_types, self.expr_type_keys);
+        retain_map_keys(&mut infer.symbol_types, self.symbol_type_keys);
+        retain_map_keys(&mut infer.binding_types, self.binding_type_keys);
+        retain_map_keys(&mut infer.definition_schemes, self.definition_scheme_keys);
+        retain_map_keys(
+            &mut infer.binding_capabilities,
+            self.binding_capability_keys,
+        );
+        retain_map_keys(
+            &mut infer.callable_capabilities,
+            self.callable_capability_keys,
+        );
+        infer.record_field_callables = self.record_field_callables;
+        retain_set_keys(&mut infer.fresh_place_exprs, self.fresh_place_expr_keys);
+        infer.inherent_methods = self.inherent_methods;
+        *env = self.env;
     }
 }
 
@@ -849,9 +901,9 @@ impl Infer {
         let mut env = seed_env.cloned().unwrap_or_else(TypeEnv::new);
         self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()));
         self.register_traits_and_ops(seed_stmts.iter().chain(program.stmts.iter()))?;
-        // Seed this program's own impl dictionaries for standalone inference. Graph
-        // inference also calls set_known_impl_dicts with the full module env; the
-        // overlap is harmless and keeps both entry points on the same call path.
+        // Fail-fast inference may resolve calls before reaching a later impl statement.
+        // Since any failed impl aborts the whole pass, these speculative names cannot
+        // leak into a partial result.
         self.register_impl_dict_names(seed_stmts.iter().chain(program.stmts.iter()));
 
         self.add_constructors_and_externs(&mut env, &mut program.stmts)?;
@@ -924,10 +976,11 @@ impl Infer {
         {
             return (ModuleInference::default(), vec![err]);
         }
-        // Seed this program's own impl dictionaries for standalone inference. Graph
-        // inference also calls set_known_impl_dicts with the full module env; the
-        // overlap is harmless and keeps both entry points on the same call path.
-        self.register_impl_dict_names(seed_stmts.iter().chain(program.stmts.iter()));
+        // Collecting inference returns partial state after failures, so current-module
+        // impl dictionaries must become visible only after their impl statement succeeds.
+        // Module-scope discovery may have preloaded them into `known_impl_dicts`; remove
+        // only this program's impl names while preserving imported/prelude impls.
+        self.remove_program_impl_dict_names(program.stmts.iter());
 
         let mut diagnostics: Vec<SpannedTypeError> = Vec::new();
         let mut unavailable = CollectedNames::default();
@@ -981,22 +1034,7 @@ impl Infer {
                 continue;
             }
 
-            let snapshot = InferSnapshot {
-                subst_map: self.subst.snapshot_map(),
-                pending_constraints: self.pending_constraints.clone(),
-                loop_break_tys: self.loop_break_tys.clone(),
-                fn_return_tys: self.fn_return_tys.clone(),
-                expr_type_keys: self.expr_types.keys().copied().collect(),
-                symbol_type_keys: self.symbol_types.keys().copied().collect(),
-                binding_type_keys: self.binding_types.keys().copied().collect(),
-                definition_scheme_keys: self.definition_schemes.keys().copied().collect(),
-                binding_capability_keys: self.binding_capabilities.keys().copied().collect(),
-                callable_capability_keys: self.callable_capabilities.keys().copied().collect(),
-                record_field_callables: self.record_field_callables.clone(),
-                fresh_place_expr_keys: self.fresh_place_exprs.iter().copied().collect(),
-                inherent_methods: self.inherent_methods.clone(),
-                env: env.clone(),
-            };
+            let snapshot = InferSnapshot::capture(self, &env);
 
             match self.infer_stmt(&mut env, stmt) {
                 Ok(stmt_ty) => {
@@ -1012,50 +1050,13 @@ impl Infer {
                 Err(err) => {
                     // Keep metadata discovered in the failed statement for editor features,
                     // but normalize type entries before discarding the statement's substitutions.
-                    let symbol_type_keys: HashSet<_> =
-                        snapshot.symbol_type_keys.iter().copied().collect();
-                    let callable_capability_keys: HashSet<_> =
-                        snapshot.callable_capability_keys.iter().copied().collect();
-                    let failed_symbol_types: HashMap<_, _> = self
-                        .symbol_types
-                        .iter()
-                        .filter(|(id, _)| !symbol_type_keys.contains(id))
-                        .map(|(id, ty)| (*id, self.subst.apply(ty)))
-                        .collect();
-                    let failed_callable_capabilities: HashMap<_, _> = self
-                        .callable_capabilities
-                        .iter()
-                        .filter(|(id, _)| !callable_capability_keys.contains(id))
-                        .map(|(id, capabilities)| (*id, capabilities.clone()))
-                        .collect();
-                    self.subst.restore_map(snapshot.subst_map);
-                    self.pending_constraints = snapshot.pending_constraints;
-                    self.loop_break_tys = snapshot.loop_break_tys;
-                    self.fn_return_tys = snapshot.fn_return_tys;
-                    retain_map_keys(&mut self.expr_types, snapshot.expr_type_keys);
-                    retain_map_keys(&mut self.symbol_types, snapshot.symbol_type_keys);
-                    retain_map_keys(&mut self.binding_types, snapshot.binding_type_keys);
-                    retain_map_keys(
-                        &mut self.definition_schemes,
-                        snapshot.definition_scheme_keys,
-                    );
-                    retain_map_keys(
-                        &mut self.binding_capabilities,
-                        snapshot.binding_capability_keys,
-                    );
-                    retain_map_keys(
-                        &mut self.callable_capabilities,
-                        snapshot.callable_capability_keys,
-                    );
-                    self.record_field_callables = snapshot.record_field_callables;
-                    retain_set_keys(&mut self.fresh_place_exprs, snapshot.fresh_place_expr_keys);
-                    self.inherent_methods = snapshot.inherent_methods;
-                    env = snapshot.env;
+                    let failed_metadata = snapshot.metadata_added_before_failure(self);
+                    snapshot.restore(self, &mut env);
                     // Keep callee metadata discovered before the error so LSP hover and
                     // signature help can still explain bad calls in a failed statement.
-                    self.symbol_types.extend(failed_symbol_types);
+                    self.symbol_types.extend(failed_metadata.symbol_types);
                     self.callable_capabilities
-                        .extend(failed_callable_capabilities);
+                        .extend(failed_metadata.callable_capabilities);
                     unavailable.extend(bound);
                     diagnostics.push(err);
                 }
@@ -1122,11 +1123,15 @@ impl Infer {
     fn register_impl_dict_names<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
         for stmt in stmts {
             if let Stmt::Impl(impl_def) = stmt {
-                self.known_impl_dicts.insert(format!(
-                    "__{}__{}",
-                    impl_def.trait_name,
-                    impl_target_name(&impl_def.target)
-                ));
+                self.known_impl_dicts.insert(impl_dict_name(impl_def));
+            }
+        }
+    }
+
+    fn remove_program_impl_dict_names<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
+        for stmt in stmts {
+            if let Stmt::Impl(impl_def) = stmt {
+                self.known_impl_dicts.remove(&impl_dict_name(impl_def));
             }
         }
     }
@@ -2382,698 +2387,6 @@ impl Infer {
         result.map_err(|err: SpannedTypeError| err.with_span_if_absent(expr.span))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_operator_dispatch(
-        &mut self,
-        env: &TypeEnv,
-        trait_name: &str,
-        op: &str,
-        resolved_target: &Ty,
-        resolved_op: &mut Option<ResolvedCallee>,
-        pending_op: &mut Option<PendingDictArg>,
-        _dict_args: &mut Vec<DictRef>,
-        _pending_dict_args: &mut Vec<PendingDictArg>,
-    ) -> Result<(), SpannedTypeError> {
-        match self
-            .resolve_trait_dict(env, trait_name, resolved_target.clone())
-            .map_err(SpannedTypeError::from)?
-        {
-            DictResolution::Resolved(dict) => {
-                *resolved_op = Some(ResolvedCallee::DictMethod {
-                    dict,
-                    method: mangle_op(op),
-                });
-            }
-            DictResolution::Pending(pending) => {
-                *pending_op = Some(pending);
-            }
-        }
-        Ok(())
-    }
-
-    fn resolve_trait_dict(
-        &mut self,
-        env: &TypeEnv,
-        trait_name: &str,
-        target: Ty,
-    ) -> Result<DictResolution, TypeError> {
-        let target = self.subst.apply(&target);
-        if let Ty::Var(var) = target {
-            let constraint = TraitConstraint {
-                var,
-                trait_name: trait_name.to_string(),
-            };
-            self.pending_constraints.push(constraint.clone());
-            return Ok(DictResolution::Pending(PendingDictArg {
-                var,
-                trait_name: trait_name.to_string(),
-            }));
-        }
-        if let Some(dict) = self.resolve_structural_dict(env, trait_name, &target)? {
-            return Ok(DictResolution::Resolved(dict));
-        }
-        let Some(target_name) = ty_target_name(&target) else {
-            return Err(TypeError::MissingTraitImpl {
-                trait_name: trait_name.to_string(),
-                impl_target: format!("{}", target),
-            });
-        };
-        if !has_trait_impl(env, &self.known_impl_dicts, trait_name, &target_name) {
-            return Err(TypeError::MissingTraitImpl {
-                trait_name: trait_name.to_string(),
-                impl_target: target_name,
-            });
-        }
-        Ok(DictResolution::Resolved(DictRef::Concrete(format!(
-            "__{}__{}",
-            trait_name, target_name
-        ))))
-    }
-
-    fn resolve_structural_dict(
-        &mut self,
-        env: &TypeEnv,
-        trait_name: &str,
-        target: &Ty,
-    ) -> Result<Option<DictRef>, TypeError> {
-        match (trait_name, target) {
-            ("Eq", Ty::Tuple(items)) => Ok(Some(DictRef::Structural(StructuralDictRef {
-                trait_name: "Eq".to_string(),
-                target: DictTarget::Tuple(items.len()),
-                args: items
-                    .iter()
-                    .map(|item| self.resolve_eq_child_dict(env, item))
-                    .collect::<Result<_, _>>()?,
-            }))),
-            _ => Ok(None),
-        }
-    }
-
-    fn resolve_eq_child_dict(&mut self, env: &TypeEnv, ty: &Ty) -> Result<DictRef, TypeError> {
-        match self.subst.apply(ty) {
-            Ty::Tuple(items) => self
-                .resolve_structural_dict(env, "Eq", &Ty::Tuple(items))?
-                .ok_or_else(|| TypeError::MissingTraitImpl {
-                    trait_name: "Eq".to_string(),
-                    impl_target: format!("{}", ty),
-                }),
-            Ty::Var(var) => {
-                let constraint = TraitConstraint {
-                    var,
-                    trait_name: "Eq".to_string(),
-                };
-                self.pending_constraints.push(constraint.clone());
-                Ok(DictRef::Param(dict_param_name(&constraint)))
-            }
-            resolved => {
-                let Some(target_name) = ty_target_name(&resolved) else {
-                    return Err(TypeError::MissingTraitImpl {
-                        trait_name: "Eq".to_string(),
-                        impl_target: format!("{}", resolved),
-                    }
-                    .into());
-                };
-                if !has_trait_impl(env, &self.known_impl_dicts, "Eq", &target_name) {
-                    return Err(TypeError::MissingTraitImpl {
-                        trait_name: "Eq".to_string(),
-                        impl_target: target_name,
-                    }
-                    .into());
-                }
-                Ok(DictRef::Concrete(format!("__Eq__{}", target_name)))
-            }
-        }
-    }
-
-    fn resolve_trait_method_call(
-        &mut self,
-        env: &TypeEnv,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        resolved_callee: &mut Option<ResolvedCallee>,
-        pending_trait_method: &mut Option<(PendingDictArg, String)>,
-        trait_def: TraitDef,
-        method: TraitMethod,
-        context: &str,
-    ) -> Result<Ty, SpannedTypeError> {
-        let trait_name = trait_def.name.clone();
-        let method_name = method.name.clone();
-
-        // Decide dispatch strategy based on whether the first parameter's type
-        // contains the trait's HKT variable (e.g. `'f` in `map(fa: 'f('a), ...)`).
-        // If it does, we can read the impl target directly from the first argument's
-        // concrete type.  If not (e.g. `pure(a: 'a)`), the target is only known from
-        // context, so we fall back to abstract unification and a pending marker.
-        let first_param_has_trait_var = method
-            .params
-            .first()
-            .map(|(_, ty)| type_contains_var(ty, &trait_def.param))
-            .unwrap_or(false);
-
-        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-        if arg_tys.len() != method.params.len() {
-            return Err(TypeError::ArityMismatch {
-                expected: method.params.len(),
-                got: arg_tys.len(),
-            }
-            .into());
-        }
-
-        if first_param_has_trait_var {
-            // ── First-arg dispatch ────────────────────────────────────────────
-            // Extract the impl target from the first argument's concrete type,
-            // then look up the concrete dict and unify against its method type.
-            // This avoids abstract HKT unification, which breaks for multi-arg
-            // type constructors like `Result('a, 'e)` vs `'f('a)`.
-            let resolved_target = self.subst.apply(&arg_tys[0]);
-            let target_name =
-                ty_target_name(&resolved_target).ok_or_else(|| TypeError::UnresolvedTrait {
-                    context: context.to_string(),
-                    trait_name: trait_name.clone(),
-                })?;
-            let dict_name = format!("__{}__{}", trait_name, target_name);
-
-            let ret_ty = if let Some(dict_info) = env.get(&dict_name) {
-                let dict_ty = self.instantiate(&dict_info.scheme);
-                let method_ty = record_field_ty(&self.subst.apply(&dict_ty), &method_name)
-                    .ok_or_else(|| TypeError::UnknownTraitMethod {
-                        trait_name: trait_name.clone(),
-                        method: method_name.clone(),
-                    })?;
-                let ret_ty = Ty::Var(self.fresh_var());
-                unify(
-                    &mut self.subst,
-                    method_ty,
-                    Ty::Func(
-                        value_func_params(arg_tys),
-                        value_func_return(ret_ty.clone()),
-                    ),
-                )?;
-                ret_ty
-            } else if self.known_impl_dicts.contains(&dict_name) {
-                self.check_trait_method_signature(&trait_def, &method, arg_tys, context)?
-            } else {
-                return Err(TypeError::MissingTraitImpl {
-                    trait_name: trait_name.clone(),
-                    impl_target: target_name.to_string(),
-                }
-                .into());
-            };
-
-            *resolved_callee = Some(ResolvedCallee::DictMethod {
-                dict: DictRef::Concrete(format!("__{}__{}", trait_name, target_name)),
-                method: mangle_op(&method_name),
-            });
-            Ok(self.subst.apply(&ret_ty))
-        } else {
-            // ── Abstract unification + pending dispatch ───────────────────────
-            // Used for methods like `pure(a: 'a) -> 'f('a)` where the first
-            // parameter doesn't reveal the impl target.  We unify the value
-            // arguments against the abstract method signature, then defer target
-            // resolution to `resolve_dict_uses_expr` once the outer context has
-            // pinned the type variable.
-            let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-            let target_var = self.fresh_var();
-            param_vars.insert(trait_def.param.clone(), target_var);
-
-            let method_param_tys: Vec<Ty> = method
-                .params
-                .iter()
-                .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
-                .collect::<Result<_, _>>()?;
-            let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-
-            for (arg_ty, param_ty) in arg_tys.into_iter().zip(method_param_tys) {
-                unify(&mut self.subst, arg_ty, param_ty)?;
-            }
-
-            let resolved_target = self.subst.apply(&Ty::Var(target_var));
-            match ty_target_name(&resolved_target) {
-                None => {
-                    if let Ty::Var(v) = resolved_target {
-                        *pending_trait_method = Some((
-                            PendingDictArg {
-                                var: v,
-                                trait_name: trait_name.clone(),
-                            },
-                            method_name,
-                        ));
-                    }
-                    Ok(self.subst.apply(&ret_ty))
-                }
-                Some(target_name) => {
-                    let dict_name = format!("__{}__{}", trait_name, target_name);
-                    if env.get(&dict_name).is_none() && !self.known_impl_dicts.contains(&dict_name)
-                    {
-                        return Err(TypeError::MissingTraitImpl {
-                            trait_name: trait_name.clone(),
-                            impl_target: target_name.to_string(),
-                        }
-                        .into());
-                    }
-                    *resolved_callee = Some(ResolvedCallee::DictMethod {
-                        dict: DictRef::Concrete(format!("__{}__{}", trait_name, target_name)),
-                        method: mangle_op(&method_name),
-                    });
-                    Ok(self.subst.apply(&ret_ty))
-                }
-            }
-        }
-    }
-
-    fn check_trait_method_signature(
-        &mut self,
-        trait_def: &TraitDef,
-        method: &TraitMethod,
-        arg_tys: Vec<Ty>,
-        context: &str,
-    ) -> Result<Ty, SpannedTypeError> {
-        let mut param_vars = HashMap::new();
-        let target_var = self.fresh_var();
-        param_vars.insert(trait_def.param.clone(), target_var);
-        let method_param_tys: Vec<Ty> = method
-            .params
-            .iter()
-            .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
-            .collect::<Result<_, _>>()?;
-        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-        for (arg_ty, expected_ty) in arg_tys.into_iter().zip(method_param_tys) {
-            unify(&mut self.subst, expected_ty, arg_ty)?;
-        }
-        let resolved_target = self.subst.apply(&Ty::Var(target_var));
-        ty_target_name(&resolved_target).ok_or_else(|| TypeError::UnresolvedTrait {
-            context: context.to_string(),
-            trait_name: trait_def.name.clone(),
-        })?;
-        Ok(ret_ty)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_associated_call(
-        &mut self,
-        env: &TypeEnv,
-        call_expr_id: NodeId,
-        callee_id: NodeId,
-        target: &Type,
-        target_span: SourceSpan,
-        member: &str,
-        member_span: SourceSpan,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        resolved_callee: &mut Option<ResolvedCallee>,
-        dict_args: &mut Vec<DictRef>,
-        pending_dict_args: &mut Vec<PendingDictArg>,
-    ) -> Result<Ty, SpannedTypeError> {
-        let target_name = validate_inherent_impl_target(target, &self.declared_types)
-            .map_err(|err| err.at(target_span))?;
-        let method_info = self
-            .inherent_methods
-            .get(&target_name)
-            .and_then(|methods| methods.get(member))
-            .or_else(|| {
-                self.scoped_inherent_methods
-                    .get(&target_name)
-                    .and_then(|methods| methods.get(member))
-            })
-            .cloned()
-            .ok_or_else(|| {
-                TypeError::UnknownAssociatedFunction {
-                    target: target_name.clone(),
-                    function: member.to_string(),
-                }
-                .at(member_span)
-            })?;
-        let method_ty = self.instantiate_value(&method_info.scheme);
-        self.record_symbol_type(callee_id, method_ty.clone());
-
-        if method_info.has_receiver {
-            return Err(TypeError::MethodRequiresReceiver {
-                target: target_name,
-                method: member.to_string(),
-            }
-            .at(member_span));
-        }
-
-        self.check_mutable_place_args(env, args, &scheme_param_capabilities(&method_info.scheme))?;
-        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-        let return_capability = scheme_return_capability(&method_info.scheme);
-        let fresh_return = return_capability == ReturnCapability::FreshPlace;
-        let ret_ty = self.infer_constrained_apply(
-            env,
-            &method_info.scheme,
-            arg_tys.clone(),
-            dict_args,
-            pending_dict_args,
-        )?;
-        self.record_symbol_type(
-            callee_id,
-            Ty::Func(
-                expected_func_params(&method_ty, arg_tys),
-                FuncReturn {
-                    ty: Box::new(ret_ty.clone()),
-                    capability: return_capability,
-                },
-            ),
-        );
-        *resolved_callee = Some(method_info.resolved_callee);
-        if fresh_return && call_expr_id != NO_NODE_ID {
-            self.fresh_place_exprs.insert(call_expr_id);
-        }
-        Ok(ret_ty)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_receiver_call(
-        &mut self,
-        env: &TypeEnv,
-        call_expr_id: NodeId,
-        callee_id: NodeId,
-        receiver: &mut Box<Expr>,
-        method_name: &str,
-        args: &mut [Expr],
-        is_method_call: &mut bool,
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        resolved_callee: &mut Option<ResolvedCallee>,
-        dict_args: &mut Vec<DictRef>,
-        pending_dict_args: &mut Vec<PendingDictArg>,
-    ) -> Result<Ty, SpannedTypeError> {
-        let inferred_receiver_ty = self.infer_expr(env, receiver)?;
-        let receiver_ty = self.subst.apply(&inferred_receiver_ty);
-        if let ExprKind::Ident(base_name) = &receiver.kind {
-            if let Some(module_name) = self.import_bindings.get(base_name)
-                && let Some(scheme) = self
-                    .import_schemes
-                    .get(module_name)
-                    .and_then(|members| members.get(method_name))
-                && matches!(scheme.ty, Ty::Func(_, _))
-            {
-                self.record_callable_capabilities(callee_id, scheme_param_capabilities(scheme));
-            } else if let Some(param_capabilities) = self
-                .record_field_callables
-                .get(base_name)
-                .and_then(|fields| fields.get(method_name))
-                .cloned()
-            {
-                self.record_callable_capabilities(callee_id, param_capabilities);
-            }
-        }
-
-        if let Some(mut field_ty) = record_field_ty(&receiver_ty, method_name) {
-            if let Ty::Qualified(constraints, inner) = field_ty {
-                attach_dict_args(
-                    env,
-                    &self.known_impl_dicts,
-                    dict_args,
-                    pending_dict_args,
-                    &mut self.pending_constraints,
-                    &constraints,
-                    &self.subst,
-                )
-                .map_err(|e| e.at(receiver.span))?;
-                field_ty = *inner;
-            }
-            self.record_symbol_type(callee_id, field_ty.clone());
-            let fresh_return = func_return_capability(&field_ty) == ReturnCapability::FreshPlace;
-            let param_capabilities = match &field_ty {
-                Ty::Func(params, _) => func_param_capabilities(params),
-                _ => self.callable_capabilities_for(callee_id),
-            };
-            self.check_mutable_place_args(env, args, &param_capabilities)?;
-            let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-            let ret_ty = Ty::Var(self.fresh_var());
-            let call_ty = Ty::Func(
-                expected_func_params(&field_ty, arg_tys),
-                expected_func_return(&field_ty, ret_ty.clone()),
-            );
-            unify(&mut self.subst, field_ty, call_ty.clone())?;
-            self.record_symbol_type(callee_id, call_ty);
-            if fresh_return && call_expr_id != NO_NODE_ID {
-                self.fresh_place_exprs.insert(call_expr_id);
-            }
-            return Ok(self.subst.apply(&ret_ty));
-        }
-
-        if matches!(receiver_ty, Ty::Var(_)) {
-            // Unconstrained receiver: default to row-polymorphic record field access.
-            // If the caller wants method dispatch on a specific type (Map, ['a], …),
-            // they must annotate the parameter; annotation drives type resolution.
-            let field_ty = Ty::Var(self.fresh_var());
-            let tail_ty = Ty::Var(self.fresh_var());
-            unify(
-                &mut self.subst,
-                receiver_ty,
-                Ty::Record(Row {
-                    fields: vec![(method_name.to_string(), field_ty.clone())],
-                    tail: Box::new(tail_ty),
-                }),
-            )?;
-            let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-            let ret_ty = Ty::Var(self.fresh_var());
-            let call_ty = Ty::Func(
-                value_func_params(arg_tys),
-                value_func_return(ret_ty.clone()),
-            );
-            unify(&mut self.subst, field_ty, call_ty.clone())?;
-            self.record_symbol_type(callee_id, call_ty);
-            return Ok(self.subst.apply(&ret_ty));
-        }
-
-        let target_name = ty_target_name(&receiver_ty).unwrap_or_else(|| receiver_ty.to_string());
-
-        if let Some(method_info) = self
-            .inherent_methods
-            .get(&target_name)
-            .and_then(|methods| methods.get(method_name))
-            .cloned()
-        {
-            let method_ty = self.instantiate_value(&method_info.scheme);
-            self.record_symbol_type(callee_id, method_ty);
-            if !method_info.has_receiver {
-                return Err(TypeError::AssociatedFunctionAsMethod {
-                    target: target_name,
-                    function: method_name.to_string(),
-                }
-                .into());
-            }
-            if scheme_param_capability(&method_info.scheme, 0).is_mut_place() {
-                self.check_mutable_place_arg(env, receiver, 0)?;
-            }
-            let param_capabilities = scheme_param_capabilities(&method_info.scheme);
-            self.check_mutable_place_args_from(env, args, &param_capabilities, 1)?;
-            let mut arg_tys = Vec::with_capacity(args.len() + 1);
-            arg_tys.push(receiver_ty);
-            arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
-            let ret_ty = self.infer_constrained_apply(
-                env,
-                &method_info.scheme,
-                arg_tys.clone(),
-                dict_args,
-                pending_dict_args,
-            )?;
-            self.record_symbol_type(
-                callee_id,
-                Ty::Func(
-                    value_func_params(arg_tys),
-                    value_func_return(ret_ty.clone()),
-                ),
-            );
-            *is_method_call = true;
-            *resolved_callee = Some(method_info.resolved_callee);
-            return Ok(ret_ty);
-        }
-
-        if let Some(method_info) = self
-            .scoped_inherent_methods
-            .get(&target_name)
-            .and_then(|methods| methods.get(method_name))
-            .cloned()
-        {
-            let method_ty = self.instantiate_value(&method_info.scheme);
-            self.record_symbol_type(callee_id, method_ty);
-            if !method_info.has_receiver {
-                return Err(TypeError::AssociatedFunctionAsMethod {
-                    target: target_name,
-                    function: method_name.to_string(),
-                }
-                .into());
-            }
-            if scheme_param_capability(&method_info.scheme, 0).is_mut_place() {
-                self.check_mutable_place_arg(env, receiver, 0)?;
-            }
-            let param_capabilities = scheme_param_capabilities(&method_info.scheme);
-            self.check_mutable_place_args_from(env, args, &param_capabilities, 1)?;
-            let mut arg_tys = Vec::with_capacity(args.len() + 1);
-            arg_tys.push(receiver_ty);
-            arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
-            let ret_ty = self.infer_constrained_apply(
-                env,
-                &method_info.scheme,
-                arg_tys.clone(),
-                dict_args,
-                pending_dict_args,
-            )?;
-            self.record_symbol_type(
-                callee_id,
-                Ty::Func(
-                    value_func_params(arg_tys),
-                    value_func_return(ret_ty.clone()),
-                ),
-            );
-            *is_method_call = true;
-            *resolved_callee = Some(method_info.resolved_callee);
-            return Ok(ret_ty);
-        }
-
-        if let Some(info) = env.get(method_name) {
-            let scheme = info.scheme.clone();
-            let method_ty = self.instantiate_value(&scheme);
-            self.record_symbol_type(callee_id, method_ty);
-            if scheme_param_capability(&scheme, 0).is_mut_place() {
-                self.check_mutable_place_arg(env, receiver, 0)?;
-            }
-            self.check_mutable_place_args_from(env, args, &scheme_param_capabilities(&scheme), 1)?;
-            let mut arg_tys = Vec::with_capacity(args.len() + 1);
-            arg_tys.push(receiver_ty);
-            arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
-            let ret_ty = self.infer_constrained_apply(
-                env,
-                &scheme,
-                arg_tys.clone(),
-                dict_args,
-                pending_dict_args,
-            )?;
-            self.record_symbol_type(
-                callee_id,
-                Ty::Func(
-                    value_func_params(arg_tys),
-                    value_func_return(ret_ty.clone()),
-                ),
-            );
-            *is_method_call = true;
-            *resolved_callee = Some(ResolvedCallee::Function(method_name.to_string()));
-            return Ok(ret_ty);
-        }
-
-        Err(TypeError::UnknownMethod {
-            receiver: target_name,
-            method: method_name.to_string(),
-        }
-        .into())
-    }
-
-    fn bare_trait_method(
-        &self,
-        method_name: &str,
-    ) -> Result<Option<ResolvedTraitMethod>, TypeError> {
-        let mut matching: Vec<_> = self
-            .trait_env
-            .values()
-            .filter_map(|trait_def| {
-                trait_def
-                    .methods
-                    .iter()
-                    .find(|method| method.name == method_name)
-                    .map(|method| ResolvedTraitMethod {
-                        trait_def: trait_def.clone(),
-                        method: method.clone(),
-                    })
-            })
-            .collect();
-        matching.sort_by(|a, b| a.trait_def.name.cmp(&b.trait_def.name));
-
-        if matching.len() > 1 {
-            return Err(TypeError::AmbiguousTraitMethod {
-                method: method_name.to_string(),
-                candidates: matching
-                    .iter()
-                    .map(|candidate| candidate.trait_def.name.clone())
-                    .collect(),
-            });
-        }
-
-        Ok(matching.into_iter().next())
-    }
-
-    fn infer_args(
-        &mut self,
-        env: &TypeEnv,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-    ) -> Result<Vec<Ty>, SpannedTypeError> {
-        arg_wrappers.clear();
-        let mut arg_tys = Vec::with_capacity(args.len());
-        for arg in args {
-            let inferred = self.infer_expr(env, arg)?;
-            if has_mut_place_func_params(&self.subst.apply(&inferred))
-                || self
-                    .callable_capabilities
-                    .get(&arg.id)
-                    .is_some_and(|capabilities| {
-                        capabilities
-                            .param_capabilities
-                            .iter()
-                            .any(|capability| capability.is_mut_place())
-                    })
-            {
-                return Err(TypeError::MutableFunctionCapabilityMismatch.at(arg.span));
-            }
-            let mut arg_ty = self.subst.apply(&inferred);
-            let wrapper = if let Ty::Qualified(constraints, inner) = arg_ty {
-                let mut wrapper = ArgWrapper {
-                    dict_args: Vec::new(),
-                    pending_dict_args: Vec::new(),
-                };
-                attach_dict_args(
-                    env,
-                    &self.known_impl_dicts,
-                    &mut wrapper.dict_args,
-                    &mut wrapper.pending_dict_args,
-                    &mut self.pending_constraints,
-                    &constraints,
-                    &self.subst,
-                )
-                .map_err(|e| e.at(arg.span))?;
-                arg_ty = *inner;
-                Some(wrapper)
-            } else {
-                None
-            };
-            arg_wrappers.push(wrapper);
-            arg_tys.push(arg_ty);
-        }
-        Ok(arg_tys)
-    }
-
-    fn infer_constrained_apply(
-        &mut self,
-        env: &TypeEnv,
-        scheme: &Scheme,
-        arg_tys: Vec<Ty>,
-        dict_args: &mut Vec<DictRef>,
-        pending_dict_args: &mut Vec<PendingDictArg>,
-    ) -> Result<Ty, SpannedTypeError> {
-        let instantiated = self.instantiate_scheme(scheme);
-        let ret_ty = Ty::Var(self.fresh_var());
-        let expected_params = expected_func_params(&instantiated.ty, arg_tys);
-        let expected_ret = expected_func_return(&instantiated.ty, ret_ty.clone());
-        unify(
-            &mut self.subst,
-            instantiated.ty,
-            Ty::Func(expected_params, expected_ret),
-        )?;
-        attach_dict_args(
-            env,
-            &self.known_impl_dicts,
-            dict_args,
-            pending_dict_args,
-            &mut self.pending_constraints,
-            &instantiated.constraints,
-            &self.subst,
-        )
-        .map_err(TypeError::unspanned)?;
-        Ok(self.subst.apply(&ret_ty))
-    }
-
     fn check_pattern(
         &mut self,
         pat: &Pattern,
@@ -3244,138 +2557,7 @@ impl Infer {
         scrutinee_ty: &Ty,
     ) -> Result<(), TypeError> {
         let patterns: Vec<&Pattern> = arms.iter().map(|(p, _)| p).collect();
-
-        if patterns.iter().any(|p| pattern_is_catch_all(p)) {
-            return Ok(());
-        }
-
-        match scrutinee_ty {
-            Ty::Con(_) | Ty::App(_, _) => {
-                let type_name = match scrutinee_ty {
-                    Ty::Con(n) => n.clone(),
-                    Ty::App(con, _) => match con.as_ref() {
-                        Ty::Con(n) => n.clone(),
-                        _ => {
-                            return Err(TypeError::NonExhaustiveMatch {
-                                missing: "non-exhaustive match — add a wildcard (_) arm"
-                                    .to_string(),
-                            });
-                        }
-                    },
-                    _ => unreachable!(),
-                };
-
-                if type_name == "Array" {
-                    return self.check_array_exhaustive(&patterns);
-                }
-
-                let type_variants: Vec<String> = self
-                    .variant_env
-                    .0
-                    .iter()
-                    .filter(|(_, vi)| vi.type_name == type_name)
-                    .map(|(vname, _)| vname.clone())
-                    .collect();
-
-                if type_variants.is_empty() {
-                    return Err(TypeError::NonExhaustiveMatch {
-                        missing: "non-exhaustive match — add a wildcard (_) arm".to_string(),
-                    });
-                }
-
-                let covered: HashSet<String> = patterns
-                    .iter()
-                    .filter_map(|p| {
-                        if let Pattern::Constructor { name, .. } = p {
-                            Some(name.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                let mut missing: Vec<_> = type_variants
-                    .iter()
-                    .filter(|v| !covered.contains(*v))
-                    .collect();
-                missing.sort();
-
-                if missing.is_empty() {
-                    Ok(())
-                } else {
-                    Err(TypeError::NonExhaustiveMatch {
-                        missing: format!(
-                            "missing constructors: {}",
-                            missing
-                                .iter()
-                                .map(|s| s.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    })
-                }
-            }
-            _ => Err(TypeError::NonExhaustiveMatch {
-                missing: "non-exhaustive match — add a wildcard (_) arm".to_string(),
-            }),
-        }
-    }
-
-    fn check_array_exhaustive(&self, patterns: &[&Pattern]) -> Result<(), TypeError> {
-        let open_lens: Vec<usize> = patterns
-            .iter()
-            .filter_map(|p| {
-                if let Pattern::List {
-                    elements,
-                    rest: Some(_),
-                } = p
-                {
-                    Some(elements.len())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let exact_lens: HashSet<usize> = patterns
-            .iter()
-            .filter_map(|p| {
-                if let Pattern::List {
-                    elements,
-                    rest: None,
-                } = p
-                {
-                    Some(elements.len())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if open_lens.is_empty() {
-            return Err(TypeError::NonExhaustiveMatch {
-                missing: "non-exhaustive: arrays longer than the matched lengths are not covered \
-                     — add [head, ..] or _ arm"
-                    .to_string(),
-            });
-        }
-
-        // open_lens.is_empty() returns early above, so min() always finds an element.
-        let min_open = *open_lens.iter().min().unwrap();
-        for len in 0..min_open {
-            if !exact_lens.contains(&len) {
-                let pat = if len == 0 {
-                    "[]".to_string()
-                } else {
-                    format!("[{}]", (0..len).map(|_| "_").collect::<Vec<_>>().join(", "))
-                };
-                return Err(TypeError::NonExhaustiveMatch {
-                    missing: format!("missing arm for arrays of length {} — add {}", len, pat),
-                });
-            }
-        }
-
-        Ok(())
+        check_exhaustive_match(&patterns, scrutinee_ty, &self.variant_env)
     }
 
     fn ast_to_ty_with_vars(
@@ -3524,181 +2706,12 @@ fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeEr
     Ok(())
 }
 
-fn is_self_param(param: &Param) -> bool {
-    matches!(&param.pat, Pattern::Variable(name, _) if name == "self")
-}
-
-fn substitute_self_in_inherent_method(method: &mut InherentMethod, target: &Type) {
-    for param in &mut method.params {
-        if let Some(ty) = &mut param.ty {
-            substitute_self_in_type(ty, target);
-        }
-    }
-    if let Some(ret_type) = &mut method.ret_type {
-        substitute_self_in_type(&mut ret_type.ty, target);
-    }
-    substitute_self_in_expr_types(&mut method.body, target);
-}
-
-fn substitute_self_in_type(ty: &mut Type, target: &Type) {
-    match ty {
-        Type::Ident(name) if name == "Self" => *ty = target.clone(),
-        Type::App(con, args) => {
-            substitute_self_in_type(con, target);
-            for arg in args {
-                substitute_self_in_type(arg, target);
-            }
-        }
-        Type::Func(params, ret) => {
-            for param in params {
-                substitute_self_in_type(&mut param.ty, target);
-            }
-            substitute_self_in_type(&mut ret.ty, target);
-        }
-        Type::Tuple(items) => {
-            for item in items {
-                substitute_self_in_type(item, target);
-            }
-        }
-        Type::Record(fields, _) => {
-            for (_, field_ty) in fields {
-                substitute_self_in_type(field_ty, target);
-            }
-        }
-        Type::Ident(_) | Type::Var(_) | Type::Unit | Type::Hole => {}
-    }
-}
-
-fn substitute_self_in_expr_types(expr: &mut Expr, target: &Type) {
-    match &mut expr.kind {
-        ExprKind::Number(_)
-        | ExprKind::StringLit(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Ident(_)
-        | ExprKind::Import(_)
-        | ExprKind::Unit
-        | ExprKind::Break(None)
-        | ExprKind::Continue
-        | ExprKind::Return(None) => {}
-        ExprKind::AssociatedAccess {
-            target: access_target,
-            ..
-        } => substitute_self_in_type(access_target, target),
-        ExprKind::Not(expr)
-        | ExprKind::Loop(expr)
-        | ExprKind::Break(Some(expr))
-        | ExprKind::Return(Some(expr))
-        | ExprKind::FieldAccess { expr, .. } => substitute_self_in_expr_types(expr, target),
-        ExprKind::Assign { target: lhs, value }
-        | ExprKind::Binary {
-            lhs, rhs: value, ..
-        } => {
-            substitute_self_in_expr_types(lhs, target);
-            substitute_self_in_expr_types(value, target);
-        }
-        ExprKind::Call { callee, args, .. } => {
-            substitute_self_in_expr_types(callee, target);
-            for arg in args {
-                substitute_self_in_expr_types(arg, target);
-            }
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            substitute_self_in_expr_types(cond, target);
-            substitute_self_in_expr_types(then_branch, target);
-            substitute_self_in_expr_types(else_branch, target);
-        }
-        ExprKind::Match { scrutinee, arms } => {
-            substitute_self_in_expr_types(scrutinee, target);
-            for (_, body) in arms {
-                substitute_self_in_expr_types(body, target);
-            }
-        }
-        ExprKind::Block { stmts, final_expr } => {
-            for stmt in stmts {
-                substitute_self_in_stmt_types(stmt, target);
-            }
-            if let Some(expr) = final_expr {
-                substitute_self_in_expr_types(expr, target);
-            }
-        }
-        ExprKind::Tuple(items) => {
-            for item in items {
-                substitute_self_in_expr_types(item, target);
-            }
-        }
-        ExprKind::Array(entries) => {
-            for entry in entries {
-                substitute_self_in_expr_types(entry.expr_mut(), target);
-            }
-        }
-        ExprKind::Record(entries) => {
-            for entry in entries {
-                substitute_self_in_expr_types(entry.expr_mut(), target);
-            }
-        }
-        ExprKind::Lambda { params, body, .. } => {
-            for param in params {
-                if let Some(ty) = &mut param.ty {
-                    substitute_self_in_type(ty, target);
-                }
-            }
-            substitute_self_in_expr_types(body, target);
-        }
-        ExprKind::For { iterable, body, .. } => {
-            substitute_self_in_expr_types(iterable, target);
-            substitute_self_in_expr_types(body, target);
-        }
-    }
-}
-
-fn substitute_self_in_stmt_types(stmt: &mut Stmt, target: &Type) {
-    match stmt {
-        Stmt::Let { ty, value, .. } => {
-            if let Some(ty) = ty {
-                substitute_self_in_type(ty, target);
-            }
-            substitute_self_in_expr_types(value, target);
-        }
-        Stmt::Fn {
-            params,
-            ret_type,
-            body,
-            ..
-        }
-        | Stmt::Op {
-            params,
-            ret_type,
-            body,
-            ..
-        } => {
-            for param in params {
-                if let Some(ty) = &mut param.ty {
-                    substitute_self_in_type(ty, target);
-                }
-            }
-            if let Some(ret_type) = ret_type {
-                substitute_self_in_type(&mut ret_type.ty, target);
-            }
-            substitute_self_in_expr_types(body, target);
-        }
-        Stmt::Expr(expr) => substitute_self_in_expr_types(expr, target),
-        // Nested item declarations own their own type scope. In particular, a nested
-        // impl's `Self` is not the outer inherent impl's `Self`.
-        Stmt::Trait(_)
-        | Stmt::Impl(_)
-        | Stmt::InherentImpl(_)
-        | Stmt::Type(_)
-        | Stmt::TypeAlias { .. }
-        | Stmt::Extern { .. } => {}
-    }
-}
-
-fn dict_param_name(constraint: &TraitConstraint) -> String {
-    format!("__dict_{}_{}", constraint.trait_name, constraint.var)
+fn impl_dict_name(impl_def: &ImplDef) -> String {
+    format!(
+        "__{}__{}",
+        impl_def.trait_name,
+        impl_target_name(&impl_def.target)
+    )
 }
 
 fn param_capabilities(params: &[Param]) -> Vec<ParamCapability> {
@@ -3796,50 +2809,6 @@ fn has_mut_place_func_params(ty: &Ty) -> bool {
     matches!(ty, Ty::Func(params, _) if params.iter().any(|param| param.capability.is_mut_place()))
 }
 
-fn attach_dict_args(
-    env: &TypeEnv,
-    known_impl_dicts: &HashSet<String>,
-    dict_args: &mut Vec<DictRef>,
-    pending_dict_args: &mut Vec<PendingDictArg>,
-    pending_constraints: &mut Vec<TraitConstraint>,
-    constraints: &[TraitConstraint],
-    subst: &Subst,
-) -> Result<(), TypeError> {
-    for constraint in constraints {
-        let resolved = subst.apply(&Ty::Var(constraint.var));
-        if let Ty::Var(var) = resolved {
-            pending_constraints.push(TraitConstraint {
-                var,
-                trait_name: constraint.trait_name.clone(),
-            });
-            pending_dict_args.push(PendingDictArg {
-                var,
-                trait_name: constraint.trait_name.clone(),
-            });
-        } else if let Some(dict_ref) =
-            resolve_concrete_dict_ref(&constraint.trait_name, &resolved, env, known_impl_dicts)
-        {
-            dict_args.push(dict_ref);
-        } else {
-            return Err(TypeError::MissingTraitImpl {
-                trait_name: constraint.trait_name.clone(),
-                impl_target: format!("{}", resolved),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn has_trait_impl(
-    env: &TypeEnv,
-    known_impl_dicts: &HashSet<String>,
-    trait_name: &str,
-    target_name: &str,
-) -> bool {
-    let dict_name = format!("__{}__{}", trait_name, target_name);
-    env.get(&dict_name).is_some() || known_impl_dicts.contains(&dict_name)
-}
-
 /// Returns true if the AST `Type` mentions `var_name` as a type variable.
 /// Used to decide whether a trait method's first parameter contains the HKT
 /// trait parameter (e.g. `'f` in `'f('a)`), which determines the dispatch
@@ -3866,715 +2835,6 @@ fn find_assignment_base_name(expr: &Expr) -> Option<String> {
         ExprKind::Ident(name) => Some(name.clone()),
         _ => None,
     }
-}
-
-fn stmt_bound_names(stmt: &Stmt) -> CollectedNames {
-    let mut names = CollectedNames::default();
-    match stmt {
-        Stmt::Let { pat, .. } => {
-            insert_pattern_bindings(&mut names.values, pat);
-        }
-        Stmt::Fn { name, .. } | Stmt::Op { name, .. } | Stmt::Extern { name, .. } => {
-            names.values.insert(name.clone());
-        }
-        Stmt::Type(td) => {
-            names.types.insert(td.name.clone());
-            names
-                .values
-                .extend(td.variants.iter().map(|variant| variant.name.clone()));
-        }
-        Stmt::TypeAlias { name, .. } => {
-            names.types.insert(name.clone());
-        }
-        Stmt::Trait(_) | Stmt::Impl(_) | Stmt::InherentImpl(_) | Stmt::Expr(_) => {}
-    }
-    names
-}
-
-fn stmt_referenced_names(stmt: &Stmt) -> CollectedNames {
-    let mut refs = CollectedNames::default();
-    collect_stmt_referenced_names(stmt, &mut refs, &HashSet::new(), &HashSet::new());
-    refs
-}
-
-fn collect_stmt_referenced_names(
-    stmt: &Stmt,
-    refs: &mut CollectedNames,
-    value_scope: &HashSet<String>,
-    type_scope: &HashSet<String>,
-) {
-    match stmt {
-        Stmt::Let { ty, value, .. } => {
-            if let Some(ty) = ty {
-                collect_type_referenced_names(ty, refs, type_scope);
-            }
-            collect_expr_referenced_names(value, refs, value_scope, type_scope);
-        }
-        Stmt::Fn {
-            name,
-            params,
-            ret_type,
-            body,
-            ..
-        } => {
-            let mut body_scope = value_scope.clone();
-            body_scope.insert(name.clone());
-            for param in params {
-                if let Some(param_ty) = &param.ty {
-                    collect_type_referenced_names(param_ty, refs, type_scope);
-                }
-                insert_pattern_bindings(&mut body_scope, &param.pat);
-            }
-            if let Some(ret_type) = ret_type {
-                collect_type_referenced_names(&ret_type.ty, refs, type_scope);
-            }
-            collect_expr_referenced_names(body, refs, &body_scope, type_scope);
-        }
-        Stmt::Op {
-            params,
-            ret_type,
-            body,
-            ..
-        } => {
-            let mut body_scope = value_scope.clone();
-            for param in params {
-                if let Some(param_ty) = &param.ty {
-                    collect_type_referenced_names(param_ty, refs, type_scope);
-                }
-                insert_pattern_bindings(&mut body_scope, &param.pat);
-            }
-            if let Some(ret_type) = ret_type {
-                collect_type_referenced_names(&ret_type.ty, refs, type_scope);
-            }
-            collect_expr_referenced_names(body, refs, &body_scope, type_scope);
-        }
-        Stmt::Trait(td) => {
-            for method in &td.methods {
-                for (_, param_ty) in &method.params {
-                    collect_type_referenced_names(param_ty, refs, type_scope);
-                }
-                collect_type_referenced_names(&method.ret_type, refs, type_scope);
-            }
-        }
-        Stmt::Impl(id) => {
-            collect_type_referenced_names(&id.target, refs, type_scope);
-            for method in &id.methods {
-                let mut method_scope = value_scope.clone();
-                for param in &method.params {
-                    if let Some(param_ty) = &param.ty {
-                        collect_type_referenced_names(param_ty, refs, type_scope);
-                    }
-                    insert_pattern_bindings(&mut method_scope, &param.pat);
-                }
-                if let Some(ret_type) = &method.ret_type {
-                    collect_type_referenced_names(&ret_type.ty, refs, type_scope);
-                }
-                collect_expr_referenced_names(&method.body, refs, &method_scope, type_scope);
-            }
-        }
-        Stmt::InherentImpl(id) => {
-            collect_type_referenced_names(&id.target, refs, type_scope);
-            for method in &id.methods {
-                let mut method_scope = value_scope.clone();
-                let mut method_type_scope = type_scope.clone();
-                method_type_scope.insert("Self".to_string());
-                for bound in &method.type_bounds {
-                    for trait_name in &bound.traits {
-                        if !method_type_scope.contains(trait_name) {
-                            refs.types.insert(trait_name.clone());
-                        }
-                    }
-                }
-                for param in &method.params {
-                    if let Some(param_ty) = &param.ty {
-                        collect_type_referenced_names(param_ty, refs, &method_type_scope);
-                    }
-                    insert_pattern_bindings(&mut method_scope, &param.pat);
-                }
-                if let Some(ret_type) = &method.ret_type {
-                    collect_type_referenced_names(&ret_type.ty, refs, &method_type_scope);
-                }
-                collect_expr_referenced_names(
-                    &method.body,
-                    refs,
-                    &method_scope,
-                    &method_type_scope,
-                );
-            }
-        }
-        Stmt::Type(td) => {
-            let mut stmt_type_scope = type_scope.clone();
-            stmt_type_scope.insert(td.name.clone());
-            for variant in &td.variants {
-                if let Some(payload) = &variant.payload {
-                    collect_type_referenced_names(payload, refs, &stmt_type_scope);
-                }
-            }
-        }
-        Stmt::TypeAlias { name, ty, .. } => {
-            let mut stmt_type_scope = type_scope.clone();
-            stmt_type_scope.insert(name.clone());
-            collect_type_referenced_names(ty, refs, &stmt_type_scope);
-        }
-        Stmt::Extern { ty, .. } => collect_type_referenced_names(ty, refs, type_scope),
-        Stmt::Expr(expr) => collect_expr_referenced_names(expr, refs, value_scope, type_scope),
-    }
-}
-
-fn collect_expr_referenced_names(
-    expr: &Expr,
-    refs: &mut CollectedNames,
-    value_scope: &HashSet<String>,
-    type_scope: &HashSet<String>,
-) {
-    match &expr.kind {
-        ExprKind::Number(_)
-        | ExprKind::StringLit(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Import(_)
-        | ExprKind::Unit
-        | ExprKind::Break(None)
-        | ExprKind::Continue
-        | ExprKind::Return(None) => {}
-        ExprKind::Ident(name) => {
-            if !value_scope.contains(name) {
-                refs.values.insert(name.clone());
-            }
-        }
-        ExprKind::Not(expr)
-        | ExprKind::Loop(expr)
-        | ExprKind::Break(Some(expr))
-        | ExprKind::Return(Some(expr))
-        | ExprKind::FieldAccess { expr, .. } => {
-            collect_expr_referenced_names(expr, refs, value_scope, type_scope);
-        }
-        ExprKind::AssociatedAccess { target, .. } => {
-            collect_type_referenced_names(target, refs, type_scope);
-        }
-        ExprKind::Assign { target, value }
-        | ExprKind::Binary {
-            lhs: target,
-            rhs: value,
-            ..
-        } => {
-            collect_expr_referenced_names(target, refs, value_scope, type_scope);
-            collect_expr_referenced_names(value, refs, value_scope, type_scope);
-        }
-        ExprKind::Call { callee, args, .. } => {
-            collect_expr_referenced_names(callee, refs, value_scope, type_scope);
-            for arg in args {
-                collect_expr_referenced_names(arg, refs, value_scope, type_scope);
-            }
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            collect_expr_referenced_names(cond, refs, value_scope, type_scope);
-            collect_expr_referenced_names(then_branch, refs, value_scope, type_scope);
-            collect_expr_referenced_names(else_branch, refs, value_scope, type_scope);
-        }
-        ExprKind::Match { scrutinee, arms } => {
-            collect_expr_referenced_names(scrutinee, refs, value_scope, type_scope);
-            for (pattern, body) in arms {
-                collect_pattern_referenced_names(pattern, refs);
-                let mut arm_scope = value_scope.clone();
-                insert_pattern_bindings(&mut arm_scope, pattern);
-                collect_expr_referenced_names(body, refs, &arm_scope, type_scope);
-            }
-        }
-        ExprKind::Block { stmts, final_expr } => {
-            let mut block_value_scope = value_scope.clone();
-            let mut block_type_scope = type_scope.clone();
-            for stmt in stmts {
-                collect_stmt_referenced_names(stmt, refs, &block_value_scope, &block_type_scope);
-                let bindings = stmt_bound_names(stmt);
-                block_value_scope.extend(bindings.values);
-                block_type_scope.extend(bindings.types);
-            }
-            if let Some(expr) = final_expr {
-                collect_expr_referenced_names(expr, refs, &block_value_scope, &block_type_scope);
-            }
-        }
-        ExprKind::Tuple(items) => {
-            for item in items {
-                collect_expr_referenced_names(item, refs, value_scope, type_scope);
-            }
-        }
-        ExprKind::Array(entries) => {
-            for entry in entries {
-                collect_expr_referenced_names(entry.expr(), refs, value_scope, type_scope);
-            }
-        }
-        ExprKind::Record(entries) => {
-            for entry in entries {
-                collect_expr_referenced_names(entry.expr(), refs, value_scope, type_scope);
-            }
-        }
-        ExprKind::Lambda { params, body, .. } => {
-            let mut lambda_scope = value_scope.clone();
-            for param in params {
-                if let Some(param_ty) = &param.ty {
-                    collect_type_referenced_names(param_ty, refs, type_scope);
-                }
-                insert_pattern_bindings(&mut lambda_scope, &param.pat);
-            }
-            collect_expr_referenced_names(body, refs, &lambda_scope, type_scope);
-        }
-        ExprKind::For {
-            pat,
-            iterable,
-            body,
-            ..
-        } => {
-            collect_expr_referenced_names(iterable, refs, value_scope, type_scope);
-            collect_pattern_referenced_names(pat, refs);
-            let mut body_scope = value_scope.clone();
-            insert_pattern_bindings(&mut body_scope, pat);
-            collect_expr_referenced_names(body, refs, &body_scope, type_scope);
-        }
-    }
-}
-
-fn collect_type_referenced_names(
-    ty: &Type,
-    refs: &mut CollectedNames,
-    type_scope: &HashSet<String>,
-) {
-    match ty {
-        Type::Ident(name) => {
-            if !type_scope.contains(name) {
-                refs.types.insert(name.clone());
-            }
-        }
-        Type::App(con, args) => {
-            collect_type_referenced_names(con, refs, type_scope);
-            for arg in args {
-                collect_type_referenced_names(arg, refs, type_scope);
-            }
-        }
-        Type::Func(params, ret) => {
-            for param in params {
-                collect_type_referenced_names(&param.ty, refs, type_scope);
-            }
-            collect_type_referenced_names(&ret.ty, refs, type_scope);
-        }
-        Type::Tuple(items) => {
-            for item in items {
-                collect_type_referenced_names(item, refs, type_scope);
-            }
-        }
-        Type::Record(fields, _) => {
-            for (_, field_ty) in fields {
-                collect_type_referenced_names(field_ty, refs, type_scope);
-            }
-        }
-        Type::Var(_) | Type::Unit | Type::Hole => {}
-    }
-}
-
-fn collect_pattern_referenced_names(pat: &Pattern, refs: &mut CollectedNames) {
-    match pat {
-        Pattern::Constructor { name, .. } => {
-            refs.values.insert(name.clone());
-        }
-        Pattern::List { elements, .. } | Pattern::Tuple(elements) => {
-            for element in elements {
-                collect_pattern_referenced_names(element, refs);
-            }
-        }
-        Pattern::Wildcard
-        | Pattern::StringLit(_)
-        | Pattern::Variable(_, _)
-        | Pattern::Record { .. } => {}
-    }
-}
-
-// ── Dict resolution helpers ───────────────────────────────────────────────────
-
-fn resolve_local_dict_name(
-    pending: &PendingDictArg,
-    constraints: &[TraitConstraint],
-    subst: &Subst,
-) -> Option<DictRef> {
-    let resolved = subst.apply(&Ty::Var(pending.var));
-    if let Ty::Var(var) = resolved {
-        constraints
-            .iter()
-            .find(|c| c.var == var && c.trait_name == pending.trait_name)
-            .map(|constraint| DictRef::Param(dict_param_name(constraint)))
-    } else {
-        None
-    }
-}
-
-fn resolve_local_or_concrete(
-    pending: &PendingDictArg,
-    constraints: &[TraitConstraint],
-    env: &TypeEnv,
-    known_impl_dicts: &HashSet<String>,
-    subst: &Subst,
-) -> Option<DictRef> {
-    resolve_local_dict_name(pending, constraints, subst)
-        .or_else(|| resolve_concrete(pending, env, known_impl_dicts, subst))
-}
-
-fn resolve_concrete(
-    pending: &PendingDictArg,
-    env: &TypeEnv,
-    known_impl_dicts: &HashSet<String>,
-    subst: &Subst,
-) -> Option<DictRef> {
-    let resolved = subst.apply(&Ty::Var(pending.var));
-    resolve_concrete_dict_ref(&pending.trait_name, &resolved, env, known_impl_dicts)
-}
-
-fn resolve_concrete_dict_ref(
-    trait_name: &str,
-    ty: &Ty,
-    env: &TypeEnv,
-    known_impl_dicts: &HashSet<String>,
-) -> Option<DictRef> {
-    if trait_name == "Eq"
-        && let Ty::Tuple(items) = ty
-    {
-        let args = items
-            .iter()
-            .map(|item| resolve_concrete_dict_ref("Eq", item, env, known_impl_dicts))
-            .collect::<Option<Vec<_>>>()?;
-        return Some(DictRef::Structural(StructuralDictRef {
-            trait_name: "Eq".to_string(),
-            target: DictTarget::Tuple(items.len()),
-            args,
-        }));
-    }
-    let target_name = ty_target_name(ty)?;
-    if !has_trait_impl(env, known_impl_dicts, trait_name, &target_name) {
-        return None;
-    }
-    Some(DictRef::Concrete(format!(
-        "__{}__{}",
-        trait_name, target_name
-    )))
-}
-
-// ── Dict-use resolution pass ──────────────────────────────────────────────────
-
-/// Resolve all `pending_dict_args` / `pending_op` / `pending_iter` nodes in an
-/// expression tree.
-///
-/// `resolve` maps a pending arg to a dict name (or `None` if not yet concrete).
-/// `process_fn` controls whether `Stmt::Fn` / `Stmt::Op` inside block
-/// expressions are recursed into — `false` during the per-function local pass
-/// (those bodies are resolved by their own call), `true` during the global
-/// final pass.
-fn resolve_dict_uses_expr(
-    expr: &mut Expr,
-    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
-    process_fn: bool,
-) -> Result<(), TypeError> {
-    resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, true)
-}
-
-fn resolve_dict_uses_expr_lenient(
-    expr: &mut Expr,
-    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
-    process_fn: bool,
-) -> Result<(), TypeError> {
-    resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, false)
-}
-
-fn resolve_dict_uses_expr_with_mode(
-    expr: &mut Expr,
-    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
-    process_fn: bool,
-    hard_unresolved: bool,
-) -> Result<(), TypeError> {
-    match &mut expr.kind {
-        ExprKind::Binary {
-            lhs,
-            rhs,
-            op,
-            resolved_op,
-            pending_op,
-            dict_args,
-            pending_dict_args,
-            ..
-        } => {
-            if let BinOp::Custom(op_str) = op
-                && let Some(pending) = pending_op.as_ref()
-            {
-                if let Some(dict) = resolve(pending) {
-                    *resolved_op = Some(ResolvedCallee::DictMethod {
-                        dict,
-                        method: mangle_op(op_str),
-                    });
-                    *pending_op = None;
-                } else if hard_unresolved {
-                    return Err(TypeError::UnresolvedTrait {
-                        context: "operator".to_string(),
-                        trait_name: pending.trait_name.clone(),
-                    });
-                }
-            }
-            if hard_unresolved {
-                drain_pending(pending_dict_args, dict_args, "call", resolve)?;
-            } else {
-                drain_pending_lenient(pending_dict_args, dict_args, resolve);
-            }
-            resolve_dict_uses_expr_with_mode(lhs, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(rhs, resolve, process_fn, hard_unresolved)?;
-            Ok(())
-        }
-        ExprKind::Call {
-            callee,
-            args,
-            arg_wrappers,
-            resolved_callee,
-            pending_trait_method,
-            dict_args,
-            pending_dict_args,
-            ..
-        } => {
-            if let Some((pending, method_name)) = pending_trait_method.take() {
-                if let Some(dict) = resolve(&pending) {
-                    *resolved_callee = Some(ResolvedCallee::DictMethod {
-                        dict,
-                        method: mangle_op(&method_name),
-                    });
-                } else {
-                    if hard_unresolved {
-                        return Err(TypeError::UnresolvedTrait {
-                            context: "method call".to_string(),
-                            trait_name: pending.trait_name.clone(),
-                        });
-                    }
-                    *pending_trait_method = Some((pending, method_name));
-                }
-            }
-            if hard_unresolved {
-                drain_pending(pending_dict_args, dict_args, "call", resolve)?;
-            } else {
-                drain_pending_lenient(pending_dict_args, dict_args, resolve);
-            }
-            for wrapper in arg_wrappers.iter_mut().flatten() {
-                drain_pending_lenient(
-                    &mut wrapper.pending_dict_args,
-                    &mut wrapper.dict_args,
-                    resolve,
-                );
-            }
-            resolve_dict_uses_expr_with_mode(callee, resolve, process_fn, hard_unresolved)?;
-            for arg in args {
-                resolve_dict_uses_expr_with_mode(arg, resolve, process_fn, hard_unresolved)?;
-            }
-            Ok(())
-        }
-        ExprKind::Block { stmts, final_expr } => {
-            for stmt in stmts {
-                resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, hard_unresolved)?;
-            }
-            if let Some(e) = final_expr {
-                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)?;
-            }
-            Ok(())
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            resolve_dict_uses_expr_with_mode(cond, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(then_branch, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(else_branch, resolve, process_fn, hard_unresolved)?;
-            Ok(())
-        }
-        ExprKind::Lambda { body, .. } => {
-            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)
-        }
-        ExprKind::Match { scrutinee, arms } => {
-            resolve_dict_uses_expr_with_mode(scrutinee, resolve, process_fn, hard_unresolved)?;
-            for (_, arm_expr) in arms {
-                resolve_dict_uses_expr_with_mode(arm_expr, resolve, process_fn, hard_unresolved)?;
-            }
-            Ok(())
-        }
-        ExprKind::Loop(body) => {
-            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)
-        }
-        ExprKind::Assign { target, value } => {
-            resolve_dict_uses_expr_with_mode(target, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(value, resolve, process_fn, hard_unresolved)?;
-            Ok(())
-        }
-        ExprKind::Not(e) => {
-            resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)
-        }
-        ExprKind::Break(Some(e)) | ExprKind::Return(Some(e)) => {
-            resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)
-        }
-        ExprKind::Tuple(es) => {
-            for e in es {
-                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)?;
-            }
-            Ok(())
-        }
-        ExprKind::Array(entries) => {
-            for entry in entries {
-                resolve_dict_uses_expr_with_mode(
-                    entry.expr_mut(),
-                    resolve,
-                    process_fn,
-                    hard_unresolved,
-                )?;
-            }
-            Ok(())
-        }
-        ExprKind::Record(entries) => {
-            for entry in entries {
-                resolve_dict_uses_expr_with_mode(
-                    entry.expr_mut(),
-                    resolve,
-                    process_fn,
-                    hard_unresolved,
-                )?;
-            }
-            Ok(())
-        }
-        ExprKind::FieldAccess { expr, .. } => {
-            resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, hard_unresolved)
-        }
-        ExprKind::For {
-            iterable,
-            body,
-            resolved_iter,
-            pending_iter,
-            ..
-        } => {
-            if let Some(pending) = pending_iter.as_ref() {
-                if let Some(dict) = resolve(pending) {
-                    *resolved_iter = Some(ResolvedCallee::DictMethod {
-                        dict,
-                        method: "iter".to_string(),
-                    });
-                    *pending_iter = None;
-                } else if hard_unresolved {
-                    return Err(TypeError::UnresolvedTrait {
-                        context: "iterator".to_string(),
-                        trait_name: pending.trait_name.clone(),
-                    });
-                }
-            }
-            resolve_dict_uses_expr_with_mode(iterable, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)?;
-            Ok(())
-        }
-        ExprKind::Import(_) => Ok(()),
-        _ => Ok(()),
-    }
-}
-
-/// Stmt-level traversal shared by both passes. `process_fn` matches the same
-/// flag as `resolve_dict_uses_expr`.
-fn resolve_dict_uses_stmt_inner(
-    stmt: &mut Stmt,
-    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
-    process_fn: bool,
-) -> Result<(), TypeError> {
-    resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, true)
-}
-
-fn resolve_dict_uses_stmt_inner_with_mode(
-    stmt: &mut Stmt,
-    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
-    process_fn: bool,
-    hard_unresolved: bool,
-) -> Result<(), TypeError> {
-    match stmt {
-        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
-            if process_fn {
-                resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)
-            } else {
-                Ok(()) // handled during that function's own inference
-            }
-        }
-        Stmt::Let { value, .. } => {
-            resolve_dict_uses_expr_with_mode(value, resolve, process_fn, hard_unresolved)
-        }
-        Stmt::Expr(e) => resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved),
-        Stmt::Impl(id) => {
-            for method in &mut id.methods {
-                resolve_dict_uses_expr_with_mode(
-                    &mut method.body,
-                    resolve,
-                    process_fn,
-                    hard_unresolved,
-                )?;
-            }
-            Ok(())
-        }
-        Stmt::InherentImpl(id) => {
-            for method in &mut id.methods {
-                resolve_dict_uses_expr_with_mode(
-                    &mut method.body,
-                    resolve,
-                    process_fn,
-                    hard_unresolved,
-                )?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Final global pass: resolves remaining pending dict args using the fully
-/// completed substitution. Called once per top-level statement after all
-/// inference is done.
-fn final_pass_stmt(
-    stmt: &mut Stmt,
-    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
-) -> Result<(), TypeError> {
-    resolve_dict_uses_stmt_inner(stmt, resolve, true)
-}
-
-/// Drain `pending_dict_args` into `dict_args` using `resolve`, emitting an
-/// error if a pending arg cannot be resolved.
-fn drain_pending(
-    pending: &mut Vec<PendingDictArg>,
-    resolved: &mut Vec<DictRef>,
-    context: &str,
-    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
-) -> Result<(), TypeError> {
-    let names: Result<Vec<_>, _> = pending
-        .iter()
-        .map(|p| {
-            resolve(p).ok_or_else(|| TypeError::UnresolvedTrait {
-                context: context.to_string(),
-                trait_name: p.trait_name.clone(),
-            })
-        })
-        .collect();
-    resolved.extend(names?);
-    pending.clear();
-    Ok(())
-}
-
-fn drain_pending_lenient(
-    pending: &mut Vec<PendingDictArg>,
-    resolved: &mut Vec<DictRef>,
-    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
-) {
-    let mut unresolved = Vec::new();
-    for item in pending.drain(..) {
-        if let Some(name) = resolve(&item) {
-            resolved.push(name);
-        } else {
-            unresolved.push(item);
-        }
-    }
-    *pending = unresolved;
 }
 
 fn expr_always_exits(expr: &Expr, include_bc: bool) -> bool {
@@ -4875,6 +3135,37 @@ mod tests {
                 ref impl_target,
             } if trait_name == "Show" && impl_target == "Boxed"
         ));
+    }
+
+    #[test]
+    fn collecting_inference_does_not_use_failed_local_impl_dict() {
+        let mut program = parse_source(
+            "type Boxed = Boxed(f64)
+
+             trait Show 'a {
+               fn show(x: 'a) -> string
+             }
+
+             impl Show for Boxed {
+               fn show(x) { 1 }
+             }
+
+             show(Boxed(1))\n",
+        )
+        .expect("source should parse");
+
+        let mut infer = Infer::new();
+        let (_inference, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            matches!(
+                &diagnostic.error,
+                TypeError::MissingTraitImpl {
+                    trait_name,
+                    impl_target,
+                } if trait_name == "Show" && impl_target == "Boxed"
+            )
+        }));
     }
 
     #[test]

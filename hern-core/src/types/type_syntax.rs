@@ -1,4 +1,4 @@
-use crate::ast::Type;
+use crate::ast::{Expr, ExprKind, InherentMethod, Param, Pattern, Stmt, Type};
 use crate::types::{Ty, error::TypeError};
 use std::collections::HashSet;
 
@@ -121,6 +121,179 @@ pub(super) fn validate_inherent_impl_target(
         _ => Err(TypeError::InvalidInherentImplTarget(type_name_for_error(
             target,
         ))),
+    }
+}
+
+pub(super) fn is_self_param(param: &Param) -> bool {
+    matches!(&param.pat, Pattern::Variable(name, _) if name == "self")
+}
+
+pub(super) fn substitute_self_in_inherent_method(method: &mut InherentMethod, target: &Type) {
+    for param in &mut method.params {
+        if let Some(ty) = &mut param.ty {
+            substitute_self_in_type(ty, target);
+        }
+    }
+    if let Some(ret_type) = &mut method.ret_type {
+        substitute_self_in_type(&mut ret_type.ty, target);
+    }
+    substitute_self_in_expr_types(&mut method.body, target);
+}
+
+fn substitute_self_in_type(ty: &mut Type, target: &Type) {
+    match ty {
+        Type::Ident(name) if name == "Self" => *ty = target.clone(),
+        Type::App(con, args) => {
+            substitute_self_in_type(con, target);
+            for arg in args {
+                substitute_self_in_type(arg, target);
+            }
+        }
+        Type::Func(params, ret) => {
+            for param in params {
+                substitute_self_in_type(&mut param.ty, target);
+            }
+            substitute_self_in_type(&mut ret.ty, target);
+        }
+        Type::Tuple(items) => {
+            for item in items {
+                substitute_self_in_type(item, target);
+            }
+        }
+        Type::Record(fields, _) => {
+            for (_, field_ty) in fields {
+                substitute_self_in_type(field_ty, target);
+            }
+        }
+        Type::Ident(_) | Type::Var(_) | Type::Unit | Type::Hole => {}
+    }
+}
+
+fn substitute_self_in_expr_types(expr: &mut Expr, target: &Type) {
+    match &mut expr.kind {
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Import(_)
+        | ExprKind::Unit
+        | ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None) => {}
+        ExprKind::AssociatedAccess {
+            target: access_target,
+            ..
+        } => substitute_self_in_type(access_target, target),
+        ExprKind::Not(expr)
+        | ExprKind::Loop(expr)
+        | ExprKind::Break(Some(expr))
+        | ExprKind::Return(Some(expr))
+        | ExprKind::FieldAccess { expr, .. } => substitute_self_in_expr_types(expr, target),
+        ExprKind::Assign { target: lhs, value }
+        | ExprKind::Binary {
+            lhs, rhs: value, ..
+        } => {
+            substitute_self_in_expr_types(lhs, target);
+            substitute_self_in_expr_types(value, target);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            substitute_self_in_expr_types(callee, target);
+            for arg in args {
+                substitute_self_in_expr_types(arg, target);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            substitute_self_in_expr_types(cond, target);
+            substitute_self_in_expr_types(then_branch, target);
+            substitute_self_in_expr_types(else_branch, target);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            substitute_self_in_expr_types(scrutinee, target);
+            for (_, body) in arms {
+                substitute_self_in_expr_types(body, target);
+            }
+        }
+        ExprKind::Block { stmts, final_expr } => {
+            for stmt in stmts {
+                substitute_self_in_stmt_types(stmt, target);
+            }
+            if let Some(expr) = final_expr {
+                substitute_self_in_expr_types(expr, target);
+            }
+        }
+        ExprKind::Tuple(items) => {
+            for item in items {
+                substitute_self_in_expr_types(item, target);
+            }
+        }
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                substitute_self_in_expr_types(entry.expr_mut(), target);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                substitute_self_in_expr_types(entry.expr_mut(), target);
+            }
+        }
+        ExprKind::Lambda { params, body, .. } => {
+            for param in params {
+                if let Some(ty) = &mut param.ty {
+                    substitute_self_in_type(ty, target);
+                }
+            }
+            substitute_self_in_expr_types(body, target);
+        }
+        ExprKind::For { iterable, body, .. } => {
+            substitute_self_in_expr_types(iterable, target);
+            substitute_self_in_expr_types(body, target);
+        }
+    }
+}
+
+fn substitute_self_in_stmt_types(stmt: &mut Stmt, target: &Type) {
+    match stmt {
+        Stmt::Let { ty, value, .. } => {
+            if let Some(ty) = ty {
+                substitute_self_in_type(ty, target);
+            }
+            substitute_self_in_expr_types(value, target);
+        }
+        Stmt::Fn {
+            params,
+            ret_type,
+            body,
+            ..
+        }
+        | Stmt::Op {
+            params,
+            ret_type,
+            body,
+            ..
+        } => {
+            for param in params {
+                if let Some(ty) = &mut param.ty {
+                    substitute_self_in_type(ty, target);
+                }
+            }
+            if let Some(ret_type) = ret_type {
+                substitute_self_in_type(&mut ret_type.ty, target);
+            }
+            substitute_self_in_expr_types(body, target);
+        }
+        Stmt::Expr(expr) => substitute_self_in_expr_types(expr, target),
+        // Nested item declarations own their own type scope. In particular, a nested
+        // impl's `Self` is not the outer inherent impl's `Self`.
+        Stmt::Trait(_)
+        | Stmt::Impl(_)
+        | Stmt::InherentImpl(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. } => {}
     }
 }
 
