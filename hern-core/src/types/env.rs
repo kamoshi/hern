@@ -35,7 +35,9 @@ impl TypeEnv {
     pub(super) fn free_vars(&self, s: &Subst) -> HashSet<TyVar> {
         let mut vars = HashSet::new();
         for info in self.0.values() {
-            vars.extend(free_type_vars(&s.apply_scheme(&info.scheme).ty));
+            for var in scheme_free_vars(&info.scheme) {
+                vars.extend(free_type_vars(&s.apply(&Ty::Var(var))));
+            }
         }
         vars
     }
@@ -43,17 +45,21 @@ impl TypeEnv {
     pub(super) fn free_vars_syntactic(&self) -> HashSet<TyVar> {
         let mut vars = HashSet::new();
         for info in self.0.values() {
-            let mut scheme_vars = free_type_vars(&info.scheme.ty);
-            for constraint in &info.scheme.constraints {
-                scheme_vars.insert(constraint.var);
-            }
-            for quantified in &info.scheme.vars {
-                scheme_vars.remove(quantified);
-            }
-            vars.extend(scheme_vars);
+            vars.extend(scheme_free_vars(&info.scheme));
         }
         vars
     }
+}
+
+fn scheme_free_vars(scheme: &crate::types::Scheme) -> HashSet<TyVar> {
+    let mut vars = free_type_vars(&scheme.ty);
+    for constraint in &scheme.constraints {
+        vars.insert(constraint.var);
+    }
+    for quantified in &scheme.vars {
+        vars.remove(quantified);
+    }
+    vars
 }
 
 impl fmt::Display for TypeEnv {

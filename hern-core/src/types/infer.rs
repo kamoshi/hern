@@ -4708,6 +4708,26 @@ mod tests {
     }
 
     #[test]
+    fn generalization_ignores_quantified_env_vars_before_substitution() {
+        let mut infer = Infer::new();
+        let mut env = TypeEnv::new();
+        env.insert(
+            "poly".to_string(),
+            EnvInfo::immutable(Scheme {
+                vars: vec![0],
+                constraints: vec![],
+                ty: Ty::Var(0),
+            }),
+        );
+
+        infer.subst.bind_ty(0, Ty::Var(1)).expect("valid alias");
+
+        let scheme = infer.generalize(&env, Ty::Var(1));
+
+        assert_eq!(scheme.vars, vec![1]);
+    }
+
+    #[test]
     fn concrete_constraints_are_resolved_without_callable_dict_params() {
         let mut infer = Infer::new();
         infer
