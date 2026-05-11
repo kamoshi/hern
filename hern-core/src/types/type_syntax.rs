@@ -158,10 +158,6 @@ pub(super) fn ty_target_name(ty: &Ty) -> Option<String> {
     }
 }
 
-pub(super) fn concrete_dict_name(trait_name: &str, ty: &Ty) -> Option<String> {
-    ty_target_name(ty).map(|name| format!("__{}__{}", trait_name, name))
-}
-
 pub(super) fn record_field_ty(ty: &Ty, field: &str) -> Option<Ty> {
     if let Ty::Record(row) = ty {
         row.fields

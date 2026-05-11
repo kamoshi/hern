@@ -1,0 +1,3 @@
+let dep = import "tuple_eq_import_dep";
+
+print(dep.eq_any((true, "x"), (true, "x")));

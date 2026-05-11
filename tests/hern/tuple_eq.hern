@@ -1,0 +1,12 @@
+fn pair_eq(a, b) {
+    a == b
+}
+
+fn eq_with_bound['a: Eq](a: ('a, f64), b: ('a, f64)) -> bool {
+    a == b
+}
+
+print((1.0, "a") == (1.0, "a"));
+print((1.0, "a") != (1.0, "b"));
+print(pair_eq((true, (2.0, "x")), (true, (2.0, "x"))));
+print(eq_with_bound(("x", 1.0), ("x", 1.0)));

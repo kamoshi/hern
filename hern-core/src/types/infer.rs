@@ -3,8 +3,8 @@ use super::{
         insert_pattern_bindings, is_irrefutable_let, is_irrefutable_param, pattern_is_catch_all,
     },
     type_syntax::{
-        concrete_dict_name, impl_target_name, inherent_impl_dict_name, record_field_ty,
-        subst_hkt_param, ty_target_name, validate_inherent_impl_target,
+        impl_target_name, inherent_impl_dict_name, record_field_ty, subst_hkt_param,
+        ty_target_name, validate_inherent_impl_target,
     },
 };
 use crate::ast::*;
@@ -30,7 +30,7 @@ struct ResolvedTraitMethod {
 #[derive(Debug, Clone)]
 struct InherentMethodInfo {
     scheme: Scheme,
-    resolved_callee: String,
+    resolved_callee: ResolvedCallee,
     has_receiver: bool,
 }
 
@@ -82,6 +82,11 @@ struct FinalizedTypeMaps {
     binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     callable_capabilities: HashMap<NodeId, CallableCapabilities>,
     fresh_place_exprs: HashSet<NodeId>,
+}
+
+enum DictResolution {
+    Resolved(DictRef),
+    Pending(PendingDictArg),
 }
 
 #[derive(Debug, Clone)]
@@ -272,7 +277,11 @@ impl Infer {
                                 name.clone(),
                                 InherentMethodInfo {
                                     scheme: method.scheme,
-                                    resolved_callee: format!("{}.{}", dict_name, mangle_op(&name)),
+                                    resolved_callee: ResolvedCallee::Function(format!(
+                                        "{}.{}",
+                                        dict_name,
+                                        mangle_op(&name)
+                                    )),
                                     has_receiver: method.has_receiver,
                                 },
                             )
@@ -640,8 +649,15 @@ impl Infer {
 
         *dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
-        let resolver =
-            |p: &PendingDictArg| resolve_local_or_concrete(p, &finalized.owned, &self.subst);
+        let resolver = |p: &PendingDictArg| {
+            resolve_local_or_concrete(
+                p,
+                &finalized.owned,
+                env,
+                &self.known_impl_dicts,
+                &self.subst,
+            )
+        };
         resolve_dict_uses_expr(body, &resolver, false)?;
 
         env.insert(
@@ -684,6 +700,15 @@ impl Infer {
             for method in &td.methods {
                 if method.fixity.is_none() {
                     continue;
+                }
+                if method.params.len() != 2 {
+                    return Err(TypeError::TraitMethodArityMismatch {
+                        trait_name: td.name.clone(),
+                        method: method.name.clone(),
+                        expected: 2,
+                        got: method.params.len(),
+                    }
+                    .at(method.span));
                 }
                 match self.op_trait_map.get(&method.name) {
                     Some(existing) if existing != &td.name => {
@@ -823,7 +848,8 @@ impl Infer {
         self.apply_env_subst(&mut env);
 
         for stmt in &mut program.stmts {
-            let resolver = |p: &PendingDictArg| resolve_concrete(p, &self.subst);
+            let resolver =
+                |p: &PendingDictArg| resolve_concrete(p, &env, &self.known_impl_dicts, &self.subst);
             final_pass_stmt(stmt, &resolver)?;
         }
 
@@ -1000,7 +1026,8 @@ impl Infer {
                 continue;
             }
             let span = stmt.span();
-            let resolver = |p: &PendingDictArg| resolve_concrete(p, &self.subst);
+            let resolver =
+                |p: &PendingDictArg| resolve_concrete(p, &env, &self.known_impl_dicts, &self.subst);
             if let Err(err) = final_pass_stmt(stmt, &resolver) {
                 diagnostics.push(err.at(span));
             }
@@ -1525,8 +1552,15 @@ impl Infer {
             self.pending_constraints.extend(finalized.bubbled.clone());
             method.dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
-            let resolver =
-                |p: &PendingDictArg| resolve_local_or_concrete(p, &finalized.owned, &self.subst);
+            let resolver = |p: &PendingDictArg| {
+                resolve_local_or_concrete(
+                    p,
+                    &finalized.owned,
+                    env,
+                    &self.known_impl_dicts,
+                    &self.subst,
+                )
+            };
             resolve_dict_uses_expr(&mut method.body, &resolver, false)?;
 
             let scheme = finalized.scheme.clone();
@@ -1539,7 +1573,11 @@ impl Infer {
                     method.name.clone(),
                     InherentMethodInfo {
                         scheme,
-                        resolved_callee: format!("{}.{}", dict_name, mangle_op(&method.name)),
+                        resolved_callee: ResolvedCallee::Function(format!(
+                            "{}.{}",
+                            dict_name,
+                            mangle_op(&method.name)
+                        )),
                         has_receiver,
                     },
                 );
@@ -1663,6 +1701,7 @@ impl Infer {
                             }
                             if !scheme.constraints.is_empty() {
                                 return self.infer_constrained_apply(
+                                    env,
                                     &scheme,
                                     vec![l_ty],
                                     dict_args,
@@ -1707,32 +1746,19 @@ impl Infer {
                                 self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
 
                             unify(&mut self.subst, l_ty, lhs_param_ty)?;
+                            unify(&mut self.subst, r_ty, rhs_param_ty)?;
 
                             let resolved_target = self.subst.apply(&Ty::Var(target_var));
-                            match ty_target_name(&resolved_target) {
-                                None => {
-                                    if let Ty::Var(v) = resolved_target {
-                                        self.pending_constraints.push(TraitConstraint {
-                                            var: v,
-                                            trait_name: trait_name.clone(),
-                                        });
-                                        *pending_op = Some(PendingDictArg {
-                                            var: v,
-                                            trait_name: trait_name.clone(),
-                                        });
-                                    }
-                                }
-                                Some(target_name) => {
-                                    *resolved_op = Some(format!(
-                                        "__{}__{}.{}",
-                                        trait_name,
-                                        target_name,
-                                        mangle_op(op)
-                                    ));
-                                }
-                            }
-
-                            unify(&mut self.subst, r_ty, rhs_param_ty)?;
+                            self.resolve_operator_dispatch(
+                                env,
+                                &trait_name,
+                                op,
+                                &resolved_target,
+                                resolved_op,
+                                pending_op,
+                                dict_args,
+                                pending_dict_args,
+                            )?;
                             Ok(self.subst.apply(&ret_ty))
                         } else {
                             // op is a regular (non-trait) operator function
@@ -1740,12 +1766,13 @@ impl Infer {
                                 let scheme = info.scheme.clone();
                                 if !scheme.constraints.is_empty() {
                                     let ret_ty = self.infer_constrained_apply(
+                                        env,
                                         &scheme,
                                         vec![l_ty, r_ty],
                                         dict_args,
                                         pending_dict_args,
                                     )?;
-                                    *resolved_op = Some(mangle_op(op));
+                                    *resolved_op = Some(ResolvedCallee::Function(mangle_op(op)));
                                     return Ok(ret_ty);
                                 }
                             }
@@ -1883,6 +1910,7 @@ impl Infer {
                         )?;
                         let arg_tys = self.infer_args(env, args, arg_wrappers)?;
                         return self.infer_constrained_apply(
+                            env,
                             &scheme,
                             arg_tys,
                             dict_args,
@@ -1917,12 +1945,15 @@ impl Infer {
                     Ty::Func(expected_params, expected_ret),
                 )?;
                 attach_dict_args(
+                    env,
+                    &self.known_impl_dicts,
                     dict_args,
                     pending_dict_args,
                     &mut self.pending_constraints,
                     &callee_constraints,
                     &self.subst,
-                );
+                )
+                .map_err(|e| e.at(expr.span))?;
                 if fresh_return && expr_id != NO_NODE_ID {
                     self.fresh_place_exprs.insert(expr_id);
                 }
@@ -2188,7 +2219,13 @@ impl Infer {
                 *dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
                 let resolver = |p: &PendingDictArg| {
-                    resolve_local_or_concrete(p, &finalized.owned, &self.subst)
+                    resolve_local_or_concrete(
+                        p,
+                        &finalized.owned,
+                        env,
+                        &self.known_impl_dicts,
+                        &self.subst,
+                    )
                 };
                 // Always use lenient mode: the inner lambda's resolver runs while
                 // outer `>>=` chains haven't yet unified types (e.g. `pure`'s
@@ -2260,7 +2297,18 @@ impl Infer {
                         }
                     }
                     Some(target_name) => {
-                        *resolved_iter = Some(format!("__Iterable__{}.iter", target_name));
+                        let dict_name = format!("__Iterable__{}", target_name);
+                        if !has_trait_impl(env, &self.known_impl_dicts, "Iterable", &target_name) {
+                            return Err(TypeError::MissingTraitImpl {
+                                trait_name: "Iterable".to_string(),
+                                impl_target: target_name,
+                            }
+                            .into());
+                        }
+                        *resolved_iter = Some(ResolvedCallee::DictMethod {
+                            dict: DictRef::Concrete(dict_name),
+                            method: "iter".to_string(),
+                        });
                     }
                 }
 
@@ -2288,12 +2336,135 @@ impl Infer {
         result.map_err(|err: SpannedTypeError| err.with_span_if_absent(expr.span))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_operator_dispatch(
+        &mut self,
+        env: &TypeEnv,
+        trait_name: &str,
+        op: &str,
+        resolved_target: &Ty,
+        resolved_op: &mut Option<ResolvedCallee>,
+        pending_op: &mut Option<PendingDictArg>,
+        _dict_args: &mut Vec<DictRef>,
+        _pending_dict_args: &mut Vec<PendingDictArg>,
+    ) -> Result<(), SpannedTypeError> {
+        match self
+            .resolve_trait_dict(env, trait_name, resolved_target.clone())
+            .map_err(SpannedTypeError::from)?
+        {
+            DictResolution::Resolved(dict) => {
+                *resolved_op = Some(ResolvedCallee::DictMethod {
+                    dict,
+                    method: mangle_op(op),
+                });
+            }
+            DictResolution::Pending(pending) => {
+                *pending_op = Some(pending);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_trait_dict(
+        &mut self,
+        env: &TypeEnv,
+        trait_name: &str,
+        target: Ty,
+    ) -> Result<DictResolution, TypeError> {
+        let target = self.subst.apply(&target);
+        if let Ty::Var(var) = target {
+            let constraint = TraitConstraint {
+                var,
+                trait_name: trait_name.to_string(),
+            };
+            self.pending_constraints.push(constraint.clone());
+            return Ok(DictResolution::Pending(PendingDictArg {
+                var,
+                trait_name: trait_name.to_string(),
+            }));
+        }
+        if let Some(dict) = self.resolve_structural_dict(env, trait_name, &target)? {
+            return Ok(DictResolution::Resolved(dict));
+        }
+        let Some(target_name) = ty_target_name(&target) else {
+            return Err(TypeError::MissingTraitImpl {
+                trait_name: trait_name.to_string(),
+                impl_target: format!("{}", target),
+            });
+        };
+        if !has_trait_impl(env, &self.known_impl_dicts, trait_name, &target_name) {
+            return Err(TypeError::MissingTraitImpl {
+                trait_name: trait_name.to_string(),
+                impl_target: target_name,
+            });
+        }
+        Ok(DictResolution::Resolved(DictRef::Concrete(format!(
+            "__{}__{}",
+            trait_name, target_name
+        ))))
+    }
+
+    fn resolve_structural_dict(
+        &mut self,
+        env: &TypeEnv,
+        trait_name: &str,
+        target: &Ty,
+    ) -> Result<Option<DictRef>, TypeError> {
+        match (trait_name, target) {
+            ("Eq", Ty::Tuple(items)) => Ok(Some(DictRef::Structural(StructuralDictRef {
+                trait_name: "Eq".to_string(),
+                target: DictTarget::Tuple(items.len()),
+                args: items
+                    .iter()
+                    .map(|item| self.resolve_eq_child_dict(env, item))
+                    .collect::<Result<_, _>>()?,
+            }))),
+            _ => Ok(None),
+        }
+    }
+
+    fn resolve_eq_child_dict(&mut self, env: &TypeEnv, ty: &Ty) -> Result<DictRef, TypeError> {
+        match self.subst.apply(ty) {
+            Ty::Tuple(items) => self
+                .resolve_structural_dict(env, "Eq", &Ty::Tuple(items))?
+                .ok_or_else(|| TypeError::MissingTraitImpl {
+                    trait_name: "Eq".to_string(),
+                    impl_target: format!("{}", ty),
+                }),
+            Ty::Var(var) => {
+                let constraint = TraitConstraint {
+                    var,
+                    trait_name: "Eq".to_string(),
+                };
+                self.pending_constraints.push(constraint.clone());
+                Ok(DictRef::Param(dict_param_name(&constraint)))
+            }
+            resolved => {
+                let Some(target_name) = ty_target_name(&resolved) else {
+                    return Err(TypeError::MissingTraitImpl {
+                        trait_name: "Eq".to_string(),
+                        impl_target: format!("{}", resolved),
+                    }
+                    .into());
+                };
+                if !has_trait_impl(env, &self.known_impl_dicts, "Eq", &target_name) {
+                    return Err(TypeError::MissingTraitImpl {
+                        trait_name: "Eq".to_string(),
+                        impl_target: target_name,
+                    }
+                    .into());
+                }
+                Ok(DictRef::Concrete(format!("__Eq__{}", target_name)))
+            }
+        }
+    }
+
     fn resolve_trait_method_call(
         &mut self,
         env: &TypeEnv,
         args: &mut [Expr],
         arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        resolved_callee: &mut Option<String>,
+        resolved_callee: &mut Option<ResolvedCallee>,
         pending_trait_method: &mut Option<(PendingDictArg, String)>,
         trait_def: TraitDef,
         method: TraitMethod,
@@ -2363,12 +2534,10 @@ impl Infer {
                 .into());
             };
 
-            *resolved_callee = Some(format!(
-                "__{}__{}.{}",
-                trait_name,
-                target_name,
-                mangle_op(&method_name)
-            ));
+            *resolved_callee = Some(ResolvedCallee::DictMethod {
+                dict: DictRef::Concrete(format!("__{}__{}", trait_name, target_name)),
+                method: mangle_op(&method_name),
+            });
             Ok(self.subst.apply(&ret_ty))
         } else {
             // ── Abstract unification + pending dispatch ───────────────────────
@@ -2408,8 +2577,7 @@ impl Infer {
                 }
                 Some(target_name) => {
                     let dict_name = format!("__{}__{}", trait_name, target_name);
-                    if env.get(&dict_name).is_none()
-                        && !self.known_impl_dicts.contains(&dict_name)
+                    if env.get(&dict_name).is_none() && !self.known_impl_dicts.contains(&dict_name)
                     {
                         return Err(TypeError::MissingTraitImpl {
                             trait_name: trait_name.clone(),
@@ -2417,12 +2585,10 @@ impl Infer {
                         }
                         .into());
                     }
-                    *resolved_callee = Some(format!(
-                        "__{}__{}.{}",
-                        trait_name,
-                        target_name,
-                        mangle_op(&method_name)
-                    ));
+                    *resolved_callee = Some(ResolvedCallee::DictMethod {
+                        dict: DictRef::Concrete(format!("__{}__{}", trait_name, target_name)),
+                        method: mangle_op(&method_name),
+                    });
                     Ok(self.subst.apply(&ret_ty))
                 }
             }
@@ -2468,8 +2634,8 @@ impl Infer {
         member_span: SourceSpan,
         args: &mut [Expr],
         arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        resolved_callee: &mut Option<String>,
-        dict_args: &mut Vec<String>,
+        resolved_callee: &mut Option<ResolvedCallee>,
+        dict_args: &mut Vec<DictRef>,
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<Ty, SpannedTypeError> {
         let target_name = validate_inherent_impl_target(target, &self.declared_types)
@@ -2507,6 +2673,7 @@ impl Infer {
         let return_capability = scheme_return_capability(&method_info.scheme);
         let fresh_return = return_capability == ReturnCapability::FreshPlace;
         let ret_ty = self.infer_constrained_apply(
+            env,
             &method_info.scheme,
             arg_tys.clone(),
             dict_args,
@@ -2540,8 +2707,8 @@ impl Infer {
         args: &mut [Expr],
         is_method_call: &mut bool,
         arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        resolved_callee: &mut Option<String>,
-        dict_args: &mut Vec<String>,
+        resolved_callee: &mut Option<ResolvedCallee>,
+        dict_args: &mut Vec<DictRef>,
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<Ty, SpannedTypeError> {
         let inferred_receiver_ty = self.infer_expr(env, receiver)?;
@@ -2568,12 +2735,15 @@ impl Infer {
         if let Some(mut field_ty) = record_field_ty(&receiver_ty, method_name) {
             if let Ty::Qualified(constraints, inner) = field_ty {
                 attach_dict_args(
+                    env,
+                    &self.known_impl_dicts,
                     dict_args,
                     pending_dict_args,
                     &mut self.pending_constraints,
                     &constraints,
                     &self.subst,
-                );
+                )
+                .map_err(|e| e.at(receiver.span))?;
                 field_ty = *inner;
             }
             self.record_symbol_type(callee_id, field_ty.clone());
@@ -2648,6 +2818,7 @@ impl Infer {
             arg_tys.push(receiver_ty);
             arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
             let ret_ty = self.infer_constrained_apply(
+                env,
                 &method_info.scheme,
                 arg_tys.clone(),
                 dict_args,
@@ -2689,6 +2860,7 @@ impl Infer {
             arg_tys.push(receiver_ty);
             arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
             let ret_ty = self.infer_constrained_apply(
+                env,
                 &method_info.scheme,
                 arg_tys.clone(),
                 dict_args,
@@ -2718,6 +2890,7 @@ impl Infer {
             arg_tys.push(receiver_ty);
             arg_tys.extend(self.infer_args(env, args, arg_wrappers)?);
             let ret_ty = self.infer_constrained_apply(
+                env,
                 &scheme,
                 arg_tys.clone(),
                 dict_args,
@@ -2731,7 +2904,7 @@ impl Infer {
                 ),
             );
             *is_method_call = true;
-            *resolved_callee = Some(method_name.to_string());
+            *resolved_callee = Some(ResolvedCallee::Function(method_name.to_string()));
             return Ok(ret_ty);
         }
 
@@ -2805,12 +2978,15 @@ impl Infer {
                     pending_dict_args: Vec::new(),
                 };
                 attach_dict_args(
+                    env,
+                    &self.known_impl_dicts,
                     &mut wrapper.dict_args,
                     &mut wrapper.pending_dict_args,
                     &mut self.pending_constraints,
                     &constraints,
                     &self.subst,
-                );
+                )
+                .map_err(|e| e.at(arg.span))?;
                 arg_ty = *inner;
                 Some(wrapper)
             } else {
@@ -2824,9 +3000,10 @@ impl Infer {
 
     fn infer_constrained_apply(
         &mut self,
+        env: &TypeEnv,
         scheme: &Scheme,
         arg_tys: Vec<Ty>,
-        dict_args: &mut Vec<String>,
+        dict_args: &mut Vec<DictRef>,
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<Ty, SpannedTypeError> {
         let instantiated = self.instantiate_scheme(scheme);
@@ -2839,12 +3016,15 @@ impl Infer {
             Ty::Func(expected_params, expected_ret),
         )?;
         attach_dict_args(
+            env,
+            &self.known_impl_dicts,
             dict_args,
             pending_dict_args,
             &mut self.pending_constraints,
             &instantiated.constraints,
             &self.subst,
-        );
+        )
+        .map_err(TypeError::unspanned)?;
         Ok(self.subst.apply(&ret_ty))
     }
 
@@ -3571,17 +3751,17 @@ fn has_mut_place_func_params(ty: &Ty) -> bool {
 }
 
 fn attach_dict_args(
-    dict_args: &mut Vec<String>,
+    env: &TypeEnv,
+    known_impl_dicts: &HashSet<String>,
+    dict_args: &mut Vec<DictRef>,
     pending_dict_args: &mut Vec<PendingDictArg>,
     pending_constraints: &mut Vec<TraitConstraint>,
     constraints: &[TraitConstraint],
     subst: &Subst,
-) {
+) -> Result<(), TypeError> {
     for constraint in constraints {
         let resolved = subst.apply(&Ty::Var(constraint.var));
-        if let Some(dict_name) = concrete_dict_name(&constraint.trait_name, &resolved) {
-            dict_args.push(dict_name);
-        } else if let Ty::Var(var) = resolved {
+        if let Ty::Var(var) = resolved {
             pending_constraints.push(TraitConstraint {
                 var,
                 trait_name: constraint.trait_name.clone(),
@@ -3590,10 +3770,28 @@ fn attach_dict_args(
                 var,
                 trait_name: constraint.trait_name.clone(),
             });
+        } else if let Some(dict_ref) =
+            resolve_concrete_dict_ref(&constraint.trait_name, &resolved, env, known_impl_dicts)
+        {
+            dict_args.push(dict_ref);
         } else {
-            unreachable!("Resolved constraint target must be concrete or a type variable")
+            return Err(TypeError::MissingTraitImpl {
+                trait_name: constraint.trait_name.clone(),
+                impl_target: format!("{}", resolved),
+            });
         }
     }
+    Ok(())
+}
+
+fn has_trait_impl(
+    env: &TypeEnv,
+    known_impl_dicts: &HashSet<String>,
+    trait_name: &str,
+    target_name: &str,
+) -> bool {
+    let dict_name = format!("__{}__{}", trait_name, target_name);
+    env.get(&dict_name).is_some() || known_impl_dicts.contains(&dict_name)
 }
 
 /// Returns true if the AST `Type` mentions `var_name` as a type variable.
@@ -3953,13 +4151,13 @@ fn resolve_local_dict_name(
     pending: &PendingDictArg,
     constraints: &[TraitConstraint],
     subst: &Subst,
-) -> Option<String> {
+) -> Option<DictRef> {
     let resolved = subst.apply(&Ty::Var(pending.var));
     if let Ty::Var(var) = resolved {
         constraints
             .iter()
             .find(|c| c.var == var && c.trait_name == pending.trait_name)
-            .map(dict_param_name)
+            .map(|constraint| DictRef::Param(dict_param_name(constraint)))
     } else {
         None
     }
@@ -3968,14 +4166,51 @@ fn resolve_local_dict_name(
 fn resolve_local_or_concrete(
     pending: &PendingDictArg,
     constraints: &[TraitConstraint],
+    env: &TypeEnv,
+    known_impl_dicts: &HashSet<String>,
     subst: &Subst,
-) -> Option<String> {
+) -> Option<DictRef> {
     resolve_local_dict_name(pending, constraints, subst)
-        .or_else(|| resolve_concrete(pending, subst))
+        .or_else(|| resolve_concrete(pending, env, known_impl_dicts, subst))
 }
 
-fn resolve_concrete(pending: &PendingDictArg, subst: &Subst) -> Option<String> {
-    concrete_dict_name(&pending.trait_name, &subst.apply(&Ty::Var(pending.var)))
+fn resolve_concrete(
+    pending: &PendingDictArg,
+    env: &TypeEnv,
+    known_impl_dicts: &HashSet<String>,
+    subst: &Subst,
+) -> Option<DictRef> {
+    let resolved = subst.apply(&Ty::Var(pending.var));
+    resolve_concrete_dict_ref(&pending.trait_name, &resolved, env, known_impl_dicts)
+}
+
+fn resolve_concrete_dict_ref(
+    trait_name: &str,
+    ty: &Ty,
+    env: &TypeEnv,
+    known_impl_dicts: &HashSet<String>,
+) -> Option<DictRef> {
+    if trait_name == "Eq"
+        && let Ty::Tuple(items) = ty
+    {
+        let args = items
+            .iter()
+            .map(|item| resolve_concrete_dict_ref("Eq", item, env, known_impl_dicts))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(DictRef::Structural(StructuralDictRef {
+            trait_name: "Eq".to_string(),
+            target: DictTarget::Tuple(items.len()),
+            args,
+        }));
+    }
+    let target_name = ty_target_name(ty)?;
+    if !has_trait_impl(env, known_impl_dicts, trait_name, &target_name) {
+        return None;
+    }
+    Some(DictRef::Concrete(format!(
+        "__{}__{}",
+        trait_name, target_name
+    )))
 }
 
 // ── Dict-use resolution pass ──────────────────────────────────────────────────
@@ -3990,7 +4225,7 @@ fn resolve_concrete(pending: &PendingDictArg, subst: &Subst) -> Option<String> {
 /// final pass.
 fn resolve_dict_uses_expr(
     expr: &mut Expr,
-    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
 ) -> Result<(), TypeError> {
     resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, true)
@@ -3998,7 +4233,7 @@ fn resolve_dict_uses_expr(
 
 fn resolve_dict_uses_expr_lenient(
     expr: &mut Expr,
-    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
 ) -> Result<(), TypeError> {
     resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, false)
@@ -4006,7 +4241,7 @@ fn resolve_dict_uses_expr_lenient(
 
 fn resolve_dict_uses_expr_with_mode(
     expr: &mut Expr,
-    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
     hard_unresolved: bool,
 ) -> Result<(), TypeError> {
@@ -4024,8 +4259,11 @@ fn resolve_dict_uses_expr_with_mode(
             if let BinOp::Custom(op_str) = op
                 && let Some(pending) = pending_op.as_ref()
             {
-                if let Some(dict_name) = resolve(pending) {
-                    *resolved_op = Some(format!("{}.{}", dict_name, mangle_op(op_str)));
+                if let Some(dict) = resolve(pending) {
+                    *resolved_op = Some(ResolvedCallee::DictMethod {
+                        dict,
+                        method: mangle_op(op_str),
+                    });
                     *pending_op = None;
                 } else if hard_unresolved {
                     return Err(TypeError::UnresolvedTrait {
@@ -4054,8 +4292,11 @@ fn resolve_dict_uses_expr_with_mode(
             ..
         } => {
             if let Some((pending, method_name)) = pending_trait_method.take() {
-                if let Some(dict_name) = resolve(&pending) {
-                    *resolved_callee = Some(format!("{}.{}", dict_name, mangle_op(&method_name)));
+                if let Some(dict) = resolve(&pending) {
+                    *resolved_callee = Some(ResolvedCallee::DictMethod {
+                        dict,
+                        method: mangle_op(&method_name),
+                    });
                 } else {
                     if hard_unresolved {
                         return Err(TypeError::UnresolvedTrait {
@@ -4166,8 +4407,11 @@ fn resolve_dict_uses_expr_with_mode(
             ..
         } => {
             if let Some(pending) = pending_iter.as_ref() {
-                if let Some(dict_name) = resolve(pending) {
-                    *resolved_iter = Some(format!("{}.iter", dict_name));
+                if let Some(dict) = resolve(pending) {
+                    *resolved_iter = Some(ResolvedCallee::DictMethod {
+                        dict,
+                        method: "iter".to_string(),
+                    });
                     *pending_iter = None;
                 } else if hard_unresolved {
                     return Err(TypeError::UnresolvedTrait {
@@ -4189,7 +4433,7 @@ fn resolve_dict_uses_expr_with_mode(
 /// flag as `resolve_dict_uses_expr`.
 fn resolve_dict_uses_stmt_inner(
     stmt: &mut Stmt,
-    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
 ) -> Result<(), TypeError> {
     resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, true)
@@ -4197,7 +4441,7 @@ fn resolve_dict_uses_stmt_inner(
 
 fn resolve_dict_uses_stmt_inner_with_mode(
     stmt: &mut Stmt,
-    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
     hard_unresolved: bool,
 ) -> Result<(), TypeError> {
@@ -4244,7 +4488,7 @@ fn resolve_dict_uses_stmt_inner_with_mode(
 /// inference is done.
 fn final_pass_stmt(
     stmt: &mut Stmt,
-    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
 ) -> Result<(), TypeError> {
     resolve_dict_uses_stmt_inner(stmt, resolve, true)
 }
@@ -4253,9 +4497,9 @@ fn final_pass_stmt(
 /// error if a pending arg cannot be resolved.
 fn drain_pending(
     pending: &mut Vec<PendingDictArg>,
-    resolved: &mut Vec<String>,
+    resolved: &mut Vec<DictRef>,
     context: &str,
-    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
 ) -> Result<(), TypeError> {
     let names: Result<Vec<_>, _> = pending
         .iter()
@@ -4273,8 +4517,8 @@ fn drain_pending(
 
 fn drain_pending_lenient(
     pending: &mut Vec<PendingDictArg>,
-    resolved: &mut Vec<String>,
-    resolve: &impl Fn(&PendingDictArg) -> Option<String>,
+    resolved: &mut Vec<DictRef>,
+    resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
 ) {
     let mut unresolved = Vec::new();
     for item in pending.drain(..) {

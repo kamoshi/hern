@@ -1,0 +1,5 @@
+fn eq_any(a, b) {
+    a == b
+}
+
+#{ eq_any: eq_any }

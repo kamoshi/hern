@@ -466,16 +466,22 @@ impl LuaCodegen {
         else {
             return false;
         };
-        let callee_name = resolved_callee.as_deref().or_else(|| {
-            if *is_method_call {
-                return None;
-            }
-            if let ExprKind::Ident(name) = &callee.kind {
-                Some(name.as_str())
-            } else {
-                None
-            }
-        });
+        let callee_name = resolved_callee
+            .as_ref()
+            .and_then(|callee| match callee {
+                ResolvedCallee::Function(name) => Some(name.as_str()),
+                ResolvedCallee::DictMethod { .. } => None,
+            })
+            .or_else(|| {
+                if *is_method_call {
+                    return None;
+                }
+                if let ExprKind::Ident(name) = &callee.kind {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            });
         !matches!(
             callee_name,
             Some(name) if dict_args.is_empty()
@@ -511,21 +517,23 @@ impl LuaCodegen {
                 let r = self.gen_expr_with_subst(rhs, subst, pre)?;
                 match op {
                     BinOp::Pipe => {
-                        let mut all_args = dict_args.clone();
+                        let mut all_args = gen_dict_refs(dict_args);
                         all_args.push(l);
                         Some(format!("{}({})", r, all_args.join(", ")))
                     }
                     BinOp::Custom(op) => match resolved_op {
                         Some(resolved) => {
+                            let resolved = gen_resolved_callee(resolved);
                             if dict_args.is_empty()
                                 && let Some(inlined) =
-                                    self.gen_inline_call(resolved, &[l.clone(), r.clone()], pre)
+                                    self.gen_inline_call(&resolved, &[l.clone(), r.clone()], pre)
                             {
                                 return Some(inlined);
                             }
                             if dict_args.is_empty() {
                                 Some(format!("{}({}, {})", resolved, l, r))
                             } else {
+                                let dict_args = gen_dict_refs(dict_args);
                                 Some(format!(
                                     "{}({}, {}, {})",
                                     resolved,
@@ -549,9 +557,10 @@ impl LuaCodegen {
                 ..
             } => {
                 let callee_s = resolved_callee
-                    .clone()
+                    .as_ref()
+                    .map(gen_resolved_callee)
                     .or_else(|| self.gen_expr_with_subst(callee, subst, pre))?;
-                let mut all_args: Vec<String> = dict_args.clone();
+                let mut all_args: Vec<String> = gen_dict_refs(dict_args);
                 if let Some(receiver) = method_receiver(callee, *is_method_call) {
                     all_args.push(self.gen_expr_with_subst(receiver, subst, pre)?);
                 }
@@ -669,21 +678,23 @@ impl LuaCodegen {
                 let r = self.gen_expr(rhs, pre);
                 match op {
                     BinOp::Pipe => {
-                        let mut all_args = dict_args.clone();
+                        let mut all_args = gen_dict_refs(dict_args);
                         all_args.push(l);
                         format!("{}({})", r, all_args.join(", "))
                     }
                     BinOp::Custom(op) => match resolved_op {
                         Some(resolved) => {
+                            let resolved = gen_resolved_callee(resolved);
                             if dict_args.is_empty()
                                 && let Some(inlined) =
-                                    self.gen_inline_call(resolved, &[l.clone(), r.clone()], pre)
+                                    self.gen_inline_call(&resolved, &[l.clone(), r.clone()], pre)
                             {
                                 return inlined;
                             }
                             if dict_args.is_empty() {
                                 format!("{}({}, {})", resolved, l, r)
                             } else {
+                                let dict_args = gen_dict_refs(dict_args);
                                 format!("{}({}, {}, {})", resolved, dict_args.join(", "), l, r)
                             }
                         }
@@ -739,9 +750,10 @@ impl LuaCodegen {
                 ..
             } => {
                 let callee_s = resolved_callee
-                    .clone()
+                    .as_ref()
+                    .map(gen_resolved_callee)
                     .unwrap_or_else(|| self.gen_expr(callee, pre));
-                let mut all_args: Vec<String> = dict_args.clone();
+                let mut all_args: Vec<String> = gen_dict_refs(dict_args);
                 if let Some(receiver) = method_receiver(callee, *is_method_call) {
                     all_args.push(self.gen_expr(receiver, pre));
                 }
@@ -894,7 +906,10 @@ impl LuaCodegen {
                 let prev_break =
                     std::mem::replace(&mut self.current_break_label, break_label.clone());
 
-                let iter_fn = resolved_iter.clone().unwrap_or_else(|| "nil".to_string());
+                let iter_fn = resolved_iter
+                    .as_ref()
+                    .map(gen_resolved_callee)
+                    .unwrap_or_else(|| "nil".to_string());
                 let mut iter_pre = String::new();
                 let iter_s = self.gen_expr(iterable, &mut iter_pre);
                 let ind = self.ind();
@@ -1887,11 +1902,80 @@ fn wrap_call_argument(arg: String, wrapper: Option<&ArgWrapper>) -> String {
     if wrapper.dict_args.is_empty() {
         return arg;
     }
+    let dict_args = gen_dict_refs(&wrapper.dict_args);
     format!(
         "(function(...) return {}({}, ...) end)",
         arg,
-        wrapper.dict_args.join(", ")
+        dict_args.join(", ")
     )
+}
+
+fn gen_resolved_callee(callee: &ResolvedCallee) -> String {
+    match callee {
+        ResolvedCallee::Function(name) => name.clone(),
+        ResolvedCallee::DictMethod { dict, method } => {
+            format!("{}.{}", gen_dict_ref(dict), method)
+        }
+    }
+}
+
+fn gen_dict_refs(dicts: &[DictRef]) -> Vec<String> {
+    dicts.iter().map(gen_dict_ref).collect()
+}
+
+fn gen_dict_ref(dict: &DictRef) -> String {
+    match dict {
+        DictRef::Param(name) | DictRef::Concrete(name) => name.clone(),
+        DictRef::Structural(structural) => gen_structural_dict_ref(structural),
+    }
+}
+
+fn gen_structural_dict_ref(dict: &StructuralDictRef) -> String {
+    match (&dict.trait_name[..], &dict.target) {
+        ("Eq", DictTarget::Tuple(len)) => format!("({})", gen_tuple_eq_dict(*len, &dict.args)),
+        _ => "nil".to_string(),
+    }
+}
+
+fn gen_tuple_eq_dict(len: usize, args: &[DictRef]) -> String {
+    let eq = gen_tuple_eq_expr(len, args, "a", "b");
+    format!(
+        "{{ __op_eqeq = function(a, b) return {} end, __op_bneq = function(a, b) return (({}) == 0 and 1 or 0) end }}",
+        eq, eq
+    )
+}
+
+fn gen_tuple_eq_expr(len: usize, args: &[DictRef], lhs: &str, rhs: &str) -> String {
+    if len == 0 {
+        return "1".to_string();
+    }
+    let parts = args
+        .iter()
+        .enumerate()
+        .map(|(idx, dict)| match dict {
+            DictRef::Structural(StructuralDictRef {
+                trait_name,
+                target: DictTarget::Tuple(nested_len),
+                args,
+            }) if trait_name == "Eq" => gen_tuple_eq_expr(
+                *nested_len,
+                args,
+                &format!("({})[{}]", lhs, idx + 1),
+                &format!("({})[{}]", rhs, idx + 1),
+            ),
+            other => format!(
+                "{}.{}(({})[{}], ({})[{}])",
+                gen_dict_ref(other),
+                mangle_op("=="),
+                lhs,
+                idx + 1,
+                rhs,
+                idx + 1
+            ),
+        })
+        .map(|part| format!("({}) ~= 0", part))
+        .collect::<Vec<_>>();
+    format!("(({}) and 1 or 0)", parts.join(" and "))
 }
 
 fn bundle_module_var(name: &str) -> String {

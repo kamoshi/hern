@@ -146,8 +146,33 @@ pub struct PendingDictArg {
 }
 
 #[derive(Debug, Clone)]
+pub enum DictRef {
+    Param(String),
+    Concrete(String),
+    Structural(StructuralDictRef),
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuralDictRef {
+    pub trait_name: String,
+    pub target: DictTarget,
+    pub args: Vec<DictRef>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DictTarget {
+    Tuple(usize),
+}
+
+#[derive(Debug, Clone)]
+pub enum ResolvedCallee {
+    Function(String),
+    DictMethod { dict: DictRef, method: String },
+}
+
+#[derive(Debug, Clone)]
 pub struct ArgWrapper {
-    pub dict_args: Vec<String>,
+    pub dict_args: Vec<DictRef>,
     pub pending_dict_args: Vec<PendingDictArg>,
 }
 
@@ -414,9 +439,9 @@ pub enum ExprKind {
         /// Source span of the operator token itself, used for hover.
         op_span: SourceSpan,
         rhs: Box<Expr>,
-        resolved_op: Option<String>,
+        resolved_op: Option<ResolvedCallee>,
         pending_op: Option<PendingDictArg>,
-        dict_args: Vec<String>,
+        dict_args: Vec<DictRef>,
         pending_dict_args: Vec<PendingDictArg>,
     },
     Call {
@@ -425,9 +450,9 @@ pub enum ExprKind {
         is_method_call: bool,
         arg_wrappers: Vec<Option<ArgWrapper>>,
         /// Resolved callee for trait methods, e.g. `__Functor__Option.map`
-        resolved_callee: Option<String>,
+        resolved_callee: Option<ResolvedCallee>,
         pending_trait_method: Option<(PendingDictArg, String)>,
-        dict_args: Vec<String>,
+        dict_args: Vec<DictRef>,
         pending_dict_args: Vec<PendingDictArg>,
     },
     If {
@@ -471,7 +496,7 @@ pub enum ExprKind {
         pat: Pattern,
         iterable: Box<Expr>,
         body: Box<Expr>,
-        resolved_iter: Option<String>,
+        resolved_iter: Option<ResolvedCallee>,
         pending_iter: Option<PendingDictArg>,
     },
     Unit,

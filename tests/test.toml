@@ -539,6 +539,11 @@ path = "tests/hern/trait_impl_arity_error.hern"
 expect = "error"
 error_contains = "wrong number of arguments"
 
+[tests.operator_trait_arity_error]
+path = "tests/hern/operator_trait_arity_error.hern"
+expect = "error"
+error_contains = "wrong number of arguments"
+
 [tests.prelude_impl_conflict]
 path = "tests/hern/prelude_impl_conflict.hern"
 expect = "error"
@@ -624,6 +629,16 @@ path = "tests/hern/missing_trait_impl.hern"
 expect = "error"
 error_contains = "trait `Show` is not implemented for `f64`"
 
+[tests.operator_missing_impl]
+path = "tests/hern/operator_missing_impl.hern"
+expect = "error"
+error_contains = "trait `Eq` is not implemented for `Boxed`"
+
+[tests.operator_structural_missing_impl]
+path = "tests/hern/operator_structural_missing_impl.hern"
+expect = "error"
+error_contains = "trait `Eq` is not implemented"
+
 [tests.trait_method_missing_target]
 path = "tests/hern/trait_method_missing_target.hern"
 expect = "error"
@@ -668,6 +683,28 @@ expect = "typecheck"
 output = """
 69
 """
+
+[tests.tuple_eq]
+path = "tests/hern/tuple_eq.hern"
+expect = "typecheck"
+output = """
+1
+1
+1
+1
+"""
+
+[tests.tuple_eq_import]
+path = "tests/hern/tuple_eq_import.hern"
+expect = "typecheck"
+output = """
+1
+"""
+
+[tests.tuple_eq_missing_elem_impl]
+path = "tests/hern/tuple_eq_missing_elem_impl.hern"
+expect = "error"
+error_contains = "trait `Eq` is not implemented for `Boxed`"
 
 [tests.nested_list_patterns]
 path = "tests/hern/nested_list_patterns.hern"

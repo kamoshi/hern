@@ -1,0 +1,5 @@
+type Boxed = Boxed(f64)
+
+fn bad(a: (Boxed, f64), b: (Boxed, f64)) -> bool {
+    a == b
+}
