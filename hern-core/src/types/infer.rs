@@ -990,8 +990,20 @@ impl Infer {
                     succeeded[idx] = true;
                 }
                 Err(err) => {
-                    let failed_symbol_types = self.symbol_types.clone();
-                    let failed_callable_capabilities = self.callable_capabilities.clone();
+                    // Keep metadata discovered in the failed statement for editor features,
+                    // but normalize type entries before discarding the statement's substitutions.
+                    let failed_symbol_types: HashMap<_, _> = self
+                        .symbol_types
+                        .iter()
+                        .filter(|(id, _)| !snapshot.symbol_types.contains_key(id))
+                        .map(|(id, ty)| (*id, self.subst.apply(ty)))
+                        .collect();
+                    let failed_callable_capabilities: HashMap<_, _> = self
+                        .callable_capabilities
+                        .iter()
+                        .filter(|(id, _)| !snapshot.callable_capabilities.contains_key(id))
+                        .map(|(id, capabilities)| (*id, capabilities.clone()))
+                        .collect();
                     self.subst.restore_map(snapshot.subst_map);
                     self.pending_constraints = snapshot.pending_constraints;
                     self.loop_break_tys = snapshot.loop_break_tys;
@@ -4646,6 +4658,48 @@ mod tests {
         );
         assert!(inference.env.get("dependent").is_none());
         assert!(inference.env.get("other").is_none());
+    }
+
+    #[test]
+    fn collecting_inference_normalizes_failed_symbol_types_before_rollback() {
+        let mut program = parse_source(
+            "fn takes(x) { x }\n\
+             if takes(1) { 0 } else { 1 }\n",
+        )
+        .expect("source should parse");
+        reassociate_standalone(&mut program);
+
+        let callee_id = match &program.stmts[1] {
+            Stmt::Expr(expr) => match &expr.kind {
+                ExprKind::If { cond, .. } => match &cond.kind {
+                    ExprKind::Call { callee, .. } => callee.id,
+                    _ => panic!("condition should be a call"),
+                },
+                _ => panic!("second statement should be an if expression"),
+            },
+            _ => panic!("second statement should be an expression"),
+        };
+
+        let mut infer = Infer::new();
+        let (inference, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
+
+        assert_eq!(diagnostics.len(), 1);
+        let callee_ty = inference
+            .symbol_types
+            .get(&callee_id)
+            .expect("failed call callee type should be retained");
+        assert!(
+            free_type_vars(callee_ty).is_empty(),
+            "retained failed symbol type should be normalized, got {callee_ty}"
+        );
+        match callee_ty {
+            Ty::Func(params, ret) => {
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].ty, Ty::F64);
+                assert_eq!(*ret.ty, Ty::F64);
+            }
+            other => panic!("callee should retain a function type, got {other}"),
+        }
     }
 
     #[test]
