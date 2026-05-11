@@ -655,12 +655,9 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
             Ok(())
         }
         (Ty::App(c1, a1), Ty::App(c2, a2)) => {
-            unify(s, *c1, *c2)?;
+            unify(s, (*c1).clone(), (*c2).clone())?;
             if a1.len() != a2.len() {
-                return Err(error::TypeError::Mismatch(
-                    Ty::App(Box::new(Ty::Unit), a1),
-                    Ty::App(Box::new(Ty::Unit), a2),
-                ));
+                return Err(error::TypeError::Mismatch(Ty::App(c1, a1), Ty::App(c2, a2)));
             }
             for (v1, v2) in a1.into_iter().zip(a2.into_iter()) {
                 unify(s, v1, v2)?;
@@ -955,5 +952,31 @@ mod tests {
 
         subst.restore_map(snapshot);
         assert_eq!(subst.fresh_tyvar(), 2);
+    }
+
+    #[test]
+    fn app_arity_mismatch_preserves_type_constructors() {
+        let mut subst = Subst::new();
+
+        let err = unify(
+            &mut subst,
+            Ty::App(Box::new(Ty::Con("Map".to_string())), vec![Ty::F64]),
+            Ty::App(
+                Box::new(Ty::Con("Map".to_string())),
+                vec![Ty::F64, Ty::Con("string".to_string())],
+            ),
+        )
+        .expect_err("different type-application arities should fail");
+
+        assert_eq!(
+            err,
+            error::TypeError::Mismatch(
+                Ty::App(Box::new(Ty::Con("Map".to_string())), vec![Ty::F64]),
+                Ty::App(
+                    Box::new(Ty::Con("Map".to_string())),
+                    vec![Ty::F64, Ty::Con("string".to_string())],
+                ),
+            )
+        );
     }
 }
