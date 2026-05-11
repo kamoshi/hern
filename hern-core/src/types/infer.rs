@@ -19,6 +19,7 @@ use crate::types::{
 };
 pub use crate::types::{TypeEnv, VariantEnv, VariantInfo, is_fresh_mutable_place, is_value};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
 const NO_NODE_ID: NodeId = 0;
 
@@ -153,6 +154,11 @@ impl Default for ModuleInference {
 /// variable IDs keep advancing across recovery — reusing IDs from a failed statement could
 /// alias new bindings against stale references and silently miscompile.
 ///
+/// Insert-only editor metadata maps keep only compact key lists here. Their keys are AST node IDs
+/// or source spans, so a top-level statement should only add fresh keys; on rollback we turn those
+/// lists into sets, retain entries that existed at the snapshot, and drop entries introduced by
+/// the failed statement. Maps that can shadow user names still keep full snapshots below.
+///
 /// `variant_env` is intentionally omitted here: it is finalized before the main recovery loop,
 /// and failed type declarations are pruned from it during pre-pass 3, so later statements never
 /// observe variants from declarations whose constructor environment was discarded.
@@ -161,14 +167,14 @@ struct InferSnapshot {
     pending_constraints: Vec<TraitConstraint>,
     loop_break_tys: Vec<Ty>,
     fn_return_tys: Vec<Ty>,
-    expr_types: HashMap<NodeId, Ty>,
-    symbol_types: HashMap<NodeId, Ty>,
-    binding_types: HashMap<SourceSpan, Ty>,
-    definition_schemes: HashMap<SourceSpan, Scheme>,
-    binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
-    callable_capabilities: HashMap<NodeId, CallableCapabilities>,
+    expr_type_keys: Vec<NodeId>,
+    symbol_type_keys: Vec<NodeId>,
+    binding_type_keys: Vec<SourceSpan>,
+    definition_scheme_keys: Vec<SourceSpan>,
+    binding_capability_keys: Vec<SourceSpan>,
+    callable_capability_keys: Vec<NodeId>,
     record_field_callables: HashMap<String, HashMap<String, Vec<ParamCapability>>>,
-    fresh_place_exprs: HashSet<NodeId>,
+    fresh_place_expr_keys: Vec<NodeId>,
     inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
     env: TypeEnv,
 }
@@ -198,6 +204,22 @@ impl CollectedNames {
         self.values.retain(|name| !other.values.contains(name));
         self.types.retain(|name| !other.types.contains(name));
     }
+}
+
+fn retain_map_keys<K, V>(map: &mut HashMap<K, V>, snapshot_keys: Vec<K>)
+where
+    K: Eq + Hash,
+{
+    let snapshot_keys: HashSet<_> = snapshot_keys.into_iter().collect();
+    map.retain(|key, _| snapshot_keys.contains(key));
+}
+
+fn retain_set_keys<K>(set: &mut HashSet<K>, snapshot_keys: Vec<K>)
+where
+    K: Eq + Hash,
+{
+    let snapshot_keys: HashSet<_> = snapshot_keys.into_iter().collect();
+    set.retain(|key| snapshot_keys.contains(key));
 }
 
 impl Default for Infer {
@@ -966,14 +988,14 @@ impl Infer {
                 pending_constraints: self.pending_constraints.clone(),
                 loop_break_tys: self.loop_break_tys.clone(),
                 fn_return_tys: self.fn_return_tys.clone(),
-                expr_types: self.expr_types.clone(),
-                symbol_types: self.symbol_types.clone(),
-                binding_types: self.binding_types.clone(),
-                definition_schemes: self.definition_schemes.clone(),
-                binding_capabilities: self.binding_capabilities.clone(),
-                callable_capabilities: self.callable_capabilities.clone(),
+                expr_type_keys: self.expr_types.keys().copied().collect(),
+                symbol_type_keys: self.symbol_types.keys().copied().collect(),
+                binding_type_keys: self.binding_types.keys().copied().collect(),
+                definition_scheme_keys: self.definition_schemes.keys().copied().collect(),
+                binding_capability_keys: self.binding_capabilities.keys().copied().collect(),
+                callable_capability_keys: self.callable_capabilities.keys().copied().collect(),
                 record_field_callables: self.record_field_callables.clone(),
-                fresh_place_exprs: self.fresh_place_exprs.clone(),
+                fresh_place_expr_keys: self.fresh_place_exprs.iter().copied().collect(),
                 inherent_methods: self.inherent_methods.clone(),
                 env: env.clone(),
             };
@@ -992,30 +1014,43 @@ impl Infer {
                 Err(err) => {
                     // Keep metadata discovered in the failed statement for editor features,
                     // but normalize type entries before discarding the statement's substitutions.
+                    let symbol_type_keys: HashSet<_> =
+                        snapshot.symbol_type_keys.iter().copied().collect();
+                    let callable_capability_keys: HashSet<_> =
+                        snapshot.callable_capability_keys.iter().copied().collect();
                     let failed_symbol_types: HashMap<_, _> = self
                         .symbol_types
                         .iter()
-                        .filter(|(id, _)| !snapshot.symbol_types.contains_key(id))
+                        .filter(|(id, _)| !symbol_type_keys.contains(id))
                         .map(|(id, ty)| (*id, self.subst.apply(ty)))
                         .collect();
                     let failed_callable_capabilities: HashMap<_, _> = self
                         .callable_capabilities
                         .iter()
-                        .filter(|(id, _)| !snapshot.callable_capabilities.contains_key(id))
+                        .filter(|(id, _)| !callable_capability_keys.contains(id))
                         .map(|(id, capabilities)| (*id, capabilities.clone()))
                         .collect();
                     self.subst.restore_map(snapshot.subst_map);
                     self.pending_constraints = snapshot.pending_constraints;
                     self.loop_break_tys = snapshot.loop_break_tys;
                     self.fn_return_tys = snapshot.fn_return_tys;
-                    self.expr_types = snapshot.expr_types;
-                    self.symbol_types = snapshot.symbol_types;
-                    self.binding_types = snapshot.binding_types;
-                    self.definition_schemes = snapshot.definition_schemes;
-                    self.binding_capabilities = snapshot.binding_capabilities;
-                    self.callable_capabilities = snapshot.callable_capabilities;
+                    retain_map_keys(&mut self.expr_types, snapshot.expr_type_keys);
+                    retain_map_keys(&mut self.symbol_types, snapshot.symbol_type_keys);
+                    retain_map_keys(&mut self.binding_types, snapshot.binding_type_keys);
+                    retain_map_keys(
+                        &mut self.definition_schemes,
+                        snapshot.definition_scheme_keys,
+                    );
+                    retain_map_keys(
+                        &mut self.binding_capabilities,
+                        snapshot.binding_capability_keys,
+                    );
+                    retain_map_keys(
+                        &mut self.callable_capabilities,
+                        snapshot.callable_capability_keys,
+                    );
                     self.record_field_callables = snapshot.record_field_callables;
-                    self.fresh_place_exprs = snapshot.fresh_place_exprs;
+                    retain_set_keys(&mut self.fresh_place_exprs, snapshot.fresh_place_expr_keys);
                     self.inherent_methods = snapshot.inherent_methods;
                     env = snapshot.env;
                     // Keep callee metadata discovered before the error so LSP hover and

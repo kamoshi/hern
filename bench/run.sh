@@ -5,11 +5,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
 BINARY="$ROOT/target/release/hern"
+GENERATOR="$SCRIPT_DIR/generate_synthetic.sh"
 
 CORPUS=(
     "examples/astar.hern"
     "examples/factory_parse.hern"
     "examples/parser_test.hern"
+    "bench/corpus/many_lets.hern"
+    "bench/corpus/growing_env_polymorphic.hern"
+    "bench/corpus/many_functions.hern"
+    "bench/corpus/large_records.hern"
+)
+
+ERROR_CORPUS=(
+    "bench/corpus/many_independent_errors.hern"
 )
 
 WARMUP=3
@@ -21,7 +30,9 @@ Usage: $0 <command> [name]
 
 Commands:
   build              Build the release binary (cargo build --release)
+  generate           Generate synthetic benchmark corpus
   run                Run benchmarks, print results, no file saved
+  run-errors         Run expected-failure collecting-inference benchmarks
   save <name>        Run benchmarks and save results as a named baseline
   compare <name>     Run benchmarks and compare against a saved baseline
 
@@ -32,6 +43,10 @@ Examples:
   $0 compare main       # see if your branch is faster or slower
 EOF
     exit 1
+}
+
+generate() {
+    bash "$GENERATOR"
 }
 
 check_hyperfine() {
@@ -79,6 +94,7 @@ run_bench() {
 
 cmd_run() {
     check_hyperfine
+    generate
     ensure_binary
     for file in "${CORPUS[@]}"; do
         echo ""
@@ -87,11 +103,29 @@ cmd_run() {
     done
 }
 
+cmd_run_errors() {
+    check_hyperfine
+    generate
+    ensure_binary
+    for file in "${ERROR_CORPUS[@]}"; do
+        local path="$ROOT/$file"
+        [[ -f "$path" ]] || { echo "warning: $file not found, skipping" >&2; continue; }
+        echo ""
+        echo "--- $file (expected failure) ---"
+        hyperfine \
+            --warmup "$WARMUP" \
+            --runs   "$RUNS" \
+            --ignore-failure \
+            "$BINARY typecheck $path >/dev/null 2>&1"
+    done
+}
+
 cmd_save() {
     local name="${1:-}"
     [[ -z "$name" ]] && { echo "error: save requires a name (e.g. 'main')"; usage; }
 
     check_hyperfine
+    generate
     ensure_binary
 
     local dir="$RESULTS_DIR/$name"
@@ -107,6 +141,7 @@ cmd_compare() {
     [[ -z "$name" ]] && { echo "error: compare requires a baseline name"; usage; }
 
     check_hyperfine
+    generate
     ensure_binary
 
     local dir="$RESULTS_DIR/$name"
@@ -137,7 +172,9 @@ cmd_compare() {
 
 case "${1:-}" in
     build)   build ;;
+    generate) generate ;;
     run)     cmd_run ;;
+    run-errors) cmd_run_errors ;;
     save)    cmd_save "${2:-}" ;;
     compare) cmd_compare "${2:-}" ;;
     *)       usage ;;

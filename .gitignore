@@ -52,4 +52,5 @@
 # Performance harness
 !bench/
 !bench/run.sh
+!bench/generate_synthetic.sh
 !bench/README.md
