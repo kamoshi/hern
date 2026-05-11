@@ -1,5 +1,6 @@
 use crate::ast::{Stmt, Type};
 use crate::types::{EnvInfo, Subst, Ty, TyVar, free_type_vars};
+use im_rc::HashMap as ImHashMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -17,7 +18,7 @@ impl fmt::Display for EnvInfo {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct TypeEnv(pub HashMap<String, EnvInfo>);
+pub struct TypeEnv(pub ImHashMap<String, EnvInfo>);
 
 impl TypeEnv {
     pub fn new() -> Self {
@@ -48,6 +49,18 @@ impl TypeEnv {
             vars.extend(scheme_free_vars(&info.scheme));
         }
         vars
+    }
+
+    pub(super) fn apply_subst(&mut self, subst: &Subst) {
+        self.0 = self
+            .0
+            .iter()
+            .map(|(name, info)| {
+                let mut info = info.clone();
+                info.scheme.ty = subst.apply(&info.scheme.ty);
+                (name.clone(), info)
+            })
+            .collect();
     }
 }
 

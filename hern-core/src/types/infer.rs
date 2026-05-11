@@ -781,9 +781,7 @@ impl Infer {
     }
 
     fn apply_env_subst(&self, env: &mut TypeEnv) {
-        for info in env.0.values_mut() {
-            info.scheme.ty = self.subst.apply(&info.scheme.ty);
-        }
+        env.apply_subst(&self.subst);
     }
 
     fn finalized_type_maps(&self) -> FinalizedTypeMaps {
