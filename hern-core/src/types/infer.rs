@@ -4802,4 +4802,130 @@ mod tests {
         assert!(finalized.bubbled.is_empty());
         assert!(finalized.scheme.constraints.is_empty());
     }
+
+    #[test]
+    fn missing_primitive_trait_impl_is_rejected_during_inference() {
+        let err = infer_source_error(
+            "trait Show 'a {
+               fn show(x: 'a) -> string
+             }
+
+             show(1)\n",
+        );
+
+        assert!(matches!(
+            err.error,
+            TypeError::MissingTraitImpl {
+                ref trait_name,
+                ref impl_target,
+            } if trait_name == "Show" && impl_target == "f64"
+        ));
+    }
+
+    #[test]
+    fn missing_custom_type_trait_impl_is_rejected_during_inference() {
+        let err = infer_source_error(
+            "type Boxed = Boxed(f64)
+
+             trait Show 'a {
+               fn show(x: 'a) -> string
+             }
+
+             show(Boxed(1))\n",
+        );
+
+        assert!(matches!(
+            err.error,
+            TypeError::MissingTraitImpl {
+                ref trait_name,
+                ref impl_target,
+            } if trait_name == "Show" && impl_target == "Boxed"
+        ));
+    }
+
+    #[test]
+    fn missing_structural_tuple_component_impl_is_rejected_during_inference() {
+        let err = infer_source_error(
+            "type Boxed = Boxed(f64)
+
+             trait Eq 'a {
+               fn infix 4 ==(lhs: 'a, rhs: 'a) -> bool
+               fn infix 4 !=(lhs: 'a, rhs: 'a) -> bool
+             }
+
+             impl Eq for f64 {
+               fn ==(lhs, rhs) { true }
+               fn !=(lhs, rhs) { false }
+             }
+
+             fn bad(a: (Boxed, f64), b: (Boxed, f64)) -> bool {
+               a == b
+             }\n",
+        );
+
+        assert!(matches!(
+            err.error,
+            TypeError::MissingTraitImpl {
+                ref trait_name,
+                ref impl_target,
+            } if trait_name == "Eq" && impl_target == "Boxed"
+        ));
+    }
+
+    #[test]
+    fn available_concrete_trait_impl_resolves_to_checked_dict_ref() {
+        let mut program = parse_source(
+            "trait Show 'a {
+               fn show(x: 'a) -> string
+             }
+
+             impl Show for f64 {
+               fn show(x) { \"ok\" }
+             }
+
+             show(1)\n",
+        )
+        .expect("source should parse");
+        reassociate_standalone(&mut program);
+
+        let mut infer = Infer::new();
+        infer
+            .infer_program(&mut program)
+            .expect("available concrete impl should infer");
+
+        let Stmt::Expr(expr) = &program.stmts[2] else {
+            panic!("third statement should be the call expression");
+        };
+        let ExprKind::Call {
+            dict_args,
+            pending_dict_args,
+            resolved_callee,
+            ..
+        } = &expr.kind
+        else {
+            panic!("third statement should be a call");
+        };
+
+        assert!(pending_dict_args.is_empty());
+        assert!(dict_args.is_empty());
+        match resolved_callee {
+            Some(ResolvedCallee::DictMethod {
+                dict: DictRef::Concrete(name),
+                method,
+            }) => {
+                assert_eq!(name, "__Show__f64");
+                assert_eq!(method, "show");
+            }
+            other => panic!("expected concrete checked dict method, got {other:?}"),
+        }
+    }
+
+    fn infer_source_error(source: &str) -> SpannedTypeError {
+        let mut program = parse_source(source).expect("source should parse");
+        reassociate_standalone(&mut program);
+
+        Infer::new()
+            .infer_program(&mut program)
+            .expect_err("source should fail inference")
+    }
 }
