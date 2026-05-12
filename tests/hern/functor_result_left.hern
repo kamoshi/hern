@@ -1,6 +1,6 @@
-fn to_len(x: string) -> f64 {
-    1
+fn to_len(x: string) -> float {
+    1.0
 }
 
-let ok: Result(string, f64) = Ok("value");
+let ok: Result(string, float) = Ok("value");
 let mapped = Functor.map(ok, to_len);

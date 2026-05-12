@@ -2,6 +2,6 @@ trait Broken 'a {
     fn infix 4 ??(lhs: 'a) -> bool
 }
 
-fn bad(x: f64, y: f64) -> bool {
+fn bad(x: float, y: float) -> bool {
     x ?? y
 }

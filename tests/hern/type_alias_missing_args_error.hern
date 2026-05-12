@@ -1,0 +1,5 @@
+#![no_implicit_prelude]
+
+type Id('a) = 'a
+
+extern bad: fn() -> Id = #[template] "nil";

@@ -1,0 +1,9 @@
+#![no_implicit_prelude]
+
+trait Functor 'f {
+    fn map(fa: 'f('a), f: fn('a) -> 'b) -> 'f('b)
+}
+
+fn fmap['f: Functor](x: 'f(int), f: fn(int) -> string) -> 'f(string) {
+    Functor.map(x, f)
+}

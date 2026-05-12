@@ -1,4 +1,4 @@
-type LocalAlias = f64
+type LocalAlias = float
 
 #{ value: 1 }
 

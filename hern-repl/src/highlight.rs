@@ -64,6 +64,7 @@ fn token_style(token: &Token) -> Style {
         | Token::Trait
         | Token::Impl
         | Token::For
+        | Token::Where
         | Token::Type
         | Token::Match
         | Token::Loop

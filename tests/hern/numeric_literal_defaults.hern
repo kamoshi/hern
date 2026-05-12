@@ -1,0 +1,7 @@
+let i: int = 1;
+let f: float = 1.0;
+
+print(i + 2);
+print(f + 2.5);
+print([1, 2, 3].sum());
+print([1.0, 2.0, 3.0].sum());

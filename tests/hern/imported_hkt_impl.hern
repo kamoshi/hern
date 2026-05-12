@@ -1,0 +1,12 @@
+#![no_implicit_prelude]
+
+type Result('a, 'e) = Ok('a) | Err('e)
+
+let dep = import "imported_hkt_impl_dep";
+
+fn to_string_value(x: int) -> string {
+    "ok"
+}
+
+let ok: Result(int, string) = Ok(1);
+let mapped: Result(string, string) = Functor.map(ok, to_string_value);

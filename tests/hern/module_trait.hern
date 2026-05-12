@@ -2,8 +2,8 @@ trait Bump 'a {
   fn bump(x: 'a) -> 'a
 }
 
-impl Bump for f64 {
+impl Bump for float {
   fn bump(x) {
-    x + 1
+    x + 1.0
   }
 }

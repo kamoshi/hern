@@ -1068,26 +1068,15 @@ mod tests {
     }
 
     #[test]
-    fn import_member_references_for_returns_matching_spans() {
-        let source = "let dep = import \"dep\";\ndep.value()\ndep.value\n";
-        let program = parse_source(source).expect("source should parse");
-        let index = index_program(&program);
-
-        let spans = index.import_member_references_for("dep", "value");
-
-        assert_eq!(spans.len(), 2);
-    }
-
-    #[test]
     fn import_member_references_for_filters_by_member_name() {
-        let source = "let dep = import \"dep\";\ndep.value()\ndep.other\n";
+        let source = "let dep = import \"dep\";\ndep.value()\ndep.value\ndep.other\n";
         let program = parse_source(source).expect("source should parse");
         let index = index_program(&program);
 
         let value_spans = index.import_member_references_for("dep", "value");
         let other_spans = index.import_member_references_for("dep", "other");
 
-        assert_eq!(value_spans.len(), 1);
+        assert_eq!(value_spans.len(), 2);
         assert_eq!(other_spans.len(), 1);
     }
 

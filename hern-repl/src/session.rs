@@ -1,12 +1,14 @@
 use crate::error::ReplError;
-use hern_core::ast::{Program, SourceSpan, Stmt};
+use hern_core::ast::{Expr, ExprKind, Program, SourceSpan, Stmt};
 use hern_core::codegen::bundle::gen_lua_iife_bundle;
-use hern_core::types::Ty;
+use hern_core::module::ModuleEnv;
+use hern_core::pipeline::parse_source;
 use hern_core::types::infer::TypeEnv;
+use hern_core::types::{ParamCapability, Ty, inherent_impl_target_keys_from_ty};
 use hern_core::workspace::{WorkspaceInputs, analyze_workspace};
 use mlua::{Function, Lua, MultiValue};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -17,6 +19,21 @@ const TYPE_HINT_BINDING: &str = "hern_repl_hint_value";
 pub(crate) struct ReplSession {
     defs: String,
     entry_path: PathBuf,
+    analysis_cache: RefCell<Option<SessionAnalysis>>,
+}
+
+#[derive(Clone)]
+struct SessionAnalysis {
+    source: String,
+    env: TypeEnv,
+    module_env: ModuleEnv,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplInputKind {
+    Definition,
+    Statement,
+    Expression,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,32 +61,44 @@ impl ReplSession {
                 std::env::current_dir()?.join(".hern_repl.hern"),
             ),
         };
-        Ok(Self { defs, entry_path })
+        Ok(Self {
+            defs,
+            entry_path,
+            analysis_cache: RefCell::new(None),
+        })
     }
 
     pub(crate) fn eval(&mut self, input: &str) -> Result<String> {
-        let definition = looks_like_definition(input);
-        let source = if definition {
-            append_source(&self.defs, input)
-        } else {
+        let kind = classify_input(input);
+        let source = if matches!(kind, ReplInputKind::Expression) {
             append_source(&self.defs, &format!("print({input})"))
+        } else {
+            append_source(&self.defs, input)
         };
 
-        let output = compile_and_run(&source, &self.entry_path)?;
-        if definition {
-            self.defs = append_source(&self.defs, input);
+        let (graph, inference, entry) = analyze_source(&source, &self.entry_path)?;
+        let lua_code = gen_lua_iife_bundle(&graph, &inference.module_envs, &entry);
+        let output = run_lua(&lua_code)?;
+        if !matches!(kind, ReplInputKind::Expression) {
+            if let Some(program) = graph.modules.get(&entry) {
+                self.defs = source_without_transient_repl_exprs(&source, program);
+            } else {
+                self.defs = source;
+            }
+            self.analysis_cache.borrow_mut().take();
         }
         Ok(output)
     }
 
     pub(crate) fn bindings(&self) -> Vec<BindingInfo> {
-        let Ok(env) = analyze_env(&self.defs, &self.entry_path) else {
+        let Ok(analysis) = self.analysis() else {
             return Vec::new();
         };
-        let mut bindings: Vec<_> = env
+        let mut bindings: Vec<_> = analysis
+            .env
             .0
             .into_iter()
-            .filter(|(name, _)| !name.starts_with("__hern_") && !name.starts_with("_t_"))
+            .filter(|(name, _)| !is_internal_binding_name(name))
             .map(|(name, info)| BindingInfo {
                 name,
                 ty: info.to_string(),
@@ -80,28 +109,87 @@ impl ReplSession {
     }
 
     pub(crate) fn member_bindings(&self, base: &str, prefix: &str) -> Vec<BindingInfo> {
-        let Ok(env) = analyze_env(&self.defs, &self.entry_path) else {
+        let Ok(analysis) = self.analysis() else {
             return Vec::new();
         };
-        let Some(info) = env.get(base) else {
+        let Some(info) = analysis.env.get(base) else {
             return Vec::new();
         };
         let prefix = prefix.to_lowercase();
-        let mut fields: Vec<_> = record_fields(&info.scheme.ty)
+        let mut seen = HashSet::new();
+        let mut bindings: Vec<_> = record_fields(&info.scheme.ty)
             .into_iter()
-            .filter(|(name, _)| prefix.is_empty() || name.to_lowercase().starts_with(&prefix))
-            .map(|(name, ty)| BindingInfo {
-                name,
-                ty: ty.to_string(),
+            .filter(|(name, _)| binding_matches_prefix(name, &prefix))
+            .map(|(name, ty)| {
+                seen.insert(name.clone());
+                BindingInfo {
+                    name,
+                    ty: ty.to_string(),
+                }
             })
             .collect();
-        fields.sort_by(|a, b| a.name.cmp(&b.name));
-        fields
+
+        for target in inherent_impl_target_keys_from_ty(&info.scheme.ty) {
+            for (_, methods) in analysis
+                .module_env
+                .all_inherent_methods()
+                .filter(|(method_target, _)| *method_target == target)
+            {
+                for (name, method) in methods {
+                    if is_internal_binding_name(name)
+                        || !method.has_receiver
+                        || (!info.is_place_mutable()
+                            && scheme_param_capability(&method.scheme, 0).is_mut_place())
+                        || !binding_matches_prefix(name, &prefix)
+                        || !seen.insert(name.clone())
+                    {
+                        continue;
+                    }
+                    bindings.push(BindingInfo {
+                        name: name.clone(),
+                        ty: method.scheme.to_string(),
+                    });
+                }
+            }
+        }
+
+        bindings.sort_by(|a, b| a.name.cmp(&b.name));
+        bindings
+    }
+
+    fn analysis(&self) -> Result<SessionAnalysis> {
+        if let Some(cached) = self.analysis_cache.borrow().as_ref()
+            && cached.source == self.defs
+        {
+            return Ok(cached.clone());
+        }
+
+        let (_graph, inference, entry) = analyze_source(&self.defs, &self.entry_path)?;
+        let env = inference
+            .env_for_module(&entry)
+            .cloned()
+            .ok_or(ReplError::MissingAnalysis(
+                "workspace analysis did not return an entry type environment",
+            ))?;
+        let module_env =
+            inference
+                .module_env_for_module(&entry)
+                .cloned()
+                .ok_or(ReplError::MissingAnalysis(
+                    "workspace analysis did not return an entry module environment",
+                ))?;
+        let analysis = SessionAnalysis {
+            source: self.defs.clone(),
+            env,
+            module_env,
+        };
+        *self.analysis_cache.borrow_mut() = Some(analysis.clone());
+        Ok(analysis)
     }
 
     pub(crate) fn type_hint(&self, input: &str) -> Option<String> {
         let trimmed = input.trim();
-        if trimmed.is_empty() || looks_like_definition(trimmed) {
+        if trimmed.is_empty() || !matches!(classify_input(trimmed), ReplInputKind::Expression) {
             return None;
         }
 
@@ -122,16 +210,64 @@ fn append_source(base: &str, addition: &str) -> String {
     out
 }
 
-fn looks_like_definition(input: &str) -> bool {
-    let first = input
-        .lines()
-        .map(str::trim_start)
-        .find(|line| !line.is_empty() && !line.starts_with("//"))
-        .unwrap_or("");
-    matches!(
+fn classify_input(input: &str) -> ReplInputKind {
+    let Ok(program) = parse_source(input) else {
+        return classify_input_lexically(input);
+    };
+    if program
+        .stmts
+        .iter()
+        .any(|stmt| !matches!(stmt, Stmt::Expr(_)))
+    {
+        ReplInputKind::Definition
+    } else if program.stmts.iter().any(|stmt| {
+        matches!(
+            stmt,
+            Stmt::Expr(expr) if is_persistent_repl_expr(expr)
+        )
+    }) {
+        ReplInputKind::Statement
+    } else {
+        ReplInputKind::Expression
+    }
+}
+
+fn classify_input_lexically(input: &str) -> ReplInputKind {
+    let first = first_code_line(input);
+    if matches!(
         first.split_whitespace().next(),
         Some("let" | "fn" | "type" | "trait" | "impl" | "extern")
-    )
+    ) {
+        ReplInputKind::Definition
+    } else {
+        ReplInputKind::Expression
+    }
+}
+
+fn first_code_line(input: &str) -> &str {
+    input
+        .lines()
+        .map(str::trim_start)
+        .find(|line| !line.is_empty() && !line.starts_with("//") && !line.starts_with("#!"))
+        .unwrap_or("")
+}
+
+fn is_internal_binding_name(name: &str) -> bool {
+    name.starts_with("__") || name.starts_with("_t_")
+}
+
+fn binding_matches_prefix(name: &str, prefix: &str) -> bool {
+    prefix.is_empty() || name.to_lowercase().starts_with(prefix)
+}
+
+fn scheme_param_capability(scheme: &hern_core::types::Scheme, idx: usize) -> ParamCapability {
+    match &scheme.ty {
+        Ty::Func(params, _) => params
+            .get(idx)
+            .map(|param| param.capability)
+            .unwrap_or(ParamCapability::Value),
+        _ => ParamCapability::Value,
+    }
 }
 
 fn record_fields(ty: &Ty) -> Vec<(String, Ty)> {
@@ -143,7 +279,7 @@ fn record_fields(ty: &Ty) -> Vec<(String, Ty)> {
 }
 
 fn source_without_top_level_exprs(source: &str, program: &Program) -> String {
-    let mut out = String::new();
+    let mut out = leading_file_directives(source);
     for stmt in &program.stmts {
         if matches!(stmt, Stmt::Expr(_)) {
             continue;
@@ -155,6 +291,40 @@ fn source_without_top_level_exprs(source: &str, program: &Program) -> String {
             out.push_str(snippet.trim_end());
             out.push('\n');
         }
+    }
+    out
+}
+
+fn source_without_transient_repl_exprs(source: &str, program: &Program) -> String {
+    let mut out = leading_file_directives(source);
+    for stmt in &program.stmts {
+        if matches!(stmt, Stmt::Expr(expr) if !is_persistent_repl_expr(expr)) {
+            continue;
+        }
+        if let Some(snippet) = source_slice(source, stmt.span()) {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(snippet.trim_end());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn is_persistent_repl_expr(expr: &Expr) -> bool {
+    matches!(expr.kind, ExprKind::Assign { .. })
+}
+
+fn leading_file_directives(source: &str) -> String {
+    let mut out = String::new();
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#!") {
+            out.push_str(line);
+            continue;
+        }
+        break;
     }
     out
 }
@@ -182,12 +352,6 @@ fn source_slice(source: &str, span: SourceSpan) -> Option<&str> {
     let start = start?;
     let end = end?;
     source.get(start..end)
-}
-
-fn compile_and_run(source: &str, entry_path: &Path) -> Result<String> {
-    let (graph, inference, entry) = analyze_source(source, entry_path)?;
-    let lua_code = gen_lua_iife_bundle(&graph, &inference.module_envs, &entry);
-    run_lua(&lua_code)
 }
 
 fn analyze_env(source: &str, entry_path: &Path) -> Result<TypeEnv> {
@@ -272,7 +436,7 @@ mod tests {
         let source = append_source("", "let hern_repl_hint_value = 2 + 2;");
         let env = analyze_env(&source, &session.entry_path).expect("expression should typecheck");
 
-        assert_eq!(session.type_hint("2 + 2").as_deref(), Some("f64"));
+        assert_eq!(session.type_hint("2 + 2").as_deref(), Some("int"));
         assert!(env.get(TYPE_HINT_BINDING).is_some());
     }
 
@@ -292,7 +456,7 @@ mod tests {
 
         assert_eq!(
             session.type_hint("loaded_value + 1").as_deref(),
-            Some("f64")
+            Some("int")
         );
         assert!(
             session
@@ -330,6 +494,74 @@ mod tests {
     }
 
     #[test]
+    fn loaded_file_preserves_leading_inner_attrs() {
+        let source = "#![no_implicit_prelude]\nlet loaded_value = 41;\nloaded_value\n";
+        let path = std::env::temp_dir().join(format!(
+            "hern-repl-attrs-{}-{}.hern",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, source).expect("fixture should be written");
+        let (graph, _inference, entry) =
+            analyze_source(source, &path).expect("fixture should analyze");
+        let program = graph
+            .modules
+            .get(&entry)
+            .expect("entry module should exist");
+
+        assert_eq!(
+            source_without_top_level_exprs(source, program),
+            "#![no_implicit_prelude]\nlet loaded_value = 41;\n"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn eval_definition_strips_trailing_top_level_expressions() {
+        let mut session = ReplSession::new(None).expect("session should initialize");
+
+        assert_eq!(
+            session
+                .eval("let x = 1;\nprint(x)")
+                .expect("definition should evaluate"),
+            "1\n"
+        );
+        assert_eq!(session.eval("x").expect("x should remain bound"), "1\n");
+    }
+
+    #[test]
+    fn eval_assignment_persists_in_replay_context() {
+        let mut session = ReplSession::new(None).expect("session should initialize");
+
+        assert_eq!(session.eval("let mut x = 1;").expect("let should work"), "");
+        assert_eq!(
+            session.eval("x = x + 1").expect("assignment should work"),
+            ""
+        );
+        assert_eq!(session.eval("x").expect("x should be updated"), "2\n");
+        assert_eq!(
+            session.eval("x = x + 1").expect("assignment should work"),
+            ""
+        );
+        assert_eq!(session.eval("x").expect("x should be updated again"), "3\n");
+    }
+
+    #[test]
+    fn bindings_hide_internal_names() {
+        let session = ReplSession::new(None).expect("session should initialize");
+
+        assert!(
+            session
+                .bindings()
+                .iter()
+                .all(|binding| !is_internal_binding_name(&binding.name))
+        );
+    }
+
+    #[test]
     fn eval_unbound_variable_returns_diagnostic() {
         let mut session = ReplSession::new(None).expect("session should initialize");
         let result = session.eval("unbound_var_123");
@@ -358,6 +590,25 @@ mod tests {
         let fields = session.member_bindings("math", "s");
 
         assert_eq!(fields.first().map(|field| field.name.as_str()), Some("sin"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn member_bindings_returns_inherent_receiver_methods() {
+        let path = std::env::temp_dir().join(format!(
+            "hern-repl-methods-{}-{}.hern",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, "let xs = [1.0, 2.0, 3.0];\n").expect("fixture should be written");
+        let session = ReplSession::new(Some(&path)).expect("session should load source");
+
+        let methods = session.member_bindings("xs", "s");
+
+        assert!(methods.iter().any(|method| method.name == "sum"));
         let _ = fs::remove_file(path);
     }
 }

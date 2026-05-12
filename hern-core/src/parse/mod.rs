@@ -463,8 +463,8 @@ impl<'tokens> Parser<'tokens> {
                     },
                 )
             })?;
-            let prec = if let Token::Number(n) = prec_tok.token {
-                n as u8
+            let prec = if let Token::Number(n) = &prec_tok.token {
+                n.precedence_value()
             } else {
                 return Err(ParseError::new("Expected precedence number", prec_tok.span));
             };
@@ -673,7 +673,7 @@ impl<'tokens> Parser<'tokens> {
 
         // Peek to see if it's a type alias or a sum type.
         //
-        // `type Wrap = Wrap(f64)` is the nominal-newtype spelling: the right-hand
+        // `type Wrap = Wrap(float)` is the nominal-newtype spelling: the right-hand
         // identifier is treated as a constructor when it matches the declared type.
         // Other single `Ident(args...)` forms remain aliases, so `type Names = Array(string)`
         // keeps its existing type-alias meaning.
@@ -795,8 +795,8 @@ impl<'tokens> Parser<'tokens> {
                         },
                     )
                 })?;
-                let p = if let Token::Number(n) = prec_tok.token {
-                    n as u8
+                let p = if let Token::Number(n) = &prec_tok.token {
+                    n.precedence_value()
                 } else {
                     return Err(ParseError::new("Expected precedence number", prec_tok.span));
                 };
@@ -868,6 +868,8 @@ impl<'tokens> Parser<'tokens> {
         ptr += self.expect(&tokens[ptr..], Token::For)?;
         let (c_target, target) = self.parse_type(&tokens[ptr..])?;
         ptr += c_target;
+        let (c_bounds, type_bounds) = self.parse_impl_where_bounds(&tokens[ptr..])?;
+        ptr += c_bounds;
         ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
         let mut methods = Vec::new();
         while tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
@@ -920,9 +922,46 @@ impl<'tokens> Parser<'tokens> {
                 span: consumed_span(tokens, ptr),
                 trait_name,
                 target,
+                type_bounds,
+                dict_params: vec![],
                 methods,
             }),
         ))
+    }
+
+    fn parse_impl_where_bounds(
+        &self,
+        tokens: &[Spanned],
+    ) -> Result<(usize, Vec<TypeBound>), ParseError> {
+        let mut ptr = 0;
+        let mut bounds = Vec::new();
+        if tokens.get(ptr).map(|t| &t.token) != Some(&Token::Where) {
+            return Ok((0, bounds));
+        }
+        ptr += 1;
+        loop {
+            let (c_p, p) = self.expect_ident(&tokens[ptr..])?;
+            ptr += c_p;
+            ptr += self.expect(&tokens[ptr..], Token::Colon)?;
+            let mut traits = Vec::new();
+            loop {
+                let (c_tr, tr) = self.expect_ident(&tokens[ptr..])?;
+                ptr += c_tr;
+                traits.push(tr);
+                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Plus) {
+                    ptr += 1;
+                } else {
+                    break;
+                }
+            }
+            bounds.push(TypeBound { var: p, traits });
+            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
+                ptr += 1;
+            } else {
+                break;
+            }
+        }
+        Ok((ptr, bounds))
     }
 
     fn parse_inherent_impl_tail(
@@ -1301,6 +1340,10 @@ impl<'tokens> Parser<'tokens> {
                 ptr += 1;
                 Type::Hole
             }
+            Token::Bang => {
+                ptr += 1;
+                Type::Never
+            }
             Token::Fn => {
                 ptr += 1;
                 ptr += self.expect(&tokens[ptr..], Token::LParen)?;
@@ -1465,8 +1508,9 @@ impl<'tokens> Parser<'tokens> {
 
         let mut lhs = match &tok.token {
             Token::Number(n) => {
+                let n = n.clone();
                 ptr += 1;
-                self.expr_from_tokens(tokens, ptr, ExprKind::Number(*n))
+                self.expr_from_tokens(tokens, ptr, ExprKind::Number(n))
             }
             Token::StringLit(s) => {
                 let s = s.clone();
@@ -1492,11 +1536,17 @@ impl<'tokens> Parser<'tokens> {
                 let (consumed, operand) = self.parse_expr(&tokens[ptr..], 11)?;
                 ptr += consumed;
                 let op_span = SourceSpan::from_lex_span(tok.span);
+                let zero = match &operand.kind {
+                    ExprKind::Number(crate::lex::NumberLiteral::Float(_)) => {
+                        crate::lex::NumberLiteral::Float(0.0)
+                    }
+                    _ => crate::lex::NumberLiteral::Int(0),
+                };
                 self.expr_from_tokens(
                     tokens,
                     ptr,
                     ExprKind::Binary {
-                        lhs: Box::new(Expr::synthetic(ExprKind::Number(0.0))),
+                        lhs: Box::new(Expr::synthetic(ExprKind::Number(zero))),
                         op: BinOp::Custom("-".to_string()),
                         op_span,
                         rhs: Box::new(operand),
@@ -2013,9 +2063,9 @@ impl<'tokens> Parser<'tokens> {
         let mut final_expr: Option<Expr> = None;
 
         while tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
-            let tok = tokens.get(ptr).ok_or_else(|| {
-                ParseError::new("unexpected end of `do` block", open_brace_span)
-            })?;
+            let tok = tokens
+                .get(ptr)
+                .ok_or_else(|| ParseError::new("unexpected end of `do` block", open_brace_span))?;
 
             if matches!(tok.token, Token::Let) {
                 let let_start = ptr;
@@ -2046,7 +2096,8 @@ impl<'tokens> Parser<'tokens> {
                     check_do_control_flow(&expr, false)?;
                     let stmt_span = consumed_span(&tokens[let_start..], ptr - let_start);
                     stmts.push(DoStmt::Let(pat, is_mutable, ty, stmt_span, expr));
-                } else if matches!(tokens.get(ptr).map(|t| &t.token), Some(Token::Op(op)) if op == "<-") {
+                } else if matches!(tokens.get(ptr).map(|t| &t.token), Some(Token::Op(op)) if op == "<-")
+                {
                     // Monadic bind: `let [mut] pat [: ty] <- expr ;`
                     let arrow_span = SourceSpan::from_lex_span(tokens[ptr].span);
                     ptr += 1;
@@ -2095,75 +2146,86 @@ impl<'tokens> Parser<'tokens> {
     /// `Let`   → `Block { let pat = value; rest }`
     /// `Bare`  → `expr >>= fn(_) { rest }`
     fn desugar_do(&self, stmts: Vec<DoStmt>, final_expr: Expr) -> Expr {
-        stmts.into_iter().rev().fold(final_expr, |rest, stmt| match stmt {
-            DoStmt::Bind(pat, is_mutable, ty, arrow_span, monad_expr) => {
-                let lambda = Expr::new(
+        stmts
+            .into_iter()
+            .rev()
+            .fold(final_expr, |rest, stmt| match stmt {
+                DoStmt::Bind(pat, is_mutable, ty, arrow_span, monad_expr) => {
+                    let lambda = Expr::new(
+                        self.next_node_id(),
+                        SourceSpan::synthetic(),
+                        ExprKind::Lambda {
+                            params: vec![Param {
+                                pat,
+                                ty,
+                                mut_place: is_mutable,
+                            }],
+                            body: Box::new(rest),
+                            dict_params: vec![],
+                        },
+                    );
+                    Expr::new(
+                        self.next_node_id(),
+                        SourceSpan::synthetic(),
+                        ExprKind::Binary {
+                            lhs: Box::new(monad_expr),
+                            op: BinOp::Custom(">>=".to_string()),
+                            op_span: arrow_span,
+                            rhs: Box::new(lambda),
+                            resolved_op: None,
+                            pending_op: None,
+                            dict_args: vec![],
+                            pending_dict_args: vec![],
+                        },
+                    )
+                }
+                DoStmt::Let(pat, is_mutable, ty, stmt_span, value) => Expr::new(
                     self.next_node_id(),
                     SourceSpan::synthetic(),
-                    ExprKind::Lambda {
-                        params: vec![Param { pat, ty, mut_place: is_mutable }],
-                        body: Box::new(rest),
-                        dict_params: vec![],
+                    ExprKind::Block {
+                        stmts: vec![Stmt::Let {
+                            span: stmt_span,
+                            pat,
+                            is_mutable,
+                            ty,
+                            value,
+                        }],
+                        final_expr: Some(Box::new(rest)),
                     },
-                );
-                Expr::new(
-                    self.next_node_id(),
-                    SourceSpan::synthetic(),
-                    ExprKind::Binary {
-                        lhs: Box::new(monad_expr),
-                        op: BinOp::Custom(">>=".to_string()),
-                        op_span: arrow_span,
-                        rhs: Box::new(lambda),
-                        resolved_op: None,
-                        pending_op: None,
-                        dict_args: vec![],
-                        pending_dict_args: vec![],
-                    },
-                )
-            }
-            DoStmt::Let(pat, is_mutable, ty, stmt_span, value) => Expr::new(
-                self.next_node_id(),
-                SourceSpan::synthetic(),
-                ExprKind::Block {
-                    stmts: vec![Stmt::Let {
-                        span: stmt_span,
-                        pat,
-                        is_mutable,
-                        ty,
-                        value,
-                    }],
-                    final_expr: Some(Box::new(rest)),
-                },
-            ),
-            DoStmt::Bare(expr) => {
-                // No written operator — use the sequenced expression's span as the best
-                // fallback so type-error diagnostics have a location to point to.
-                let op_span = expr.span;
-                let lambda = Expr::new(
-                    self.next_node_id(),
-                    SourceSpan::synthetic(),
-                    ExprKind::Lambda {
-                        params: vec![Param { pat: Pattern::Wildcard, ty: None, mut_place: false }],
-                        body: Box::new(rest),
-                        dict_params: vec![],
-                    },
-                );
-                Expr::new(
-                    self.next_node_id(),
-                    SourceSpan::synthetic(),
-                    ExprKind::Binary {
-                        lhs: Box::new(expr),
-                        op: BinOp::Custom(">>=".to_string()),
-                        op_span,
-                        rhs: Box::new(lambda),
-                        resolved_op: None,
-                        pending_op: None,
-                        dict_args: vec![],
-                        pending_dict_args: vec![],
-                    },
-                )
-            }
-        })
+                ),
+                DoStmt::Bare(expr) => {
+                    // No written operator — use the sequenced expression's span as the best
+                    // fallback so type-error diagnostics have a location to point to.
+                    let op_span = expr.span;
+                    let lambda = Expr::new(
+                        self.next_node_id(),
+                        SourceSpan::synthetic(),
+                        ExprKind::Lambda {
+                            params: vec![Param {
+                                pat: Pattern::Wildcard,
+                                ty: None,
+                                mut_place: false,
+                            }],
+                            body: Box::new(rest),
+                            dict_params: vec![],
+                        },
+                    );
+                    Expr::new(
+                        self.next_node_id(),
+                        SourceSpan::synthetic(),
+                        ExprKind::Binary {
+                            lhs: Box::new(expr),
+                            op: BinOp::Custom(">>=".to_string()),
+                            op_span,
+                            rhs: Box::new(lambda),
+                            resolved_op: None,
+                            pending_op: None,
+                            dict_args: vec![],
+                            pending_dict_args: vec![],
+                        },
+                    )
+                }
+            })
     }
 
     fn parse_record(&self, tokens: &[Spanned]) -> Result<(usize, Expr), ParseError> {

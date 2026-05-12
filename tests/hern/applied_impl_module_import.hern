@@ -1,0 +1,4 @@
+let labels = import "applied_impl_module_labels";
+
+print(label([1.0]));
+print(label(["a"]));

@@ -12,13 +12,13 @@ print(unwrap_or(None, 99));
 
 // ── Record patterns ───────────────────────────────────────────────────────────
 
-fn get_x(p: #{ x: f64, y: f64 }) -> f64 {
+fn get_x(p: #{ x: int, y: int }) -> int {
     match p {
         #{ x, .. } -> x,
     }
 }
 
-fn swap_label(p: #{ x: f64, y: f64 }) -> f64 {
+fn swap_label(p: #{ x: int, y: int }) -> int {
     match p {
         #{ x: a, y: b } -> a + b,
     }
@@ -28,7 +28,7 @@ let point = #{ x: 3, y: 4 };
 print(get_x(point));
 print(swap_label(point));
 
-fn first_field(r: #{ x: f64, y: f64 }) -> f64 {
+fn first_field(r: #{ x: int, y: int }) -> int {
     match r {
         #{ x, ..rest } -> x,
     }
@@ -38,14 +38,14 @@ print(first_field(#{ x: 10, y: 20 }));
 
 // ── List patterns ─────────────────────────────────────────────────────────────
 
-fn list_head(xs: [f64]) -> f64 {
+fn list_head(xs: [int]) -> int {
     match xs {
         [] -> 0,
         [h, ..] -> h,
     }
 }
 
-fn list_sum(xs: [f64]) -> f64 {
+fn list_sum(xs: [int]) -> int {
     match xs {
         [] -> 0,
         [h, ..rest] -> h + list_sum(rest),
@@ -56,7 +56,7 @@ print(list_head([]));
 print(list_head([5, 6, 7]));
 print(list_sum([1, 2, 3, 4, 5]));
 
-fn is_pair(xs: [f64]) -> f64 {
+fn is_pair(xs: [int]) -> int {
     match xs {
         [_, _] -> 1,
         _ -> 0,

@@ -1,5 +1,5 @@
-type Boxed = Boxed(f64)
+type Boxed = Boxed(float)
 
-fn bad(a: (Boxed, f64), b: (Boxed, f64)) -> bool {
+fn bad(a: (Boxed, float), b: (Boxed, float)) -> bool {
     a == b
 }

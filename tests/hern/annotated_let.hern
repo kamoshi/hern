@@ -1,2 +1,2 @@
-let a: f64 = 42;
+let a: int = 42;
 print(a);

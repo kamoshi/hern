@@ -2,10 +2,14 @@ mod env;
 pub mod error;
 pub mod infer;
 mod patterns;
-mod type_syntax;
+pub(crate) mod type_syntax;
 mod value;
 
 pub use env::{TypeEnv, VariantEnv, VariantInfo};
+pub use type_syntax::{
+    inherent_impl_target_keys_from_ty, trait_impl_dict_name, trait_impl_target_key_from_ast,
+    trait_impl_target_keys_from_ty,
+};
 pub use value::{is_fresh_mutable_place, is_value};
 
 use std::collections::{HashMap, HashSet};
@@ -24,15 +28,17 @@ pub struct TraitConstraint {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ty {
-    F64,
+    Int,
+    Float,
     Unit,
+    Never,
     Qualified(Vec<TraitConstraint>, Box<Ty>),
     Tuple(Vec<Ty>),
     Func(Vec<FuncParam>, FuncReturn),
     Var(TyVar),
     /// A concrete type constructor: `bool`, `Array`, `Option`
     Con(String),
-    /// Type application: `Array[f64]`, `Map[string, i32]`
+    /// Type application: `Array[float]`, `Map[string, int]`
     App(Box<Ty>, Vec<Ty>),
     Record(Row),
 }
@@ -140,8 +146,10 @@ impl fmt::Display for DisplayTy<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (ty, names) = (self.0, self.1);
         match ty {
-            Ty::F64 => write!(f, "f64"),
+            Ty::Int => write!(f, "int"),
+            Ty::Float => write!(f, "float"),
             Ty::Unit => write!(f, "()"),
+            Ty::Never => write!(f, "!"),
             Ty::Var(v) => match names.get(v) {
                 Some(name) => write!(f, "'{}", name),
                 None => write!(f, "'{}", v),
@@ -306,7 +314,7 @@ pub fn free_type_vars_in_display_order(ty: &Ty) -> Vec<TyVar> {
                 }
                 collect(&row.tail, vars);
             }
-            Ty::F64 | Ty::Unit | Ty::Con(_) => {}
+            Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => {}
         }
     }
 
@@ -622,7 +630,7 @@ fn type_contains_var(ty: &Ty, needle: TyVar) -> bool {
                 .any(|(_, ty)| type_contains_var(ty, needle))
                 || type_contains_var(&row.tail, needle)
         }
-        Ty::F64 | Ty::Unit | Ty::Con(_) => false,
+        Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => false,
     }
 }
 
@@ -671,12 +679,10 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
     let t2 = s.apply(&t2);
 
     match (t1, t2) {
-        (Ty::F64, Ty::F64) | (Ty::Unit, Ty::Unit) => Ok(()),
+        (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) | (Ty::Unit, Ty::Unit) => Ok(()),
+        (Ty::Never, Ty::Never) => Ok(()),
         (Ty::Con(n1), Ty::Con(n2)) if n1 == n2 => Ok(()),
         (Ty::Var(v), t) | (t, Ty::Var(v)) => s.bind_ty(v, t),
-        (Ty::Qualified(_, t1), Ty::Qualified(_, t2)) => unify(s, *t1, *t2),
-        (Ty::Qualified(_, t1), t2) => unify(s, *t1, t2),
-        (t1, Ty::Qualified(_, t2)) => unify(s, t1, *t2),
         (Ty::Func(p1, r1), Ty::Func(p2, r2)) => {
             if p1.len() != p2.len() {
                 return Err(error::TypeError::ArityMismatch {
@@ -899,7 +905,7 @@ mod tests {
 
     #[test]
     fn scheme_display_includes_constraints_with_letter_names() {
-        // ∀ 'a ['a: Iterable]. fn('a(f64)) -> f64
+        // ∀ 'a ['a: Iterable]. fn('a(float)) -> float
         let scheme = Scheme {
             vars: vec![90],
             constraints: vec![TraitConstraint {
@@ -907,13 +913,13 @@ mod tests {
                 trait_name: "Iterable".to_string(),
             }],
             ty: Ty::Func(
-                value_func_params(vec![Ty::App(Box::new(Ty::Var(90)), vec![Ty::F64])]),
-                value_func_return(Ty::F64),
+                value_func_params(vec![Ty::App(Box::new(Ty::Var(90)), vec![Ty::Float])]),
+                value_func_return(Ty::Float),
             ),
         };
         assert_eq!(
             scheme.to_string(),
-            "∀ 'a ['a: Iterable]. fn('a(f64)) -> f64"
+            "∀ 'a ['a: Iterable]. fn('a(float)) -> float"
         );
     }
 
@@ -933,8 +939,8 @@ mod tests {
 
     #[test]
     fn scheme_display_mono_type_no_forall() {
-        let scheme = Scheme::mono(Ty::F64);
-        assert_eq!(scheme.to_string(), "f64");
+        let scheme = Scheme::mono(Ty::Float);
+        assert_eq!(scheme.to_string(), "float");
     }
 
     #[test]
@@ -979,16 +985,16 @@ mod tests {
 
     #[test]
     fn scheme_display_record_with_var_tail() {
-        // ∀ 'a. #{ x: f64, ..'a }
+        // ∀ 'a. #{ x: float, ..'a }
         let scheme = Scheme {
             vars: vec![2],
             constraints: vec![],
             ty: Ty::Record(Row {
-                fields: vec![("x".to_string(), Ty::F64)],
+                fields: vec![("x".to_string(), Ty::Float)],
                 tail: Box::new(Ty::Var(2)),
             }),
         };
-        assert_eq!(scheme.to_string(), "∀ 'a. #{ x: f64, ..'a }");
+        assert_eq!(scheme.to_string(), "∀ 'a. #{ x: float, ..'a }");
     }
 
     #[test]
@@ -1021,7 +1027,7 @@ mod tests {
     fn subst_clear_map_keeps_fresh_var_counter_advancing() {
         let mut subst = Subst::new();
         assert_eq!(subst.fresh_tyvar(), 0);
-        subst.bind_ty(0, Ty::F64).expect("binding should succeed");
+        subst.bind_ty(0, Ty::Float).expect("binding should succeed");
 
         subst.clear_map_keep_counter();
 
@@ -1037,7 +1043,7 @@ mod tests {
             .bind_ty(
                 0,
                 Ty::Func(
-                    value_func_params(vec![Ty::F64]),
+                    value_func_params(vec![Ty::Float]),
                     value_func_return(Ty::Var(0)),
                 ),
             )
@@ -1068,14 +1074,14 @@ mod tests {
         let subst = Subst::new();
 
         let applied = subst.apply(&Ty::Record(Row {
-            fields: vec![("z".to_string(), Ty::F64), ("a".to_string(), Ty::Unit)],
+            fields: vec![("z".to_string(), Ty::Float), ("a".to_string(), Ty::Unit)],
             tail: Box::new(Ty::Unit),
         }));
 
         assert_eq!(
             applied,
             Ty::Record(Row {
-                fields: vec![("a".to_string(), Ty::Unit), ("z".to_string(), Ty::F64)],
+                fields: vec![("a".to_string(), Ty::Unit), ("z".to_string(), Ty::Float)],
                 tail: Box::new(Ty::Unit),
             })
         );
@@ -1087,7 +1093,7 @@ mod tests {
         subst.map.insert(
             0,
             Ty::Record(Row {
-                fields: vec![("b".to_string(), Ty::F64)],
+                fields: vec![("b".to_string(), Ty::Float)],
                 tail: Box::new(Ty::Unit),
             }),
         );
@@ -1100,7 +1106,7 @@ mod tests {
         assert_eq!(
             applied,
             Ty::Record(Row {
-                fields: vec![("a".to_string(), Ty::Unit), ("b".to_string(), Ty::F64)],
+                fields: vec![("a".to_string(), Ty::Unit), ("b".to_string(), Ty::Float)],
                 tail: Box::new(Ty::Unit),
             })
         );
@@ -1112,10 +1118,10 @@ mod tests {
 
         let err = unify(
             &mut subst,
-            Ty::App(Box::new(Ty::Con("Map".to_string())), vec![Ty::F64]),
+            Ty::App(Box::new(Ty::Con("Map".to_string())), vec![Ty::Float]),
             Ty::App(
                 Box::new(Ty::Con("Map".to_string())),
-                vec![Ty::F64, Ty::Con("string".to_string())],
+                vec![Ty::Float, Ty::Con("string".to_string())],
             ),
         )
         .expect_err("different type-application arities should fail");
@@ -1123,10 +1129,10 @@ mod tests {
         assert_eq!(
             err,
             error::TypeError::Mismatch(
-                Ty::App(Box::new(Ty::Con("Map".to_string())), vec![Ty::F64]),
+                Ty::App(Box::new(Ty::Con("Map".to_string())), vec![Ty::Float]),
                 Ty::App(
                     Box::new(Ty::Con("Map".to_string())),
-                    vec![Ty::F64, Ty::Con("string".to_string())],
+                    vec![Ty::Float, Ty::Con("string".to_string())],
                 ),
             )
         );
@@ -1138,8 +1144,8 @@ mod tests {
 
         let err = unify(
             &mut subst,
-            Ty::Tuple(vec![Ty::F64, Ty::Con("bool".to_string())]),
-            Ty::Tuple(vec![Ty::F64, Ty::Con("string".to_string())]),
+            Ty::Tuple(vec![Ty::Float, Ty::Con("bool".to_string())]),
+            Ty::Tuple(vec![Ty::Float, Ty::Con("string".to_string())]),
         )
         .expect_err("tuple element mismatch should fail");
 
@@ -1168,7 +1174,7 @@ mod tests {
                 tail: Box::new(Ty::Unit),
             }),
             Ty::Record(Row {
-                fields: vec![("name".to_string(), Ty::F64)],
+                fields: vec![("name".to_string(), Ty::Float)],
                 tail: Box::new(Ty::Unit),
             }),
         )
@@ -1178,13 +1184,13 @@ mod tests {
             err,
             error::TypeError::MismatchWithContext {
                 context: vec![TypeMismatchContext::RecordField("name".to_string())],
-                expected: Ty::F64,
+                expected: Ty::Float,
                 got: Ty::Con("string".to_string()),
             }
         );
         assert_eq!(
             err.to_string(),
-            "type mismatch in record field `name`: expected `f64`, got `string`"
+            "type mismatch in record field `name`: expected `float`, got `string`"
         );
     }
 
@@ -1199,7 +1205,7 @@ mod tests {
                 tail: Box::new(Ty::Unit),
             })]),
             Ty::Tuple(vec![Ty::Record(Row {
-                fields: vec![("ok".to_string(), Ty::F64)],
+                fields: vec![("ok".to_string(), Ty::Float)],
                 tail: Box::new(Ty::Unit),
             })]),
         )
@@ -1212,13 +1218,13 @@ mod tests {
                     TypeMismatchContext::TupleElement(0),
                     TypeMismatchContext::RecordField("ok".to_string()),
                 ],
-                expected: Ty::F64,
+                expected: Ty::Float,
                 got: Ty::Con("bool".to_string()),
             }
         );
         assert_eq!(
             err.to_string(),
-            "type mismatch in tuple element 1, record field `ok`: expected `f64`, got `bool`"
+            "type mismatch in tuple element 1, record field `ok`: expected `float`, got `bool`"
         );
     }
 }

@@ -1,7 +1,7 @@
 use super::state::{ServerState, cached_analysis};
 use super::uri::uri_to_path;
-use super::workspace::load_workspace_graphs;
-use hern_core::analysis::hover_at;
+use super::workspace::{document_source, load_workspace_graphs};
+use hern_core::analysis::{PreludeAnalysis, analyze_prelude_source, hover_at};
 use hern_core::ast::{
     BinOp, Expr, ExprKind, Fixity, ImplMethod, InherentMethod, Param, Pattern, Program,
     SourcePosition, SourceSpan, Stmt, TraitDef, TraitMethod,
@@ -11,13 +11,18 @@ use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference,
 use hern_core::types::infer::{TypeEnv, VariantEnv};
 use hern_core::types::{
     BindingCapabilities, Scheme, TraitConstraint, Ty, TyVar, display_ty_with_var_names,
-    free_type_vars_in_display_order, type_var_name,
+    free_type_vars_in_display_order, trait_impl_dict_name, trait_impl_target_key_from_ast,
+    type_var_name,
 };
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 use std::collections::HashMap;
+use std::path::Path;
 
 pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position) -> Option<Hover> {
     let path = uri_to_path(&uri)?;
+    if is_std_prelude_path(&path) {
+        return prelude_hover(state, &uri, position);
+    }
     let fallback;
     let (graph, inference) = if let Some(analysis) = cached_analysis(state, &uri) {
         (&analysis.graph, &analysis.inference)
@@ -64,6 +69,84 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
         ty_to_display_string_with_place_mutability(&info.ty, place_mutable),
         markdown,
     ))
+}
+
+fn prelude_hover(state: &ServerState, uri: &lsp_types::Uri, position: Position) -> Option<Hover> {
+    let source = document_source(state, uri)?;
+    let prelude = match analyze_prelude_source(&source) {
+        Ok(prelude) => prelude,
+        Err(_) => state.prelude.clone(),
+    };
+    prelude_hover_from_analysis(state, &prelude, position)
+}
+
+fn prelude_hover_from_analysis(
+    state: &ServerState,
+    prelude: &PreludeAnalysis,
+    position: Position,
+) -> Option<Hover> {
+    let position = SourcePosition {
+        line: position.line as usize + 1,
+        col: position.character as usize + 1,
+    };
+    let markdown = state.supports_markdown_hover;
+    let index = index_program(&prelude.program);
+    if let Some(definition) = index.definition_at(position)
+        && let Some(contents) = definition_hover_text(
+            definition,
+            Some(&prelude.inference.env),
+            Some(&prelude.inference.expr_types),
+            Some(&prelude.inference.binding_types),
+            Some(&prelude.inference.definition_schemes),
+            Some(&prelude.inference.binding_capabilities),
+            Some(&prelude.inference.variant_env),
+            &prelude.program,
+        )
+    {
+        return Some(type_hover(contents, markdown));
+    }
+    if let Some(operator) = operator_use_at(&prelude.program, position)
+        && let Some(contents) = operator_definition_hover_text(
+            &prelude.program,
+            Some(&prelude.inference.env),
+            Some(&prelude.inference.definition_schemes),
+            operator.name,
+        )
+    {
+        return Some(type_hover(contents, markdown));
+    }
+    let info = hover_at(
+        &prelude.program,
+        &prelude.inference.expr_types,
+        &prelude.inference.symbol_types,
+        position,
+    )?;
+    let place_mutable = prelude
+        .inference
+        .binding_capabilities
+        .get(&info.span)
+        .is_some_and(|capabilities| capabilities.place_mutable);
+    if prelude
+        .inference
+        .callable_capabilities
+        .get(&info.node_id)
+        .is_some()
+    {
+        let scheme = Scheme::mono(info.ty.clone());
+        return Some(type_hover(hover_scheme_to_string(&scheme), markdown));
+    }
+    Some(type_hover(
+        ty_to_display_string_with_place_mutability(&info.ty, place_mutable),
+        markdown,
+    ))
+}
+
+fn is_std_prelude_path(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "prelude.hern")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "std")
 }
 
 /// Wrap a type string for display in a hover response.
@@ -787,6 +870,7 @@ pub(super) fn ast_type_to_string(ty: &hern_core::ast::Type) -> String {
             format!("#{{ {} }}", parts.join(", "))
         }
         Type::Unit => "()".to_string(),
+        Type::Never => "!".to_string(),
         Type::Hole => "*".to_string(),
     }
 }
@@ -1026,7 +1110,9 @@ fn param_type_in_stmt(
             ..
         } => param_type_from_fn_scheme(fn_name, params, name, param_span, env, variant_env),
         Stmt::Impl(id) => {
-            let dict_key = format!("__{}__{}", id.trait_name, impl_target_name(&id.target));
+            let dict_key = trait_impl_target_key_from_ast(&id.target)
+                .ok()
+                .map(|target| trait_impl_dict_name(&id.trait_name, &target))?;
             for method in &id.methods {
                 if let Some(ty) =
                     param_type_from_impl_dict(&dict_key, method, name, param_span, env, variant_env)
@@ -1043,15 +1129,6 @@ fn param_type_in_stmt(
             param_type_in_expr_stmts(expr, name, param_span, env, expr_types, variant_env)
         }
         _ => None,
-    }
-}
-
-/// Mirrors `impl_target_name` from the type inferencer.
-fn impl_target_name(target: &hern_core::ast::Type) -> String {
-    match target {
-        hern_core::ast::Type::Ident(name) => name.clone(),
-        hern_core::ast::Type::App(con, _) => impl_target_name(con),
-        _ => "Unknown".to_string(),
     }
 }
 
@@ -1239,7 +1316,7 @@ fn extract_binding_type(
 /// Resolve the payload type of a constructor binding such as `Some(x)` or `Err(e)`.
 ///
 /// Uses the variant environment to correctly map type parameters to their instantiated
-/// types — for example, `Err(e)` in a `Result(f64, string)` correctly yields `string`
+/// types — for example, `Err(e)` in a `Result(float, string)` correctly yields `string`
 /// rather than the first type argument.
 ///
 /// Falls back to a positional heuristic (`args[0]` / `args[1]` for `Err`) only when the
@@ -1350,7 +1427,7 @@ fn instantiate_variant_template(
                 args,
             )),
         }),
-        Ty::F64 | Ty::Unit | Ty::Con(_) => template.clone(),
+        Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => template.clone(),
     }
 }
 

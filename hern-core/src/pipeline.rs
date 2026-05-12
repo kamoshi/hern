@@ -313,7 +313,7 @@ mod tests {
     fn collecting_inference_avoids_trait_impl_cascades() {
         let mut program = parse_source(
             "trait Pair 'a {\n    fn combine(lhs: 'a, rhs: 'a) -> 'a\n}\n\
-             impl Pair for f64 {\n    fn combine(lhs) { lhs }\n}\n\
+             impl Pair for float {\n    fn combine(lhs) { lhs }\n}\n\
              let via_trait = Pair.combine(1, 2);\nlet other: bool = 2;\n",
         )
         .expect("source should parse");

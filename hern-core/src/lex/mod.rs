@@ -12,6 +12,7 @@ pub enum Token {
     Trait,
     Impl,
     For,
+    Where,
     Type,
     Match,
     Loop,
@@ -31,7 +32,7 @@ pub enum Token {
 
     // Literals
     Ident(String),
-    Number(f64),
+    Number(NumberLiteral),
     StringLit(String),
 
     // Operators
@@ -69,6 +70,28 @@ pub enum Token {
     InnerAttr(String), // #![name]
 
     Eof,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NumberLiteral {
+    Int(i32),
+    Float(f64),
+}
+
+impl NumberLiteral {
+    pub fn precedence_value(&self) -> u8 {
+        match self {
+            NumberLiteral::Int(n) => (*n).try_into().unwrap_or(0),
+            NumberLiteral::Float(n) => *n as u8,
+        }
+    }
+
+    pub fn as_lua_source(&self) -> String {
+        match self {
+            NumberLiteral::Int(n) => n.to_string(),
+            NumberLiteral::Float(n) => n.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +167,9 @@ impl<'src> Lexer<'src> {
 
     fn next_token(&mut self) -> Result<Spanned, LexError> {
         loop {
-            if self.pos == 0 && self.peek() == Some(b'#') && self.peek2() == Some(b'!')
+            if self.pos == 0
+                && self.peek() == Some(b'#')
+                && self.peek2() == Some(b'!')
                 && self.src.get(2) != Some(&b'[')
             {
                 while let Some(ch) = self.peek() {
@@ -305,7 +330,11 @@ impl<'src> Lexer<'src> {
         }
         // The lexer only allows ASCII digits and '.' in this range, so it is always valid UTF-8.
         let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
-        Token::Number(s.parse().unwrap_or(0.0))
+        if s.contains('.') {
+            Token::Number(NumberLiteral::Float(s.parse().unwrap_or(0.0)))
+        } else {
+            Token::Number(NumberLiteral::Int(s.parse().unwrap_or(0)))
+        }
     }
 
     fn lex_string(&mut self, line: usize, col: usize) -> Result<Token, LexError> {
@@ -417,6 +446,7 @@ impl<'src> Lexer<'src> {
             "trait" => Token::Trait,
             "impl" => Token::Impl,
             "for" => Token::For,
+            "where" => Token::Where,
             "type" => Token::Type,
             "match" => Token::Match,
             "loop" => Token::Loop,

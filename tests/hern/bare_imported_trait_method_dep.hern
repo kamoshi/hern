@@ -2,6 +2,6 @@ trait Double 'a {
     fn double(x: 'a) -> 'a
 }
 
-impl Double for f64 {
+impl Double for float {
     fn double(x) { x + x }
 }

@@ -1,16 +1,16 @@
 trait Runner 'a {
-    fn run(x: 'a) -> f64
+    fn run(x: 'a) -> float
 }
 
 trait Executor 'a {
-    fn run(x: 'a) -> f64
+    fn run(x: 'a) -> float
 }
 
-impl Runner for f64 {
+impl Runner for float {
     fn run(x) { x }
 }
 
-impl Executor for f64 {
+impl Executor for float {
     fn run(x) { x + 1 }
 }
 

@@ -1,0 +1,14 @@
+trait Label 'a {
+    fn label(x: 'a) -> string
+}
+
+impl Label for [float] {
+    fn label(xs) { "numbers" }
+}
+
+impl Label for [string] {
+    fn label(xs) { "strings" }
+}
+
+print(label([1.0]));
+print(label(["a"]));

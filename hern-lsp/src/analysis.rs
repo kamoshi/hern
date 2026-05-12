@@ -176,6 +176,25 @@ pub(super) mod tests {
         item.insert_text.as_deref().unwrap_or(&item.label)
     }
 
+    pub(super) fn source_with_cursor(source: &str) -> (String, Position) {
+        const MARKER: &str = "<|>";
+        let Some(marker_index) = source.find(MARKER) else {
+            panic!("test source must contain a {MARKER} cursor marker");
+        };
+        assert!(
+            source[marker_index + MARKER.len()..].find(MARKER).is_none(),
+            "test source must contain exactly one cursor marker"
+        );
+        let before_marker = &source[..marker_index];
+        let line = before_marker.lines().count().saturating_sub(1) as u32;
+        let col = before_marker
+            .rsplit_once('\n')
+            .map_or(before_marker, |(_, line)| line)
+            .chars()
+            .count() as u32;
+        (source.replace(MARKER, ""), Position::new(line, col))
+    }
+
     #[test]
     fn diagnostics_from_compiler_diagnostics_routes_source_path_to_that_uri() {
         use diagnostics::diagnostics_from_compiler_diagnostics;
@@ -329,6 +348,22 @@ pub(super) mod tests {
         );
 
         state.documents.clear();
+    }
+
+    #[test]
+    fn diagnostics_for_open_std_prelude_uses_prelude_analysis() {
+        let project = TestProject::new("diagnostics-open-prelude");
+        let prelude_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../std/prelude.hern");
+        let source =
+            fs::read_to_string(prelude_path).expect("workspace prelude should be readable");
+        let (mut state, uri) = project.open("std/prelude.hern", &source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        assert!(
+            diagnostics[&uri].is_empty(),
+            "opening std/prelude.hern should not report ordinary workspace diagnostics: {:?}",
+            diagnostics[&uri]
+        );
     }
 
     #[test]
@@ -513,7 +548,7 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(1, 1)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
     }
 
     #[test]
@@ -538,10 +573,13 @@ pub(super) mod tests {
         assert_eq!(hover::ty_to_display_string(&ty), "fn('a, ('b, 'a)) -> 'b");
 
         let scheme = Scheme::mono(Ty::Func(
-            vec![FuncParam::mut_place(Ty::F64)],
+            vec![FuncParam::mut_place(Ty::Float)],
             value_func_return(Ty::Unit),
         ));
-        assert_eq!(hover::hover_scheme_to_string(&scheme), "fn(mut f64) -> ()");
+        assert_eq!(
+            hover::hover_scheme_to_string(&scheme),
+            "fn(mut float) -> ()"
+        );
     }
 
     #[test]
@@ -564,8 +602,8 @@ pub(super) mod tests {
         let binding = hover(&state, uri.clone(), Position::new(0, 8)).expect("binding hover");
         let use_site = hover(&state, uri, Position::new(1, 0)).expect("use hover");
 
-        assert_eq!(hover_text(binding), "mut #{ x: f64 }");
-        assert_eq!(hover_text(use_site), "mut #{ x: f64 }");
+        assert_eq!(hover_text(binding), "mut #{ x: int }");
+        assert_eq!(hover_text(use_site), "mut #{ x: int }");
     }
 
     #[test]
@@ -576,14 +614,14 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(1, 8)).expect("alias hover");
 
-        assert_eq!(hover_text(info), "#{ x: f64 }");
+        assert_eq!(hover_text(info), "#{ x: int }");
     }
 
     #[test]
     fn hover_renders_mutable_function_parameters() {
         let project = TestProject::new("mutable-param-hover");
         let source = concat!(
-            "fn bump(mut r: #{ x: f64 }) {\n",
+            "fn bump(mut r: #{ x: int }) {\n",
             "  r.x = r.x + 1;\n",
             "}\n",
             "bump\n",
@@ -594,9 +632,9 @@ pub(super) mod tests {
         let param_hover = hover(&state, uri.clone(), Position::new(0, 12)).expect("param hover");
         let callee_hover = hover(&state, uri, Position::new(3, 0)).expect("callee hover");
 
-        assert_eq!(hover_text(fn_hover), "fn(mut #{ x: f64 }) -> ()");
-        assert_eq!(hover_text(param_hover), "mut #{ x: f64 }");
-        assert_eq!(hover_text(callee_hover), "fn(mut #{ x: f64 }) -> ()");
+        assert_eq!(hover_text(fn_hover), "fn(mut #{ x: int }) -> ()");
+        assert_eq!(hover_text(param_hover), "mut #{ x: int }");
+        assert_eq!(hover_text(callee_hover), "fn(mut #{ x: int }) -> ()");
     }
 
     #[test]
@@ -607,7 +645,7 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(2, 1)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
     }
 
     #[test]
@@ -617,22 +655,66 @@ pub(super) mod tests {
             "trait Bump 'a {\n",
             "  fn bump(x: 'a) -> 'a\n",
             "}\n",
-            "impl Bump for f64 {\n",
-            "  fn bump(x: f64) -> f64 { x + 1 }\n",
+            "impl Bump for float {\n",
+            "  fn bump(x: float) -> float { x + 1.0 }\n",
             "}\n",
         );
         let (state, uri) = project.open("main.hern", source);
 
         let info = hover(&state, uri, Position::new(4, 5)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "fn(f64) -> f64");
+        assert_eq!(hover_text(info), "fn(float) -> float");
+    }
+
+    #[test]
+    fn hover_open_std_prelude_uses_prelude_inference() {
+        let project = TestProject::new("hover-open-prelude");
+        let prelude_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../std/prelude.hern");
+        let source =
+            fs::read_to_string(prelude_path).expect("workspace prelude should be readable");
+        let array_impl = source
+            .find("impl Functor for Array")
+            .expect("prelude should contain Functor Array impl");
+        let needle = "fa.map(f)";
+        let offset = source[array_impl..]
+            .find(needle)
+            .map(|idx| array_impl + idx + "fa.".len())
+            .expect("prelude should contain Functor Array map body");
+        let line = source[..offset].lines().count().saturating_sub(1) as u32;
+        let character = source[..offset]
+            .rsplit_once('\n')
+            .map_or(&source[..offset], |(_, line)| line)
+            .chars()
+            .count() as u32;
+        let (state, uri) = project.open("std/prelude.hern", &source);
+
+        let info = hover(&state, uri, Position::new(line, character)).expect("prelude map hover");
+        assert_eq!(hover_text(info), "fn(['a], fn('a) -> 'b) -> ['b]");
+    }
+
+    #[test]
+    fn hover_returns_exact_applied_trait_impl_parameter_type() {
+        let project = TestProject::new("exact-applied-impl-param-hover");
+        let source = concat!(
+            "trait Label 'a {\n",
+            "  fn label(x: 'a) -> string\n",
+            "}\n",
+            "impl Label for [float] {\n",
+            "  fn label(xs) { \"numbers\" }\n",
+            "}\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(4, 11)).expect("param hover should resolve");
+
+        assert_eq!(hover_text(info), "[float]");
     }
 
     #[test]
     fn hover_returns_type_and_trait_declarations() {
         let project = TestProject::new("type-trait-hover");
         let source = concat!(
-            "type Pair = #{ x: f64, y: f64 }\n",
+            "type Pair = #{ x: float, y: float }\n",
             "type Option2('a) = Some2('a) | None2\n",
             "trait Show 'a {\n",
             "  fn show(x: 'a) -> string\n",
@@ -645,7 +727,7 @@ pub(super) mod tests {
         let trait_info = hover(&state, uri.clone(), Position::new(2, 7)).expect("trait hover");
         let trait_method = hover(&state, uri, Position::new(3, 5)).expect("trait method hover");
 
-        assert_eq!(hover_text(alias), "type Pair = #{ x: f64, y: f64 }");
+        assert_eq!(hover_text(alias), "type Pair = #{ x: float, y: float }");
         assert_eq!(hover_text(sum), "type Option2('a) = Some2('a) | None2");
         assert_eq!(hover_text(trait_info), "trait Show 'a");
         assert_eq!(hover_text(trait_method), "fn show(x: 'a) -> string");
@@ -658,10 +740,10 @@ pub(super) mod tests {
             "trait Show 'a {\n",
             "  fn show(x: 'a) -> string\n",
             "}\n",
-            "impl Show for f64 {\n",
+            "impl Show for float {\n",
             "  fn show(x) { \"ok\" }\n",
             "}\n",
-            "Show.show(1)\n",
+            "Show.show(1.0)\n",
         );
         let (state, uri) = project.open("main.hern", source);
 
@@ -687,7 +769,7 @@ pub(super) mod tests {
 
         let info = hover(&state, entry_uri, Position::new(1, 5)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "dep.value: fn() -> f64");
+        assert_eq!(hover_text(info), "dep.value: fn() -> int");
     }
 
     #[test]
@@ -700,8 +782,8 @@ pub(super) mod tests {
             hover(&state, uri.clone(), Position::new(1, 1)).expect("callee hover should resolve");
         let call = hover(&state, uri, Position::new(1, 10)).expect("call hover should resolve");
 
-        assert_eq!(hover_text(callee), "fn(f64) -> f64");
-        assert_eq!(hover_text(call), "f64");
+        assert_eq!(hover_text(callee), "fn(int) -> int");
+        assert_eq!(hover_text(call), "int");
     }
 
     #[test]
@@ -720,12 +802,12 @@ pub(super) mod tests {
     #[test]
     fn hover_shows_plain_function_signature_when_call_has_wrong_arity() {
         let project = TestProject::new("function-hover-wrong-arity");
-        let source = "fn add(x: f64, y: f64) -> f64 { x + y }\nadd(1)\n";
+        let source = "fn add(x: float, y: float) -> float { x + y }\nadd(1)\n";
         let (state, uri) = project.open("main.hern", source);
 
         let info = hover(&state, uri, Position::new(1, 1)).expect("function hover should resolve");
 
-        assert_eq!(hover_text(info), "fn(f64, f64) -> f64");
+        assert_eq!(hover_text(info), "fn(float, float) -> float");
     }
 
     #[test]
@@ -774,7 +856,7 @@ pub(super) mod tests {
             callee_text.contains("'a: Iterable"),
             "expected constraints section, got: {callee_text}"
         );
-        assert_eq!(hover_text(call), "f64");
+        assert_eq!(hover_text(call), "int");
     }
 
     #[test]
@@ -855,7 +937,7 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(0, 4)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
     }
 
     #[test]
@@ -866,7 +948,7 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(1, 1)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
     }
 
     #[test]
@@ -884,7 +966,7 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(1, 6)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
     }
 
     #[test]
@@ -903,8 +985,8 @@ pub(super) mod tests {
         let x_info = hover(&state, uri.clone(), Position::new(1, 7)).expect("hover should resolve");
         let y_info = hover(&state, uri, Position::new(1, 10)).expect("hover should resolve");
 
-        assert_eq!(hover_text(x_info), "f64");
-        assert_eq!(hover_text(y_info), "f64");
+        assert_eq!(hover_text(x_info), "int");
+        assert_eq!(hover_text(y_info), "int");
     }
 
     #[test]
@@ -922,12 +1004,12 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(1, 9)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
     }
 
     #[test]
     fn hover_returns_type_for_plain_function_parameter() {
-        // `x + 1` with the literal `1 :: f64` forces `x` to be `f64`,
+        // `x + 1` with the literal `1 :: int` forces `x` to be `int`,
         // so the parameter type is fully concrete and hover shows it directly.
         let project = TestProject::new("fn-param-hover");
         let source = "fn add_one(x) { x + 1 }\nadd_one(1)\n";
@@ -936,7 +1018,7 @@ pub(super) mod tests {
         // "fn add_one(" = 11 chars; `x` is at col 11 on line 0.
         let info = hover(&state, uri, Position::new(0, 11)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
     }
 
     #[test]
@@ -954,12 +1036,12 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(2, 7)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
     }
 
     #[test]
     fn hover_returns_correct_type_for_match_ok_and_err_bindings() {
-        // `Ok(v)` should give the first Result type argument (f64),
+        // `Ok(v)` should give the first Result type argument (int),
         // `Err(e)` should give the *second* type argument (string) — this validates
         // that the variant-env lookup picks the right type param, not always args[0].
         let project = TestProject::new("match-result-hover");
@@ -978,7 +1060,7 @@ pub(super) mod tests {
             hover(&state, uri.clone(), Position::new(4, 5)).expect("Ok hover should resolve");
         let err_info = hover(&state, uri, Position::new(5, 6)).expect("Err hover should resolve");
 
-        assert_eq!(hover_text(ok_info), "f64");
+        assert_eq!(hover_text(ok_info), "int");
         assert_eq!(hover_text(err_info), "string");
     }
 
@@ -986,18 +1068,18 @@ pub(super) mod tests {
     fn hover_resolves_constructor_payload_type_aliases() {
         let project = TestProject::new("match-aliased-payload-hover");
         let source = concat!(
-            "type Amount = f64\n",
+            "type Amount = float\n",
             "type Wrapped = Wrap(Amount) | Empty\n",
-            "match Wrap(1) {\n",
-            "  Wrap(v) -> v + 1,\n",
-            "  Empty -> 0,\n",
+            "match Wrap(1.0) {\n",
+            "  Wrap(v) -> v + 1.0,\n",
+            "  Empty -> 0.0,\n",
             "}\n",
         );
         let (state, uri) = project.open("main.hern", source);
 
         let info = hover(&state, uri, Position::new(3, 7)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "float");
     }
 
     #[test]
@@ -1013,7 +1095,7 @@ pub(super) mod tests {
 
         let info = hover(&state, entry_uri, Position::new(1, 5)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "dep.value: fn() -> f64");
+        assert_eq!(hover_text(info), "dep.value: fn() -> int");
     }
 
     #[test]
@@ -1025,7 +1107,7 @@ pub(super) mod tests {
 
         let info = hover(&state, uri, Position::new(1, 1)).expect("hover should resolve");
 
-        assert_eq!(hover_text(info), "fn(f64) -> f64");
+        assert_eq!(hover_text(info), "fn(int) -> int");
     }
 
     #[test]
@@ -1040,7 +1122,7 @@ pub(super) mod tests {
         assert!(diagnostics[&uri].is_empty());
         assert!(state.cached_analyses.contains_key(&uri));
         let info = hover(&state, uri, Position::new(1, 1)).expect("hover should resolve");
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
     }
 
     #[test]
@@ -1277,7 +1359,7 @@ pub(super) mod tests {
             "test must exercise a file that has not been saved to disk"
         );
         assert!(diagnostics.values().all(Vec::is_empty));
-        assert_eq!(hover_text(info), "f64");
+        assert_eq!(hover_text(info), "int");
         assert!(
             items
                 .iter()
@@ -1306,7 +1388,7 @@ pub(super) mod tests {
         assert!(!entry_path.exists());
         assert!(!dep_path.exists());
         assert!(diagnostics.values().all(Vec::is_empty));
-        assert_eq!(hover_text(info), "dep.value: f64");
+        assert_eq!(hover_text(info), "dep.value: int");
     }
 
     #[test]
@@ -1323,6 +1405,49 @@ pub(super) mod tests {
             .expect("type diagnostic should be reported");
 
         assert!(diagnostic.range.end.character > diagnostic.range.start.character);
+    }
+
+    #[test]
+    fn method_diagnostic_includes_inherent_candidates() {
+        let project = TestProject::new("method-diagnostic-candidates");
+        let (mut state, uri) = project.open("main.hern", "let xs = [];\nxs.sum();\n");
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let messages: Vec<_> = diagnostics
+            .values()
+            .flat_map(|items| items.iter())
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("array element type is unknown")
+                    && message.contains("available candidates: [float].sum, [int].sum")),
+            "expected candidate-rich method diagnostic, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn completion_suggests_exact_applied_inherent_receiver_methods() {
+        let project = TestProject::new("completion-exact-applied-inherent");
+        let (source, position) = source_with_cursor(concat!(
+            "impl [float] {\n",
+            "  fn total(self) -> float { 0.0 }\n",
+            "}\n",
+            "let xs: [float] = [];\n",
+            "xs.<|>\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let items = completion(&state, uri, position);
+
+        assert!(
+            items
+                .iter()
+                .any(|item| completion_insert_name(item) == "total"),
+            "exact applied receiver method should be suggested, got {items:?}"
+        );
     }
 
     #[test]
@@ -1558,7 +1683,7 @@ pub(super) mod tests {
         assert!(
             math.detail
                 .as_deref()
-                .is_some_and(|detail| detail.contains("sqrt: fn(f64) -> f64")),
+                .is_some_and(|detail| detail.contains("sqrt: fn(float) -> float")),
             "math should include its prelude module type detail, got {:?}",
             math.detail
         );
@@ -1584,7 +1709,7 @@ pub(super) mod tests {
             .find(|item| completion_insert_name(item) == "sqrt")
             .expect("prelude record field `math.sqrt` should be a completion candidate");
         assert_eq!(sqrt.kind, Some(CompletionItemKind::FIELD));
-        assert_eq!(sqrt.detail.as_deref(), Some("fn(f64) -> f64"));
+        assert_eq!(sqrt.detail.as_deref(), Some("fn(float) -> float"));
     }
 
     #[test]
@@ -1835,7 +1960,7 @@ pub(super) mod tests {
     #[test]
     fn completion_provides_type_detail_for_top_level_function() {
         let project = TestProject::new("completion-type-detail");
-        let source = "fn double(x: f64) -> f64 { x + x }\ndouble(1)\n";
+        let source = "fn double(x: float) -> float { x + x }\ndouble(1)\n";
         let (state, uri) = project.open("main.hern", source);
 
         let items = completion(&state, uri, Position::new(1, 1));
@@ -1846,13 +1971,13 @@ pub(super) mod tests {
             .expect("double should appear in completion");
         assert_eq!(double_item.label, "double");
         assert_eq!(double_item.insert_text.as_deref(), Some("double"));
-        assert_eq!(double_item.detail.as_deref(), Some("fn(f64) -> f64"));
+        assert_eq!(double_item.detail.as_deref(), Some("fn(float) -> float"));
         assert_eq!(
             double_item
                 .label_details
                 .as_ref()
                 .and_then(|details| details.detail.as_deref()),
-            Some(": fn(f64) -> f64")
+            Some(": fn(float) -> float")
         );
     }
 
@@ -1860,7 +1985,7 @@ pub(super) mod tests {
     fn completion_keeps_type_detail_during_partial_identifier_edit() {
         use lsp_types::{CompletionTextEdit, TextEdit};
         let project = TestProject::new("completion-partial-identifier-type-detail");
-        let source = "fn double(x: f64) -> f64 { x + x }\ndo\n";
+        let source = "fn double(x: float) -> float { x + x }\ndo\n";
         let (state, uri) = project.open("main.hern", source);
 
         let items = completion(&state, uri, Position::new(1, 2));
@@ -1870,7 +1995,7 @@ pub(super) mod tests {
             .find(|i| completion_insert_name(i) == "double")
             .expect("double should appear while a partial identifier is being typed");
         assert_eq!(double_item.label, "double");
-        assert_eq!(double_item.detail.as_deref(), Some("fn(f64) -> f64"));
+        assert_eq!(double_item.detail.as_deref(), Some("fn(float) -> float"));
         assert_eq!(
             double_item.text_edit.as_ref(),
             Some(&CompletionTextEdit::Edit(TextEdit {
@@ -1897,21 +2022,21 @@ pub(super) mod tests {
             .find(|i| completion_insert_name(i) == "local")
             .expect("local should appear in completion");
 
-        assert_eq!(x_item.detail.as_deref(), Some("f64"));
-        assert_eq!(local_item.detail.as_deref(), Some("f64"));
+        assert_eq!(x_item.detail.as_deref(), Some("int"));
+        assert_eq!(local_item.detail.as_deref(), Some("int"));
         assert_eq!(
             x_item
                 .label_details
                 .as_ref()
                 .and_then(|details| details.detail.as_deref()),
-            Some(": f64")
+            Some(": int")
         );
         assert_eq!(
             local_item
                 .label_details
                 .as_ref()
                 .and_then(|details| details.detail.as_deref()),
-            Some(": f64")
+            Some(": int")
         );
     }
 
@@ -1934,13 +2059,13 @@ pub(super) mod tests {
             .iter()
             .find(|i| completion_insert_name(i) == "sum")
             .expect("sum should appear in completion");
-        assert_eq!(sum_item.detail.as_deref(), Some("fn('a(f64)) -> f64"));
+        assert_eq!(sum_item.detail.as_deref(), Some("fn('a(int)) -> int"));
         assert_eq!(
             sum_item
                 .label_details
                 .as_ref()
                 .and_then(|details| details.detail.as_deref()),
-            Some(": fn('a(f64)) -> f64")
+            Some(": fn('a(int)) -> int")
         );
     }
 

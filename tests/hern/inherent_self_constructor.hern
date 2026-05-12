@@ -2,7 +2,7 @@ impl Map('k, 'v) {
     fn empty() -> mut Self { __map_new() }
 }
 
-let mut m: Map(string, f64) = Map::empty();
+let mut m: Map(string, int) = Map::empty();
 
 m.set("x", 1);
 

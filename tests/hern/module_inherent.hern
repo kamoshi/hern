@@ -1,10 +1,10 @@
-type Boxed = MkBoxed(f64) | Empty
+type Boxed = MkBoxed(float) | Empty
 
 impl Boxed {
-  fn value(self) -> f64 {
+  fn value(self) -> float {
     match self {
       MkBoxed(v) -> v,
-      Empty -> 0,
+      Empty -> 0.0,
     }
   }
 }
@@ -13,9 +13,9 @@ impl Boxed {
   fn fallback(self) {
     match self {
       MkBoxed(v) -> v,
-      Empty -> 99,
+      Empty -> 99.0,
     }
   }
 }
 
-MkBoxed(11)
+MkBoxed(11.0)

@@ -274,7 +274,7 @@ type Option('a) = Some('a) | None
 trait Show 'a {
     fn show(x: 'a) -> string
 }
-impl Show for f64 {
+impl Show for float {
     fn show(x) { "number" }
 }
 fn main() { 1 }

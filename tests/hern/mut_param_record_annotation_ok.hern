@@ -1,8 +1,8 @@
-fn bump(mut r: #{ x: f64 }) {
+fn bump(mut r: #{ x: int }) {
   r.x = 2;
 }
 
-fn use_ops(ops: #{ bump: fn(mut #{ x: f64 }) -> Unit }, mut r: #{ x: f64 }) {
+fn use_ops(ops: #{ bump: fn(mut #{ x: int }) -> Unit }, mut r: #{ x: int }) {
   ops.bump(r);
 }
 

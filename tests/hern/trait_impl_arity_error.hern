@@ -2,7 +2,7 @@ trait Pair 'a {
     fn combine(lhs: 'a, rhs: 'a) -> 'a
 }
 
-impl Pair for f64 {
+impl Pair for float {
     fn combine(lhs) { lhs }
 }
 

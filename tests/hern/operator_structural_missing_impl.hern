@@ -1,3 +1,3 @@
-fn bad(a: fn() -> f64, b: fn() -> f64) -> bool {
+fn bad(a: fn() -> float, b: fn() -> float) -> bool {
     a == b
 }

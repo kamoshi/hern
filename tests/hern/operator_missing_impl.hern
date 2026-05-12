@@ -1,4 +1,4 @@
-type Boxed = Boxed(f64)
+type Boxed = Boxed(float)
 
 fn bad(a: Boxed, b: Boxed) -> bool {
     a == b

@@ -1,0 +1,7 @@
+fn double['a: Add](x: 'a) -> 'a {
+    x + x
+}
+
+let unconstrained: fn('a) -> 'a = double;
+
+print(unconstrained("hello"));

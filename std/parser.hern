@@ -14,7 +14,7 @@
 // For recursive grammars, wrap the self-reference in lazy:
 //   fn expr_p() { p.lazy(fn() { ... }) }
 
-extern __str_drop: fn(string, f64) -> string = #[template] "($1):sub(($2))";
+extern __str_drop: fn(string, int) -> string = #[template] "($1):sub(($2))";
 
 // --- Core type ---
 
@@ -285,14 +285,14 @@ fn spaces1() -> Parser(string) {
 // --- Number parsers ---
 
 // Parse a non-negative integer (digits only, no sign).
-fn natural() -> Parser(f64) {
+fn natural() -> Parser(int) {
   map(many1(digit()), fn(digits: [string]) {
     digits.fold("", fn(acc, c) { acc <> c }).to_int()
   })
 }
 
 // Parse an optionally-signed integer.
-fn integer() -> Parser(f64) {
+fn integer() -> Parser(int) {
   do {
     let sign <- optional(char_p("-"));
     let n <- natural();

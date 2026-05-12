@@ -1,0 +1,21 @@
+fn fail(message: string) -> ! {
+  error(message)
+}
+
+fn choose(flag) {
+  if flag {
+    todo("choose true branch")
+  } else {
+    41
+  }
+}
+
+fn unwrap_or_todo(value) {
+  match value {
+    Some(n) -> n,
+    None -> todo("expected Some"),
+  }
+}
+
+print(choose(false) + 1);
+print(unwrap_or_todo(Some(6)) + 1);

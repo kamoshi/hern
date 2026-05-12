@@ -1,0 +1,7 @@
+let f: fn(!) -> float = fn(x) {
+    x
+};
+
+let g: fn(string) -> float = f;
+
+print(g("hello") + 1.0);

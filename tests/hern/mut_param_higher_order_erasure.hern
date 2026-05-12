@@ -1,8 +1,8 @@
-fn apply(f: fn(#{ x: f64 }) -> (), value: #{ x: f64 }) {
+fn apply(f: fn(#{ x: int }) -> (), value: #{ x: int }) {
   f(value);
 }
 
-fn bump(mut r: #{ x: f64 }) {
+fn bump(mut r: #{ x: int }) {
   r.x = 2;
 }
 

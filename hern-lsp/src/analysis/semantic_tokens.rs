@@ -157,6 +157,7 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
         | Token::Trait
         | Token::Impl
         | Token::For
+        | Token::Where
         | Token::Type
         | Token::Match
         | Token::Loop
@@ -661,8 +662,8 @@ mod tests {
                 fields: vec![(
                     "add".to_string(),
                     Ty::Func(
-                        hern_core::types::value_func_params(vec![Ty::F64]),
-                        hern_core::types::value_func_return(Ty::F64),
+                        hern_core::types::value_func_params(vec![Ty::Float]),
+                        hern_core::types::value_func_return(Ty::Float),
                     ),
                 )],
                 tail: Box::new(Ty::Unit),

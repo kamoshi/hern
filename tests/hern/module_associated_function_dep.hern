@@ -1,6 +1,6 @@
-impl f64 {
-  fn from(value: f64) -> f64 {
-    value + 1
+impl float {
+  fn from(value: float) -> float {
+    value + 1.0
   }
 }
 

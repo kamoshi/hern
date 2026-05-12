@@ -344,7 +344,7 @@ fn collect_type_referenced_names(
                 collect_type_referenced_names(field_ty, refs, type_scope);
             }
         }
-        Type::Var(_) | Type::Unit | Type::Hole => {}
+        Type::Var(_) | Type::Unit | Type::Never | Type::Hole => {}
     }
 }
 

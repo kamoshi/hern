@@ -1,0 +1,10 @@
+impl ['a] {
+    fn tag(self) { "generic" }
+}
+
+impl [float] {
+    fn tag(self) { "numbers" }
+}
+
+print([1.0].tag());
+print(["a"].tag());

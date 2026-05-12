@@ -1,0 +1,4 @@
+let empty = #{};
+let copied = #{ ..empty };
+
+print(copied.missing);

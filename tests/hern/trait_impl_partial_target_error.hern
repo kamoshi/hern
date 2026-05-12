@@ -1,0 +1,11 @@
+trait Describe 'a {
+    fn describe(x: 'a) -> string
+}
+
+type Pair('a, 'b) = PairValue(#{ left: 'a, right: 'b })
+
+impl Describe for Pair(int, 'b) {
+    fn describe(x) {
+        "pair"
+    }
+}

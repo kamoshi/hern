@@ -1,4 +1,8 @@
 use crate::ast::*;
+use crate::types::{
+    trait_impl_dict_name, trait_impl_target_key_from_ast,
+    type_syntax::exact_impl_target_key_from_ast,
+};
 use std::collections::HashMap;
 
 // Must stay in sync with the prelude's `impl Iterable for Array` dictionary name.
@@ -225,7 +229,7 @@ impl LuaCodegen {
             let Stmt::Impl(id) = stmt else {
                 continue;
             };
-            let dict_name = format!("__{}__{}", id.trait_name, impl_target_name(&id.target));
+            let dict_name = trait_impl_dict_name_lua(id);
             for method in &id.methods {
                 if !method.inline {
                     continue;
@@ -470,6 +474,7 @@ impl LuaCodegen {
             .as_ref()
             .and_then(|callee| match callee {
                 ResolvedCallee::Function(name) => Some(name.as_str()),
+                ResolvedCallee::InherentMethod { .. } => None,
                 ResolvedCallee::DictMethod { .. } => None,
             })
             .or_else(|| {
@@ -497,7 +502,7 @@ impl LuaCodegen {
     ) -> Option<String> {
         match &expr.kind {
             ExprKind::Ident(name) => Some(subst.get(name).cloned().unwrap_or_else(|| name.clone())),
-            ExprKind::Number(n) => Some(n.to_string()),
+            ExprKind::Number(n) => Some(n.as_lua_source()),
             ExprKind::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
             ExprKind::Unit => Some("{}".to_string()),
             ExprKind::StringLit(s) => Some(lua_string(s)),
@@ -652,7 +657,7 @@ impl LuaCodegen {
     /// before using the returned string.
     fn gen_expr(&mut self, expr: &Expr, pre: &mut String) -> String {
         match &expr.kind {
-            ExprKind::Number(n) => n.to_string(),
+            ExprKind::Number(n) => n.as_lua_source(),
             ExprKind::Bool(b) => if *b { "1" } else { "0" }.to_string(),
             ExprKind::Unit => "{}".to_string(),
             ExprKind::Ident(name) => name.clone(),
@@ -1530,9 +1535,17 @@ impl LuaCodegen {
     }
 
     fn gen_impl(&mut self, id: &ImplDef) -> String {
-        let dict_name = format!("__{}__{}", id.trait_name, impl_target_name(&id.target));
+        let dict_name = trait_impl_dict_name_lua(id);
         let ind = self.ind();
-        let mut out = format!("{}local {} = {{\n", ind, dict_name);
+        let dict_params = id.dict_params.join(", ");
+        let mut out = if id.dict_params.is_empty() {
+            format!("{}local {} = {{\n", ind, dict_name)
+        } else {
+            format!(
+                "{}local function {}({})\n{}return {{\n",
+                ind, dict_name, dict_params, ind
+            )
+        };
         self.indent += 2;
         for method in &id.methods {
             let mut param_names: Vec<String> = Vec::new();
@@ -1565,12 +1578,16 @@ impl LuaCodegen {
             out.push_str(&format!("{}end,\n", self.ind()));
         }
         self.indent -= 2;
-        out.push_str(&format!("{}}}", self.ind()));
+        if id.dict_params.is_empty() {
+            out.push_str(&format!("{}}}", self.ind()));
+        } else {
+            out.push_str(&format!("{}}}\n{}end", self.ind(), ind));
+        }
         out
     }
 
     fn gen_inherent_impl(&mut self, id: &InherentImplDef) -> String {
-        let dict_name = format!("__impl__{}", impl_target_name(&id.target));
+        let dict_name = inherent_impl_dict_name_lua(&id.target);
         let ind = self.ind();
         let mut out = format!("{}local {} = {} or {{}}\n", ind, dict_name, dict_name);
         for method in &id.methods {
@@ -1752,17 +1769,23 @@ fn method_receiver(callee: &Expr, is_method_call: bool) -> Option<&Expr> {
 fn associated_access_lua(target: &Type, member: &str) -> String {
     format!(
         "__impl__{}.{}",
-        impl_target_name_lua(target),
+        inherent_impl_target_key_lua(target),
         mangle_op(member)
     )
 }
 
-fn impl_target_name_lua(target: &Type) -> String {
+fn inherent_impl_target_key_lua(target: &Type) -> String {
     match target {
         Type::Ident(name) => name.clone(),
-        Type::App(con, _) => impl_target_name_lua(con),
-        other => unreachable!("invalid inherent impl target reached codegen: {other:?}"),
+        Type::App(_, args) if args.iter().all(|arg| matches!(arg, Type::Var(_))) => {
+            impl_target_name(target)
+        }
+        _ => exact_impl_target_key_from_ast(target).unwrap_or_else(|_| impl_target_name(target)),
     }
+}
+
+fn inherent_impl_dict_name_lua(target: &Type) -> String {
+    format!("__impl__{}", inherent_impl_target_key_lua(target))
 }
 
 pub(crate) fn mangle_op(name: &str) -> String {
@@ -1803,6 +1826,12 @@ fn impl_target_name(target: &Type) -> String {
     }
 }
 
+fn trait_impl_dict_name_lua(id: &ImplDef) -> String {
+    let target_key = trait_impl_target_key_from_ast(&id.target)
+        .expect("invalid trait impl target reached codegen");
+    trait_impl_dict_name(&id.trait_name, &target_key)
+}
+
 fn split_module_body(stmts: &[Stmt]) -> (&[Stmt], Option<&Expr>) {
     match stmts.last() {
         Some(Stmt::Expr(expr)) => (&stmts[..stmts.len() - 1], Some(expr)),
@@ -1819,13 +1848,9 @@ fn impl_dict_names_from_stmts(stmts: &[Stmt]) -> Vec<String> {
         .iter()
         .filter_map(|stmt| {
             if let Stmt::Impl(id) = stmt {
-                Some(format!(
-                    "__{}__{}",
-                    id.trait_name,
-                    impl_target_name(&id.target)
-                ))
+                Some(trait_impl_dict_name_lua(id))
             } else if let Stmt::InherentImpl(id) = stmt {
-                Some(format!("__impl__{}", impl_target_name(&id.target)))
+                Some(inherent_impl_dict_name_lua(&id.target))
             } else {
                 None
             }
@@ -1912,9 +1937,12 @@ fn wrap_call_argument(arg: String, wrapper: Option<&ArgWrapper>) -> String {
 
 fn gen_resolved_callee(callee: &ResolvedCallee) -> String {
     match callee {
-        ResolvedCallee::Function(name) => name.clone(),
+        ResolvedCallee::Function(name) => mangle_op(name),
+        ResolvedCallee::InherentMethod { dict, method } => {
+            format!("{}.{}", dict, mangle_op(method))
+        }
         ResolvedCallee::DictMethod { dict, method } => {
-            format!("{}.{}", gen_dict_ref(dict), method)
+            format!("{}.{}", gen_dict_ref(dict), mangle_op(method))
         }
     }
 }
@@ -1926,6 +1954,9 @@ fn gen_dict_refs(dicts: &[DictRef]) -> Vec<String> {
 fn gen_dict_ref(dict: &DictRef) -> String {
     match dict {
         DictRef::Param(name) | DictRef::Concrete(name) => name.clone(),
+        DictRef::Applied { dict, args } => {
+            format!("{}({})", dict, gen_dict_refs(args).join(", "))
+        }
         DictRef::Structural(structural) => gen_structural_dict_ref(structural),
     }
 }
@@ -2031,7 +2062,7 @@ let hof_result = apply_twice(local_double, 1.0);
 
         assert!(
             lua.contains(
-                "local hof_result = apply_twice((function(...) return local_double(__Add__f64, ...) end), 1)"
+                "local hof_result = apply_twice((function(...) return local_double(__Add__float, ...) end), 1)"
             ),
             "higher-order constrained lambda arguments should eta-expand with the concrete dict:\n{lua}"
         );
@@ -2227,7 +2258,7 @@ touch(1);
     #[test]
     fn discarded_template_call_codegen_keeps_expression_statement_valid() {
         let source = r##"
-extern len_raw: fn([f64]) -> f64 = #[template] "#($1)";
+extern len_raw: fn([int]) -> int = #[template] "#($1)";
 let xs = [1, 2];
 len_raw(xs);
 "##;

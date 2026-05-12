@@ -1,4 +1,4 @@
-let mut m: Map(string, f64) = Map::new();
+let mut m: Map(string, int) = Map::new();
 
 m.set("a", 1);
 m.set("b", 2);

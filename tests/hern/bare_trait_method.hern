@@ -2,10 +2,10 @@ trait Double 'a {
     fn double(x: 'a) -> 'a
 }
 
-impl Double for f64 {
+impl Double for float {
     fn double(x) { x + x }
 }
 
 // bare call — dispatches via Double without explicit trait prefix
-print(double(21));
-print(double(0));
+print(double(21.0));
+print(double(0.0));

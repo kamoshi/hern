@@ -1,0 +1,5 @@
+impl [float] {
+    fn local_sum(self) {
+        self.fold(0.0, fn(acc, x) { acc + x })
+    }
+}

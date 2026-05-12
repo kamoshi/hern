@@ -21,8 +21,8 @@ fn reconstruct(came_from: Map('a, 'b), current, key) {
 //
 // start:     starting node
 // is_goal:   fn('node) -> bool
-// h:         admissible heuristic fn('node) -> f64
-// neighbors: fn('node) -> [('node, f64)]  (neighbor, edge_cost)
+// h:         admissible heuristic fn('node) -> float
+// neighbors: fn('node) -> [('node, float)]  (neighbor, edge_cost)
 // key:       fn('node) -> string  (unique string identity for a node)
 //
 // Returns Some(path) where path is [start, ..., goal], or None if unreachable.

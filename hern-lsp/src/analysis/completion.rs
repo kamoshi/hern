@@ -17,7 +17,7 @@ use hern_core::source_index::{
     CompletionCandidate, Definition, DefinitionKind, SourceIndex, index_program,
 };
 use hern_core::types::infer::TypeEnv;
-use hern_core::types::{ParamCapability, Scheme, Ty};
+use hern_core::types::{ParamCapability, Scheme, Ty, inherent_impl_target_keys_from_ty};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit, Position,
     Range, TextEdit, Uri,
@@ -640,31 +640,36 @@ fn receiver_method_completion_items(
     receiver_place_mutable: bool,
     replacement_range: Range,
 ) -> Vec<CompletionItem> {
-    let Some(target) = completion_ty_target_name(receiver_ty) else {
-        return Vec::new();
-    };
     let Some(module_env) = inference.module_env_for_module(current_module) else {
         return Vec::new();
     };
-    module_env
-        .all_inherent_methods()
-        .filter(|(method_target, _)| *method_target == target)
-        .flat_map(|(_, methods)| methods.iter())
-        .filter(|(name, method)| {
-            !is_internal_completion_name(name)
-                && method.has_receiver
-                && (receiver_place_mutable
-                    || !scheme_param_capability(&method.scheme, 0).is_mut_place())
-        })
-        .map(|(name, method)| {
-            method_completion_item(
-                name,
-                &method.scheme,
-                CompletionItemKind::METHOD,
-                replacement_range,
-            )
-        })
-        .collect()
+    let target_keys = inherent_impl_target_keys_from_ty(receiver_ty);
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for target in target_keys {
+        for (_, methods) in module_env
+            .all_inherent_methods()
+            .filter(|(method_target, _)| *method_target == target)
+        {
+            for (name, method) in methods {
+                if is_internal_completion_name(name)
+                    || !method.has_receiver
+                    || (!receiver_place_mutable
+                        && scheme_param_capability(&method.scheme, 0).is_mut_place())
+                    || !seen.insert(name.clone())
+                {
+                    continue;
+                }
+                items.push(method_completion_item(
+                    name,
+                    &method.scheme,
+                    CompletionItemKind::METHOD,
+                    replacement_range,
+                ));
+            }
+        }
+    }
+    items
 }
 
 fn method_completion_item(
@@ -1211,16 +1216,6 @@ fn scheme_param_capability(scheme: &Scheme, idx: usize) -> ParamCapability {
     }
 }
 
-fn completion_ty_target_name(ty: &Ty) -> Option<String> {
-    match ty {
-        Ty::F64 => Some("f64".to_string()),
-        Ty::Con(name) => Some(name.clone()),
-        Ty::App(con, _) => completion_ty_target_name(con),
-        Ty::Qualified(_, inner) => completion_ty_target_name(inner),
-        _ => None,
-    }
-}
-
 fn completion_place_mutable_for_definition(
     inference: &GraphInference,
     current_module: &str,
@@ -1282,7 +1277,7 @@ fn visible_definition_named<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::tests::{ImportFixture, TestProject, import_fixture};
+    use crate::analysis::tests::{ImportFixture, TestProject, import_fixture, source_with_cursor};
 
     fn labels(items: Vec<CompletionItem>) -> Vec<String> {
         items.into_iter().map(|item| item.label).collect()
@@ -1306,10 +1301,10 @@ mod tests {
     fn associated_completion_lists_static_functions_with_parameters() {
         let project = TestProject::new("completion-associated-parameterized");
         let source = concat!(
-            "type Counter = Counter(f64)\n",
+            "type Counter = Counter(float)\n",
             "impl Counter {\n",
-            "  fn make(value: f64) -> Self { Counter(value) }\n",
-            "  fn value(self) -> f64 { match self { Counter(value) -> value } }\n",
+            "  fn make(value: float) -> Self { Counter(value) }\n",
+            "  fn value(self) -> float { match self { Counter(value) -> value } }\n",
             "}\n",
             "let c = Counter::\n",
         );
@@ -1322,28 +1317,30 @@ mod tests {
     }
 
     #[test]
-    fn associated_completion_works_after_bare_coloncolon() {
-        let project = TestProject::new("completion-associated-incomplete");
-        let source = "let mut g = Map::\n";
-        let (state, uri) = project.open("main.hern", source);
+    fn associated_completion_works_on_and_after_coloncolon() {
+        for (name, marked_source) in [
+            ("cursor-on-trigger", "let mut g = Map:<|>:\n"),
+            ("after-trigger", "let mut g = Map::<|>\n"),
+        ] {
+            let project = TestProject::new(&format!("completion-associated-{name}"));
+            let (source, position) = source_with_cursor(marked_source);
+            let (state, uri) = project.open("main.hern", &source);
 
-        let labels = labels(completion(&state, uri, Position::new(0, 17)));
+            let labels = labels(completion(&state, uri, position));
 
-        assert!(labels.iter().any(|label| label == "new"));
-        assert!(!labels.iter().any(|label| label == "set"));
-        assert!(!labels.iter().any(|label| label.starts_with("__")));
-    }
-
-    #[test]
-    fn associated_completion_works_when_cursor_is_on_coloncolon() {
-        let project = TestProject::new("completion-associated-on-trigger");
-        let source = "let mut g = Map::\n";
-        let (state, uri) = project.open("main.hern", source);
-
-        let labels = labels(completion(&state, uri, Position::new(0, 16)));
-
-        assert!(labels.iter().any(|label| label == "new"));
-        assert!(!labels.iter().any(|label| label == "set"));
+            assert!(
+                labels.iter().any(|label| label == "new"),
+                "{name}: {labels:?}"
+            );
+            assert!(
+                !labels.iter().any(|label| label == "set"),
+                "{name}: {labels:?}"
+            );
+            assert!(
+                !labels.iter().any(|label| label.starts_with("__")),
+                "{name}: {labels:?}"
+            );
+        }
     }
 
     #[test]
@@ -1363,82 +1360,65 @@ mod tests {
     }
 
     #[test]
-    fn receiver_completion_works_when_cursor_is_on_dot() {
-        let project = TestProject::new("completion-map-dot-trigger");
-        let source = "let mut g = Map::new();\ng.\n";
-        let (state, uri) = project.open("main.hern", source);
+    fn receiver_completion_recovers_around_incomplete_dot_contexts() {
+        let cases = [
+            ("on-trigger", "let mut g = Map::new();\ng<|>.\n", "g"),
+            (
+                "inside-block",
+                "fn main() {\n    let mut g = Map::new();\n    g.<|>\n}\n",
+                "main",
+            ),
+            (
+                "unclosed-function",
+                "fn main() {\n    let mut g = Map::new();\n    g.<|>\n",
+                "main",
+            ),
+            (
+                "before-let",
+                concat!(
+                    "fn main() {\n",
+                    "    let mut g = Map::new();\n",
+                    "    g.<|>\n",
+                    "    let x = 1;\n",
+                    "    x\n",
+                    "}\n",
+                ),
+                "main",
+            ),
+            (
+                "before-control-flow",
+                concat!(
+                    "fn main() {\n",
+                    "    let mut g = Map::new();\n",
+                    "    g.<|>\n",
+                    "    if true { 1 } else { 2 };\n",
+                    "    loop { break 0; }\n",
+                    "}\n",
+                ),
+                "main",
+            ),
+        ];
 
-        let labels = labels(completion(&state, uri, Position::new(1, 1)));
+        for (name, marked_source, unexpected_label) in cases {
+            let project = TestProject::new(&format!("completion-map-dot-{name}"));
+            let (source, position) = source_with_cursor(marked_source);
+            let (state, uri) = project.open("main.hern", &source);
 
-        assert!(labels.iter().any(|label| label == "set"));
-        assert!(labels.iter().any(|label| label == "get"));
-        assert!(!labels.iter().any(|label| label == "g"));
-    }
+            let labels = labels(completion(&state, uri, position));
 
-    #[test]
-    fn receiver_completion_works_for_incomplete_dot_inside_block() {
-        let project = TestProject::new("completion-map-dot-in-block");
-        let source = "fn main() {\n    let mut g = Map::new();\n    g.\n}\n";
-        let (state, uri) = project.open("main.hern", source);
-
-        let labels = labels(completion(&state, uri, Position::new(2, 6)));
-
-        assert!(labels.iter().any(|label| label == "set"), "{labels:?}");
-        assert!(labels.iter().any(|label| label == "get"), "{labels:?}");
-        assert!(!labels.iter().any(|label| label == "main"));
-    }
-
-    #[test]
-    fn receiver_completion_works_inside_unclosed_function_body() {
-        let project = TestProject::new("completion-map-dot-unclosed-function");
-        let source = "fn main() {\n    let mut g = Map::new();\n    g.\n";
-        let (state, uri) = project.open("main.hern", source);
-
-        let labels = labels(completion(&state, uri, Position::new(2, 6)));
-
-        assert!(labels.iter().any(|label| label == "set"), "{labels:?}");
-        assert!(labels.iter().any(|label| label == "get"), "{labels:?}");
-        assert!(!labels.iter().any(|label| label == "main"));
-    }
-
-    #[test]
-    fn receiver_completion_ignores_following_let_after_incomplete_dot() {
-        let project = TestProject::new("completion-map-dot-before-let");
-        let source = concat!(
-            "fn main() {\n",
-            "    let mut g = Map::new();\n",
-            "    g.\n",
-            "    let x = 1;\n",
-            "    x\n",
-            "}\n",
-        );
-        let (state, uri) = project.open("main.hern", source);
-
-        let labels = labels(completion(&state, uri, Position::new(2, 6)));
-
-        assert!(labels.iter().any(|label| label == "set"), "{labels:?}");
-        assert!(labels.iter().any(|label| label == "get"), "{labels:?}");
-        assert!(!labels.iter().any(|label| label == "main"));
-    }
-
-    #[test]
-    fn receiver_completion_ignores_following_control_flow_after_incomplete_dot() {
-        let project = TestProject::new("completion-map-dot-before-if-loop");
-        let source = concat!(
-            "fn main() {\n",
-            "    let mut g = Map::new();\n",
-            "    g.\n",
-            "    if true { 1 } else { 2 };\n",
-            "    loop { break 0; }\n",
-            "}\n",
-        );
-        let (state, uri) = project.open("main.hern", source);
-
-        let labels = labels(completion(&state, uri, Position::new(2, 6)));
-
-        assert!(labels.iter().any(|label| label == "set"), "{labels:?}");
-        assert!(labels.iter().any(|label| label == "get"), "{labels:?}");
-        assert!(!labels.iter().any(|label| label == "main"));
+            assert!(
+                labels.iter().any(|label| label == "set"),
+                "{name}: {labels:?}"
+            );
+            assert!(
+                labels.iter().any(|label| label == "get"),
+                "{name}: {labels:?}"
+            );
+            assert!(
+                !labels.iter().any(|label| label == unexpected_label),
+                "{name}: {labels:?}"
+            );
+        }
     }
 
     #[test]
@@ -1471,6 +1451,18 @@ mod tests {
     }
 
     #[test]
+    fn receiver_completion_works_after_chained_method_call_result() {
+        let project = TestProject::new("completion-chained-method-result-dot");
+        let (source, position) =
+            source_with_cursor("let data = [1, 2, 3];\nlet a = data.sum().<|>\n");
+        let (state, uri) = project.open("main.hern", &source);
+
+        let labels = labels(completion(&state, uri, position));
+
+        assert!(labels.iter().any(|label| label == "to_float"), "{labels:?}");
+    }
+
+    #[test]
     fn default_completion_hides_internal_names() {
         let project = TestProject::new("completion-hides-internals");
         let source = "let mut g = Map::new();\ng\n";
@@ -1489,7 +1481,7 @@ mod tests {
         } = import_fixture(
             "completion-import-internals",
             "let dep = import \"dep\";\ndep.\n",
-            "fn public() -> f64 { 1 }\nfn __hidden() -> f64 { 2 }\n#{ public: public, __hidden: __hidden }\n",
+            "fn public() -> float { 1 }\nfn __hidden() -> float { 2 }\n#{ public: public, __hidden: __hidden }\n",
         );
 
         let labels = labels(completion(&state, entry_uri, Position::new(1, 4)));

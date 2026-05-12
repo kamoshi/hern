@@ -1,0 +1,16 @@
+#![no_implicit_prelude]
+
+type Result('a, 'e) = Ok('a) | Err('e)
+
+trait Functor 'f {
+    fn map(fa: 'f('a), f: fn('a) -> 'b) -> 'f('b)
+}
+
+impl Functor for Result(*, *) {
+    fn map(fa, f) {
+        match fa {
+            Ok(value) -> Ok(f(value)),
+            Err(error) -> Err(error),
+        }
+    }
+}

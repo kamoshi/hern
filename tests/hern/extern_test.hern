@@ -1,7 +1,7 @@
 type MathModule = #{
-  floor: fn(f64) -> f64,
-  abs: fn(f64) -> f64,
-  max: fn(f64, f64) -> f64
+  floor: fn(float) -> float,
+  abs: fn(float) -> float,
+  max: fn(float, float) -> float
 }
 
 extern math: MathModule = "math";

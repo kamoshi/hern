@@ -1,0 +1,9 @@
+#![no_implicit_prelude]
+
+trait Applicative 'f {
+    fn pure(x: 'a) -> 'f('a)
+}
+
+fn make(x) {
+    Applicative.pure(x)
+}

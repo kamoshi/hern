@@ -1,0 +1,5 @@
+let numbers = import "applied_impl_module_numbers";
+let strings = import "applied_impl_module_strings";
+
+print(label([1.0]));
+print(label(["a"]));

@@ -1,4 +1,4 @@
-fn double(x: f64) -> f64 {
+fn double(x: float) -> float {
     x + x
 }
 
@@ -9,12 +9,12 @@ fn unwrap_or(opt: Option('a), default: 'a) -> 'a {
     }
 }
 
-let a = Some(21);
+let a = Some(21.0);
 let b = None;
 
 // map through the impl dict
 let mapped_a = Functor.map(a, double);
 let mapped_b = Functor.map(b, double);
 
-print(unwrap_or(mapped_a, 0));
-print(unwrap_or(mapped_b, 0));
+print(unwrap_or(mapped_a, 0.0));
+print(unwrap_or(mapped_b, 0.0));

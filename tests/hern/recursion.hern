@@ -1,4 +1,4 @@
-fn sum_up_to(n: f64) -> f64 {
+fn sum_up_to(n: int) -> int {
   if n == 0 {
     0
   } else {
@@ -10,7 +10,7 @@ let res = sum_up_to(5);
 print(res);
 
 // Test new type notation
-fn first_element(list: [f64]) -> f64 {
+fn first_element(list: [float]) -> float {
   1.0
 }
 

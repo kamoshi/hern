@@ -1,0 +1,21 @@
+let some = Some(2);
+let none: Option(int) = None;
+
+print(some.unwrap_or(0));
+print(none.unwrap_or(9));
+
+print([1, 2, 3].first().unwrap_or(0));
+print([].first().unwrap_or(7));
+print([1, 2, 3].find(fn(x) { x == 2 }).unwrap_or(0));
+print([1, 2, 3].any(fn(x) { x > 2 }));
+print([1, 2, 3].all(fn(x) { x > 0 }));
+
+print("abc".get(2).unwrap_or("?"));
+print("abc".get(4).unwrap_or("?"));
+
+let i = 2;
+let f = 3.9;
+print(i.to_float() + 0.5);
+print(f.trunc());
+print("42".to_int() + 1);
+print("3.5".to_float() + 0.5);

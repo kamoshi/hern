@@ -4,7 +4,9 @@ use super::diagnostics::{
     DiagnosticsByUri, diagnostic_identity, diagnostics_from_compiler_diagnostics,
 };
 use super::uri::{path_to_uri, uri_to_path};
-use hern_core::analysis::{CompilerDiagnostic, PreludeAnalysis, analyze_prelude};
+use hern_core::analysis::{
+    CompilerDiagnostic, DiagnosticSource, PreludeAnalysis, analyze_prelude, analyze_prelude_source,
+};
 use hern_core::module::{GraphInference, ModuleGraph, normalize_overlay_path};
 use hern_core::workspace::{WorkspaceInputs, analyze_workspace};
 use lsp_types::{Diagnostic, InitializeParams, Uri};
@@ -333,6 +335,28 @@ pub(crate) fn diagnostics_for_document(
             );
         }
     };
+    if is_std_prelude_path(&path) {
+        let source = state
+            .documents
+            .get(entry_uri)
+            .cloned()
+            .or_else(|| std::fs::read_to_string(&path).ok())
+            .unwrap_or_default();
+        match analyze_prelude_source(&source) {
+            Ok(prelude) => {
+                state.prelude = prelude;
+                state.update_entry_dependencies(entry_uri, None);
+                return diagnostics_from_compiler_diagnostics(entry_uri, Vec::new());
+            }
+            Err(diagnostic) => {
+                state.update_entry_dependencies(entry_uri, None);
+                return diagnostics_from_compiler_diagnostics(
+                    entry_uri,
+                    vec![diagnostic.with_source_if_absent(DiagnosticSource::Path(path))],
+                );
+            }
+        }
+    }
     let analysis = state.timed("workspace analysis", || {
         analyze_workspace(WorkspaceInputs {
             entry: path,
@@ -355,6 +379,14 @@ pub(crate) fn diagnostics_for_document(
         );
     }
     diagnostics_from_compiler_diagnostics(entry_uri, analysis.diagnostics)
+}
+
+fn is_std_prelude_path(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "prelude.hern")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "std")
 }
 
 pub(crate) fn combined_diagnostics_for_uri(state: &ServerState, uri: &Uri) -> Vec<Diagnostic> {

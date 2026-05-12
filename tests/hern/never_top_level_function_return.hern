@@ -1,0 +1,5 @@
+fn always() -> int {
+    return 42
+}
+
+print(always());

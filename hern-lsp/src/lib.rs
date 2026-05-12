@@ -612,7 +612,7 @@ mod tests {
         harness.send_hover_request(first.clone(), uri.clone(), Position::new(1, 1));
         assert_eq!(
             hover_result_text(harness.recv_response(first)),
-            Some("f64".to_string())
+            Some("int".to_string())
         );
 
         harness.send_change(uri.clone(), 1, "let value = \"hi\";\nvalue\n");

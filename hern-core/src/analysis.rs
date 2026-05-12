@@ -26,6 +26,7 @@ pub struct PreludeAnalysis {
     pub env: TypeEnv,
     pub variant_env: VariantEnv,
     pub inherent_method_schemes: HashMap<String, HashMap<String, InherentMethodScheme>>,
+    pub inference: InferenceResult,
 }
 
 #[derive(Debug, Clone)]
@@ -111,18 +112,23 @@ impl fmt::Display for CompilerDiagnostic {
 impl std::error::Error for CompilerDiagnostic {}
 
 pub fn analyze_prelude() -> Result<PreludeAnalysis, CompilerDiagnostic> {
-    let mut program = parse_source(PRELUDE)?;
+    analyze_prelude_source(PRELUDE)
+}
+
+pub fn analyze_prelude_source(source: &str) -> Result<PreludeAnalysis, CompilerDiagnostic> {
+    let mut program = parse_source(source)?;
     reassociate_standalone(&mut program);
 
     let inference = infer_program(&mut program)?;
-    let env = inference.env;
-    let variant_env = inference.variant_env;
+    let env = inference.env.clone();
+    let variant_env = inference.variant_env.clone();
 
     Ok(PreludeAnalysis {
         program,
         env,
         variant_env,
-        inherent_method_schemes: inference.inherent_method_schemes,
+        inherent_method_schemes: inference.inherent_method_schemes.clone(),
+        inference,
     })
 }
 
@@ -471,7 +477,7 @@ mod tests {
     fn unknown_associated_function_error_points_at_member() {
         let prelude = analyze_prelude().expect("prelude should analyze");
         let err = analyze_source(
-            "type Counter = Counter(f64)\nlet x = Counter::missing();",
+            "type Counter = Counter(float)\nlet x = Counter::missing();",
             &prelude,
         )
         .expect_err("unknown associated function should be rejected");

@@ -1,0 +1,3 @@
+trait Label 'a {
+    fn label(x: 'a) -> string
+}

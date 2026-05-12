@@ -1,35 +1,42 @@
 mod calls;
+mod decls;
 mod dicts;
+mod impls;
+mod metadata;
 mod recovery;
+mod snapshot;
 
-use self::dicts::has_trait_impl;
 use self::dicts::{
-    attach_dict_args, dict_param_name, final_pass_stmt, resolve_concrete, resolve_dict_uses_expr,
-    resolve_dict_uses_expr_lenient, resolve_local_or_concrete,
+    attach_dict_args, dict_param_name, dict_ref_concrete_name, final_pass_stmt, resolve_concrete,
+    resolve_concrete_dict_ref, resolve_dict_uses_expr, resolve_dict_uses_expr_lenient,
+    resolve_local_or_concrete,
 };
 use super::{
     patterns::{
         check_exhaustive_match, insert_pattern_bindings, is_irrefutable_let, is_irrefutable_param,
     },
     type_syntax::{
-        impl_target_name, inherent_impl_dict_name, is_self_param, record_field_ty, subst_hkt_param,
-        substitute_self_in_inherent_method, ty_target_name, validate_inherent_impl_target,
+        inherent_impl_dict_name, inherent_impl_target_key_from_ast,
+        inherent_impl_target_keys_from_ty, is_self_param, record_field_ty, subst_hkt_param,
+        substitute_self_in_inherent_method, trait_impl_dict_name, trait_impl_target_key_from_ast,
+        trait_impl_target_keys_from_ty,
     },
 };
 use crate::ast::*;
-use crate::codegen::lua::mangle_op;
 use crate::types::{
     BindingCapabilities, CallableCapabilities, EnvInfo, FuncParam, FuncReturn,
     InherentMethodScheme, ParamCapability, ReturnCapability, Row, Scheme, Subst, TraitConstraint,
-    Ty, TyVar,
+    Ty, TyVar, display_ty_with_var_names,
     env::build_variant_env_from_stmts,
     error::{SpannedTypeError, TypeError},
-    free_type_vars, unify, value_func_params, value_func_return,
+    free_type_vars, free_type_vars_in_display_order, type_var_name, unify, value_func_params,
+    value_func_return,
 };
 pub use crate::types::{TypeEnv, VariantEnv, VariantInfo, is_fresh_mutable_place, is_value};
+use metadata::{FinalizedTypeMaps, TypeMetadata};
 use recovery::{CollectedNames, stmt_bound_names, stmt_referenced_names};
+use snapshot::InferSnapshot;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 
 const NO_NODE_ID: NodeId = 0;
 
@@ -64,13 +71,8 @@ pub struct Infer {
     loop_break_tys: Vec<Ty>,
     fn_return_tys: Vec<Ty>,
     pending_constraints: Vec<TraitConstraint>,
-    expr_types: HashMap<NodeId, Ty>,
-    symbol_types: HashMap<NodeId, Ty>,
-    binding_types: HashMap<SourceSpan, Ty>,
-    definition_schemes: HashMap<SourceSpan, Scheme>,
-    binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
-    callable_capabilities: HashMap<NodeId, CallableCapabilities>,
-    fresh_place_exprs: HashSet<NodeId>,
+    known_impl_schemes: HashMap<String, Scheme>,
+    metadata: TypeMetadata,
 }
 
 struct InstantiatedScheme {
@@ -83,16 +85,6 @@ struct FinalizedConstraints {
     scheme: Scheme,
     owned: Vec<TraitConstraint>,
     bubbled: Vec<TraitConstraint>,
-}
-
-struct FinalizedTypeMaps {
-    expr_types: HashMap<NodeId, Ty>,
-    symbol_types: HashMap<NodeId, Ty>,
-    binding_types: HashMap<SourceSpan, Ty>,
-    definition_schemes: HashMap<SourceSpan, Scheme>,
-    binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
-    callable_capabilities: HashMap<NodeId, CallableCapabilities>,
-    fresh_place_exprs: HashSet<NodeId>,
 }
 
 enum DictResolution {
@@ -156,124 +148,6 @@ impl Default for ModuleInference {
     }
 }
 
-/// Snapshot of mutable per-statement state inside [`Infer`], taken before each top-level
-/// statement during collecting inference. On statement failure the snapshot is restored so
-/// the next statement starts from a clean baseline.
-///
-/// Note: only the substitution **map** is snapshotted, not `Subst::next_var`. Fresh type
-/// variable IDs keep advancing across recovery — reusing IDs from a failed statement could
-/// alias new bindings against stale references and silently miscompile.
-///
-/// Insert-only editor metadata maps keep only compact key lists here. Their keys are AST node IDs
-/// or source spans, so a top-level statement should only add fresh keys; on rollback we turn those
-/// lists into sets, retain entries that existed at the snapshot, and drop entries introduced by
-/// the failed statement. Maps that can shadow user names still keep full snapshots below.
-///
-/// `variant_env` is intentionally omitted here: it is finalized before the main recovery loop,
-/// and failed type declarations are pruned from it during pre-pass 3, so later statements never
-/// observe variants from declarations whose constructor environment was discarded.
-struct InferSnapshot {
-    subst_map: HashMap<TyVar, Ty>,
-    pending_constraints: Vec<TraitConstraint>,
-    loop_break_tys: Vec<Ty>,
-    fn_return_tys: Vec<Ty>,
-    expr_type_keys: Vec<NodeId>,
-    symbol_type_keys: Vec<NodeId>,
-    binding_type_keys: Vec<SourceSpan>,
-    definition_scheme_keys: Vec<SourceSpan>,
-    binding_capability_keys: Vec<SourceSpan>,
-    callable_capability_keys: Vec<NodeId>,
-    record_field_callables: HashMap<String, HashMap<String, Vec<ParamCapability>>>,
-    fresh_place_expr_keys: Vec<NodeId>,
-    inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
-    env: TypeEnv,
-}
-
-struct FailedStatementMetadata {
-    symbol_types: HashMap<NodeId, Ty>,
-    callable_capabilities: HashMap<NodeId, CallableCapabilities>,
-}
-
-impl InferSnapshot {
-    fn capture(infer: &Infer, env: &TypeEnv) -> Self {
-        Self {
-            subst_map: infer.subst.snapshot_map(),
-            pending_constraints: infer.pending_constraints.clone(),
-            loop_break_tys: infer.loop_break_tys.clone(),
-            fn_return_tys: infer.fn_return_tys.clone(),
-            expr_type_keys: infer.expr_types.keys().copied().collect(),
-            symbol_type_keys: infer.symbol_types.keys().copied().collect(),
-            binding_type_keys: infer.binding_types.keys().copied().collect(),
-            definition_scheme_keys: infer.definition_schemes.keys().copied().collect(),
-            binding_capability_keys: infer.binding_capabilities.keys().copied().collect(),
-            callable_capability_keys: infer.callable_capabilities.keys().copied().collect(),
-            record_field_callables: infer.record_field_callables.clone(),
-            fresh_place_expr_keys: infer.fresh_place_exprs.iter().copied().collect(),
-            inherent_methods: infer.inherent_methods.clone(),
-            env: env.clone(),
-        }
-    }
-
-    fn metadata_added_before_failure(&self, infer: &Infer) -> FailedStatementMetadata {
-        let symbol_type_keys: HashSet<_> = self.symbol_type_keys.iter().copied().collect();
-        let callable_capability_keys: HashSet<_> =
-            self.callable_capability_keys.iter().copied().collect();
-        FailedStatementMetadata {
-            symbol_types: infer
-                .symbol_types
-                .iter()
-                .filter(|(id, _)| !symbol_type_keys.contains(id))
-                .map(|(id, ty)| (*id, infer.subst.apply(ty)))
-                .collect(),
-            callable_capabilities: infer
-                .callable_capabilities
-                .iter()
-                .filter(|(id, _)| !callable_capability_keys.contains(id))
-                .map(|(id, capabilities)| (*id, capabilities.clone()))
-                .collect(),
-        }
-    }
-
-    fn restore(self, infer: &mut Infer, env: &mut TypeEnv) {
-        infer.subst.restore_map(self.subst_map);
-        infer.pending_constraints = self.pending_constraints;
-        infer.loop_break_tys = self.loop_break_tys;
-        infer.fn_return_tys = self.fn_return_tys;
-        retain_map_keys(&mut infer.expr_types, self.expr_type_keys);
-        retain_map_keys(&mut infer.symbol_types, self.symbol_type_keys);
-        retain_map_keys(&mut infer.binding_types, self.binding_type_keys);
-        retain_map_keys(&mut infer.definition_schemes, self.definition_scheme_keys);
-        retain_map_keys(
-            &mut infer.binding_capabilities,
-            self.binding_capability_keys,
-        );
-        retain_map_keys(
-            &mut infer.callable_capabilities,
-            self.callable_capability_keys,
-        );
-        infer.record_field_callables = self.record_field_callables;
-        retain_set_keys(&mut infer.fresh_place_exprs, self.fresh_place_expr_keys);
-        infer.inherent_methods = self.inherent_methods;
-        *env = self.env;
-    }
-}
-
-fn retain_map_keys<K, V>(map: &mut HashMap<K, V>, snapshot_keys: Vec<K>)
-where
-    K: Eq + Hash,
-{
-    let snapshot_keys: HashSet<_> = snapshot_keys.into_iter().collect();
-    map.retain(|key, _| snapshot_keys.contains(key));
-}
-
-fn retain_set_keys<K>(set: &mut HashSet<K>, snapshot_keys: Vec<K>)
-where
-    K: Eq + Hash,
-{
-    let snapshot_keys: HashSet<_> = snapshot_keys.into_iter().collect();
-    set.retain(|key| snapshot_keys.contains(key));
-}
-
 impl Default for Infer {
     fn default() -> Self {
         Self::new()
@@ -299,13 +173,8 @@ impl Infer {
             loop_break_tys: Vec::new(),
             fn_return_tys: Vec::new(),
             pending_constraints: Vec::new(),
-            expr_types: HashMap::new(),
-            symbol_types: HashMap::new(),
-            binding_types: HashMap::new(),
-            definition_schemes: HashMap::new(),
-            binding_capabilities: HashMap::new(),
-            callable_capabilities: HashMap::new(),
-            fresh_place_exprs: HashSet::new(),
+            known_impl_schemes: HashMap::new(),
+            metadata: TypeMetadata::default(),
         }
     }
 
@@ -323,6 +192,10 @@ impl Infer {
 
     pub fn set_known_impl_dicts(&mut self, dicts: HashSet<String>) {
         self.known_impl_dicts = dicts;
+    }
+
+    pub fn set_known_impl_schemes(&mut self, schemes: HashMap<String, Scheme>) {
+        self.known_impl_schemes = schemes;
     }
 
     pub fn set_trait_scope(
@@ -351,11 +224,10 @@ impl Infer {
                                 name.clone(),
                                 InherentMethodInfo {
                                     scheme: method.scheme,
-                                    resolved_callee: ResolvedCallee::Function(format!(
-                                        "{}.{}",
-                                        dict_name,
-                                        mangle_op(&name)
-                                    )),
+                                    resolved_callee: ResolvedCallee::InherentMethod {
+                                        dict: dict_name.clone(),
+                                        method: name.clone(),
+                                    },
                                     has_receiver: method.has_receiver,
                                 },
                             )
@@ -405,9 +277,7 @@ impl Infer {
     }
 
     fn record_symbol_type(&mut self, node_id: NodeId, ty: Ty) {
-        if node_id != NO_NODE_ID {
-            self.symbol_types.insert(node_id, self.subst.apply(&ty));
-        }
+        self.metadata.record_symbol_type(node_id, ty, &self.subst);
     }
 
     fn record_callable_capabilities(
@@ -415,26 +285,12 @@ impl Infer {
         node_id: NodeId,
         param_capabilities: Vec<ParamCapability>,
     ) {
-        if node_id != NO_NODE_ID {
-            self.callable_capabilities
-                .insert(node_id, CallableCapabilities { param_capabilities });
-        }
+        self.metadata
+            .record_callable_capabilities(node_id, param_capabilities);
     }
 
     fn callable_capabilities_for(&self, node_id: NodeId) -> Vec<ParamCapability> {
-        self.callable_capabilities
-            .get(&node_id)
-            .map(|capabilities| capabilities.param_capabilities.clone())
-            .unwrap_or_default()
-    }
-
-    fn check_mutable_place_args(
-        &self,
-        env: &TypeEnv,
-        args: &[Expr],
-        param_capabilities: &[ParamCapability],
-    ) -> Result<(), SpannedTypeError> {
-        self.check_mutable_place_args_from(env, args, param_capabilities, 0)
+        self.metadata.callable_capabilities_for(node_id)
     }
 
     fn check_mutable_place_args_from(
@@ -499,7 +355,7 @@ impl Infer {
             let RecordEntry::Field(name, expr) = entry else {
                 continue;
             };
-            let Some(capabilities) = self.callable_capabilities.get(&expr.id) else {
+            let Some(capabilities) = self.metadata.callable_capabilities(expr.id) else {
                 continue;
             };
             if capabilities
@@ -713,9 +569,13 @@ impl Infer {
         }
 
         self.fn_return_tys.push(ret_ty.clone());
-        let body_ty = self.infer_expr(&body_env, body)?;
+        let body_ty = if ret_type.is_some() {
+            self.infer_expr_expected(&body_env, body, ret_ty.clone())?
+        } else {
+            self.infer_expr(&body_env, body)?
+        };
         self.fn_return_tys.pop();
-        unify(&mut self.subst, body_ty, ret_ty).map_err(|err| err.at(body.span))?;
+        unify_expr_result(&mut self.subst, body_ty, ret_ty).map_err(|err| err.at(body.span))?;
 
         let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
         let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
@@ -729,6 +589,7 @@ impl Infer {
                 &finalized.owned,
                 env,
                 &self.known_impl_dicts,
+                &self.known_impl_schemes,
                 &self.subst,
             )
         };
@@ -738,97 +599,8 @@ impl Infer {
             name.to_string(),
             EnvInfo::immutable(finalized.scheme.clone()),
         );
-        self.definition_schemes.insert(name_span, finalized.scheme);
-        Ok(())
-    }
-
-    fn register_type_declarations<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
-        for stmt in stmts {
-            match stmt {
-                Stmt::Type(td) => {
-                    self.declared_types.insert(td.name.clone());
-                }
-                Stmt::TypeAlias {
-                    name, params, ty, ..
-                } => {
-                    self.declared_types.insert(name.clone());
-                    self.type_aliases
-                        .insert(name.clone(), (params.clone(), ty.clone()));
-                }
-                _ => {}
-            }
-        }
-        self.resolve_variant_payload_types();
-    }
-
-    fn register_traits_and_ops<'a>(
-        &mut self,
-        stmts: impl Iterator<Item = &'a Stmt>,
-    ) -> Result<(), SpannedTypeError> {
-        for stmt in stmts {
-            let Stmt::Trait(td) = stmt else {
-                continue;
-            };
-            validate_trait_methods_have_target(td)?;
-            self.trait_env.insert(td.name.clone(), td.clone());
-            for method in &td.methods {
-                if method.fixity.is_none() {
-                    continue;
-                }
-                if method.params.len() != 2 {
-                    return Err(TypeError::TraitMethodArityMismatch {
-                        trait_name: td.name.clone(),
-                        method: method.name.clone(),
-                        expected: 2,
-                        got: method.params.len(),
-                    }
-                    .at(method.span));
-                }
-                match self.op_trait_map.get(&method.name) {
-                    Some(existing) if existing != &td.name => {
-                        return Err(
-                            TypeError::DuplicateOperator(method.name.clone()).at(stmt.span())
-                        );
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.op_trait_map
-                            .insert(method.name.clone(), td.name.clone());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn add_constructors_and_externs(
-        &mut self,
-        env: &mut TypeEnv,
-        stmts: &mut [Stmt],
-    ) -> Result<(), SpannedTypeError> {
-        for stmt in stmts {
-            let span = stmt.span();
-            match stmt {
-                Stmt::Type(td) => self
-                    .add_constructors_to_env(env, td)
-                    .map_err(|err| err.at(span))?,
-                Stmt::Extern {
-                    name,
-                    name_span,
-                    ty,
-                    ..
-                } => {
-                    let mut param_vars = HashMap::new();
-                    let t = self
-                        .ast_to_ty_with_vars(ty, &mut param_vars)
-                        .map_err(|err| err.at(span))?;
-                    let scheme = self.generalize(env, t);
-                    self.definition_schemes.insert(*name_span, scheme.clone());
-                    env.insert(name.clone(), EnvInfo::immutable(scheme));
-                }
-                _ => {}
-            }
-        }
+        self.metadata
+            .record_definition_scheme(name_span, finalized.scheme);
         Ok(())
     }
 
@@ -837,31 +609,13 @@ impl Infer {
     }
 
     fn finalized_type_maps(&self) -> FinalizedTypeMaps {
-        FinalizedTypeMaps {
-            expr_types: self
-                .expr_types
-                .iter()
-                .map(|(id, ty)| (*id, self.subst.apply(ty)))
-                .collect(),
-            symbol_types: self
-                .symbol_types
-                .iter()
-                .map(|(id, ty)| (*id, self.subst.apply(ty)))
-                .collect(),
-            binding_types: self
-                .binding_types
-                .iter()
-                .map(|(span, ty)| (*span, self.subst.apply(ty)))
-                .collect(),
-            definition_schemes: self
-                .definition_schemes
-                .iter()
-                .map(|(span, scheme)| (*span, self.subst.apply_scheme(scheme)))
-                .collect(),
-            binding_capabilities: self.binding_capabilities.clone(),
-            callable_capabilities: self.callable_capabilities.clone(),
-            fresh_place_exprs: self.fresh_place_exprs.clone(),
-        }
+        self.metadata.finalize(&self.subst)
+    }
+
+    fn record_expr_type_for_node(&mut self, node_id: NodeId, ty: Ty) -> Ty {
+        self.metadata
+            .record_expr_type(node_id, ty.clone(), &self.subst);
+        ty
     }
 
     pub fn infer_program(&mut self, program: &mut Program) -> Result<TypeEnv, SpannedTypeError> {
@@ -920,8 +674,15 @@ impl Infer {
         self.apply_env_subst(&mut env);
 
         for stmt in &mut program.stmts {
-            let resolver =
-                |p: &PendingDictArg| resolve_concrete(p, &env, &self.known_impl_dicts, &self.subst);
+            let resolver = |p: &PendingDictArg| {
+                resolve_concrete(
+                    p,
+                    &env,
+                    &self.known_impl_dicts,
+                    &self.known_impl_schemes,
+                    &self.subst,
+                )
+            };
             final_pass_stmt(stmt, &resolver)?;
         }
 
@@ -1007,7 +768,8 @@ impl Infer {
                     match self.ast_to_ty_with_vars(ty, &mut param_vars) {
                         Ok(t) => {
                             let scheme = self.generalize(&env, t);
-                            self.definition_schemes.insert(*name_span, scheme.clone());
+                            self.metadata
+                                .record_definition_scheme(*name_span, scheme.clone());
                             env.insert(name.clone(), EnvInfo::immutable(scheme));
                         }
                         Err(err) => {
@@ -1054,9 +816,7 @@ impl Infer {
                     snapshot.restore(self, &mut env);
                     // Keep callee metadata discovered before the error so LSP hover and
                     // signature help can still explain bad calls in a failed statement.
-                    self.symbol_types.extend(failed_metadata.symbol_types);
-                    self.callable_capabilities
-                        .extend(failed_metadata.callable_capabilities);
+                    self.metadata.extend_failed_statement(failed_metadata);
                     unavailable.extend(bound);
                     diagnostics.push(err);
                 }
@@ -1072,8 +832,15 @@ impl Infer {
                 continue;
             }
             let span = stmt.span();
-            let resolver =
-                |p: &PendingDictArg| resolve_concrete(p, &env, &self.known_impl_dicts, &self.subst);
+            let resolver = |p: &PendingDictArg| {
+                resolve_concrete(
+                    p,
+                    &env,
+                    &self.known_impl_dicts,
+                    &self.known_impl_schemes,
+                    &self.subst,
+                )
+            };
             if let Err(err) = final_pass_stmt(stmt, &resolver) {
                 diagnostics.push(err.at(span));
             }
@@ -1104,61 +871,14 @@ impl Infer {
         self.type_aliases.clear();
         self.declared_types.clear();
         self.declared_types
-            .extend(["string", "bool", "f64", "Array", "Iter"].map(str::to_string));
+            .extend(["string", "bool", "int", "float", "Array", "Iter"].map(str::to_string));
         self.inherent_methods.clear();
         self.pending_constraints.clear();
         self.loop_break_tys.clear();
         self.fn_return_tys.clear();
-        self.expr_types.clear();
-        self.symbol_types.clear();
-        self.binding_types.clear();
-        self.definition_schemes.clear();
-        self.binding_capabilities.clear();
-        self.callable_capabilities.clear();
-        self.fresh_place_exprs.clear();
+        self.metadata.clear();
         self.import_bindings.clear();
         self.record_field_callables.clear();
-    }
-
-    fn register_impl_dict_names<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
-        for stmt in stmts {
-            if let Stmt::Impl(impl_def) = stmt {
-                self.known_impl_dicts.insert(impl_dict_name(impl_def));
-            }
-        }
-    }
-
-    fn remove_program_impl_dict_names<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
-        for stmt in stmts {
-            if let Stmt::Impl(impl_def) = stmt {
-                self.known_impl_dicts.remove(&impl_dict_name(impl_def));
-            }
-        }
-    }
-
-    fn export_inherent_method_schemes(
-        &self,
-    ) -> HashMap<String, HashMap<String, InherentMethodScheme>> {
-        self.inherent_methods
-            .iter()
-            .map(|(target, methods)| {
-                (
-                    target.clone(),
-                    methods
-                        .iter()
-                        .map(|(name, info)| {
-                            (
-                                name.clone(),
-                                InherentMethodScheme {
-                                    scheme: self.subst.apply_scheme(&info.scheme),
-                                    has_receiver: info.has_receiver,
-                                },
-                            )
-                        })
-                        .collect(),
-                )
-            })
-            .collect()
     }
 
     fn infer_stmt(&mut self, env: &mut TypeEnv, stmt: &mut Stmt) -> Result<Ty, SpannedTypeError> {
@@ -1171,16 +891,15 @@ impl Infer {
                 value,
                 ..
             } => {
-                let value_ty = self.infer_expr(env, value)?;
-
                 let inferred_ty = if let Some(ast_ty) = ty {
                     let mut param_vars = HashMap::new();
                     let expected_ty = self.ast_to_ty_with_vars(ast_ty, &mut param_vars)?;
-                    unify(&mut self.subst, expected_ty.clone(), value_ty)
+                    let value_ty = self.infer_expr_expected(env, value, expected_ty.clone())?;
+                    unify_expr_result(&mut self.subst, value_ty, expected_ty.clone())
                         .map_err(|err| err.at(value.span))?;
                     expected_ty
                 } else {
-                    value_ty
+                    self.infer_expr(env, value)?
                 };
 
                 // Reject refutable patterns in let position.
@@ -1190,7 +909,8 @@ impl Infer {
 
                 // For a simple variable binding, support let-polymorphism.
                 if let Pattern::Variable(name, span) = pat {
-                    self.binding_types.insert(*span, inferred_ty.clone());
+                    self.metadata
+                        .record_binding_type(*span, inferred_ty.clone());
                     let scheme = if *is_mutable || !is_value(&*value) {
                         Scheme::mono(inferred_ty)
                     } else {
@@ -1198,9 +918,9 @@ impl Infer {
                     };
                     let place_mutable = *is_mutable
                         && (is_fresh_mutable_place(value)
-                            || self.fresh_place_exprs.contains(&value.id));
-                    self.binding_capabilities
-                        .insert(*span, BindingCapabilities { place_mutable });
+                            || self.metadata.is_fresh_place_expr(value.id));
+                    self.metadata
+                        .record_binding_capability(*span, BindingCapabilities { place_mutable });
                     if let ExprKind::Import(path) = &value.kind {
                         self.import_bindings.insert(name.clone(), path.clone());
                     } else if let Some(fields) = self.record_literal_callable_fields(value) {
@@ -1326,333 +1046,122 @@ impl Infer {
         result.map_err(|err| err.with_span_if_absent(span))
     }
 
-    fn add_constructors_to_env(
+    fn infer_expr_expected(
         &mut self,
-        env: &mut TypeEnv,
-        td: &TypeDef,
-    ) -> Result<(), TypeError> {
-        let mut param_map: HashMap<String, TyVar> = HashMap::new();
-        let mut quantified: Vec<TyVar> = Vec::new();
-        let mut type_args: Vec<Ty> = Vec::new();
-
-        for p in &td.params {
-            let v = self.fresh_var();
-            param_map.insert(p.clone(), v);
-            quantified.push(v);
-            type_args.push(Ty::Var(v));
+        env: &TypeEnv,
+        expr: &mut Expr,
+        expected: Ty,
+    ) -> Result<Ty, SpannedTypeError> {
+        let expected = self.subst.apply(&expected);
+        let expr_span = expr.span;
+        let expr_id = expr.id;
+        match &mut expr.kind {
+            ExprKind::Array(entries) => {
+                let ty = self.infer_array_entries(env, entries, Some(expected), expr_span)?;
+                return Ok(self.record_expr_type_for_node(expr_id, ty));
+            }
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let cond_ty = self.infer_expr(env, cond)?;
+                unify(&mut self.subst, cond_ty, Ty::Con("bool".to_string()))?;
+                let then_ty = self.infer_expr_expected(env, then_branch, expected.clone())?;
+                let else_ty = self.infer_expr_expected(env, else_branch, expected.clone())?;
+                let combined = combine_branch_types(&mut self.subst, then_ty, else_ty)?;
+                unify(&mut self.subst, combined, expected.clone())
+                    .map_err(|err| err.at(expr_span))?;
+                let ty = self.subst.apply(&expected);
+                return Ok(self.record_expr_type_for_node(expr_id, ty));
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                let scrutinee_ty = self.infer_expr(env, scrutinee)?;
+                let mut result_ty = None;
+                for (pattern, arm_expr) in &mut *arms {
+                    let mut arm_env = env.clone();
+                    let s_ty = self.subst.apply(&scrutinee_ty);
+                    self.check_pattern(pattern, s_ty, &mut arm_env, false)?;
+                    let arm_ty = self.infer_expr_expected(&arm_env, arm_expr, expected.clone())?;
+                    result_ty = Some(match result_ty {
+                        Some(existing) => combine_branch_types(&mut self.subst, existing, arm_ty)?,
+                        None => arm_ty,
+                    });
+                }
+                let s_ty = self.subst.apply(&scrutinee_ty);
+                self.check_exhaustive(arms, &s_ty)?;
+                if let Some(result_ty) = result_ty {
+                    unify(&mut self.subst, result_ty, expected.clone())
+                        .map_err(|err| err.at(expr_span))?;
+                }
+                let ty = self.subst.apply(&expected);
+                return Ok(self.record_expr_type_for_node(expr_id, ty));
+            }
+            ExprKind::Lambda {
+                params,
+                body,
+                dict_params,
+            } => {
+                if let Ty::Func(expected_params, expected_ret) = expected.clone() {
+                    let ty = self.infer_lambda_expr(
+                        env,
+                        expr_id,
+                        params,
+                        body,
+                        dict_params,
+                        Some((expected_params, expected_ret)),
+                    )?;
+                    return Ok(self.record_expr_type_for_node(expr_id, ty));
+                }
+            }
+            ExprKind::Call {
+                callee,
+                args,
+                is_method_call,
+                arg_wrappers,
+                resolved_callee,
+                pending_trait_method,
+                dict_args,
+                pending_dict_args,
+            } => {
+                if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind
+                    && !matches!(&expr.kind, ExprKind::Ident(name) if self.trait_env.contains_key(name))
+                {
+                    let ty = self.resolve_receiver_call(
+                        env,
+                        expr_id,
+                        callee.id,
+                        expr,
+                        field,
+                        args,
+                        is_method_call,
+                        arg_wrappers,
+                        resolved_callee,
+                        dict_args,
+                        pending_dict_args,
+                        Some(expected),
+                    )?;
+                    return Ok(self.record_expr_type_for_node(expr_id, ty));
+                }
+                let _ = pending_trait_method;
+            }
+            _ => {}
         }
 
-        let result_ty = if type_args.is_empty() {
-            Ty::Con(td.name.clone())
-        } else {
-            Ty::App(Box::new(Ty::Con(td.name.clone())), type_args)
-        };
-
-        let mut entries = Vec::new();
-        for variant in &td.variants {
-            let ty = match &variant.payload {
-                None => result_ty.clone(),
-                Some(payload_ast) => {
-                    let mut pm = param_map.clone();
-                    let payload_ty = self.ast_to_ty_with_vars(payload_ast, &mut pm)?;
-                    Ty::Func(
-                        value_func_params(vec![payload_ty]),
-                        value_func_return(result_ty.clone()),
-                    )
-                }
-            };
-            entries.push((
-                variant.name.clone(),
-                EnvInfo::immutable(Scheme {
-                    vars: quantified.clone(),
-                    constraints: vec![],
-                    ty,
-                }),
-            ));
-        }
-        for (name, info) in entries {
-            env.insert(name, info);
-        }
-        for variant in &td.variants {
-            if let Some(info) = env.get(&variant.name) {
-                self.definition_schemes
-                    .insert(variant.name_span, info.scheme.clone());
-            }
-        }
-        Ok(())
-    }
-
-    fn resolve_variant_payload_types(&mut self) {
-        let variants: Vec<(String, Vec<String>, Option<Type>)> = self
-            .variant_env
-            .0
-            .iter()
-            .map(|(name, info)| (name.clone(), info.type_params.clone(), info.payload.clone()))
-            .collect();
-
-        for (name, type_params, payload) in variants {
-            let mut param_vars = HashMap::new();
-            let type_param_vars: Vec<TyVar> = type_params
-                .iter()
-                .map(|param| {
-                    let var = self.fresh_var();
-                    param_vars.insert(param.clone(), var);
-                    var
-                })
-                .collect();
-
-            let payload_ty = payload
-                .as_ref()
-                .and_then(|ty| self.ast_to_ty_with_vars(ty, &mut param_vars).ok());
-
-            if let Some(info) = self.variant_env.0.get_mut(&name) {
-                info.type_param_vars = type_param_vars;
-                info.payload_ty = payload_ty;
-            }
-        }
-    }
-
-    fn discard_failed_type_decl(&mut self, td: &TypeDef) {
-        self.declared_types.remove(&td.name);
-        for variant in &td.variants {
-            self.variant_env.0.remove(&variant.name);
-        }
-    }
-
-    fn infer_impl(&mut self, env: &mut TypeEnv, id: &mut ImplDef) -> Result<(), SpannedTypeError> {
-        let trait_def = self
-            .trait_env
-            .get(&id.trait_name)
-            .ok_or_else(|| TypeError::UnknownTrait(id.trait_name.clone()))?
-            .clone();
-
-        let impl_target = impl_target_name(&id.target);
-
-        for tm in &trait_def.methods {
-            if !id.methods.iter().any(|m| m.name == tm.name) {
-                return Err(TypeError::MissingTraitMethod {
-                    trait_name: id.trait_name.clone(),
-                    impl_target: impl_target.clone(),
-                    method: tm.name.clone(),
-                }
-                .into());
-            }
-        }
-
-        let mut dict_fields: Vec<(String, Ty)> = Vec::new();
-
-        for impl_method in &mut id.methods {
-            let Some(trait_method) = trait_def
-                .methods
-                .iter()
-                .find(|m| m.name == impl_method.name)
-            else {
-                return Err(TypeError::ExtraTraitMethod {
-                    trait_name: id.trait_name.clone(),
-                    method: impl_method.name.clone(),
-                }
-                .at(impl_method.span));
-            };
-
-            if trait_method.inline {
-                impl_method.inline = true;
-            }
-
-            if impl_method.params.len() != trait_method.params.len() {
-                return Err(TypeError::TraitMethodArityMismatch {
-                    trait_name: id.trait_name.clone(),
-                    method: impl_method.name.clone(),
-                    expected: trait_method.params.len(),
-                    got: impl_method.params.len(),
-                }
-                .at(impl_method.span));
-            }
-
-            let derived_params: Vec<Type> = trait_method
-                .params
-                .iter()
-                .map(|(_, t)| subst_hkt_param(t, &trait_def.param, &id.target))
-                .collect();
-            let derived_ret = subst_hkt_param(&trait_method.ret_type, &trait_def.param, &id.target);
-
-            let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-            let mut param_tys: Vec<Ty> = Vec::new();
-            let mut body_env = env.clone();
-
-            for (param, derived_ty) in impl_method.params.iter().zip(derived_params.iter()) {
-                if param.mut_place {
-                    return Err(TypeError::MutableFunctionCapabilityMismatch.at(impl_method.span));
-                }
-                if !is_irrefutable_param(&param.pat, &self.variant_env) {
-                    return Err(TypeError::RefutableParamPattern.at(impl_method.body.span));
-                }
-                let p_ty = self.ast_to_ty_with_vars(derived_ty, &mut param_vars)?;
-                if let Some(p_type) = &param.ty {
-                    let explicit_ty = self.ast_to_ty_with_vars(p_type, &mut param_vars)?;
-                    unify(&mut self.subst, p_ty.clone(), explicit_ty)
-                        .map_err(|err| err.at(impl_method.body.span))?;
-                }
-                param_tys.push(p_ty.clone());
-                self.check_pattern(&param.pat, p_ty, &mut body_env, false)?;
-            }
-            let ret_ty = self.ast_to_ty_with_vars(&derived_ret, &mut param_vars)?;
-
-            if let Some(ret_type_opt) = &impl_method.ret_type {
-                let explicit_ret = self.ast_to_ty_with_vars(&ret_type_opt.ty, &mut param_vars)?;
-                unify(&mut self.subst, ret_ty.clone(), explicit_ret)
-                    .map_err(|err| err.at(impl_method.body.span))?;
-            }
-
-            self.fn_return_tys.push(ret_ty.clone());
-            let body_ty = self.infer_expr(&body_env, &mut impl_method.body)?;
-            self.fn_return_tys.pop();
-            unify(&mut self.subst, body_ty, ret_ty.clone())
-                .map_err(|err| err.at(impl_method.body.span))?;
-
-            let method_ty = Ty::Func(value_func_params(param_tys), value_func_return(ret_ty));
-            self.definition_schemes
-                .insert(impl_method.name_span, Scheme::mono(method_ty.clone()));
-            dict_fields.push((impl_method.name.clone(), method_ty));
-        }
-
-        dict_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let dict_ty = Ty::Record(Row {
-            fields: dict_fields,
-            tail: Box::new(Ty::Unit),
-        });
-        let dict_scheme = self.generalize(env, dict_ty);
-        let dict_name = format!("__{}__{}", id.trait_name, impl_target);
-        env.insert(dict_name, EnvInfo::immutable(dict_scheme));
-        Ok(())
-    }
-
-    fn infer_inherent_impl(
-        &mut self,
-        env: &mut TypeEnv,
-        id: &mut InherentImplDef,
-    ) -> Result<(), SpannedTypeError> {
-        let target_name = validate_inherent_impl_target(&id.target, &self.declared_types)
-            .map_err(|err| err.at(id.span))?;
-        let dict_name = inherent_impl_dict_name(&target_name);
-        let mut seen_methods = HashSet::new();
-        let mut dict_fields = Vec::new();
-
-        for method in &mut id.methods {
-            if !seen_methods.insert(method.name.clone())
-                || self
-                    .inherent_methods
-                    .get(&target_name)
-                    .is_some_and(|methods| methods.contains_key(&method.name))
-            {
-                return Err(TypeError::DuplicateInherentMethod {
-                    target: target_name.clone(),
-                    method: method.name.clone(),
-                }
-                .at(method.name_span));
-            }
-            let has_receiver = method.params.first().is_some_and(is_self_param);
-            substitute_self_in_inherent_method(method, &id.target);
-
-            let mut param_vars = HashMap::new();
-            let target_ty = self.ast_to_ty_with_vars(&id.target, &mut param_vars)?;
-            let initial_constraints =
-                self.collect_type_bound_constraints(&mut param_vars, &method.type_bounds);
-            let mut param_tys = Vec::new();
-            let mut body_env = env.clone();
-
-            for (idx, param) in method.params.iter().enumerate() {
-                if !is_irrefutable_param(&param.pat, &self.variant_env) {
-                    return Err(TypeError::RefutableParamPattern.at(method.body.span));
-                }
-                let p_ty = if has_receiver && idx == 0 {
-                    let receiver_ty = target_ty.clone();
-                    if let Some(explicit) = &param.ty {
-                        let explicit_ty = self.ast_to_ty_with_vars(explicit, &mut param_vars)?;
-                        unify(&mut self.subst, receiver_ty.clone(), explicit_ty)
-                            .map_err(|err| err.at(method.body.span))?;
-                    }
-                    receiver_ty
-                } else {
-                    match &param.ty {
-                        Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
-                        None => self.subst.fresh_var(),
-                    }
-                };
-                param_tys.push(p_ty.clone());
-                self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
-            }
-
-            let ret_ty = match &method.ret_type {
-                Some(t) => self.ast_to_ty_with_vars(&t.ty, &mut param_vars)?,
-                None => self.subst.fresh_var(),
-            };
-            let fn_ty = Ty::Func(
-                func_params_from_params(&method.params, param_tys.clone()),
-                func_return_from_annotation(&method.ret_type, ret_ty.clone()),
-            );
-
-            let saved_pending = std::mem::take(&mut self.pending_constraints);
-            self.pending_constraints.extend(initial_constraints);
-            self.fn_return_tys.push(ret_ty.clone());
-            let body_ty = self.infer_expr(&body_env, &mut method.body)?;
-            self.fn_return_tys.pop();
-            unify(&mut self.subst, body_ty, ret_ty).map_err(|err| err.at(method.body.span))?;
-
-            let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
-            let finalized = self.finalize_constraints(env, fn_ty.clone(), fn_constraints);
-            self.pending_constraints.extend(finalized.bubbled.clone());
-            method.dict_params = finalized.owned.iter().map(dict_param_name).collect();
-
-            let resolver = |p: &PendingDictArg| {
-                resolve_local_or_concrete(
-                    p,
-                    &finalized.owned,
-                    env,
-                    &self.known_impl_dicts,
-                    &self.subst,
-                )
-            };
-            resolve_dict_uses_expr(&mut method.body, &resolver, false)?;
-
-            let scheme = finalized.scheme.clone();
-            self.definition_schemes
-                .insert(method.name_span, scheme.clone());
-            self.inherent_methods
-                .entry(target_name.clone())
-                .or_default()
-                .insert(
-                    method.name.clone(),
-                    InherentMethodInfo {
-                        scheme,
-                        resolved_callee: ResolvedCallee::Function(format!(
-                            "{}.{}",
-                            dict_name,
-                            mangle_op(&method.name)
-                        )),
-                        has_receiver,
-                    },
-                );
-            dict_fields.push((method.name.clone(), self.subst.apply(&fn_ty)));
-        }
-
-        dict_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
-        env.insert(
-            dict_name,
-            EnvInfo::immutable(self.generalize(
-                env,
-                Ty::Record(Row {
-                    fields: dict_fields,
-                    tail: Box::new(Ty::Unit),
-                }),
-            )),
-        );
-        Ok(())
+        let actual = self.infer_expr(env, expr)?;
+        unify_expr_result(&mut self.subst, actual, expected.clone())
+            .map_err(|err| err.at(expr_span))?;
+        let ty = self.subst.apply(&expected);
+        Ok(self.record_expr_type_for_node(expr_id, ty))
     }
 
     fn infer_expr(&mut self, env: &TypeEnv, expr: &mut Expr) -> Result<Ty, SpannedTypeError> {
         let expr_id = expr.id;
         let result: Result<Ty, SpannedTypeError> = match &mut expr.kind {
-            ExprKind::Number(_) => Ok(Ty::F64),
+            ExprKind::Number(n) => match n {
+                crate::lex::NumberLiteral::Int(_) => Ok(Ty::Int),
+                crate::lex::NumberLiteral::Float(_) => Ok(Ty::Float),
+            },
             ExprKind::StringLit(_) => Ok(Ty::Con("string".to_string())),
             ExprKind::Bool(_) => Ok(Ty::Con("bool".to_string())),
             ExprKind::Not(operand) => {
@@ -1676,19 +1185,18 @@ impl Infer {
                         Ty::Qualified(instantiated.constraints, Box::new(instantiated.ty))
                     };
                     if expr.id != NO_NODE_ID {
-                        self.symbol_types.insert(expr.id, self.subst.apply(&ty));
-                        self.binding_capabilities.insert(
+                        self.metadata
+                            .record_symbol_type(expr.id, ty.clone(), &self.subst);
+                        self.metadata.record_binding_capability(
                             expr.span,
                             BindingCapabilities {
                                 place_mutable: info.is_place_mutable(),
                             },
                         );
                         if matches!(self.subst.apply(&info.scheme.ty), Ty::Func(_, _)) {
-                            self.callable_capabilities.insert(
+                            self.metadata.record_callable_capabilities(
                                 expr.id,
-                                CallableCapabilities {
-                                    param_capabilities: scheme_param_capabilities(&info.scheme),
-                                },
+                                scheme_param_capabilities(&info.scheme),
                             );
                         }
                     }
@@ -1706,7 +1214,8 @@ impl Infer {
                         }
                         let ty = self.instantiate(&info.scheme);
                         if target.id != NO_NODE_ID {
-                            self.symbol_types.insert(target.id, self.subst.apply(&ty));
+                            self.metadata
+                                .record_symbol_type(target.id, ty.clone(), &self.subst);
                         }
                         ty
                     }
@@ -1739,9 +1248,9 @@ impl Infer {
                 ..
             } => {
                 let l_ty = self.infer_expr(env, lhs)?;
-                let r_ty = self.infer_expr(env, rhs)?;
                 match op {
                     BinOp::Pipe => {
+                        let r_ty = self.infer_expr(env, rhs)?;
                         // Fast path: if RHS is a constrained identifier, resolve its dict args.
                         if let ExprKind::Ident(callee_name) = &rhs.kind
                             && let Some(info) = env.get(callee_name.as_str())
@@ -1797,6 +1306,8 @@ impl Infer {
                                 self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
 
                             unify(&mut self.subst, l_ty, lhs_param_ty)?;
+                            let rhs_param_ty = self.subst.apply(&rhs_param_ty);
+                            let r_ty = self.infer_expr_expected(env, rhs, rhs_param_ty.clone())?;
                             unify(&mut self.subst, r_ty, rhs_param_ty)?;
 
                             let resolved_target = self.subst.apply(&Ty::Var(target_var));
@@ -1812,6 +1323,7 @@ impl Infer {
                             )?;
                             Ok(self.subst.apply(&ret_ty))
                         } else {
+                            let r_ty = self.infer_expr(env, rhs)?;
                             // op is a regular (non-trait) operator function
                             if let Some(info) = env.get(op.as_str()) {
                                 let scheme = info.scheme.clone();
@@ -1823,7 +1335,7 @@ impl Infer {
                                         dict_args,
                                         pending_dict_args,
                                     )?;
-                                    *resolved_op = Some(ResolvedCallee::Function(mangle_op(op)));
+                                    *resolved_op = Some(ResolvedCallee::Function(op.to_string()));
                                     return Ok(ret_ty);
                                 }
                             }
@@ -1859,7 +1371,7 @@ impl Infer {
                     member_span,
                 } = &callee.kind
                 {
-                    return self.resolve_associated_call(
+                    let ty = self.resolve_associated_call(
                         env,
                         expr_id,
                         callee.id,
@@ -1872,7 +1384,8 @@ impl Infer {
                         resolved_callee,
                         dict_args,
                         pending_dict_args,
-                    );
+                    )?;
+                    return Ok(self.record_expr_type_for_node(expr_id, ty));
                 }
 
                 // Trait method call: `TraitName.method(args...)`.
@@ -1890,7 +1403,7 @@ impl Infer {
                         })?
                         .clone();
 
-                    return self.resolve_trait_method_call(
+                    let ty = self.resolve_trait_method_call(
                         env,
                         args,
                         arg_wrappers,
@@ -1899,12 +1412,13 @@ impl Infer {
                         trait_def,
                         method,
                         "trait method call",
-                    );
+                    )?;
+                    return Ok(self.record_expr_type_for_node(expr_id, ty));
                 }
 
                 if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind {
                     let callee_id = callee.id;
-                    return self.resolve_receiver_call(
+                    let ty = self.resolve_receiver_call(
                         env,
                         expr_id,
                         callee_id,
@@ -1916,7 +1430,9 @@ impl Infer {
                         resolved_callee,
                         dict_args,
                         pending_dict_args,
-                    );
+                        None,
+                    )?;
+                    return Ok(self.record_expr_type_for_node(expr_id, ty));
                 }
 
                 // Bare trait method call: `method(args...)` without explicit `Trait.` prefix.
@@ -1927,7 +1443,7 @@ impl Infer {
                     && env.get(method_name.as_str()).is_none()
                 {
                     if let Some(resolved) = self.bare_trait_method(method_name)? {
-                        return self.resolve_trait_method_call(
+                        let ty = self.resolve_trait_method_call(
                             env,
                             args,
                             arg_wrappers,
@@ -1936,7 +1452,8 @@ impl Infer {
                             resolved.trait_def,
                             resolved.method,
                             "bare trait method call",
-                        );
+                        )?;
+                        return Ok(self.record_expr_type_for_node(expr_id, ty));
                     }
                 }
 
@@ -1951,22 +1468,22 @@ impl Infer {
                         // constrained path bypasses that and must record it explicitly.
                         if callee.id != NO_NODE_ID {
                             let instantiated = self.instantiate_value(&scheme);
-                            self.symbol_types
-                                .insert(callee.id, self.subst.apply(&instantiated));
+                            self.metadata
+                                .record_symbol_type(callee.id, instantiated, &self.subst);
                         }
-                        self.check_mutable_place_args(
+                        let applied = self.apply_scheme_callable(
                             env,
                             args,
-                            &scheme_param_capabilities(&scheme),
-                        )?;
-                        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-                        return self.infer_constrained_apply(
-                            env,
+                            arg_wrappers,
                             &scheme,
-                            arg_tys,
+                            Vec::new(),
+                            0,
                             dict_args,
                             pending_dict_args,
                         );
+                        return applied.map(|applied| {
+                            self.record_expr_type_for_node(expr_id, applied.ret_ty)
+                        });
                     }
                 }
 
@@ -1983,35 +1500,26 @@ impl Infer {
                     Ty::Func(params, _) => func_param_capabilities(params),
                     _ => self.callable_capabilities_for(callee.id),
                 };
-                let fresh_return =
-                    func_return_capability(&callee_ty) == ReturnCapability::FreshPlace;
-                self.check_mutable_place_args(env, args, &param_capabilities)?;
-                let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-                let ret_ty = Ty::Var(self.fresh_var());
-                let expected_params = expected_func_params(&callee_ty, arg_tys);
-                let expected_ret = expected_func_return(&callee_ty, ret_ty.clone());
-                unify(
-                    &mut self.subst,
-                    callee_ty,
-                    Ty::Func(expected_params, expected_ret),
-                )?;
-                attach_dict_args(
+                let applied = self.apply_callable_type(
                     env,
-                    &self.known_impl_dicts,
+                    args,
+                    arg_wrappers,
+                    callee_ty,
+                    callee_constraints,
+                    Vec::new(),
+                    param_capabilities,
+                    0,
+                    expr.span,
                     dict_args,
                     pending_dict_args,
-                    &mut self.pending_constraints,
-                    &callee_constraints,
-                    &self.subst,
-                )
-                .map_err(|e| e.at(expr.span))?;
-                if fresh_return && expr_id != NO_NODE_ID {
-                    self.fresh_place_exprs.insert(expr_id);
+                )?;
+                if applied.fresh_return && expr_id != NO_NODE_ID {
+                    self.metadata.mark_fresh_place(expr_id);
                 }
-                Ok(self.subst.apply(&ret_ty))
+                Ok(applied.ret_ty)
             }
             ExprKind::AssociatedAccess { target, member, .. } => {
-                let target_name = validate_inherent_impl_target(target, &self.declared_types)
+                let target_name = inherent_impl_target_key_from_ast(target, &self.declared_types)
                     .map_err(|err| err.at(expr.span))?;
                 let method_info = self
                     .inherent_methods
@@ -2049,22 +1557,24 @@ impl Infer {
                 unify(&mut self.subst, cond_ty, Ty::Con("bool".to_string()))?;
                 let then_ty = self.infer_expr(env, then_branch)?;
                 let else_ty = self.infer_expr(env, else_branch)?;
-                unify(&mut self.subst, then_ty.clone(), else_ty)?;
-                Ok(then_ty)
+                combine_branch_types(&mut self.subst, then_ty, else_ty).map_err(|err| err.into())
             }
             ExprKind::Match { scrutinee, arms } => {
                 let scrutinee_ty = self.infer_expr(env, scrutinee)?;
-                let result_ty = self.subst.fresh_var();
+                let mut result_ty = None;
                 for (pattern, arm_expr) in &mut *arms {
                     let mut arm_env = env.clone();
                     let s_ty = self.subst.apply(&scrutinee_ty);
                     self.check_pattern(pattern, s_ty, &mut arm_env, false)?;
                     let arm_ty = self.infer_expr(&arm_env, arm_expr)?;
-                    unify(&mut self.subst, result_ty.clone(), arm_ty)?;
+                    result_ty = Some(match result_ty {
+                        Some(existing) => combine_branch_types(&mut self.subst, existing, arm_ty)?,
+                        None => arm_ty,
+                    });
                 }
                 let s_ty = self.subst.apply(&scrutinee_ty);
                 self.check_exhaustive(arms, &s_ty)?;
-                Ok(result_ty)
+                Ok(result_ty.unwrap_or(Ty::Never))
             }
             ExprKind::Loop(body) => {
                 let break_ty = self.subst.fresh_var();
@@ -2081,17 +1591,17 @@ impl Infer {
                     .ok_or(TypeError::BreakOutsideLoop)?;
                 if let Some(val_expr) = val {
                     let val_ty = self.infer_expr(env, val_expr)?;
-                    unify(&mut self.subst, break_ty, val_ty)?;
+                    unify_expr_result(&mut self.subst, val_ty, break_ty)?;
                 } else {
                     unify(&mut self.subst, break_ty, Ty::Unit)?;
                 }
-                Ok(self.subst.fresh_var())
+                Ok(Ty::Never)
             }
             ExprKind::Continue => {
                 if self.loop_break_tys.is_empty() {
                     Err(TypeError::ContinueOutsideLoop.into())
                 } else {
-                    Ok(self.subst.fresh_var())
+                    Ok(Ty::Never)
                 }
             }
             ExprKind::Return(val) => {
@@ -2102,11 +1612,11 @@ impl Infer {
                     .ok_or(TypeError::ReturnOutsideFunction)?;
                 if let Some(val_expr) = val {
                     let val_ty = self.infer_expr(env, val_expr)?;
-                    unify(&mut self.subst, ret_ty, val_ty)?;
+                    unify_expr_result(&mut self.subst, val_ty, ret_ty)?;
                 } else {
                     unify(&mut self.subst, ret_ty, Ty::Unit)?;
                 }
-                Ok(self.subst.fresh_var())
+                Ok(Ty::Never)
             }
             ExprKind::Block { stmts, final_expr } => {
                 let mut block_env = env.clone();
@@ -2128,63 +1638,47 @@ impl Infer {
                     .collect::<Result<_, _>>()?;
                 Ok(Ty::Tuple(tys))
             }
-            ExprKind::Array(entries) => {
-                let elt_ty = self.subst.fresh_var();
-                for entry in entries {
-                    match entry {
-                        ArrayEntry::Elem(expr) => {
-                            let ty = self.infer_expr(env, expr)?;
-                            unify(&mut self.subst, elt_ty.clone(), ty)?;
-                        }
-                        ArrayEntry::Spread(expr) => {
-                            let ty = self.infer_expr(env, expr)?;
-                            let expected = Ty::App(
-                                Box::new(Ty::Con("Array".to_string())),
-                                vec![elt_ty.clone()],
-                            );
-                            unify(&mut self.subst, ty, expected)?;
-                        }
-                    }
-                }
-                Ok(Ty::App(
-                    Box::new(Ty::Con("Array".to_string())),
-                    vec![elt_ty],
-                ))
-            }
+            ExprKind::Array(entries) => self.infer_array_entries(env, entries, None, expr.span),
             ExprKind::Record(entries) => {
                 let mut field_tys: Vec<(String, Ty)> = Vec::new();
-                let mut has_spread = false;
+                let mut tail = Ty::Unit;
                 for entry in entries {
                     match entry {
                         RecordEntry::Field(name, expr) => {
                             let ty = self.infer_expr(env, expr)?;
-                            if let Some(pos) = field_tys.iter().position(|(n, _)| n == name) {
-                                field_tys[pos].1 = ty;
-                            } else {
-                                field_tys.push((name.clone(), ty));
-                            }
+                            merge_record_field(&mut field_tys, name.clone(), ty);
                         }
                         RecordEntry::Spread(expr) => {
-                            has_spread = true;
                             let spread_ty = self.infer_expr(env, expr)?;
                             let tail_var = self.subst.fresh_var();
                             unify(
                                 &mut self.subst,
-                                spread_ty,
+                                spread_ty.clone(),
                                 Ty::Record(Row {
                                     fields: vec![],
                                     tail: Box::new(tail_var),
                                 }),
                             )?;
+                            let resolved_spread = self.subst.apply(&spread_ty);
+                            let Ty::Record(row) = resolved_spread else {
+                                return Err(TypeError::Mismatch(
+                                    Ty::Record(Row {
+                                        fields: vec![],
+                                        tail: Box::new(self.subst.fresh_var()),
+                                    }),
+                                    resolved_spread,
+                                )
+                                .at(expr.span));
+                            };
+                            for (name, ty) in row.fields {
+                                merge_record_field(&mut field_tys, name, ty);
+                            }
+                            tail = merge_record_spread_tail(&mut self.subst, tail, *row.tail)
+                                .map_err(|err| err.at(expr.span))?;
                         }
                     }
                 }
                 field_tys.sort_by(|(a, _), (b, _)| a.cmp(b));
-                let tail = if has_spread {
-                    self.subst.fresh_var()
-                } else {
-                    Ty::Unit
-                };
                 Ok(Ty::Record(Row {
                     fields: field_tys,
                     tail: Box::new(tail),
@@ -2234,65 +1728,7 @@ impl Infer {
                 params,
                 body,
                 dict_params,
-            } => {
-                let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-                let mut param_tys = Vec::new();
-                let mut body_env = env.clone();
-                for param in params.iter() {
-                    if !is_irrefutable_param(&param.pat, &self.variant_env) {
-                        return Err(TypeError::RefutableParamPattern.at(body.span));
-                    }
-                    let p_ty = match &param.ty {
-                        Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
-                        None => self.subst.fresh_var(),
-                    };
-                    param_tys.push(p_ty.clone());
-                    self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
-                }
-
-                let saved_pending = std::mem::take(&mut self.pending_constraints);
-
-                let ret_var = self.fresh_var();
-                let ret_ty = Ty::Var(ret_var);
-                self.fn_return_tys.push(ret_ty.clone());
-                let body_ty = self.infer_expr(&body_env, body)?;
-                self.fn_return_tys.pop();
-                unify(&mut self.subst, body_ty, ret_ty.clone())?;
-
-                let fn_ty = Ty::Func(
-                    func_params_from_params(params, param_tys),
-                    value_func_return(self.subst.apply(&ret_ty)),
-                );
-                let fn_constraints =
-                    std::mem::replace(&mut self.pending_constraints, saved_pending);
-                let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
-                self.pending_constraints.extend(finalized.bubbled.clone());
-                *dict_params = finalized.owned.iter().map(dict_param_name).collect();
-
-                let resolver = |p: &PendingDictArg| {
-                    resolve_local_or_concrete(
-                        p,
-                        &finalized.owned,
-                        env,
-                        &self.known_impl_dicts,
-                        &self.subst,
-                    )
-                };
-                // Always use lenient mode: the inner lambda's resolver runs while
-                // outer `>>=` chains haven't yet unified types (e.g. `pure`'s
-                // target), so any unresolved pending_trait_method nodes must be
-                // left for the enclosing function's hard-mode resolver to finish.
-                // Bubbled-constraint uses similarly need the outer resolver.
-                resolve_dict_uses_expr_lenient(body, &resolver, false)?;
-
-                self.record_callable_capabilities(expr_id, param_capabilities(params));
-
-                Ok(if finalized.owned.is_empty() {
-                    finalized.scheme.ty
-                } else {
-                    Ty::Qualified(finalized.owned, Box::new(finalized.scheme.ty))
-                })
-            }
+            } => self.infer_lambda_expr(env, expr_id, params, body, dict_params, None),
             ExprKind::For {
                 pat,
                 iterable,
@@ -2328,9 +1764,10 @@ impl Infer {
                 unify(&mut self.subst, iter_ty, self_ty)?;
 
                 let resolved_target = self.subst.apply(&Ty::Var(target_var));
-                match ty_target_name(&resolved_target) {
-                    None => {
-                        if let Ty::Var(v) = resolved_target {
+                let target_keys = trait_impl_target_keys_from_ty(&resolved_target);
+                if target_keys.is_empty() {
+                    match resolved_target {
+                        Ty::Var(v) => {
                             self.pending_constraints.push(TraitConstraint {
                                 var: v,
                                 trait_name: "Iterable".to_string(),
@@ -2339,7 +1776,8 @@ impl Infer {
                                 var: v,
                                 trait_name: "Iterable".to_string(),
                             });
-                        } else {
+                        }
+                        _ => {
                             return Err(TypeError::UnresolvedTrait {
                                 context: "for loop".to_string(),
                                 trait_name: "Iterable".to_string(),
@@ -2347,19 +1785,28 @@ impl Infer {
                             .into());
                         }
                     }
-                    Some(target_name) => {
-                        let dict_name = format!("__Iterable__{}", target_name);
-                        if !has_trait_impl(env, &self.known_impl_dicts, "Iterable", &target_name) {
+                } else {
+                    let dict_name = target_keys
+                        .into_iter()
+                        .map(|key| trait_impl_dict_name("Iterable", &key))
+                        .find(|dict_name| {
+                            env.get(dict_name).is_some()
+                                || self.known_impl_dicts.contains(dict_name)
+                        });
+                    match dict_name {
+                        Some(dict_name) => {
+                            *resolved_iter = Some(ResolvedCallee::DictMethod {
+                                dict: DictRef::Concrete(dict_name),
+                                method: "iter".to_string(),
+                            });
+                        }
+                        None => {
                             return Err(TypeError::MissingTraitImpl {
                                 trait_name: "Iterable".to_string(),
-                                impl_target: target_name,
+                                impl_target: format!("{}", resolved_target),
                             }
                             .into());
                         }
-                        *resolved_iter = Some(ResolvedCallee::DictMethod {
-                            dict: DictRef::Concrete(dict_name),
-                            method: "iter".to_string(),
-                        });
                     }
                 }
 
@@ -2382,9 +1829,153 @@ impl Infer {
         if let Ok(ty) = &result
             && expr.id != NO_NODE_ID
         {
-            self.expr_types.insert(expr.id, self.subst.apply(ty));
+            self.metadata
+                .record_expr_type(expr.id, ty.clone(), &self.subst);
         }
         result.map_err(|err: SpannedTypeError| err.with_span_if_absent(expr.span))
+    }
+
+    fn infer_array_entries(
+        &mut self,
+        env: &TypeEnv,
+        entries: &mut [ArrayEntry],
+        expected: Option<Ty>,
+        span: SourceSpan,
+    ) -> Result<Ty, SpannedTypeError> {
+        let expected_element = expected.as_ref().and_then(array_element_ty);
+        let elt_ty = expected_element
+            .clone()
+            .unwrap_or_else(|| self.subst.fresh_var());
+        for entry in entries {
+            match entry {
+                ArrayEntry::Elem(expr) => {
+                    let ty = if expected_element.is_some() {
+                        self.infer_expr_expected(env, expr, elt_ty.clone())?
+                    } else {
+                        self.infer_expr(env, expr)?
+                    };
+                    unify(&mut self.subst, elt_ty.clone(), ty)?;
+                }
+                ArrayEntry::Spread(expr) => {
+                    let expected_array =
+                        Ty::App(Box::new(Ty::Con("Array".to_string())), vec![elt_ty.clone()]);
+                    let ty = if expected_element.is_some() {
+                        self.infer_expr_expected(env, expr, expected_array.clone())?
+                    } else {
+                        self.infer_expr(env, expr)?
+                    };
+                    unify(&mut self.subst, ty, expected_array)?;
+                }
+            }
+        }
+        let array_ty = Ty::App(Box::new(Ty::Con("Array".to_string())), vec![elt_ty]);
+        if let Some(expected) = expected {
+            unify(&mut self.subst, array_ty.clone(), expected).map_err(|err| err.at(span))?;
+        }
+        Ok(self.subst.apply(&array_ty))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_lambda_expr(
+        &mut self,
+        env: &TypeEnv,
+        expr_id: NodeId,
+        params: &[Param],
+        body: &mut Expr,
+        dict_params: &mut Vec<String>,
+        expected_func: Option<(Vec<FuncParam>, FuncReturn)>,
+    ) -> Result<Ty, SpannedTypeError> {
+        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
+        let mut param_tys = Vec::new();
+        let mut body_env = env.clone();
+
+        if let Some((expected_params, _)) = &expected_func
+            && expected_params.len() != params.len()
+        {
+            return Err(TypeError::ArityMismatch {
+                expected: expected_params.len(),
+                got: params.len(),
+            }
+            .at(body.span));
+        }
+
+        for (idx, param) in params.iter().enumerate() {
+            if !is_irrefutable_param(&param.pat, &self.variant_env) {
+                return Err(TypeError::RefutableParamPattern.at(body.span));
+            }
+            let expected_param = expected_func
+                .as_ref()
+                .and_then(|(expected_params, _)| expected_params.get(idx));
+            if let Some(expected_param) = expected_param
+                && expected_param.capability.is_mut_place() != param.mut_place
+            {
+                return Err(TypeError::MutableFunctionCapabilityMismatch.at(body.span));
+            }
+            let p_ty = match (&param.ty, expected_param) {
+                (Some(t), Some(expected_param)) => {
+                    let annotated = self.ast_to_ty_with_vars(t, &mut param_vars)?;
+                    unify(
+                        &mut self.subst,
+                        annotated.clone(),
+                        expected_param.ty.clone(),
+                    )
+                    .map_err(|err| err.at(body.span))?;
+                    annotated
+                }
+                (Some(t), None) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
+                (None, Some(expected_param)) => expected_param.ty.clone(),
+                (None, None) => self.subst.fresh_var(),
+            };
+            param_tys.push(p_ty.clone());
+            self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
+        }
+
+        let saved_pending = std::mem::take(&mut self.pending_constraints);
+
+        let (ret_ty, ret_capability) = match &expected_func {
+            Some((_, expected_ret)) => ((*expected_ret.ty).clone(), expected_ret.capability),
+            None => (self.subst.fresh_var(), ReturnCapability::Value),
+        };
+        self.fn_return_tys.push(ret_ty.clone());
+        let body_ty = if expected_func.is_some() {
+            self.infer_expr_expected(&body_env, body, ret_ty.clone())?
+        } else {
+            self.infer_expr(&body_env, body)?
+        };
+        self.fn_return_tys.pop();
+        unify_expr_result(&mut self.subst, body_ty, ret_ty.clone())?;
+
+        let fn_ty = Ty::Func(
+            func_params_from_params(params, param_tys),
+            FuncReturn {
+                ty: Box::new(self.subst.apply(&ret_ty)),
+                capability: ret_capability,
+            },
+        );
+        let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
+        let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
+        self.pending_constraints.extend(finalized.bubbled.clone());
+        *dict_params = finalized.owned.iter().map(dict_param_name).collect();
+
+        let resolver = |p: &PendingDictArg| {
+            resolve_local_or_concrete(
+                p,
+                &finalized.owned,
+                env,
+                &self.known_impl_dicts,
+                &self.known_impl_schemes,
+                &self.subst,
+            )
+        };
+        resolve_dict_uses_expr_lenient(body, &resolver, false)?;
+
+        self.record_callable_capabilities(expr_id, param_capabilities(params));
+
+        Ok(if finalized.owned.is_empty() {
+            finalized.scheme.ty
+        } else {
+            Ty::Qualified(finalized.owned, Box::new(finalized.scheme.ty))
+        })
     }
 
     fn check_pattern(
@@ -2407,7 +1998,8 @@ impl Infer {
                 unify(&mut self.subst, scrutinee_ty, Ty::Con("string".to_string()))
             }
             Pattern::Variable(name, span) => {
-                self.binding_types.insert(*span, scrutinee_ty.clone());
+                self.metadata
+                    .record_binding_type(*span, scrutinee_ty.clone());
                 env.insert(name.clone(), binding_info(Scheme::mono(scrutinee_ty)));
                 Ok(())
             }
@@ -2482,8 +2074,8 @@ impl Infer {
                         continue;
                     }
                     if let Some((_, field_ty)) = field_tys.iter().find(|(n, _)| n == field_name) {
-                        self.binding_types
-                            .insert(*binding_span, self.subst.apply(field_ty));
+                        self.metadata
+                            .record_binding_type(*binding_span, self.subst.apply(field_ty));
                         env.insert(
                             binding_name.clone(),
                             binding_info(Scheme::mono(self.subst.apply(field_ty))),
@@ -2493,7 +2085,8 @@ impl Infer {
 
                 if let Some(Some((rest_name, rest_span))) = rest {
                     let rest_ty = self.subst.apply(&Ty::Var(tail_var));
-                    self.binding_types.insert(*rest_span, rest_ty.clone());
+                    self.metadata
+                        .record_binding_type(*rest_span, rest_ty.clone());
                     env.insert(rest_name.clone(), binding_info(Scheme::mono(rest_ty)));
                 }
                 Ok(())
@@ -2507,7 +2100,8 @@ impl Infer {
                     self.check_pattern(elem, elt_ty.clone(), env, binding_mutable)?;
                 }
                 if let Some(Some((rest_name, rest_span))) = rest {
-                    self.binding_types.insert(*rest_span, arr_ty.clone());
+                    self.metadata
+                        .record_binding_type(*rest_span, arr_ty.clone());
                     env.insert(rest_name.clone(), binding_info(Scheme::mono(arr_ty)));
                 }
                 Ok(())
@@ -2537,8 +2131,9 @@ impl Infer {
         let Pattern::Variable(name, span) = pat else {
             return Err(TypeError::MutableParamMustBindName);
         };
-        self.binding_types.insert(*span, scrutinee_ty.clone());
-        self.binding_capabilities.insert(
+        self.metadata
+            .record_binding_type(*span, scrutinee_ty.clone());
+        self.metadata.record_binding_capability(
             *span,
             BindingCapabilities {
                 place_mutable: true,
@@ -2576,18 +2171,25 @@ impl Infer {
     ) -> Result<Ty, TypeError> {
         Ok(match ast_ty {
             Type::Ident(name) => {
-                if let Some((params, aliased_ty)) = self.type_aliases.get(name).cloned()
-                    && params.is_empty()
-                {
+                if let Some((params, aliased_ty)) = self.type_aliases.get(name).cloned() {
+                    if !params.is_empty() {
+                        return Err(TypeError::TypeAliasArityMismatch {
+                            name: name.clone(),
+                            expected: params.len(),
+                            got: 0,
+                        });
+                    }
                     return self.expand_type_alias(name, &aliased_ty, param_vars, alias_stack);
                 }
                 match name.as_str() {
-                    "f64" => Ty::F64,
+                    "int" => Ty::Int,
+                    "float" => Ty::Float,
                     "Unit" | "()" => Ty::Unit,
                     _ if self.declared_types.contains(name) => Ty::Con(name.clone()),
                     _ => return Err(TypeError::UnknownType(name.clone())),
                 }
             }
+            Type::Never => Ty::Never,
             Type::Var(name) => {
                 if let Some(&v) = param_vars.get(name) {
                     Ty::Var(v)
@@ -2631,8 +2233,14 @@ impl Infer {
             Type::App(con, args) => {
                 if let Type::Ident(name) = &**con
                     && let Some((params, aliased_ty)) = self.type_aliases.get(name).cloned()
-                    && params.len() == args.len()
                 {
+                    if params.len() != args.len() {
+                        return Err(TypeError::TypeAliasArityMismatch {
+                            name: name.clone(),
+                            expected: params.len(),
+                            got: args.len(),
+                        });
+                    }
                     let mut substituted = aliased_ty;
                     for (param, arg) in params.iter().zip(args.iter()) {
                         substituted = subst_hkt_param(&substituted, param, arg);
@@ -2693,27 +2301,6 @@ impl Infer {
     }
 }
 
-fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeError> {
-    for method in &td.methods {
-        if method.params.is_empty() {
-            return Err(TypeError::TraitMethodMissingTarget {
-                trait_name: td.name.clone(),
-                method: method.name.clone(),
-            }
-            .at(method.span));
-        }
-    }
-    Ok(())
-}
-
-fn impl_dict_name(impl_def: &ImplDef) -> String {
-    format!(
-        "__{}__{}",
-        impl_def.trait_name,
-        impl_target_name(&impl_def.target)
-    )
-}
-
 fn param_capabilities(params: &[Param]) -> Vec<ParamCapability> {
     params
         .iter()
@@ -2746,6 +2333,59 @@ fn func_return_from_annotation(ret_type: &Option<TypeReturn>, ret_ty: Ty) -> Fun
         FuncReturn::fresh_place(ret_ty)
     } else {
         value_func_return(ret_ty)
+    }
+}
+
+fn combine_branch_types(subst: &mut Subst, left: Ty, right: Ty) -> Result<Ty, TypeError> {
+    let left = subst.apply(&left);
+    let right = subst.apply(&right);
+    match (&left, &right) {
+        (Ty::Never, Ty::Never) => Ok(Ty::Never),
+        (Ty::Never, _) => Ok(right),
+        (_, Ty::Never) => Ok(left),
+        _ => {
+            unify(subst, left.clone(), right)?;
+            Ok(subst.apply(&left))
+        }
+    }
+}
+
+fn unify_expr_result(subst: &mut Subst, actual: Ty, expected: Ty) -> Result<(), TypeError> {
+    if matches!(subst.apply(&actual), Ty::Never) {
+        return Ok(());
+    }
+    unify(subst, actual, expected)
+}
+
+fn merge_record_field(fields: &mut Vec<(String, Ty)>, name: String, ty: Ty) {
+    if let Some(pos) = fields.iter().position(|(existing, _)| existing == &name) {
+        fields[pos].1 = ty;
+    } else {
+        fields.push((name, ty));
+    }
+}
+
+fn merge_record_spread_tail(subst: &mut Subst, existing: Ty, next: Ty) -> Result<Ty, TypeError> {
+    let existing = subst.apply(&existing);
+    let next = subst.apply(&next);
+    match (existing, next) {
+        (Ty::Unit, tail) | (tail, Ty::Unit) => Ok(tail),
+        (Ty::Var(left), Ty::Var(right)) if left == right => Ok(Ty::Var(left)),
+        (left, right) => {
+            unify(subst, left.clone(), right)?;
+            Ok(subst.apply(&left))
+        }
+    }
+}
+
+fn array_element_ty(ty: &Ty) -> Option<Ty> {
+    match ty {
+        Ty::App(con, args)
+            if matches!(con.as_ref(), Ty::Con(name) if name == "Array") && args.len() == 1 =>
+        {
+            Some(args[0].clone())
+        }
+        _ => None,
     }
 }
 
@@ -2825,7 +2465,7 @@ fn type_contains_var(ty: &Type, var_name: &str) -> bool {
         }
         Type::Tuple(tys) => tys.iter().any(|t| type_contains_var(t, var_name)),
         Type::Record(fields, _) => fields.iter().any(|(_, t)| type_contains_var(t, var_name)),
-        Type::Ident(_) | Type::Unit | Type::Hole => false,
+        Type::Ident(_) | Type::Unit | Type::Never | Type::Hole => false,
     }
 }
 
@@ -2989,8 +2629,8 @@ mod tests {
         match callee_ty {
             Ty::Func(params, ret) => {
                 assert_eq!(params.len(), 1);
-                assert_eq!(params[0].ty, Ty::F64);
-                assert_eq!(*ret.ty, Ty::F64);
+                assert_eq!(params[0].ty, Ty::Int);
+                assert_eq!(*ret.ty, Ty::Int);
             }
             other => panic!("callee should retain a function type, got {other}"),
         }
@@ -2999,11 +2639,11 @@ mod tests {
     #[test]
     fn same_name_single_constructor_type_is_nominal() {
         let mut program = parse_source(
-            "type Wrap = Wrap(f64)\n\
+            "type Wrap = Wrap(float)\n\
              impl Wrap {\n\
                fn unwrap(self) { match self { Wrap(value) -> value } }\n\
              }\n\
-             let wrapped = Wrap(1);\n\
+             let wrapped = Wrap(1.0);\n\
              let value = wrapped.unwrap();\n",
         )
         .expect("source should parse");
@@ -3080,12 +2720,15 @@ mod tests {
         let mut infer = Infer::new();
         infer
             .subst
-            .bind_ty(0, Ty::F64)
+            .bind_ty(0, Ty::Float)
             .expect("valid concrete type");
 
         let finalized = infer.finalize_constraints(
             &TypeEnv::new(),
-            Ty::Func(value_func_params(vec![Ty::F64]), value_func_return(Ty::F64)),
+            Ty::Func(
+                value_func_params(vec![Ty::Float]),
+                value_func_return(Ty::Float),
+            ),
             vec![TraitConstraint {
                 var: 0,
                 trait_name: "Add".to_string(),
@@ -3112,20 +2755,20 @@ mod tests {
             TypeError::MissingTraitImpl {
                 ref trait_name,
                 ref impl_target,
-            } if trait_name == "Show" && impl_target == "f64"
+            } if trait_name == "Show" && impl_target == "int"
         ));
     }
 
     #[test]
     fn missing_custom_type_trait_impl_is_rejected_during_inference() {
         let err = infer_source_error(
-            "type Boxed = Boxed(f64)
+            "type Boxed = Boxed(float)
 
              trait Show 'a {
                fn show(x: 'a) -> string
              }
 
-             show(Boxed(1))\n",
+             show(Boxed(1.0))\n",
         );
 
         assert!(matches!(
@@ -3140,7 +2783,7 @@ mod tests {
     #[test]
     fn collecting_inference_does_not_use_failed_local_impl_dict() {
         let mut program = parse_source(
-            "type Boxed = Boxed(f64)
+            "type Boxed = Boxed(float)
 
              trait Show 'a {
                fn show(x: 'a) -> string
@@ -3150,7 +2793,7 @@ mod tests {
                fn show(x) { 1 }
              }
 
-             show(Boxed(1))\n",
+             show(Boxed(1.0))\n",
         )
         .expect("source should parse");
 
@@ -3171,19 +2814,19 @@ mod tests {
     #[test]
     fn missing_structural_tuple_component_impl_is_rejected_during_inference() {
         let err = infer_source_error(
-            "type Boxed = Boxed(f64)
+            "type Boxed = Boxed(float)
 
              trait Eq 'a {
                fn infix 4 ==(lhs: 'a, rhs: 'a) -> bool
                fn infix 4 !=(lhs: 'a, rhs: 'a) -> bool
              }
 
-             impl Eq for f64 {
+             impl Eq for float {
                fn ==(lhs, rhs) { true }
                fn !=(lhs, rhs) { false }
              }
 
-             fn bad(a: (Boxed, f64), b: (Boxed, f64)) -> bool {
+             fn bad(a: (Boxed, float), b: (Boxed, float)) -> bool {
                a == b
              }\n",
         );
@@ -3204,11 +2847,11 @@ mod tests {
                fn show(x: 'a) -> string
              }
 
-             impl Show for f64 {
+             impl Show for float {
                fn show(x) { \"ok\" }
              }
 
-             show(1)\n",
+             show(1.0)\n",
         )
         .expect("source should parse");
         reassociate_standalone(&mut program);
@@ -3238,7 +2881,7 @@ mod tests {
                 dict: DictRef::Concrete(name),
                 method,
             }) => {
-                assert_eq!(name, "__Show__f64");
+                assert_eq!(name, "__Show__float");
                 assert_eq!(method, "show");
             }
             other => panic!("expected concrete checked dict method, got {other:?}"),

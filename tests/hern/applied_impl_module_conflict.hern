@@ -1,0 +1,4 @@
+let a = import "applied_impl_module_conflict_a";
+let b = import "applied_impl_module_conflict_b";
+
+print(1);

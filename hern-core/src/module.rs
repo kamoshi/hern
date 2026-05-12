@@ -1,12 +1,14 @@
 use crate::analysis::{CompilerDiagnostic, DiagnosticSource, analyze_prelude};
-use crate::ast::{
-    Expr, ExprKind, NodeId, Param, Pattern, Program, SourceSpan, Stmt, TraitDef, Type,
-};
+use crate::ast::{Expr, ExprKind, NodeId, Param, Pattern, Program, SourceSpan, Stmt, TraitDef};
 use crate::pipeline::{
     AnalysisOutput, parse_source, parse_source_recovering, reassociate_with_program,
 };
 use crate::types::infer::{Infer, TypeEnv, VariantEnv};
-use crate::types::{BindingCapabilities, CallableCapabilities, InherentMethodScheme, Scheme, Ty};
+use crate::types::{
+    BindingCapabilities, CallableCapabilities, InherentMethodScheme, Scheme, Ty,
+    trait_impl_dict_name, trait_impl_target_key_from_ast,
+    type_syntax::exact_impl_target_key_from_ast,
+};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -72,6 +74,7 @@ struct EnvOp {
 #[derive(Clone)]
 struct EnvImpl {
     dict_name: String,
+    scheme: Option<Scheme>,
     owner: String,
 }
 
@@ -257,8 +260,18 @@ impl ModuleGraph {
                 .to_path_buf();
             resolve_imports_in_program(&mut program, &base_dir, self)
                 .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
-            if program.inner_attrs.iter().any(|a| a == "no_implicit_prelude") {
-                reassociate_with_program(&mut program, &Program { stmts: vec![], inner_attrs: vec![] });
+            if program
+                .inner_attrs
+                .iter()
+                .any(|a| a == "no_implicit_prelude")
+            {
+                reassociate_with_program(
+                    &mut program,
+                    &Program {
+                        stmts: vec![],
+                        inner_attrs: vec![],
+                    },
+                );
             } else {
                 reassociate_with_program(&mut program, &self.prelude);
             }
@@ -267,7 +280,11 @@ impl ModuleGraph {
         self.loading.remove(&path);
 
         let program = loaded?;
-        if program.inner_attrs.iter().any(|a| a == "no_implicit_prelude") {
+        if program
+            .inner_attrs
+            .iter()
+            .any(|a| a == "no_implicit_prelude")
+        {
             self.no_prelude_modules.insert(name.clone());
         }
         self.paths.insert(name.clone(), path);
@@ -320,8 +337,19 @@ impl ModuleGraph {
                 self,
                 DiagnosticSource::Path(path.clone()),
             ));
-            if parsed.program.inner_attrs.iter().any(|a| a == "no_implicit_prelude") {
-                reassociate_with_program(&mut parsed.program, &Program { stmts: vec![], inner_attrs: vec![] });
+            if parsed
+                .program
+                .inner_attrs
+                .iter()
+                .any(|a| a == "no_implicit_prelude")
+            {
+                reassociate_with_program(
+                    &mut parsed.program,
+                    &Program {
+                        stmts: vec![],
+                        inner_attrs: vec![],
+                    },
+                );
             } else {
                 reassociate_with_program(&mut parsed.program, &self.prelude);
             }
@@ -334,7 +362,11 @@ impl ModuleGraph {
             Ok(loaded) => loaded,
             Err(diagnostic) => return (name, vec![diagnostic]),
         };
-        if program.inner_attrs.iter().any(|a| a == "no_implicit_prelude") {
+        if program
+            .inner_attrs
+            .iter()
+            .any(|a| a == "no_implicit_prelude")
+        {
             self.no_prelude_modules.insert(name.clone());
         }
         self.paths.insert(name.clone(), path);
@@ -594,6 +626,7 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
             ]);
         }
     };
+    prelude_module_env.attach_trait_impl_schemes(&prelude_env);
     prelude_module_env.attach_inherent_method_schemes(&prelude_inference.inherent_method_schemes);
 
     let empty_module_env = ModuleEnv::default();
@@ -616,7 +649,11 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
         }
 
         let is_no_prelude = graph.no_prelude_modules.contains(&name);
-        let effective_prelude_env = if is_no_prelude { &empty_module_env } else { &prelude_module_env };
+        let effective_prelude_env = if is_no_prelude {
+            &empty_module_env
+        } else {
+            &prelude_module_env
+        };
         let module_env =
             match build_module_env(graph, &result.module_envs, effective_prelude_env, &name)
                 .map_err(|err| err.with_source_if_absent(source.clone()))
@@ -632,6 +669,7 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
         infer.set_trait_scope(traits, ops);
         infer.set_inherent_scope(inherent_methods);
         infer.set_known_impl_dicts(module_env.all_dict_names());
+        infer.set_known_impl_schemes(module_env.all_trait_impl_schemes());
         infer.set_import_types(result.import_types.clone());
         infer.set_import_schemes(result.import_schemes.clone());
         let program = match graph.modules.get_mut(&name) {
@@ -665,12 +703,13 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
             name.clone(),
             export_schemes_from_program(program, &inference.env),
         );
+        let mut module_env = module_env;
+        module_env.attach_trait_impl_schemes(&inference.env);
+        module_env.attach_inherent_method_schemes(&inference.inherent_method_schemes);
         result.envs.insert(name.clone(), inference.env);
         result
             .variant_envs
             .insert(name.clone(), inference.variant_env);
-        let mut module_env = module_env;
-        module_env.attach_inherent_method_schemes(&inference.inherent_method_schemes);
         result.module_envs.insert(name.clone(), module_env);
         result.expr_types.insert(name.clone(), inference.expr_types);
         result
@@ -790,6 +829,18 @@ impl ModuleEnv {
             .collect()
     }
 
+    pub fn all_trait_impl_schemes(&self) -> HashMap<String, Scheme> {
+        self.impls
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .scheme
+                    .clone()
+                    .map(|scheme| (entry.dict_name.clone(), scheme))
+            })
+            .collect()
+    }
+
     /// Look up a trait definition by name. Covers all in-scope traits: local, imported, prelude.
     pub fn trait_def(&self, name: &str) -> Option<&TraitDef> {
         self.traits.get(name).map(|e| &e.def)
@@ -825,6 +876,14 @@ impl ModuleEnv {
                         existing.has_receiver = method.has_receiver;
                     }
                 }
+            }
+        }
+    }
+
+    fn attach_trait_impl_schemes(&mut self, env: &TypeEnv) {
+        for entry in self.impls.values_mut() {
+            if let Some(info) = env.get(&entry.dict_name) {
+                entry.scheme = Some(info.scheme.clone());
             }
         }
     }
@@ -1423,7 +1482,8 @@ fn add_own_module_env(
                 }
             }
             Stmt::Impl(id) => {
-                let target = impl_target_name(&id.target);
+                let target = trait_impl_target_key_from_ast(&id.target)
+                    .map_err(|err| CompilerDiagnostic::error(None, err.to_string()))?;
                 let key = ImplKey {
                     trait_name: id.trait_name.clone(),
                     target: target.clone(),
@@ -1432,7 +1492,8 @@ fn add_own_module_env(
                     env,
                     key,
                     EnvImpl {
-                        dict_name: format!("__{}__{}", id.trait_name, target),
+                        dict_name: trait_impl_dict_name(&id.trait_name, &target),
+                        scheme: None,
                         owner: owner.to_string(),
                     },
                     false,
@@ -1440,7 +1501,8 @@ fn add_own_module_env(
                 .map_err(|err| err.with_span_if_absent(id.span))?;
             }
             Stmt::InherentImpl(id) => {
-                let target = impl_target_name(&id.target);
+                let target = module_inherent_impl_target_key(&id.target)
+                    .map_err(|err| CompilerDiagnostic::error(None, err.to_string()))?;
                 add_inherent_impl_env(
                     env,
                     target.clone(),
@@ -1472,6 +1534,30 @@ fn add_own_module_env(
         }
     }
     Ok(())
+}
+
+fn module_inherent_impl_target_key(
+    target: &crate::ast::Type,
+) -> Result<String, crate::types::error::TypeError> {
+    match target {
+        crate::ast::Type::Ident(name) => Ok(name.clone()),
+        crate::ast::Type::App(_, args)
+            if args
+                .iter()
+                .all(|arg| matches!(arg, crate::ast::Type::Var(_))) =>
+        {
+            Ok(module_inherent_impl_generic_target_name(target))
+        }
+        _ => exact_impl_target_key_from_ast(target),
+    }
+}
+
+fn module_inherent_impl_generic_target_name(target: &crate::ast::Type) -> String {
+    match target {
+        crate::ast::Type::Ident(name) => name.clone(),
+        crate::ast::Type::App(con, _) => module_inherent_impl_generic_target_name(con),
+        _ => "Unknown".to_string(),
+    }
 }
 
 fn add_trait_env(
@@ -1560,14 +1646,6 @@ fn add_inherent_impl_env(
     }
     env.inherent_impls.insert(target, entry);
     Ok(())
-}
-
-fn impl_target_name(target: &Type) -> String {
-    match target {
-        Type::Ident(name) => name.clone(),
-        Type::App(con, _) => impl_target_name(con),
-        _ => "Unknown".to_string(),
-    }
 }
 
 fn is_self_param(param: &Param) -> bool {

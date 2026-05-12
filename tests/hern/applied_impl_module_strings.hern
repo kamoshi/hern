@@ -1,0 +1,5 @@
+let traits = import "applied_impl_module_trait";
+
+impl Label for [string] {
+    fn label(xs) { "strings" }
+}

@@ -250,13 +250,13 @@ mod tests {
         let changes = edit.changes.expect("edit should use simple changes");
         let edits = changes.get(&uri).expect("edit should target document");
         assert_eq!(edits[0].range.start, Position::new(0, 9));
-        assert_eq!(edits[0].new_text, ": f64");
+        assert_eq!(edits[0].new_text, ": int");
     }
 
     #[test]
     fn code_action_absent_when_binding_already_has_annotation() {
         let project = TestProject::new("code-action-existing-type");
-        let source = "let value: f64 = 1;\nvalue\n";
+        let source = "let value: int = 1;\nvalue\n";
         let (state, uri) = project.open("main.hern", source);
 
         let actions = code_actions(

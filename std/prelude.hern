@@ -1,12 +1,396 @@
 #![no_implicit_prelude]
 
-// Extern Array
+// --- Core data ---
 
-extern __array_len: fn(['a]) -> f64 = #[template] "#($1)";
-extern __array_get: fn(['a], f64) -> 'a = #[template] "($1)[($2)]";
-extern __array_set: fn(['a], f64, 'a) -> () = "(function(a, i, v) a[i] = v; return {} end)";
+trait ToString 'a {
+  fn to_string(self: 'a) -> string
+}
+
+fn to_string['a: ToString](value: 'a) -> string {
+  ToString.to_string(value)
+}
+
+type Option('a) = Some('a) | None
+
+impl Option('a) {
+  fn is_some(self) -> bool {
+    match self {
+      Some(_) -> true,
+      None -> false,
+    }
+  }
+
+  fn is_none(self) -> bool {
+    match self {
+      Some(_) -> false,
+      None -> true,
+    }
+  }
+
+  fn unwrap_or(self, default: 'a) -> 'a {
+    match self {
+      Some(value) -> value,
+      None -> default,
+    }
+  }
+
+  fn map(self, f: fn('a) -> 'b) -> Option('b) {
+    match self {
+      Some(value) -> Some(f(value)),
+      None -> None,
+    }
+  }
+
+  fn and_then(self, f: fn('a) -> Option('b)) -> Option('b) {
+    match self {
+      Some(value) -> f(value),
+      None -> None,
+    }
+  }
+}
+
+type Result('a, 'e) = Ok('a) | Err('e)
+
+impl Result('a, 'e) {
+  fn is_ok(self) -> bool {
+    match self {
+      Ok(_) -> true,
+      Err(_) -> false,
+    }
+  }
+
+  fn is_err(self) -> bool {
+    match self {
+      Ok(_) -> false,
+      Err(_) -> true,
+    }
+  }
+
+  fn unwrap_or(self, default: 'a) -> 'a {
+    match self {
+      Ok(value) -> value,
+      Err(_) -> default,
+    }
+  }
+
+  fn map(self, f: fn('a) -> 'b) -> Result('b, 'e) {
+    match self {
+      Ok(value) -> Ok(f(value)),
+      Err(error) -> Err(error),
+    }
+  }
+
+  fn map_err(self, f: fn('e) -> 'b) -> Result('a, 'b) {
+    match self {
+      Ok(value) -> Ok(value),
+      Err(error) -> Err(f(error)),
+    }
+  }
+
+  fn and_then(self, f: fn('a) -> Result('b, 'e)) -> Result('b, 'e) {
+    match self {
+      Ok(value) -> f(value),
+      Err(error) -> Err(error),
+    }
+  }
+}
+
+impl ToString for Option('a)
+where 'a: ToString
+{
+  fn to_string(self) {
+    match self {
+      Some(value) -> "Some(" <> ToString.to_string(value) <> ")",
+      None -> "None",
+    }
+  }
+}
+
+impl ToString for Result('a, 'e)
+where 'a: ToString, 'e: ToString
+{
+  fn to_string(self) {
+    match self {
+      Ok(value) -> "Ok(" <> ToString.to_string(value) <> ")",
+      Err(error) -> "Err(" <> ToString.to_string(error) <> ")",
+    }
+  }
+}
+
+type Map('k, 'v) = *
+
+type Heap('a) = *
+
+// --- Primitive operators ---
+
+extern __float_add: fn(float, float) -> float = #[template] "(($1) + ($2))";
+extern __float_sub: fn(float, float) -> float = #[template] "(($1) - ($2))";
+extern __float_mul: fn(float, float) -> float = #[template] "(($1) * ($2))";
+extern __float_div: fn(float, float) -> float = #[template] "(($1) / ($2))";
+extern __float_mod: fn(float, float) -> float = #[template] "(($1) % ($2))";
+
+extern __int_add: fn(int, int) -> int = #[template] "bit.tobit(($1) + ($2))";
+extern __int_sub: fn(int, int) -> int = #[template] "bit.tobit(($1) - ($2))";
+extern __int_mul: fn(int, int) -> int = #[template] "bit.tobit(($1) * ($2))";
+extern __int_div: fn(int, int) -> int = #[template] "bit.tobit(($1) / ($2))";
+extern __int_mod: fn(int, int) -> int = #[template] "bit.tobit(($1) % ($2))";
+
+extern __float_lt:  fn(float, float) -> bool = #[template] "((($1) < ($2)) and 1 or 0)";
+extern __float_gt:  fn(float, float) -> bool = #[template] "((($1) > ($2)) and 1 or 0)";
+extern __float_lte: fn(float, float) -> bool = #[template] "((($1) <= ($2)) and 1 or 0)";
+extern __float_gte: fn(float, float) -> bool = #[template] "((($1) >= ($2)) and 1 or 0)";
+extern __int_lt:  fn(int, int) -> bool = #[template] "((($1) < ($2)) and 1 or 0)";
+extern __int_gt:  fn(int, int) -> bool = #[template] "((($1) > ($2)) and 1 or 0)";
+extern __int_lte: fn(int, int) -> bool = #[template] "((($1) <= ($2)) and 1 or 0)";
+extern __int_gte: fn(int, int) -> bool = #[template] "((($1) >= ($2)) and 1 or 0)";
+
+extern __eq_float:  fn(float, float) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
+extern __eq_int:  fn(int, int) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
+extern __eq_string: fn(string, string) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
+extern __eq_bool: fn(bool, bool) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
+extern __neq_float: fn(float, float) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
+extern __neq_int: fn(int, int) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
+extern __neq_string: fn(string, string) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
+extern __neq_bool: fn(bool, bool) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
+
+extern __and: fn(bool, bool) -> bool = #[template] "((($1) ~= 0 and ($2) ~= 0) and 1 or 0)";
+extern __or:  fn(bool, bool) -> bool = #[template] "((($1) ~= 0 or ($2) ~= 0) and 1 or 0)";
+
+extern __concat: fn(string, string) -> string = #[template] "(($1) .. ($2))";
+
+extern __int_to_float: fn(int) -> float = #[template] "($1)";
+extern __float_trunc_to_int: fn(float) -> int = #[template] "bit.tobit(math.modf($1))";
+extern __float_floor_to_int: fn(float) -> int = #[template] "bit.tobit(math.floor($1))";
+extern __float_ceil_to_int: fn(float) -> int = #[template] "bit.tobit(math.ceil($1))";
+
+trait Add 'a {
+  fn infixl 6 +(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Sub 'a {
+  fn infixl 6 -(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Mul 'a {
+  fn infixl 7 *(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Div 'a {
+  fn infixl 7 /(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Mod 'a {
+  fn infixl 7 %(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait Ord 'a {
+  fn infix 4 <(lhs: 'a, rhs: 'a) -> bool
+  fn infix 4 >(lhs: 'a, rhs: 'a) -> bool
+  fn infix 4 <=(lhs: 'a, rhs: 'a) -> bool
+  fn infix 4 >=(lhs: 'a, rhs: 'a) -> bool
+}
+
+trait Eq 'a {
+  fn infix 4 ==(lhs: 'a, rhs: 'a) -> bool
+  fn infix 4 !=(lhs: 'a, rhs: 'a) -> bool
+}
+
+trait Semigroup 'a {
+  fn infixr 5 <>(lhs: 'a, rhs: 'a) -> 'a
+}
+
+trait And 'a {
+  fn infixl 3 &&(lhs: 'a, rhs: 'a) -> bool
+}
+
+trait Or 'a {
+  fn infixl 2 ||(lhs: 'a, rhs: 'a) -> bool
+}
+
+impl Add for float {
+  #[inline]
+  fn +(lhs, rhs) { __float_add(lhs, rhs) }
+}
+
+impl Sub for float {
+  #[inline]
+  fn -(lhs, rhs) { __float_sub(lhs, rhs) }
+}
+
+impl Mul for float {
+  #[inline]
+  fn *(lhs, rhs) { __float_mul(lhs, rhs) }
+}
+
+impl Div for float {
+  #[inline]
+  fn /(lhs, rhs) { __float_div(lhs, rhs) }
+}
+
+impl Mod for float {
+  #[inline]
+  fn %(lhs, rhs) { __float_mod(lhs, rhs) }
+}
+
+impl Ord for float {
+  #[inline]
+  fn <(lhs, rhs) { __float_lt(lhs, rhs) }
+  #[inline]
+  fn >(lhs, rhs) { __float_gt(lhs, rhs) }
+  #[inline]
+  fn <=(lhs, rhs) { __float_lte(lhs, rhs) }
+  #[inline]
+  fn >=(lhs, rhs) { __float_gte(lhs, rhs) }
+}
+
+impl Eq for float {
+  #[inline]
+  fn ==(lhs, rhs) { __eq_float(lhs, rhs) }
+  #[inline]
+  fn !=(lhs, rhs) { __neq_float(lhs, rhs) }
+}
+
+impl float {
+  fn trunc(self) -> int { __float_trunc_to_int(self) }
+  fn floor(self) -> int { __float_floor_to_int(self) }
+  fn ceil(self) -> int { __float_ceil_to_int(self) }
+}
+
+impl ToString for float {
+  fn to_string(self) { tostring(self) }
+}
+
+impl Add for int {
+  #[inline]
+  fn +(lhs, rhs) { __int_add(lhs, rhs) }
+}
+
+impl Sub for int {
+  #[inline]
+  fn -(lhs, rhs) { __int_sub(lhs, rhs) }
+}
+
+impl Mul for int {
+  #[inline]
+  fn *(lhs, rhs) { __int_mul(lhs, rhs) }
+}
+
+impl Div for int {
+  #[inline]
+  fn /(lhs, rhs) { __int_div(lhs, rhs) }
+}
+
+impl Mod for int {
+  #[inline]
+  fn %(lhs, rhs) { __int_mod(lhs, rhs) }
+}
+
+impl Ord for int {
+  #[inline]
+  fn <(lhs, rhs) { __int_lt(lhs, rhs) }
+  #[inline]
+  fn >(lhs, rhs) { __int_gt(lhs, rhs) }
+  #[inline]
+  fn <=(lhs, rhs) { __int_lte(lhs, rhs) }
+  #[inline]
+  fn >=(lhs, rhs) { __int_gte(lhs, rhs) }
+}
+
+impl Eq for int {
+  #[inline]
+  fn ==(lhs, rhs) { __eq_int(lhs, rhs) }
+  #[inline]
+  fn !=(lhs, rhs) { __neq_int(lhs, rhs) }
+}
+
+impl int {
+  fn to_float(self) -> float { __int_to_float(self) }
+}
+
+impl ToString for int {
+  fn to_string(self) { tostring(self) }
+}
+
+impl Eq for string {
+  #[inline]
+  fn ==(lhs, rhs) { __eq_string(lhs, rhs) }
+  #[inline]
+  fn !=(lhs, rhs) { __neq_string(lhs, rhs) }
+}
+
+impl Eq for bool {
+  #[inline]
+  fn ==(lhs, rhs) { __eq_bool(lhs, rhs) }
+  #[inline]
+  fn !=(lhs, rhs) { __neq_bool(lhs, rhs) }
+}
+
+impl ToString for bool {
+  fn to_string(self) {
+    if self { "true" } else { "false" }
+  }
+}
+
+impl And for bool {
+  #[inline]
+  fn &&(lhs, rhs) { __and(lhs, rhs) }
+}
+
+impl Or for bool {
+  #[inline]
+  fn ||(lhs, rhs) { __or(lhs, rhs) }
+}
+
+impl Semigroup for string {
+  #[inline]
+  fn <>(lhs, rhs) { __concat(lhs, rhs) }
+}
+
+impl ToString for string {
+  fn to_string(self) { self }
+}
+
+// --- Globals ---
+
+extern _unpack: fn(['a], int) -> ['a] = "table.unpack or unpack";
+
+extern print: fn('a) -> () = "(function(x)
+  if type(x) == \"table\" then
+  local s = \"{\"
+  for k, v in pairs(x) do s = s .. tostring(k) .. \"=\" .. tostring(v) .. \", \" end
+  _G.print(s .. \"}\")
+  else
+  _G.print(x)
+  end
+  return {}
+end)";
+
+extern assert: fn(bool, string) -> () = "(function(c, m) if c == 0 then _G.error(m or \"assertion failed!\") end end)";
+extern error: fn(string) -> ! = "error";
+extern todo: fn(string) -> ! = "(function(message) _G.error(\"todo: \" .. (message or \"not implemented\")) end)";
+extern tostring: fn('a) -> string = "tostring";
+extern type_of: fn('a) -> string = "type";
+extern collectgarbage: fn(string) -> float = "collectgarbage";
+
+extern _VERSION: string = "_VERSION";
+
+extern pcall: fn(fn() -> 'a) -> Result('a, string) = "(function(f)
+  local ok, res = _G.pcall(f)
+  if ok then return { _tag = \"Ok\", _0 = res } else return { _tag = \"Err\", _0 = _G.tostring(res) } end
+end)";
+
+extern rawequal: fn('a, 'a) -> bool = "(function(a, b) return _G.rawequal(a, b) and 1 or 0 end)";
+extern rawget: fn(Map('k, 'v), 'k) -> 'v = "rawget";
+extern rawset: fn(Map('k, 'v), 'k, 'v) -> () = "rawset";
+
+// --- Arrays ---
+
+extern __array_len: fn(['a]) -> int = #[template] "#($1)";
+extern __array_get: fn(['a], int) -> 'a = #[template] "($1)[($2)]";
+extern __array_set: fn(['a], int, 'a) -> () = "(function(a, i, v) a[i] = v; return {} end)";
 extern __push: fn(['a], 'a) -> () = "(function(a, x) a[#a+1] = x; return {} end)";
 extern __pop: fn(['a]) -> 'a = "(function(a) return table.remove(a) end)";
+
 extern __array_map: fn(['a], fn('a) -> 'b) -> ['b] = "(function(a, f)
   local r = {}
   for i, v in ipairs(a) do r[i] = f(v) end
@@ -33,65 +417,168 @@ extern __array_concat: fn(['a], ['a]) -> ['a] = "(function(a, b)
   for _, v in ipairs(b) do r[#r+1] = v end
   return r
 end)";
-extern __array_sum: fn([f64]) -> f64 = "(function(a)
-  local s = 0
-  for _, v in ipairs(a) do s = s + v end
-  return s
-end)";
-extern __array_max: fn([f64]) -> f64 = "(function(a)
-  local m = -math.huge
-  for _, v in ipairs(a) do if v > m then m = v end end
-  return m
-end)";
-extern __array_min: fn([f64]) -> f64 = "(function(a)
-  local m = math.huge
-  for _, v in ipairs(a) do if v < m then m = v end end
-  return m
-end)";
-extern __array_range: fn(f64, f64) -> [f64] = "(function(a, b)
+extern __array_range: fn(int, int) -> [int] = "(function(a, b)
   local r = {}
   for i = a, b do r[#r+1] = i end
   return r
 end)";
-
-// other
-
-extern _unpack: fn(['a], f64) -> ['a] = "table.unpack or unpack";
-extern print: fn('a) -> () = "(function(x)
-  if type(x) == \"table\" then
-    local s = \"{\"
-    for k, v in pairs(x) do s = s .. tostring(k) .. \"=\" .. tostring(v) .. \", \" end
-    _G.print(s .. \"}\")
-  else
-    _G.print(x)
-  end
-  return {}
+extern __array_sum_float: fn([float]) -> float = "(function(a)
+  local s = 0
+  for _, v in ipairs(a) do s = s + v end
+  return s
+end)";
+extern __array_sum_int: fn([int]) -> int = "(function(a)
+  local s = 0
+  for _, v in ipairs(a) do s = bit.tobit(s + v) end
+  return s
+end)";
+extern __array_max: fn([float]) -> float = "(function(a)
+  local m = -math.huge
+  for _, v in ipairs(a) do if v > m then m = v end end
+  return m
+end)";
+extern __array_min: fn([float]) -> float = "(function(a)
+  local m = math.huge
+  for _, v in ipairs(a) do if v < m then m = v end end
+  return m
 end)";
 
-extern assert: fn(bool, string) -> () = "(function(c, m) if c == 0 then _G.error(m or \"assertion failed!\") end end)";
-extern error: fn(string) -> () = "error";
-extern tostring: fn('a) -> string = "tostring";
-extern type_of: fn('a) -> string = "type";
-extern collectgarbage: fn(string) -> f64 = "collectgarbage";
+fn range(a: int, b: int) -> [int] { __array_range(a, b) }
 
-extern _VERSION: string = "_VERSION";
+impl ['a] {
+  fn len(self) -> int {
+    __array_len(self)
+  }
 
-extern pcall: fn(fn() -> 'a) -> Result('a, string) = "(function(f)
-  local ok, res = _G.pcall(f)
-  if ok then return { _tag = \"Ok\", _0 = res } else return { _tag = \"Err\", _0 = _G.tostring(res) } end
-end)";
+  fn is_empty(self) -> bool {
+    self.len() == 0
+  }
 
-extern rawequal: fn('a, 'a) -> bool = "(function(a, b) return _G.rawequal(a, b) and 1 or 0 end)";
-extern rawget: fn(Map('k, 'v), 'k) -> 'v = "rawget";
-extern rawset: fn(Map('k, 'v), 'k, 'v) -> () = "rawset";
+  fn get(self, i: int) -> 'a {
+    __array_get(self, i)
+  }
 
-// --- Standard Data Types ---
+  fn get_opt(self, i: int) -> Option('a) {
+    if i >= 1 && i <= self.len() {
+      Some(self.get(i))
+    } else {
+      None
+    }
+  }
 
-type Option('a) = Some('a) | None
+  fn first(self) -> Option('a) {
+    self.get_opt(1)
+  }
 
-type Result('a, 'e) = Ok('a) | Err('e)
+  fn last(self) -> Option('a) {
+    self.get_opt(self.len())
+  }
 
-type Map('k, 'v) = *
+  fn set(mut self, i: int, val: 'a) -> () {
+    __array_set(self, i, val)
+  }
+
+  fn push(mut self, val: 'a) -> () {
+    __push(self, val)
+  }
+
+  fn pop(mut self) -> 'a {
+    __pop(self)
+  }
+
+  fn map(self, f: fn('a) -> 'b) -> ['b] {
+    __array_map(self, f)
+  }
+
+  fn filter(self, f: fn('a) -> bool) -> ['a] {
+    __array_filter(self, f)
+  }
+
+  fn fold(self, init: 'b, f: fn('b, 'a) -> 'b) -> 'b {
+    __array_fold(self, init, f)
+  }
+
+  fn reverse(self) -> ['a] {
+    __array_reverse(self)
+  }
+
+  fn any(self, f: fn('a) -> bool) -> bool {
+    let mut found = false;
+    for item in self {
+      if f(item) {
+        found = true;
+        break;
+      };
+    };
+    found
+  }
+
+  fn all(self, f: fn('a) -> bool) -> bool {
+    let mut ok = true;
+    for item in self {
+      if !f(item) {
+        ok = false;
+        break;
+      };
+    };
+    ok
+  }
+
+  fn find(self, f: fn('a) -> bool) -> Option('a) {
+    let mut found = None;
+    for item in self {
+      if f(item) {
+        found = Some(item);
+        break;
+      };
+    };
+    found
+  }
+}
+
+impl ToString for ['a]
+where 'a: ToString
+{
+  fn to_string(self) {
+    let mut out = "[";
+    let mut first = true;
+    for item in self {
+      if first {
+        first = false;
+      } else {
+        out = out <> ", ";
+      };
+      out = out <> ToString.to_string(item);
+    };
+    out <> "]"
+  }
+}
+
+impl [float] {
+  fn sum(self) -> float {
+    __array_sum_float(self)
+  }
+
+  fn max(self) -> float {
+    __array_max(self)
+  }
+
+  fn min(self) -> float {
+    __array_min(self)
+  }
+}
+
+impl [int] {
+  fn sum(self) -> int {
+    __array_sum_int(self)
+  }
+}
+
+impl Semigroup for ['a] {
+  fn <>(lhs, rhs) { __array_concat(lhs, rhs) }
+}
+
+// --- Functional traits ---
 
 trait Functor 'f {
   fn map(fa: 'f('a), f: fn('a) -> 'b) -> 'f('b)
@@ -99,26 +586,20 @@ trait Functor 'f {
 
 impl Functor for Option {
   fn map(fa: Option('a), f: fn('a) -> 'b) -> Option('b) {
-    match fa {
-      Some(v) -> Some(f(v)),
-      None -> None,
-    }
+    fa.map(f)
   }
 }
 
 impl Functor for Array {
   fn map(fa: ['a], f: fn('a) -> 'b) -> ['b] {
-    __array_map(fa, f)
+    fa.map(f)
   }
 }
 
 // Result(*, 'e) maps over the Ok side, leaving the error type fixed.
 impl Functor for Result(*, 'e) {
   fn map(fa: Result('a, 'e), f: fn('a) -> 'b) -> Result('b, 'e) {
-    match fa {
-      Ok(v) -> Ok(f(v)),
-      Err(e) -> Err(e),
-    }
+    fa.map(f)
   }
 }
 
@@ -133,10 +614,7 @@ impl Applicative for Option {
 
   fn <*>(ff: Option(fn('a) -> 'b), fa: Option('a)) -> Option('b) {
     match ff {
-      Some(f) -> match fa {
-        Some(a) -> Some(f(a)),
-        None -> None,
-      },
+      Some(f) -> fa.map(f),
       None -> None,
     }
   }
@@ -155,10 +633,7 @@ impl Applicative for Result(*, 'e) {
 
   fn <*>(ff: Result(fn('a) -> 'b, 'e), fa: Result('a, 'e)) -> Result('b, 'e) {
     match ff {
-      Ok(f) -> match fa {
-        Ok(a) -> Ok(f(a)),
-        Err(e) -> Err(e),
-      },
+      Ok(f) -> fa.map(f),
       Err(e) -> Err(e),
     }
   }
@@ -170,10 +645,7 @@ trait Monad 'f {
 
 impl Monad for Option {
   fn >>=(fa: Option('a), f: fn('a) -> Option('b)) -> Option('b) {
-    match fa {
-      Some(a) -> f(a),
-      None -> None,
-    }
+    fa.and_then(f)
   }
 }
 
@@ -185,332 +657,35 @@ impl Monad for Array {
 
 impl Monad for Result(*, 'e) {
   fn >>=(fa: Result('a, 'e), f: fn('a) -> Result('b, 'e)) -> Result('b, 'e) {
-    match fa {
-      Ok(a) -> f(a),
-      Err(e) -> Err(e),
-    }
+    fa.and_then(f)
   }
 }
 
-// --- Primitives ---
-
-extern __add: fn(f64, f64) -> f64 = #[template] "(($1) + ($2))";
-extern __sub: fn(f64, f64) -> f64 = #[template] "(($1) - ($2))";
-extern __mul: fn(f64, f64) -> f64 = #[template] "(($1) * ($2))";
-extern __div: fn(f64, f64) -> f64 = #[template] "(($1) / ($2))";
-extern __mod: fn(f64, f64) -> f64 = #[template] "(($1) % ($2))";
-
-extern __lt:  fn(f64, f64) -> bool = #[template] "((($1) < ($2)) and 1 or 0)";
-extern __gt:  fn(f64, f64) -> bool = #[template] "((($1) > ($2)) and 1 or 0)";
-extern __lte: fn(f64, f64) -> bool = #[template] "((($1) <= ($2)) and 1 or 0)";
-extern __gte: fn(f64, f64) -> bool = #[template] "((($1) >= ($2)) and 1 or 0)";
-extern __eq_f64:  fn(f64, f64) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
-extern __eq_string: fn(string, string) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
-extern __eq_bool: fn(bool, bool) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
-extern __neq_f64: fn(f64, f64) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
-extern __neq_string: fn(string, string) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
-extern __neq_bool: fn(bool, bool) -> bool = #[template] "((($1) ~= ($2)) and 1 or 0)";
-
-extern __and: fn(bool, bool) -> bool = #[template] "((($1) ~= 0 and ($2) ~= 0) and 1 or 0)";
-extern __or:  fn(bool, bool) -> bool = #[template] "((($1) ~= 0 or ($2) ~= 0) and 1 or 0)";
-
-extern __concat: fn(string, string) -> string = #[template] "(($1) .. ($2))";
-
-// --- Map ---
+// --- Maps ---
 
 extern __map_new: fn() -> mut Map('k, 'v) = "(function() return {} end)";
-
 extern __map_set: fn(Map('k, 'v), 'k, 'v) -> () = "(function(m, k, v) m[k] = v; return {} end)";
 extern __map_get: fn(Map('k, 'v), 'k) -> Option('v) = "(function(m, k) local v = m[k]; if v ~= nil then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end end)";
 extern __map_delete: fn(Map('k, 'v), 'k) -> () = "(function(m, k) m[k] = nil; return {} end)";
 extern __map_has: fn(Map('k, 'v), 'k) -> bool = "(function(m, k) return m[k] ~= nil and 1 or 0 end)";
 extern __map_keys: fn(Map('k, 'v)) -> ['k] = "(function(m) local ks = {}; for k in pairs(m) do ks[#ks + 1] = k end; return ks end)";
-extern __map_size: fn(Map('k, 'v)) -> f64 = "(function(m) local n = 0; for _ in pairs(m) do n = n + 1 end; return n end)";
-
-fn map_set(mut m: Map('k, 'v), key: 'k, value: 'v) -> () { __map_set(m, key, value) }
-fn map_get(m: Map('k, 'v), key: 'k) -> Option('v) { __map_get(m, key) }
-fn map_delete(mut m: Map('k, 'v), key: 'k) -> () { __map_delete(m, key) }
-fn map_has(m: Map('k, 'v), key: 'k) -> bool { __map_has(m, key) }
-fn map_keys(m: Map('k, 'v)) -> ['k] { __map_keys(m) }
-fn map_size(m: Map('k, 'v)) -> f64 { __map_size(m) }
+extern __map_size: fn(Map('k, 'v)) -> int = "(function(m) local n = 0; for _ in pairs(m) do n = n + 1 end; return n end)";
 
 impl Map('k, 'v) {
-    fn new() -> mut Self { __map_new() }
-    fn set(mut self, key: 'k, value: 'v) -> () { map_set(self, key, value) }
-    fn get(self, key: 'k) -> Option('v) { map_get(self, key) }
-    fn delete(mut self, key: 'k) -> () { map_delete(self, key) }
-    fn has(self, key: 'k) -> bool { map_has(self, key) }
-    fn keys(self) -> ['k] { map_keys(self) }
-    fn size(self) -> f64 { map_size(self) }
+  fn new() -> mut Self { __map_new() }
+  fn set(mut self, key: 'k, value: 'v) -> () { __map_set(self, key, value) }
+  fn get(self, key: 'k) -> Option('v) { __map_get(self, key) }
+  fn delete(mut self, key: 'k) -> () { __map_delete(self, key) }
+  fn has(self, key: 'k) -> bool { __map_has(self, key) }
+  fn keys(self) -> ['k] { __map_keys(self) }
+  fn size(self) -> int { __map_size(self) }
+  fn is_empty(self) -> bool { self.size() == 0 }
 }
 
-// --- Standard Operator Traits ---
+// --- Strings ---
 
-trait Add 'a {
-    fn infixl 6 +(lhs: 'a, rhs: 'a) -> 'a
-}
-
-trait Sub 'a {
-    fn infixl 6 -(lhs: 'a, rhs: 'a) -> 'a
-}
-
-trait Mul 'a {
-    fn infixl 7 *(lhs: 'a, rhs: 'a) -> 'a
-}
-
-trait Div 'a {
-    fn infixl 7 /(lhs: 'a, rhs: 'a) -> 'a
-}
-
-trait Mod 'a {
-    fn infixl 7 %(lhs: 'a, rhs: 'a) -> 'a
-}
-
-trait Ord 'a {
-    fn infix 4 <(lhs: 'a, rhs: 'a) -> bool
-    fn infix 4 >(lhs: 'a, rhs: 'a) -> bool
-    fn infix 4 <=(lhs: 'a, rhs: 'a) -> bool
-    fn infix 4 >=(lhs: 'a, rhs: 'a) -> bool
-}
-
-trait Eq 'a {
-    fn infix 4 ==(lhs: 'a, rhs: 'a) -> bool
-    fn infix 4 !=(lhs: 'a, rhs: 'a) -> bool
-}
-
-trait Semigroup 'a {
-    fn infixr 5 <>(lhs: 'a, rhs: 'a) -> 'a
-}
-
-trait And 'a {
-    fn infixl 3 &&(lhs: 'a, rhs: 'a) -> bool
-}
-
-trait Or 'a {
-    fn infixl 2 ||(lhs: 'a, rhs: 'a) -> bool
-}
-
-// --- Implementations ---
-
-impl Add for f64 {
-    #[inline]
-    fn +(lhs, rhs) { __add(lhs, rhs) }
-}
-
-impl Sub for f64 {
-    #[inline]
-    fn -(lhs, rhs) { __sub(lhs, rhs) }
-}
-
-impl Mul for f64 {
-    #[inline]
-    fn *(lhs, rhs) { __mul(lhs, rhs) }
-}
-
-impl Div for f64 {
-    #[inline]
-    fn /(lhs, rhs) { __div(lhs, rhs) }
-}
-
-impl Mod for f64 {
-    #[inline]
-    fn %(lhs, rhs) { __mod(lhs, rhs) }
-}
-
-impl Ord for f64 {
-    #[inline]
-    fn <(lhs, rhs) { __lt(lhs, rhs) }
-    #[inline]
-    fn >(lhs, rhs) { __gt(lhs, rhs) }
-    #[inline]
-    fn <=(lhs, rhs) { __lte(lhs, rhs) }
-    #[inline]
-    fn >=(lhs, rhs) { __gte(lhs, rhs) }
-}
-
-impl Eq for f64 {
-    #[inline]
-    fn ==(lhs, rhs) { __eq_f64(lhs, rhs) }
-    #[inline]
-    fn !=(lhs, rhs) { __neq_f64(lhs, rhs) }
-}
-
-impl Eq for string {
-    #[inline]
-    fn ==(lhs, rhs) { __eq_string(lhs, rhs) }
-    #[inline]
-    fn !=(lhs, rhs) { __neq_string(lhs, rhs) }
-}
-
-impl Eq for bool {
-    #[inline]
-    fn ==(lhs, rhs) { __eq_bool(lhs, rhs) }
-    #[inline]
-    fn !=(lhs, rhs) { __neq_bool(lhs, rhs) }
-}
-
-impl And for bool {
-    #[inline]
-    fn &&(lhs, rhs) { __and(lhs, rhs) }
-}
-
-impl Or for bool {
-    #[inline]
-    fn ||(lhs, rhs) { __or(lhs, rhs) }
-}
-
-impl Semigroup for string {
-    #[inline]
-    fn <>(lhs, rhs) { __concat(lhs, rhs) }
-}
-
-// --- Iterable ---
-
-trait Iterable 'f {
-    fn iter(self: 'f('a)) -> Iter('a)
-}
-
-extern __array_iter: fn(['a]) -> Iter('a) = "(function(arr)
-  local i = 0
-  local n = #arr
-  return function()
-    i = i + 1
-    if i <= n then return arr[i] else return nil end
-  end
-end)";
-
-impl Iterable for Array {
-    fn iter(self) { __array_iter(self) }
-}
-
-// --- Lua Builtin Modules ---
-
-type Math = #{
-    abs: fn(f64) -> f64,
-    acos: fn(f64) -> f64,
-    asin: fn(f64) -> f64,
-    atan: fn(f64) -> f64,
-    atan2: fn(f64, f64) -> f64,
-    ceil: fn(f64) -> f64,
-    cos: fn(f64) -> f64,
-    cosh: fn(f64) -> f64,
-    deg: fn(f64) -> f64,
-    exp: fn(f64) -> f64,
-    floor: fn(f64) -> f64,
-    fmod: fn(f64, f64) -> f64,
-    ldexp: fn(f64, f64) -> f64,
-    log: fn(f64) -> f64,
-    log10: fn(f64) -> f64,
-    max: fn(f64, f64) -> f64,
-    min: fn(f64, f64) -> f64,
-    pow: fn(f64, f64) -> f64,
-    rad: fn(f64) -> f64,
-    random: fn() -> f64,
-    randomseed: fn(f64) -> (),
-    sin: fn(f64) -> f64,
-    sinh: fn(f64) -> f64,
-    sqrt: fn(f64) -> f64,
-    tan: fn(f64) -> f64,
-    tanh: fn(f64) -> f64,
-    pi: f64,
-    huge: f64
-}
-
-extern math: Math = "math";
-
-type StringModule = #{
-    byte: fn(string, f64) -> f64,
-    char: fn(f64) -> string,
-    len: fn(string) -> f64,
-    lower: fn(string) -> string,
-    rep: fn(string, f64) -> string,
-    reverse: fn(string) -> string,
-    sub: fn(string, f64, f64) -> string,
-    upper: fn(string) -> string
-}
-
-extern string: StringModule = "string";
-
-type TableModule = #{
-    concat: fn(['a], string) -> string,
-    insert: fn(['a], 'a) -> (),
-    maxn: fn(['a]) -> f64,
-    remove: fn(['a], f64) -> 'a,
-    sort: fn(['a], fn('a, 'a) -> bool) -> ()
-}
-
-extern table: TableModule = "table";
-
-type OSModule = #{
-    clock: fn() -> f64,
-    date: fn(string) -> string,
-    difftime: fn(f64, f64) -> f64,
-    execute: fn(string) -> f64,
-    exit: fn(f64) -> (),
-    time: fn() -> f64
-}
-
-extern os: OSModule = "os";
-
-type BitModule = #{
-    tobit: fn(f64) -> f64,
-    tohex: fn(f64) -> string,
-    bnot: fn(f64) -> f64,
-    band: fn(f64, f64) -> f64,
-    bor: fn(f64, f64) -> f64,
-    bxor: fn(f64, f64) -> f64,
-    lshift: fn(f64, f64) -> f64,
-    rshift: fn(f64, f64) -> f64,
-    arshift: fn(f64, f64) -> f64,
-    rol: fn(f64, f64) -> f64,
-    ror: fn(f64, f64) -> f64,
-    bswap: fn(f64) -> f64
-}
-
-extern bit: BitModule = "bit or {}";
-
-type JitModule = #{
-    on: fn() -> (),
-    off: fn() -> (),
-    flush: fn() -> (),
-    version: string,
-    version_num: f64,
-    arch: string,
-    os: string
-}
-
-extern jit: JitModule = "jit or {}";
-
-// --- Wrapped Lua Functions ---
-
-extern getenv: fn(string) -> Option(string) = "(function(k)
-  local v = os.getenv(k)
-  if v then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end
-end)";
-
-extern modf: fn(f64) -> (f64, f64) = "(function(x) return {math.modf(x)} end)";
-extern frexp: fn(f64) -> (f64, f64) = "(function(x) return {math.frexp(x)} end)";
-
-extern tonumber: fn(string) -> Option(f64) = "(function(s)
-  local n = _G.tonumber(s)
-  if n then return { _tag = \"Some\", _0 = n } else return { _tag = \"None\" } end
-end)";
-
-// --- I/O ---
-
-extern read_file: fn(string) -> string = "(function(path)
-  local f = _G.assert(io.open(path, \"r\"))
-  local s = f:read(\"*a\")
-  f:close()
-  return s
-end)";
-
-extern read_stdin: fn() -> string = "(function() return io.read(\"*a\") end)";
-
-// --- String utilities ---
-
-extern __str_len: fn(string) -> f64 = #[template] "#($1)";
-extern __char_at: fn(string, f64) -> string = #[template] "($1):sub(($2),($2))";
+extern __str_len: fn(string) -> int = #[template] "#($1)";
+extern __char_at: fn(string, int) -> string = #[template] "($1):sub(($2),($2))";
 extern __str_lines: fn(string) -> [string] = "(function(s)
   local r = {}
   s = s:gsub(\"\\r\\n\", \"\\n\")
@@ -526,10 +701,10 @@ end)";
 extern __str_split: fn(string, string) -> [string] = "(function(s, sep)
   local r, l, n = {}, 1, #sep
   while true do
-    local f = s:find(sep, l, true)
-    if not f then break end
-    r[#r+1] = s:sub(l, f - 1)
-    l = f + n
+  local f = s:find(sep, l, true)
+  if not f then break end
+  r[#r+1] = s:sub(l, f - 1)
+  l = f + n
   end
   r[#r+1] = s:sub(l)
   return r
@@ -546,99 +721,202 @@ extern __str_starts_with: fn(string, string) -> bool =
   "(function(s, p) return s:sub(1, #p) == p and 1 or 0 end)";
 extern __str_ends_with: fn(string, string) -> bool =
   "(function(s, p) return #p == 0 or s:sub(-#p) == p and 1 or 0 end)";
-extern __str_to_int: fn(string) -> f64 = "(function(s)
+extern __str_to_int: fn(string) -> int = "(function(s)
   local n = _G.tonumber(s)
-  if not n then _G.error(\"int: cannot parse \" .. _G.tostring(s)) end
+  if not n or n ~= math.floor(n) then _G.error(\"int: cannot parse \" .. _G.tostring(s)) end
+  return bit.tobit(n)
+end)";
+extern __str_to_float: fn(string) -> float = "(function(s)
+  local n = _G.tonumber(s)
+  if not n then _G.error(\"float: cannot parse \" .. _G.tostring(s)) end
   return n
 end)";
 
 impl string {
-    fn len(self) -> f64 { __str_len(self) }
-    fn char_at(self, i: f64) -> string { __char_at(self, i) }
-    fn lines(self) -> [string] { __str_lines(self) }
-    fn words(self) -> [string] { __str_words(self) }
-    fn split(self, sep: string) -> [string] { __str_split(self, sep) }
-    fn chars(self) -> [string] { __str_chars(self) }
-    fn trim(self) -> string { __str_trim(self) }
-    fn contains(self, sub: string) -> bool { __str_contains(self, sub) }
-    fn starts_with(self, prefix: string) -> bool { __str_starts_with(self, prefix) }
-    fn ends_with(self, suffix: string) -> bool { __str_ends_with(self, suffix) }
-    fn to_int(self) -> f64 { __str_to_int(self) }
+  fn len(self) -> int { __str_len(self) }
+  fn is_empty(self) -> bool { self.len() == 0 }
+  fn char_at(self, i: int) -> string { __char_at(self, i) }
+  fn get(self, i: int) -> Option(string) {
+    if i >= 1 && i <= self.len() {
+      Some(self.char_at(i))
+    } else {
+      None
+    }
+  }
+  fn lines(self) -> [string] { __str_lines(self) }
+  fn words(self) -> [string] { __str_words(self) }
+  fn split(self, sep: string) -> [string] { __str_split(self, sep) }
+  fn chars(self) -> [string] { __str_chars(self) }
+  fn trim(self) -> string { __str_trim(self) }
+  fn contains(self, sub: string) -> bool { __str_contains(self, sub) }
+  fn starts_with(self, prefix: string) -> bool { __str_starts_with(self, prefix) }
+  fn ends_with(self, suffix: string) -> bool { __str_ends_with(self, suffix) }
+  fn to_int(self) -> int { __str_to_int(self) }
+  fn to_float(self) -> float { __str_to_float(self) }
 }
 
-// --- Array utilities ---
+// --- Iteration ---
 
-fn range(a: f64, b: f64) -> [f64] { __array_range(a, b) }
-fn array_sum(arr: [f64]) -> f64 { __array_sum(arr) }
-fn array_max(arr: [f64]) -> f64 { __array_max(arr) }
-fn array_min(arr: [f64]) -> f64 { __array_min(arr) }
-
-impl ['a] {
-    fn len(self) -> f64 {
-        __array_len(self)
-    }
-
-    fn get(self, i: f64) -> 'a {
-        __array_get(self, i)
-    }
-
-    fn set(mut self, i: f64, val: 'a) -> () {
-        __array_set(self, i, val)
-    }
-
-    fn push(mut self, val: 'a) -> () {
-        __push(self, val)
-    }
-
-    fn pop(mut self) -> 'a {
-        __pop(self)
-    }
-
-    fn map(self, f: fn('a) -> 'b) -> ['b] {
-        __array_map(self, f)
-    }
-
-    fn filter(self, f: fn('a) -> bool) -> ['a] {
-        __array_filter(self, f)
-    }
-
-    fn fold(self, init: 'b, f: fn('b, 'a) -> 'b) -> 'b {
-        __array_fold(self, init, f)
-    }
-
-    fn reverse(self) -> ['a] {
-        __array_reverse(self)
-    }
+trait Iterable 'f {
+  fn iter(self: 'f('a)) -> Iter('a)
 }
 
-impl Semigroup for ['a] {
-    fn <>(lhs, rhs) { __array_concat(lhs, rhs) }
+extern __array_iter: fn(['a]) -> Iter('a) = "(function(arr)
+  local i = 0
+  local n = #arr
+  return function()
+  i = i + 1
+  if i <= n then return arr[i] else return nil end
+  end
+end)";
+
+impl Iterable for Array {
+  fn iter(self) { __array_iter(self) }
 }
 
-// --- Priority queue (min-heap) ---
-// Heap('a) stores (priority: f64, value: 'a) pairs.
+// --- Lua interop ---
 
-type Heap('a) = *
+type Math = #{
+  abs: fn(float) -> float,
+  acos: fn(float) -> float,
+  asin: fn(float) -> float,
+  atan: fn(float) -> float,
+  atan2: fn(float, float) -> float,
+  ceil: fn(float) -> float,
+  cos: fn(float) -> float,
+  cosh: fn(float) -> float,
+  deg: fn(float) -> float,
+  exp: fn(float) -> float,
+  floor: fn(float) -> float,
+  fmod: fn(float, float) -> float,
+  ldexp: fn(float, float) -> float,
+  log: fn(float) -> float,
+  log10: fn(float) -> float,
+  max: fn(float, float) -> float,
+  min: fn(float, float) -> float,
+  pow: fn(float, float) -> float,
+  rad: fn(float) -> float,
+  random: fn() -> float,
+  randomseed: fn(float) -> (),
+  sin: fn(float) -> float,
+  sinh: fn(float) -> float,
+  sqrt: fn(float) -> float,
+  tan: fn(float) -> float,
+  tanh: fn(float) -> float,
+  pi: float,
+  huge: float
+}
+
+extern math: Math = "math";
+
+type StringModule = #{
+  byte: fn(string, int) -> int,
+  char: fn(int) -> string,
+  len: fn(string) -> int,
+  lower: fn(string) -> string,
+  rep: fn(string, int) -> string,
+  reverse: fn(string) -> string,
+  sub: fn(string, int, int) -> string,
+  upper: fn(string) -> string
+}
+
+extern string: StringModule = "string";
+
+type TableModule = #{
+  concat: fn(['a], string) -> string,
+  insert: fn(['a], 'a) -> (),
+  maxn: fn(['a]) -> int,
+  remove: fn(['a], int) -> 'a,
+  sort: fn(['a], fn('a, 'a) -> bool) -> ()
+}
+
+extern table: TableModule = "table";
+
+type OSModule = #{
+  clock: fn() -> float,
+  date: fn(string) -> string,
+  difftime: fn(float, float) -> float,
+  execute: fn(string) -> int,
+  exit: fn(int) -> (),
+  time: fn() -> float
+}
+
+extern os: OSModule = "os";
+
+type BitModule = #{
+  tobit: fn(int) -> int,
+  tohex: fn(int) -> string,
+  bnot: fn(int) -> int,
+  band: fn(int, int) -> int,
+  bor: fn(int, int) -> int,
+  bxor: fn(int, int) -> int,
+  lshift: fn(int, int) -> int,
+  rshift: fn(int, int) -> int,
+  arshift: fn(int, int) -> int,
+  rol: fn(int, int) -> int,
+  ror: fn(int, int) -> int,
+  bswap: fn(int) -> int
+}
+
+extern bit: BitModule = "bit or {}";
+
+type JitModule = #{
+  on: fn() -> (),
+  off: fn() -> (),
+  flush: fn() -> (),
+  version: string,
+  version_num: float,
+  arch: string,
+  os: string
+}
+
+extern jit: JitModule = "jit or {}";
+
+extern getenv: fn(string) -> Option(string) = "(function(k)
+  local v = os.getenv(k)
+  if v then return { _tag = \"Some\", _0 = v } else return { _tag = \"None\" } end
+end)";
+
+extern modf: fn(float) -> (float, float) = "(function(x) return {math.modf(x)} end)";
+extern frexp: fn(float) -> (float, float) = "(function(x) return {math.frexp(x)} end)";
+
+extern tonumber: fn(string) -> Option(float) = "(function(s)
+  local n = _G.tonumber(s)
+  if n then return { _tag = \"Some\", _0 = n } else return { _tag = \"None\" } end
+end)";
+
+// --- I/O ---
+
+extern read_file: fn(string) -> string = "(function(path)
+  local f = _G.assert(io.open(path, \"r\"))
+  local s = f:read(\"*a\")
+  f:close()
+  return s
+end)";
+
+extern read_stdin: fn() -> string = "(function() return io.read(\"*a\") end)";
+
+// --- Algorithms ---
 
 extern __heap_new: fn() -> mut Heap('a) = "(function() return {} end)";
 
-extern __heap_push: fn(Heap('a), f64, 'a) -> () = "(function(heap, priority, value)
+extern __heap_push: fn(Heap('a), float, 'a) -> () = "(function(heap, priority, value)
   local item = {priority, value}
   heap[#heap + 1] = item
   local i = #heap
   while i > 1 do
-    local p = math.floor(i / 2)
-    if heap[i][1] < heap[p][1] then
+  local p = math.floor(i / 2)
+  if heap[i][1] < heap[p][1] then
       heap[i], heap[p] = heap[p], heap[i]
       i = p
-    else
+  else
       break
-    end
+  end
   end
   return {}
 end)";
 
-extern __heap_pop: fn(Heap('a)) -> (f64, 'a) = "(function(heap)
+extern __heap_pop: fn(Heap('a)) -> (float, 'a) = "(function(heap)
   local n = #heap
   local top = heap[1]
   heap[1] = heap[n]
@@ -646,70 +924,72 @@ extern __heap_pop: fn(Heap('a)) -> (f64, 'a) = "(function(heap)
   n = n - 1
   local i = 1
   while true do
-    local left = i * 2
-    local right = left + 1
-    local smallest = i
-    if left <= n and heap[left][1] < heap[smallest][1] then smallest = left end
-    if right <= n and heap[right][1] < heap[smallest][1] then smallest = right end
-    if smallest == i then break end
-    heap[i], heap[smallest] = heap[smallest], heap[i]
-    i = smallest
+  local left = i * 2
+  local right = left + 1
+  local smallest = i
+  if left <= n and heap[left][1] < heap[smallest][1] then smallest = left end
+  if right <= n and heap[right][1] < heap[smallest][1] then smallest = right end
+  if smallest == i then break end
+  heap[i], heap[smallest] = heap[smallest], heap[i]
+  i = smallest
   end
   return top
 end)";
 
-extern __heap_size: fn(Heap('a)) -> f64 = #[template] "#($1)";
+extern __heap_size: fn(Heap('a)) -> int = #[template] "#($1)";
 extern __heap_is_empty: fn(Heap('a)) -> bool = #[template] "(#($1) == 0 and 1 or 0)";
 
 impl Heap('a) {
-    fn new() -> mut Self { __heap_new() }
-    fn push(mut self, priority: f64, value: 'a) -> () { __heap_push(self, priority, value) }
-    fn pop(mut self) -> (f64, 'a) { __heap_pop(self) }
-    fn size(self) -> f64 { __heap_size(self) }
-    fn is_empty(self) -> bool { __heap_is_empty(self) }
+  fn new() -> mut Self { __heap_new() }
+  fn push(mut self, priority: float, value: 'a) -> () { __heap_push(self, priority, value) }
+  fn pop(mut self) -> (float, 'a) { __heap_pop(self) }
+  fn size(self) -> int { __heap_size(self) }
+  fn is_empty(self) -> bool { __heap_is_empty(self) }
 }
 
-// --- JSON serialization ---
+// --- Debugging ---
 
-extern json: fn('a) -> string = "(function(v)
+extern inspect: fn('a) -> string = "(function(v)
   local dq = string.char(34)
   local nl = string.char(10)
   local tab = string.char(9)
   local bs = string.char(92)
   local function ser(val)
-    local t = type(val)
-    if val == nil then
+  local t = type(val)
+  if val == nil then
       return 'null'
-    elseif t == 'string' then
+  elseif t == 'string' then
       return dq .. val:gsub(bs, bs..bs):gsub(dq, bs..dq):gsub(nl, bs..'n'):gsub(tab, bs..'t') .. dq
-    elseif t == 'number' or t == 'boolean' then
+  elseif t == 'number' or t == 'boolean' then
       return tostring(val)
-    elseif t == 'table' then
+  elseif t == 'table' then
       if val._tag ~= nil then
-        local parts = {}
-        for k, v2 in pairs(val) do
+    local parts = {}
+    for k, v2 in pairs(val) do
           if k ~= '_tag' then parts[#parts+1] = ser(v2) end
-        end
-        if #parts == 0 then return val._tag end
-        if #parts == 1 then return val._tag .. '(' .. parts[1] .. ')' end
-        return val._tag .. '(' .. table.concat(parts, ', ') .. ')'
+    end
+    if #parts == 0 then return val._tag end
+    if #parts == 1 then return val._tag .. '(' .. parts[1] .. ')' end
+    return val._tag .. '(' .. table.concat(parts, ', ') .. ')'
       end
       local n = #val
       local size = 0
       for _ in pairs(val) do size = size + 1 end
       if size == n then
-        local items = {}
-        for i = 1, n do items[i] = ser(val[i]) end
-        return '[' .. table.concat(items, ', ') .. ']'
+    local items = {}
+    for i = 1, n do items[i] = ser(val[i]) end
+    return '[' .. table.concat(items, ', ') .. ']'
       end
       local kvs = {}
       for k, v2 in pairs(val) do
-        kvs[#kvs+1] = dq .. tostring(k) .. dq .. ': ' .. ser(v2)
+    kvs[#kvs+1] = dq .. tostring(k) .. dq .. ': ' .. ser(v2)
       end
       return '{' .. table.concat(kvs, ', ') .. '}'
-    else
+  else
       return dq .. '<' .. t .. '>' .. dq
-    end
+  end
   end
   return ser(v)
 end)";
+
+fn json(value: 'a) -> string { inspect(value) }

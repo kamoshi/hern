@@ -2,7 +2,7 @@ fn pair_eq(a, b) {
     a == b
 }
 
-fn eq_with_bound['a: Eq](a: ('a, f64), b: ('a, f64)) -> bool {
+fn eq_with_bound['a: Eq](a: ('a, float), b: ('a, float)) -> bool {
     a == b
 }
 

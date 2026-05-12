@@ -1,4 +1,4 @@
-impl Add for f64 {
+impl Add for float {
     fn +(lhs, rhs) { lhs }
 }
 

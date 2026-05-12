@@ -1,17 +1,17 @@
-type Counter = Counter(f64)
+type Counter = Counter(float)
 
 impl Counter {
-  fn make(value: f64) -> Self {
+  fn make(value: float) -> Self {
     Counter(value)
   }
 
-  fn value(self) -> f64 {
+  fn value(self) -> float {
     match self {
       Counter(value) -> value,
     }
   }
 }
 
-let counter = Counter::make(41);
+let counter = Counter::make(41.0);
 
 print(counter.value());

@@ -1,0 +1,11 @@
+let xs = [1, 2, 3];
+let ok: Result(int, string) = Ok(1);
+let err: Result(int, string) = Err("bad");
+
+print(to_string(xs));
+print(xs.to_string());
+print(to_string([[1, 2], [3]]));
+print(to_string(["a", "b"]));
+print(to_string(Some([1, 2])));
+print(to_string(ok));
+print(to_string(err));

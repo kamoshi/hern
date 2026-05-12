@@ -1,0 +1,5 @@
+trait Sink 'a {
+    fn sink(x: int, target: 'a) -> int
+}
+
+Sink.sink(1, #{ value: 2 });

@@ -1,4 +1,4 @@
-use crate::lex::error::Span;
+use crate::lex::{NumberLiteral, error::Span};
 
 pub type NodeId = u32;
 
@@ -149,6 +149,7 @@ pub struct PendingDictArg {
 pub enum DictRef {
     Param(String),
     Concrete(String),
+    Applied { dict: String, args: Vec<DictRef> },
     Structural(StructuralDictRef),
 }
 
@@ -167,6 +168,7 @@ pub enum DictTarget {
 #[derive(Debug, Clone)]
 pub enum ResolvedCallee {
     Function(String),
+    InherentMethod { dict: String, method: String },
     DictMethod { dict: DictRef, method: String },
 }
 
@@ -283,6 +285,8 @@ pub struct ImplDef {
     pub span: SourceSpan,
     pub trait_name: String,
     pub target: Type,
+    pub type_bounds: Vec<TypeBound>,
+    pub dict_params: Vec<String>,
     pub methods: Vec<ImplMethod>,
 }
 
@@ -424,7 +428,7 @@ impl Expr {
 
 #[derive(Debug, Clone)]
 pub enum ExprKind {
-    Number(f64),
+    Number(NumberLiteral),
     StringLit(String),
     Bool(bool),
     Ident(String),
@@ -519,6 +523,7 @@ pub enum Type {
     Tuple(Vec<Type>),
     Record(Vec<(String, Type)>, bool),
     Unit,
+    Never,
     /// Hole marker `*` in impl heads
     Hole,
 }

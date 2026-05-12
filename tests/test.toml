@@ -5,12 +5,85 @@ output = """
 12
 """
 
+[tests.numeric_literal_defaults]
+path = "tests/hern/numeric_literal_defaults.hern"
+expect = "typecheck"
+output = """
+3
+3.5
+6
+6
+"""
+
 [tests.hashbang]
 path = "tests/hern/hashbang.hern"
 expect = "typecheck"
 output = """
 42
 """
+
+[tests.never_type]
+path = "tests/hern/never_type.hern"
+expect = "typecheck"
+output = """
+42
+7
+"""
+
+[tests.never_function_param_erasure_error]
+path = "tests/hern/never_function_param_erasure_error.hern"
+expect = "error"
+error_contains = "type mismatch"
+
+[tests.never_top_level_function_return]
+path = "tests/hern/never_top_level_function_return.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
+[tests.trait_method_non_keyable_target_error]
+path = "tests/hern/trait_method_non_keyable_target_error.hern"
+expect = "error"
+error_contains = "trait `Sink` is not implemented"
+
+[tests.trait_impl_partial_target_error]
+path = "tests/hern/trait_impl_partial_target_error.hern"
+expect = "error"
+error_contains = "invalid trait impl target"
+
+[tests.type_alias_arity_error]
+path = "tests/hern/type_alias_arity_error.hern"
+expect = "error"
+error_contains = "type alias `Id` expects 1 type argument, got 2"
+
+[tests.type_alias_missing_args_error]
+path = "tests/hern/type_alias_missing_args_error.hern"
+expect = "error"
+error_contains = "type alias `Id` expects 1 type argument, got 0"
+
+[tests.imported_hkt_impl]
+path = "tests/hern/imported_hkt_impl.hern"
+fixtures = ["tests/hern/imported_hkt_impl_dep.hern"]
+expect = "typecheck"
+
+[tests.hkt_impl_without_hole_error]
+path = "tests/hern/hkt_impl_without_hole_error.hern"
+expect = "error"
+error_contains = "invalid trait impl target"
+
+[tests.hkt_impl_multiple_holes_error]
+path = "tests/hern/hkt_impl_multiple_holes_error.hern"
+expect = "error"
+error_contains = "invalid trait impl target"
+
+[tests.hkt_generic_bound_method]
+path = "tests/hern/hkt_generic_bound_method.hern"
+expect = "typecheck"
+
+[tests.pending_trait_method_generalizes]
+path = "tests/hern/pending_trait_method_generalizes.hern"
+expect = "typecheck"
 
 [tests.mut_reassign]
 path = "tests/hern/mut_reassign.hern"
@@ -133,6 +206,7 @@ output = """
 
 [tests.mut_param_module_import]
 path = "tests/hern/mut_param_module_import.hern"
+fixtures = ["tests/hern/mut_param_module_dep.hern"]
 expect = "typecheck"
 output = """
 2
@@ -140,6 +214,7 @@ output = """
 
 [tests.mut_param_module_import_immutable_arg]
 path = "tests/hern/mut_param_module_import_immutable_arg.hern"
+fixtures = ["tests/hern/mut_param_module_dep.hern"]
 expect = "error"
 error_contains = "must be a mutable place"
 
@@ -236,14 +311,6 @@ output = """
 {x=1, }
 """
 
-[tests.sum_types]
-path = "tests/hern/sum_types.hern"
-expect = "typecheck"
-output = """
-42
-0
-"""
-
 [tests.annotated_let]
 path = "tests/hern/annotated_let.hern"
 expect = "typecheck"
@@ -337,8 +404,42 @@ hello
 10
 """
 
+[tests.inherent_applied_array_float_sum]
+path = "tests/hern/inherent_applied_array_float_sum.hern"
+expect = "typecheck"
+output = """
+10
+"""
+
+[tests.inherent_applied_array_missing]
+path = "tests/hern/inherent_applied_array_missing.hern"
+expect = "error"
+error_contains = "available candidates: [float].sum, [int].sum"
+
+[tests.empty_array_specialized_method_error]
+path = "tests/hern/empty_array_specialized_method_error.hern"
+expect = "error"
+error_contains = "array element type is unknown"
+
+[tests.inherent_applied_exact_beats_generic]
+path = "tests/hern/inherent_applied_exact_beats_generic.hern"
+expect = "typecheck"
+output = """
+numbers
+generic
+"""
+
+[tests.inherent_applied_module_import]
+path = "tests/hern/inherent_applied_module_import.hern"
+fixtures = ["tests/hern/inherent_applied_module_methods.hern"]
+expect = "typecheck"
+output = """
+6
+"""
+
 [tests.module_inherent_import]
 path = "tests/hern/module_inherent_import.hern"
+fixtures = ["tests/hern/module_inherent.hern"]
 expect = "typecheck"
 output = """
 11
@@ -347,6 +448,7 @@ output = """
 
 [tests.module_associated_function_import]
 path = "tests/hern/module_associated_function_import.hern"
+fixtures = ["tests/hern/module_associated_function_dep.hern"]
 expect = "typecheck"
 output = """
 42
@@ -519,6 +621,11 @@ output = """
 42
 """
 
+[tests.qualified_constraint_erasure_error]
+path = "tests/hern/qualified_constraint_erasure_error.hern"
+expect = "error"
+error_contains = "Add"
+
 [tests.multi_trait_ops]
 path = "tests/hern/multi_trait_ops.hern"
 expect = "typecheck"
@@ -547,10 +654,30 @@ error_contains = "wrong number of arguments"
 [tests.prelude_impl_conflict]
 path = "tests/hern/prelude_impl_conflict.hern"
 expect = "error"
-error_contains = "impl Add for f64 is defined in multiple modules"
+error_contains = "impl Add for float is defined in multiple modules"
+
+[tests.prelude_ergonomics]
+path = "tests/hern/prelude_ergonomics.hern"
+expect = "typecheck"
+output = """
+2
+9
+1
+7
+2
+1
+1
+b
+?
+2.5
+3
+43
+4
+"""
 
 [tests.module_import]
 path = "tests/hern/module_import.hern"
+fixtures = ["tests/hern/module_math.hern"]
 expect = "typecheck"
 output = """
 5
@@ -559,6 +686,7 @@ output = """
 
 [tests.module_trait_import]
 path = "tests/hern/module_trait_import.hern"
+fixtures = ["tests/hern/module_trait.hern"]
 expect = "typecheck"
 output = """
 42
@@ -566,16 +694,82 @@ output = """
 
 [tests.module_trait_conflict]
 path = "tests/hern/module_trait_conflict.hern"
+fixtures = [
+    "tests/hern/module_trait_conflict_a.hern",
+    "tests/hern/module_trait_conflict_b.hern",
+]
 expect = "error"
 error_contains = "trait `LocalAdd` is defined in multiple modules"
 
 [tests.module_impl_conflict]
 path = "tests/hern/module_impl_conflict.hern"
+fixtures = [
+    "tests/hern/module_impl_conflict_a.hern",
+    "tests/hern/module_impl_conflict_b.hern",
+    "tests/hern/module_impl_conflict_trait.hern",
+]
 expect = "error"
-error_contains = "impl SharedBump for f64 is defined in multiple modules"
+error_contains = "impl SharedBump for float is defined in multiple modules"
+
+[tests.applied_impl_array_dispatch]
+path = "tests/hern/applied_impl_array_dispatch.hern"
+expect = "typecheck"
+output = """
+numbers
+strings
+"""
+
+[tests.applied_impl_array_missing]
+path = "tests/hern/applied_impl_array_missing.hern"
+expect = "error"
+error_contains = "trait `Label` is not implemented for `[string]`"
+
+[tests.applied_impl_exact_beats_generic]
+path = "tests/hern/applied_impl_exact_beats_generic.hern"
+expect = "typecheck"
+output = """
+numbers
+generic
+"""
+
+[tests.applied_impl_module_import]
+path = "tests/hern/applied_impl_module_import.hern"
+fixtures = ["tests/hern/applied_impl_module_labels.hern"]
+expect = "typecheck"
+output = """
+numbers
+strings
+"""
+
+[tests.applied_impl_module_distinct]
+path = "tests/hern/applied_impl_module_distinct.hern"
+fixtures = [
+    "tests/hern/applied_impl_module_numbers.hern",
+    "tests/hern/applied_impl_module_strings.hern",
+    "tests/hern/applied_impl_module_trait.hern",
+]
+expect = "typecheck"
+output = """
+numbers
+strings
+"""
+
+[tests.applied_impl_module_conflict]
+path = "tests/hern/applied_impl_module_conflict.hern"
+fixtures = [
+    "tests/hern/applied_impl_module_conflict_a.hern",
+    "tests/hern/applied_impl_module_conflict_b.hern",
+    "tests/hern/applied_impl_module_trait.hern",
+]
+expect = "error"
+error_contains = "impl Label for Array__app1__float is defined in multiple modules"
 
 [tests.module_alias_leak]
 path = "tests/hern/module_alias_leak.hern"
+fixtures = [
+    "tests/hern/module_alias_a.hern",
+    "tests/hern/module_alias_b.hern",
+]
 expect = "error"
 error_contains = "unknown type: `LocalAlias`"
 
@@ -607,6 +801,7 @@ output = """
 
 [tests.bare_imported_trait_method]
 path = "tests/hern/bare_imported_trait_method.hern"
+fixtures = ["tests/hern/bare_imported_trait_method_dep.hern"]
 expect = "typecheck"
 output = """
 42
@@ -627,7 +822,7 @@ error_contains = "ambiguous method `run`"
 [tests.missing_trait_impl]
 path = "tests/hern/missing_trait_impl.hern"
 expect = "error"
-error_contains = "trait `Show` is not implemented for `f64`"
+error_contains = "trait `Show` is not implemented for `int`"
 
 [tests.operator_missing_impl]
 path = "tests/hern/operator_missing_impl.hern"
@@ -665,6 +860,11 @@ output = """
 3
 """
 
+[tests.record_spread_closed_missing_field_error]
+path = "tests/hern/record_spread_closed_missing_field_error.hern"
+expect = "error"
+error_contains = "missing"
+
 [tests.array_spread_type_error]
 path = "tests/hern/array_spread_type_error.hern"
 expect = "error"
@@ -696,6 +896,7 @@ output = """
 
 [tests.tuple_eq_import]
 path = "tests/hern/tuple_eq_import.hern"
+fixtures = ["tests/hern/tuple_eq_import_dep.hern"]
 expect = "typecheck"
 output = """
 1
@@ -773,3 +974,38 @@ OK: assert passed
 42
 OK: pcall caught error
 """
+
+[tests.expected_type_method_chains]
+path = "tests/hern/expected_type_method_chains.hern"
+expect = "typecheck"
+output = """
+6
+6
+0
+0
+0
+0
+"""
+
+[tests.tostring_prelude]
+path = "tests/hern/tostring_prelude.hern"
+expect = "typecheck"
+output = """
+[1, 2, 3]
+[1, 2, 3]
+[[1, 2], [3]]
+[a, b]
+Some([1, 2])
+Ok(1)
+Err(bad)
+"""
+
+[tests.tostring_array_missing_elem_error]
+path = "tests/hern/tostring_array_missing_elem_error.hern"
+expect = "error"
+error_contains = "trait `ToString` is not implemented for `[Boxed]`"
+
+[tests.tostring_result_unresolved_error]
+path = "tests/hern/tostring_result_unresolved_error.hern"
+expect = "error"
+error_contains = "trait `ToString` is not implemented for `Result(int,"

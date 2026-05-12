@@ -60,6 +60,11 @@ pub enum TypeError {
     },
     UnknownImport(String),
     UnknownType(String),
+    TypeAliasArityMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
     RecursiveTypeAlias(String),
     MissingTraitImpl {
         trait_name: String,
@@ -73,6 +78,17 @@ pub enum TypeError {
         receiver: String,
         method: String,
     },
+    UnknownMethodWithCandidates {
+        receiver: String,
+        method: String,
+        candidates: Vec<String>,
+    },
+    UnknownMethodOnUnresolvedArray {
+        receiver: String,
+        method: String,
+        candidates: Vec<String>,
+    },
+    InvalidTraitImplTarget(String),
     UnknownAssociatedFunction {
         target: String,
         function: String,
@@ -304,6 +320,18 @@ impl fmt::Display for TypeError {
             }
             TypeError::UnknownImport(path) => write!(f, "unknown import: `{}`", path),
             TypeError::UnknownType(name) => write!(f, "unknown type: `{}`", name),
+            TypeError::TypeAliasArityMismatch {
+                name,
+                expected,
+                got,
+            } => write!(
+                f,
+                "type alias `{}` expects {} type argument{}, got {}",
+                name,
+                expected,
+                if *expected == 1 { "" } else { "s" },
+                got
+            ),
             TypeError::RecursiveTypeAlias(name) => write!(
                 f,
                 "recursive type alias `{}` is not supported; use a nominal type constructor instead",
@@ -328,6 +356,43 @@ impl fmt::Display for TypeError {
             TypeError::UnknownMethod { receiver, method } => {
                 write!(f, "type `{}` has no method `{}`", receiver, method)
             }
+            TypeError::UnknownMethodWithCandidates {
+                receiver,
+                method,
+                candidates,
+            } => {
+                let note = if receiver.contains('\'') {
+                    "; the receiver type is still unresolved"
+                } else {
+                    ""
+                };
+                write!(
+                    f,
+                    "type `{}` has no method `{}`{}; available candidates: {}",
+                    receiver,
+                    method,
+                    note,
+                    candidates.join(", ")
+                )
+            }
+            TypeError::UnknownMethodOnUnresolvedArray {
+                receiver,
+                method,
+                candidates,
+            } => {
+                write!(
+                    f,
+                    "type `{}` has no method `{}`; the array element type is unknown, so Hern cannot choose a specialized method; available candidates: {}; add an element type annotation such as `[int]` or `[float]`",
+                    receiver,
+                    method,
+                    candidates.join(", ")
+                )
+            }
+            TypeError::InvalidTraitImplTarget(target) => write!(
+                f,
+                "invalid trait impl target `{}`: expected a named type or type application",
+                target
+            ),
             TypeError::UnknownAssociatedFunction { target, function } => {
                 write!(
                     f,
@@ -352,7 +417,7 @@ impl fmt::Display for TypeError {
             ),
             TypeError::InvalidInherentImplTarget(target) => write!(
                 f,
-                "invalid inherent impl target `{}`: expected a nominal type or one of `string`, `f64`, `bool`",
+                "invalid inherent impl target `{}`: expected a nominal type or one of `string`, `int`, `float`, `bool`",
                 target
             ),
             TypeError::DuplicateInherentMethod { target, method } => write!(

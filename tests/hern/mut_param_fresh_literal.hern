@@ -1,4 +1,4 @@
-fn bump(mut r: #{ x: f64 }) {
+fn bump(mut r: #{ x: int }) {
   r.x = 2;
   print(r.x);
 }

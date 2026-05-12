@@ -1,0 +1,33 @@
+let total_int: fn([int]) -> int = fn(xs) {
+    xs.sum()
+};
+
+let total_float: fn([float]) -> float = fn(xs) {
+    xs.sum()
+};
+
+fn choose_int(flag: bool) -> [int] {
+    if flag {
+        []
+    } else {
+        [1]
+    }
+}
+
+fn choose_float(flag: bool) -> [float] {
+    if flag {
+        []
+    } else {
+        [1.0]
+    }
+}
+
+let empty_int_sum: int = [].sum();
+let empty_float_sum: float = [].sum();
+
+print(total_int([1, 2, 3]));
+print(total_float([1.0, 2.0, 3.0]));
+print(choose_int(true).sum());
+print(choose_float(true).sum());
+print(empty_int_sum);
+print(empty_float_sum);

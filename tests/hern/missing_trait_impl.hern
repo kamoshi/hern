@@ -2,6 +2,6 @@ trait Show 'a {
     fn show(x: 'a) -> string
 }
 
-// no impl Show for f64
+// no impl Show for float
 
 print(show(1));

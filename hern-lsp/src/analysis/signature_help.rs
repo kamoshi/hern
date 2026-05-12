@@ -276,21 +276,21 @@ mod tests {
     #[test]
     fn signature_help_for_top_level_function_call() {
         let project = crate::analysis::tests::TestProject::new("signature-help");
-        let source = "fn add(x: f64, y: f64) -> f64 { x + y }\nadd(1, 2)\n";
+        let source = "fn add(x: float, y: float) -> float { x + y }\nadd(1, 2)\n";
         let (state, uri) = project.open("main.hern", source);
 
         let help = signature_help(&state, uri, Position::new(1, 5)).expect("signature help");
         let (label, params, active) = signature_labels(help);
 
-        assert_eq!(label, "fn(f64, f64) -> f64");
-        assert_eq!(params, vec!["f64", "f64"]);
+        assert_eq!(label, "fn(float, float) -> float");
+        assert_eq!(params, vec!["float", "float"]);
         assert_eq!(active, 0);
     }
 
     #[test]
     fn signature_help_active_parameter_after_comma() {
         let project = crate::analysis::tests::TestProject::new("signature-active-param");
-        let source = "fn add(x: f64, y: f64) -> f64 { x + y }\nadd(1, 2)\n";
+        let source = "fn add(x: float, y: float) -> float { x + y }\nadd(1, 2)\n";
         let (state, uri) = project.open("main.hern", source);
 
         let help = signature_help(&state, uri, Position::new(1, 8)).expect("signature help");
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn signature_help_chooses_innermost_call() {
         let project = crate::analysis::tests::TestProject::new("signature-innermost");
-        let source = "fn add(x: f64, y: f64) -> f64 { x + y }\nadd(add(1, 2), 3)\n";
+        let source = "fn add(x: float, y: float) -> float { x + y }\nadd(add(1, 2), 3)\n";
         let (state, uri) = project.open("main.hern", source);
 
         let help = signature_help(&state, uri, Position::new(1, 9)).expect("signature help");
@@ -316,13 +316,13 @@ mod tests {
         } = import_fixture(
             "signature-imported",
             "let dep = import \"dep\";\ndep.add(1, 2)\n",
-            "fn add(x: f64, y: f64) -> f64 { x + y }\n#{ add: add }\n",
+            "fn add(x: float, y: float) -> float { x + y }\n#{ add: add }\n",
         );
 
         let help = signature_help(&state, entry_uri, Position::new(1, 9)).expect("signature help");
         let (label, _, active) = signature_labels(help);
 
-        assert_eq!(label, "fn(f64, f64) -> f64");
+        assert_eq!(label, "fn(float, float) -> float");
         assert_eq!(active, 0);
     }
 
@@ -330,7 +330,7 @@ mod tests {
     fn signature_help_shows_mutable_place_parameter() {
         let project = crate::analysis::tests::TestProject::new("signature-mut-param");
         let source = concat!(
-            "fn bump(mut r: #{ x: f64 }) { r.x = r.x + 1; }\n",
+            "fn bump(mut r: #{ x: int }) { r.x = r.x + 1; }\n",
             "let mut r = #{ x: 1 };\n",
             "bump(r)\n",
         );
@@ -339,8 +339,8 @@ mod tests {
         let help = signature_help(&state, uri, Position::new(2, 5)).expect("signature help");
         let (label, params, active) = signature_labels(help);
 
-        assert_eq!(label, "fn(mut #{ x: f64 }) -> ()");
-        assert_eq!(params, vec!["mut #{ x: f64 }"]);
+        assert_eq!(label, "fn(mut #{ x: int }) -> ()");
+        assert_eq!(params, vec!["mut #{ x: int }"]);
         assert_eq!(active, 0);
     }
 
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn signature_help_returns_none_outside_call_context() {
         let project = crate::analysis::tests::TestProject::new("signature-none");
-        let source = "fn add(x: f64, y: f64) -> f64 { x + y }\nadd\n";
+        let source = "fn add(x: float, y: float) -> float { x + y }\nadd\n";
         let (state, uri) = project.open("main.hern", source);
 
         assert!(signature_help(&state, uri, Position::new(1, 1)).is_none());

@@ -1,5 +1,5 @@
 // #{ x } is a closed pattern — rejects records with extra fields
-fn get_x(p: #{ x: f64, y: f64 }) -> f64 {
+fn get_x(p: #{ x: float, y: float }) -> float {
     match p {
         #{ x } -> x,
     }
