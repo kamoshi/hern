@@ -1,6 +1,6 @@
 use super::state::{ServerState, cached_analysis};
 use super::uri::{source_span_to_range, uri_to_path};
-use super::workspace::load_document_graph;
+use super::workspace::load_document_graph_recovering;
 use hern_core::ast::{SourcePosition, SourceSpan};
 use hern_core::lex::{Lexer, Token};
 use hern_core::module::ModuleGraph;
@@ -87,7 +87,7 @@ fn resolve_graph<'a>(
     if let Some(analysis) = cached_analysis(state, uri) {
         return Some(&analysis.graph);
     }
-    *fallback = Some(load_document_graph(state, uri).ok()?);
+    *fallback = Some(load_document_graph_recovering(state, uri)?);
     fallback.as_ref()
 }
 

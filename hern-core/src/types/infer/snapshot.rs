@@ -21,7 +21,7 @@ pub(super) struct InferSnapshot {
     subst_map: HashMap<TyVar, Ty>,
     pending_constraints: Vec<TraitConstraint>,
     loop_break_tys: Vec<Ty>,
-    fn_return_tys: Vec<Ty>,
+    fn_return_tys: Vec<FuncReturn>,
     metadata: TypeMetadataSnapshot,
     record_field_callables: HashMap<String, HashMap<String, Vec<ParamCapability>>>,
     inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,

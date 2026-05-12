@@ -1,7 +1,7 @@
 use super::hover::ty_to_display_string;
-use super::state::{ServerState, cached_analysis};
-use super::uri::{source_span_to_range, uri_to_path};
-use super::workspace::load_workspace_graphs;
+use super::snapshot::{SnapshotMode, analysis_snapshot};
+use super::state::ServerState;
+use super::uri::source_span_to_range;
 use hern_core::ast::{Expr, ExprKind, Pattern, SourceSpan, Stmt};
 use hern_core::types::Ty;
 use lsp_types::{
@@ -16,20 +16,13 @@ pub(crate) fn code_actions(
     range: Range,
     _context: CodeActionContext,
 ) -> Vec<CodeActionOrCommand> {
-    let Some(path) = uri_to_path(&uri) else {
+    let Some(snapshot) = analysis_snapshot(state, &uri, SnapshotMode::RequireTyped) else {
         return Vec::new();
     };
-    let fallback;
-    let (graph, inference) = if let Some(analysis) = cached_analysis(state, &uri) {
-        (&analysis.graph, &analysis.inference)
-    } else {
-        let Some(analysis) = load_workspace_graphs(state, &uri) else {
-            return Vec::new();
-        };
-        fallback = analysis;
-        (&fallback.graph, &fallback.inference)
+    let Some(inference) = snapshot.inference() else {
+        return Vec::new();
     };
-    let Some((module_name, program)) = graph.module_for_path(&path) else {
+    let Some((module_name, program)) = snapshot.module() else {
         return Vec::new();
     };
     let Some(binding_types) = inference.binding_types_for_module(module_name) else {

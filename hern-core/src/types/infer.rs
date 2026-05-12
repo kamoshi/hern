@@ -69,7 +69,7 @@ pub struct Infer {
     record_field_callables: HashMap<String, HashMap<String, Vec<ParamCapability>>>,
     known_impl_dicts: HashSet<String>,
     loop_break_tys: Vec<Ty>,
-    fn_return_tys: Vec<Ty>,
+    fn_return_tys: Vec<FuncReturn>,
     pending_constraints: Vec<TraitConstraint>,
     known_impl_schemes: HashMap<String, Scheme>,
     metadata: TypeMetadata,
@@ -110,27 +110,14 @@ pub struct InferenceResult {
 /// Partial result returned by [`Infer::infer_program_collecting`].
 ///
 /// Diagnostics for individual top-level declarations are reported separately by the caller;
-/// this struct carries only the inference state that survived recovery.
+/// this alias carries only the inference state that survived recovery.
 ///
 /// `value_ty` is the trailing-expression type when the trailing expression succeeded, or
 /// `Ty::Unit` when the module ends in a declaration or its trailing expression failed.
 /// Importing modules should treat `value_ty` of a partial inference as best-effort.
-#[derive(Debug, Clone)]
-pub struct ModuleInference {
-    pub env: TypeEnv,
-    pub variant_env: VariantEnv,
-    pub inherent_method_schemes: HashMap<String, HashMap<String, InherentMethodScheme>>,
-    pub value_ty: Ty,
-    pub expr_types: HashMap<NodeId, Ty>,
-    pub symbol_types: HashMap<NodeId, Ty>,
-    pub binding_types: HashMap<SourceSpan, Ty>,
-    pub definition_schemes: HashMap<SourceSpan, Scheme>,
-    pub binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
-    pub callable_capabilities: HashMap<NodeId, CallableCapabilities>,
-    pub fresh_place_exprs: HashSet<NodeId>,
-}
+pub type ModuleInference = InferenceResult;
 
-impl Default for ModuleInference {
+impl Default for InferenceResult {
     fn default() -> Self {
         Self {
             env: TypeEnv::new(),
@@ -318,7 +305,7 @@ impl Infer {
         arg: &Expr,
         idx: usize,
     ) -> Result<(), SpannedTypeError> {
-        if is_fresh_mutable_place(arg) {
+        if self.is_fresh_mutable_place_expr(arg) {
             return Ok(());
         }
         let Some(name) = find_assignment_base_name(arg) else {
@@ -371,6 +358,57 @@ impl Infer {
         } else {
             Some(fields)
         }
+    }
+
+    fn is_fresh_mutable_place_expr(&self, expr: &Expr) -> bool {
+        if is_fresh_mutable_place(expr) || self.metadata.is_fresh_place_expr(expr.id) {
+            return true;
+        }
+        match &expr.kind {
+            ExprKind::Tuple(exprs) => exprs
+                .iter()
+                .all(|expr| self.is_fresh_mutable_place_expr(expr)),
+            ExprKind::Record(entries) => entries
+                .iter()
+                .all(|entry| self.is_fresh_mutable_place_expr(entry.expr())),
+            ExprKind::Array(entries) => entries
+                .iter()
+                .all(|entry| self.is_fresh_array_element_place(entry.expr())),
+            ExprKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.is_fresh_mutable_place_expr(then_branch)
+                    && self.is_fresh_mutable_place_expr(else_branch)
+            }
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .all(|(_, body)| self.is_fresh_mutable_place_expr(body)),
+            ExprKind::Block { final_expr, .. } => final_expr
+                .as_deref()
+                .is_some_and(|expr| self.is_fresh_mutable_place_expr(expr)),
+            _ => false,
+        }
+    }
+
+    fn is_fresh_array_element_place(&self, expr: &Expr) -> bool {
+        matches!(expr.kind, ExprKind::Ident(_)) || self.is_fresh_mutable_place_expr(expr)
+    }
+
+    fn check_fresh_return_expr(
+        &self,
+        expr: &Expr,
+        ret: &FuncReturn,
+    ) -> Result<(), SpannedTypeError> {
+        if ret.capability == ReturnCapability::FreshPlace && !self.is_fresh_mutable_place_expr(expr)
+        {
+            return Err(TypeError::ExpectedMutablePlace(
+                "return value must be a fresh mutable place".to_string(),
+            )
+            .at(expr.span));
+        }
+        Ok(())
     }
 
     fn apply_inst(&self, ty: &Ty, map: &HashMap<TyVar, Ty>) -> Ty {
@@ -553,10 +591,8 @@ impl Infer {
             None => self.subst.fresh_var(),
         };
 
-        let fn_ty = Ty::Func(
-            func_params_from_params(params, param_tys),
-            func_return_from_annotation(ret_type, ret_ty.clone()),
-        );
+        let fn_ret = func_return_from_annotation(ret_type, ret_ty.clone());
+        let fn_ty = Ty::Func(func_params_from_params(params, param_tys), fn_ret.clone());
 
         let saved_pending = std::mem::take(&mut self.pending_constraints);
         self.pending_constraints.extend(initial_constraints);
@@ -568,14 +604,18 @@ impl Infer {
             );
         }
 
-        self.fn_return_tys.push(ret_ty.clone());
+        self.fn_return_tys.push(fn_ret.clone());
         let body_ty = if ret_type.is_some() {
             self.infer_expr_expected(&body_env, body, ret_ty.clone())?
         } else {
             self.infer_expr(&body_env, body)?
         };
         self.fn_return_tys.pop();
-        unify_expr_result(&mut self.subst, body_ty, ret_ty).map_err(|err| err.at(body.span))?;
+        unify_expr_result(&mut self.subst, body_ty.clone(), ret_ty)
+            .map_err(|err| err.at(body.span))?;
+        if !matches!(self.subst.apply(&body_ty), Ty::Never) {
+            self.check_fresh_return_expr(body, &fn_ret)?;
+        }
 
         let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
         let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
@@ -916,9 +956,7 @@ impl Infer {
                     } else {
                         self.generalize(env, inferred_ty)
                     };
-                    let place_mutable = *is_mutable
-                        && (is_fresh_mutable_place(value)
-                            || self.metadata.is_fresh_place_expr(value.id));
+                    let place_mutable = *is_mutable && self.is_fresh_mutable_place_expr(value);
                     self.metadata
                         .record_binding_capability(*span, BindingCapabilities { place_mutable });
                     if let ExprKind::Import(path) = &value.kind {
@@ -1124,9 +1162,7 @@ impl Infer {
                 dict_args,
                 pending_dict_args,
             } => {
-                if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind
-                    && !matches!(&expr.kind, ExprKind::Ident(name) if self.trait_env.contains_key(name))
-                {
+                if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind {
                     let ty = self.resolve_receiver_call(
                         env,
                         expr_id,
@@ -1246,114 +1282,16 @@ impl Infer {
                 dict_args,
                 pending_dict_args,
                 ..
-            } => {
-                let l_ty = self.infer_expr(env, lhs)?;
-                match op {
-                    BinOp::Pipe => {
-                        let r_ty = self.infer_expr(env, rhs)?;
-                        // Fast path: if RHS is a constrained identifier, resolve its dict args.
-                        if let ExprKind::Ident(callee_name) = &rhs.kind
-                            && let Some(info) = env.get(callee_name.as_str())
-                        {
-                            let scheme = info.scheme.clone();
-                            if scheme_param_capability(&scheme, 0).is_mut_place() {
-                                self.check_mutable_place_arg(env, lhs, 0)?;
-                            }
-                            if !scheme.constraints.is_empty() {
-                                return self.infer_constrained_apply(
-                                    env,
-                                    &scheme,
-                                    vec![l_ty],
-                                    dict_args,
-                                    pending_dict_args,
-                                );
-                            }
-                        }
-                        let ret_var = self.fresh_var();
-                        let expected_r_ty = Ty::Func(
-                            value_func_params(vec![l_ty]),
-                            value_func_return(Ty::Var(ret_var)),
-                        );
-                        unify(&mut self.subst, r_ty, expected_r_ty)?;
-                        Ok(self.subst.apply(&Ty::Var(ret_var)))
-                    }
-                    BinOp::Custom(op) => {
-                        if let Some(trait_name) = self.op_trait_map.get(op.as_str()).cloned() {
-                            let trait_def = self
-                                .trait_env
-                                .get(&trait_name)
-                                .ok_or_else(|| TypeError::UnknownTrait(trait_name.clone()))?
-                                .clone();
-                            let method = trait_def
-                                .methods
-                                .iter()
-                                .find(|m| m.name == *op)
-                                .ok_or_else(|| TypeError::UnknownTraitMethod {
-                                    trait_name: trait_name.clone(),
-                                    method: op.clone(),
-                                })?
-                                .clone();
-
-                            let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-                            let target_var = self.fresh_var();
-                            param_vars.insert(trait_def.param.clone(), target_var);
-
-                            let lhs_param_ty =
-                                self.ast_to_ty_with_vars(&method.params[0].1, &mut param_vars)?;
-                            let rhs_param_ty =
-                                self.ast_to_ty_with_vars(&method.params[1].1, &mut param_vars)?;
-                            let ret_ty =
-                                self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-
-                            unify(&mut self.subst, l_ty, lhs_param_ty)?;
-                            let rhs_param_ty = self.subst.apply(&rhs_param_ty);
-                            let r_ty = self.infer_expr_expected(env, rhs, rhs_param_ty.clone())?;
-                            unify(&mut self.subst, r_ty, rhs_param_ty)?;
-
-                            let resolved_target = self.subst.apply(&Ty::Var(target_var));
-                            self.resolve_operator_dispatch(
-                                env,
-                                &trait_name,
-                                op,
-                                &resolved_target,
-                                resolved_op,
-                                pending_op,
-                                dict_args,
-                                pending_dict_args,
-                            )?;
-                            Ok(self.subst.apply(&ret_ty))
-                        } else {
-                            let r_ty = self.infer_expr(env, rhs)?;
-                            // op is a regular (non-trait) operator function
-                            if let Some(info) = env.get(op.as_str()) {
-                                let scheme = info.scheme.clone();
-                                if !scheme.constraints.is_empty() {
-                                    let ret_ty = self.infer_constrained_apply(
-                                        env,
-                                        &scheme,
-                                        vec![l_ty, r_ty],
-                                        dict_args,
-                                        pending_dict_args,
-                                    )?;
-                                    *resolved_op = Some(ResolvedCallee::Function(op.to_string()));
-                                    return Ok(ret_ty);
-                                }
-                            }
-                            let fn_ty = env
-                                .get(op.as_str())
-                                .map(|info| self.instantiate(&info.scheme))
-                                .ok_or_else(|| TypeError::UnboundVariable(op.clone()))?;
-                            let ret_var = self.fresh_var();
-                            let expected = Ty::Func(
-                                value_func_params(vec![l_ty, r_ty]),
-                                value_func_return(Ty::Var(ret_var)),
-                            );
-                            unify(&mut self.subst, fn_ty, expected)?;
-                            Ok(self.subst.apply(&Ty::Var(ret_var)))
-                        }
-                    }
-                }
-            }
+            } => self.infer_binary_expr(
+                env,
+                lhs,
+                op,
+                rhs,
+                resolved_op,
+                pending_op,
+                dict_args,
+                pending_dict_args,
+            ),
             ExprKind::Call {
                 callee,
                 args,
@@ -1363,161 +1301,19 @@ impl Infer {
                 pending_trait_method,
                 dict_args,
                 pending_dict_args,
-            } => {
-                if let ExprKind::AssociatedAccess {
-                    target,
-                    target_span,
-                    member,
-                    member_span,
-                } = &callee.kind
-                {
-                    let ty = self.resolve_associated_call(
-                        env,
-                        expr_id,
-                        callee.id,
-                        target,
-                        *target_span,
-                        member,
-                        *member_span,
-                        args,
-                        arg_wrappers,
-                        resolved_callee,
-                        dict_args,
-                        pending_dict_args,
-                    )?;
-                    return Ok(self.record_expr_type_for_node(expr_id, ty));
-                }
-
-                // Trait method call: `TraitName.method(args...)`.
-                if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind
-                    && let ExprKind::Ident(trait_name) = &expr.kind
-                    && let Some(trait_def) = self.trait_env.get(trait_name).cloned()
-                {
-                    let method = trait_def
-                        .methods
-                        .iter()
-                        .find(|m| m.name == *field)
-                        .ok_or_else(|| TypeError::UnknownTraitMethod {
-                            trait_name: trait_name.clone(),
-                            method: field.clone(),
-                        })?
-                        .clone();
-
-                    let ty = self.resolve_trait_method_call(
-                        env,
-                        args,
-                        arg_wrappers,
-                        resolved_callee,
-                        pending_trait_method,
-                        trait_def,
-                        method,
-                        "trait method call",
-                    )?;
-                    return Ok(self.record_expr_type_for_node(expr_id, ty));
-                }
-
-                if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind {
-                    let callee_id = callee.id;
-                    let ty = self.resolve_receiver_call(
-                        env,
-                        expr_id,
-                        callee_id,
-                        expr,
-                        field,
-                        args,
-                        is_method_call,
-                        arg_wrappers,
-                        resolved_callee,
-                        dict_args,
-                        pending_dict_args,
-                        None,
-                    )?;
-                    return Ok(self.record_expr_type_for_node(expr_id, ty));
-                }
-
-                // Bare trait method call: `method(args...)` without explicit `Trait.` prefix.
-                // This is call-only sugar: bare trait methods are not first-class values,
-                // because dispatch is resolved from the first argument's concrete target.
-                // Allowed only when the method name belongs to exactly one trait in scope.
-                if let ExprKind::Ident(method_name) = &callee.kind
-                    && env.get(method_name.as_str()).is_none()
-                {
-                    if let Some(resolved) = self.bare_trait_method(method_name)? {
-                        let ty = self.resolve_trait_method_call(
-                            env,
-                            args,
-                            arg_wrappers,
-                            resolved_callee,
-                            pending_trait_method,
-                            resolved.trait_def,
-                            resolved.method,
-                            "bare trait method call",
-                        )?;
-                        return Ok(self.record_expr_type_for_node(expr_id, ty));
-                    }
-                }
-
-                // Constrained function call: resolve dict args
-                if let ExprKind::Ident(callee_name) = &callee.kind
-                    && let Some(info) = env.get(callee_name.as_str())
-                {
-                    let scheme = info.scheme.clone();
-                    if !scheme.constraints.is_empty() {
-                        // Record the instantiated callee type so hover/tooling can show its type.
-                        // The normal plain-call path does this via infer_expr(callee), but the
-                        // constrained path bypasses that and must record it explicitly.
-                        if callee.id != NO_NODE_ID {
-                            let instantiated = self.instantiate_value(&scheme);
-                            self.metadata
-                                .record_symbol_type(callee.id, instantiated, &self.subst);
-                        }
-                        let applied = self.apply_scheme_callable(
-                            env,
-                            args,
-                            arg_wrappers,
-                            &scheme,
-                            Vec::new(),
-                            0,
-                            dict_args,
-                            pending_dict_args,
-                        );
-                        return applied.map(|applied| {
-                            self.record_expr_type_for_node(expr_id, applied.ret_ty)
-                        });
-                    }
-                }
-
-                // Plain call
-                let mut callee_ty = self.infer_expr(env, callee)?;
-                callee_ty = self.subst.apply(&callee_ty);
-                let callee_constraints = if let Ty::Qualified(constraints, inner) = callee_ty {
-                    callee_ty = *inner;
-                    constraints
-                } else {
-                    Vec::new()
-                };
-                let param_capabilities = match &callee_ty {
-                    Ty::Func(params, _) => func_param_capabilities(params),
-                    _ => self.callable_capabilities_for(callee.id),
-                };
-                let applied = self.apply_callable_type(
-                    env,
-                    args,
-                    arg_wrappers,
-                    callee_ty,
-                    callee_constraints,
-                    Vec::new(),
-                    param_capabilities,
-                    0,
-                    expr.span,
-                    dict_args,
-                    pending_dict_args,
-                )?;
-                if applied.fresh_return && expr_id != NO_NODE_ID {
-                    self.metadata.mark_fresh_place(expr_id);
-                }
-                Ok(applied.ret_ty)
-            }
+            } => self.infer_call_expr(
+                env,
+                expr_id,
+                expr.span,
+                callee,
+                args,
+                is_method_call,
+                arg_wrappers,
+                resolved_callee,
+                pending_trait_method,
+                dict_args,
+                pending_dict_args,
+            ),
             ExprKind::AssociatedAccess { target, member, .. } => {
                 let target_name = inherent_impl_target_key_from_ast(target, &self.declared_types)
                     .map_err(|err| err.at(expr.span))?;
@@ -1605,16 +1401,17 @@ impl Infer {
                 }
             }
             ExprKind::Return(val) => {
-                let ret_ty = self
+                let ret = self
                     .fn_return_tys
                     .last()
                     .cloned()
                     .ok_or(TypeError::ReturnOutsideFunction)?;
                 if let Some(val_expr) = val {
                     let val_ty = self.infer_expr(env, val_expr)?;
-                    unify_expr_result(&mut self.subst, val_ty, ret_ty)?;
+                    unify_expr_result(&mut self.subst, val_ty, (*ret.ty).clone())?;
+                    self.check_fresh_return_expr(val_expr, &ret)?;
                 } else {
-                    unify(&mut self.subst, ret_ty, Ty::Unit)?;
+                    unify(&mut self.subst, (*ret.ty).clone(), Ty::Unit)?;
                 }
                 Ok(Ty::Never)
             }
@@ -1639,51 +1436,7 @@ impl Infer {
                 Ok(Ty::Tuple(tys))
             }
             ExprKind::Array(entries) => self.infer_array_entries(env, entries, None, expr.span),
-            ExprKind::Record(entries) => {
-                let mut field_tys: Vec<(String, Ty)> = Vec::new();
-                let mut tail = Ty::Unit;
-                for entry in entries {
-                    match entry {
-                        RecordEntry::Field(name, expr) => {
-                            let ty = self.infer_expr(env, expr)?;
-                            merge_record_field(&mut field_tys, name.clone(), ty);
-                        }
-                        RecordEntry::Spread(expr) => {
-                            let spread_ty = self.infer_expr(env, expr)?;
-                            let tail_var = self.subst.fresh_var();
-                            unify(
-                                &mut self.subst,
-                                spread_ty.clone(),
-                                Ty::Record(Row {
-                                    fields: vec![],
-                                    tail: Box::new(tail_var),
-                                }),
-                            )?;
-                            let resolved_spread = self.subst.apply(&spread_ty);
-                            let Ty::Record(row) = resolved_spread else {
-                                return Err(TypeError::Mismatch(
-                                    Ty::Record(Row {
-                                        fields: vec![],
-                                        tail: Box::new(self.subst.fresh_var()),
-                                    }),
-                                    resolved_spread,
-                                )
-                                .at(expr.span));
-                            };
-                            for (name, ty) in row.fields {
-                                merge_record_field(&mut field_tys, name, ty);
-                            }
-                            tail = merge_record_spread_tail(&mut self.subst, tail, *row.tail)
-                                .map_err(|err| err.at(expr.span))?;
-                        }
-                    }
-                }
-                field_tys.sort_by(|(a, _), (b, _)| a.cmp(b));
-                Ok(Ty::Record(Row {
-                    fields: field_tys,
-                    tail: Box::new(tail),
-                }))
-            }
+            ExprKind::Record(entries) => self.infer_record_expr(env, entries, expr.span),
             ExprKind::FieldAccess {
                 expr: base, field, ..
             } => {
@@ -1735,96 +1488,7 @@ impl Infer {
                 body,
                 resolved_iter,
                 pending_iter,
-            } => {
-                let iter_ty = self.infer_expr(env, iterable)?;
-
-                let iterable_trait = self
-                    .trait_env
-                    .get("Iterable")
-                    .ok_or_else(|| TypeError::UnknownTrait("Iterable".to_string()))?
-                    .clone();
-                let iter_method = iterable_trait
-                    .methods
-                    .iter()
-                    .find(|m| m.name == "iter")
-                    .ok_or_else(|| TypeError::UnknownTraitMethod {
-                        trait_name: "Iterable".to_string(),
-                        method: "iter".to_string(),
-                    })?
-                    .clone();
-
-                let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-                let target_var = self.fresh_var();
-                param_vars.insert(iterable_trait.param.clone(), target_var);
-
-                let self_ty =
-                    self.ast_to_ty_with_vars(&iter_method.params[0].1, &mut param_vars)?;
-                let ret_ty = self.ast_to_ty_with_vars(&iter_method.ret_type, &mut param_vars)?;
-
-                unify(&mut self.subst, iter_ty, self_ty)?;
-
-                let resolved_target = self.subst.apply(&Ty::Var(target_var));
-                let target_keys = trait_impl_target_keys_from_ty(&resolved_target);
-                if target_keys.is_empty() {
-                    match resolved_target {
-                        Ty::Var(v) => {
-                            self.pending_constraints.push(TraitConstraint {
-                                var: v,
-                                trait_name: "Iterable".to_string(),
-                            });
-                            *pending_iter = Some(PendingDictArg {
-                                var: v,
-                                trait_name: "Iterable".to_string(),
-                            });
-                        }
-                        _ => {
-                            return Err(TypeError::UnresolvedTrait {
-                                context: "for loop".to_string(),
-                                trait_name: "Iterable".to_string(),
-                            }
-                            .into());
-                        }
-                    }
-                } else {
-                    let dict_name = target_keys
-                        .into_iter()
-                        .map(|key| trait_impl_dict_name("Iterable", &key))
-                        .find(|dict_name| {
-                            env.get(dict_name).is_some()
-                                || self.known_impl_dicts.contains(dict_name)
-                        });
-                    match dict_name {
-                        Some(dict_name) => {
-                            *resolved_iter = Some(ResolvedCallee::DictMethod {
-                                dict: DictRef::Concrete(dict_name),
-                                method: "iter".to_string(),
-                            });
-                        }
-                        None => {
-                            return Err(TypeError::MissingTraitImpl {
-                                trait_name: "Iterable".to_string(),
-                                impl_target: format!("{}", resolved_target),
-                            }
-                            .into());
-                        }
-                    }
-                }
-
-                let elem_ty = match self.subst.apply(&ret_ty) {
-                    Ty::App(_, args) if args.len() == 1 => args.into_iter().next().unwrap(), // len == 1 from pattern guard
-                    other => other,
-                };
-
-                let mut body_env = env.clone();
-                let elem_ty_applied = self.subst.apply(&elem_ty);
-                self.check_pattern(pat, elem_ty_applied, &mut body_env, false)?;
-
-                self.loop_break_tys.push(Ty::Unit);
-                self.infer_expr(&body_env, body)?;
-                self.loop_break_tys.pop();
-
-                Ok(Ty::Unit)
-            }
+            } => self.infer_for_expr(env, pat, iterable, body, resolved_iter, pending_iter),
         };
         if let Ok(ty) = &result
             && expr.id != NO_NODE_ID
@@ -1833,6 +1497,510 @@ impl Infer {
                 .record_expr_type(expr.id, ty.clone(), &self.subst);
         }
         result.map_err(|err: SpannedTypeError| err.with_span_if_absent(expr.span))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_binary_expr(
+        &mut self,
+        env: &TypeEnv,
+        lhs: &mut Expr,
+        op: &BinOp,
+        rhs: &mut Expr,
+        resolved_op: &mut Option<ResolvedCallee>,
+        pending_op: &mut Option<PendingDictArg>,
+        dict_args: &mut Vec<DictRef>,
+        pending_dict_args: &mut Vec<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        let l_ty = self.infer_expr(env, lhs)?;
+        match op {
+            BinOp::Pipe => self.infer_pipe_expr(env, lhs, rhs, l_ty, dict_args, pending_dict_args),
+            BinOp::Custom(op) => self.infer_custom_binary_expr(
+                env,
+                op,
+                rhs,
+                l_ty,
+                resolved_op,
+                pending_op,
+                dict_args,
+                pending_dict_args,
+            ),
+        }
+    }
+
+    fn infer_pipe_expr(
+        &mut self,
+        env: &TypeEnv,
+        lhs: &mut Expr,
+        rhs: &mut Expr,
+        l_ty: Ty,
+        dict_args: &mut Vec<DictRef>,
+        pending_dict_args: &mut Vec<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        let r_ty = self.infer_expr(env, rhs)?;
+        if let ExprKind::Ident(callee_name) = &rhs.kind
+            && let Some(info) = env.get(callee_name.as_str())
+        {
+            let scheme = info.scheme.clone();
+            if scheme_param_capability(&scheme, 0).is_mut_place() {
+                self.check_mutable_place_arg(env, lhs, 0)?;
+            }
+            if !scheme.constraints.is_empty() {
+                return self.infer_constrained_apply(
+                    env,
+                    &scheme,
+                    vec![l_ty],
+                    dict_args,
+                    pending_dict_args,
+                );
+            }
+        }
+        let ret_var = self.fresh_var();
+        let expected_r_ty = Ty::Func(
+            value_func_params(vec![l_ty]),
+            value_func_return(Ty::Var(ret_var)),
+        );
+        unify(&mut self.subst, r_ty, expected_r_ty)?;
+        Ok(self.subst.apply(&Ty::Var(ret_var)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_custom_binary_expr(
+        &mut self,
+        env: &TypeEnv,
+        op: &str,
+        rhs: &mut Expr,
+        l_ty: Ty,
+        resolved_op: &mut Option<ResolvedCallee>,
+        pending_op: &mut Option<PendingDictArg>,
+        dict_args: &mut Vec<DictRef>,
+        pending_dict_args: &mut Vec<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        if let Some(trait_name) = self.op_trait_map.get(op).cloned() {
+            self.infer_trait_operator_expr(
+                env,
+                op,
+                rhs,
+                l_ty,
+                &trait_name,
+                resolved_op,
+                pending_op,
+                dict_args,
+                pending_dict_args,
+            )
+        } else {
+            self.infer_function_operator_expr(
+                env,
+                op,
+                rhs,
+                l_ty,
+                resolved_op,
+                dict_args,
+                pending_dict_args,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_trait_operator_expr(
+        &mut self,
+        env: &TypeEnv,
+        op: &str,
+        rhs: &mut Expr,
+        l_ty: Ty,
+        trait_name: &str,
+        resolved_op: &mut Option<ResolvedCallee>,
+        pending_op: &mut Option<PendingDictArg>,
+        dict_args: &mut Vec<DictRef>,
+        pending_dict_args: &mut Vec<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        let trait_def = self
+            .trait_env
+            .get(trait_name)
+            .ok_or_else(|| TypeError::UnknownTrait(trait_name.to_string()))?
+            .clone();
+        let method = trait_def
+            .methods
+            .iter()
+            .find(|m| m.name == op)
+            .ok_or_else(|| TypeError::UnknownTraitMethod {
+                trait_name: trait_name.to_string(),
+                method: op.to_string(),
+            })?
+            .clone();
+
+        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
+        let target_var = self.fresh_var();
+        param_vars.insert(trait_def.param.clone(), target_var);
+
+        let lhs_param_ty = self.ast_to_ty_with_vars(&method.params[0].1, &mut param_vars)?;
+        let rhs_param_ty = self.ast_to_ty_with_vars(&method.params[1].1, &mut param_vars)?;
+        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
+
+        unify(&mut self.subst, l_ty, lhs_param_ty)?;
+        let rhs_param_ty = self.subst.apply(&rhs_param_ty);
+        let r_ty = self.infer_expr_expected(env, rhs, rhs_param_ty.clone())?;
+        unify(&mut self.subst, r_ty, rhs_param_ty)?;
+
+        let resolved_target = self.subst.apply(&Ty::Var(target_var));
+        self.resolve_operator_dispatch(
+            env,
+            trait_name,
+            op,
+            &resolved_target,
+            resolved_op,
+            pending_op,
+            dict_args,
+            pending_dict_args,
+        )?;
+        Ok(self.subst.apply(&ret_ty))
+    }
+
+    fn infer_function_operator_expr(
+        &mut self,
+        env: &TypeEnv,
+        op: &str,
+        rhs: &mut Expr,
+        l_ty: Ty,
+        resolved_op: &mut Option<ResolvedCallee>,
+        dict_args: &mut Vec<DictRef>,
+        pending_dict_args: &mut Vec<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        let r_ty = self.infer_expr(env, rhs)?;
+        if let Some(info) = env.get(op) {
+            let scheme = info.scheme.clone();
+            if !scheme.constraints.is_empty() {
+                let ret_ty = self.infer_constrained_apply(
+                    env,
+                    &scheme,
+                    vec![l_ty, r_ty],
+                    dict_args,
+                    pending_dict_args,
+                )?;
+                *resolved_op = Some(ResolvedCallee::Function(op.to_string()));
+                return Ok(ret_ty);
+            }
+        }
+        let fn_ty = env
+            .get(op)
+            .map(|info| self.instantiate(&info.scheme))
+            .ok_or_else(|| TypeError::UnboundVariable(op.to_string()))?;
+        let ret_var = self.fresh_var();
+        let expected = Ty::Func(
+            value_func_params(vec![l_ty, r_ty]),
+            value_func_return(Ty::Var(ret_var)),
+        );
+        unify(&mut self.subst, fn_ty, expected)?;
+        Ok(self.subst.apply(&Ty::Var(ret_var)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_call_expr(
+        &mut self,
+        env: &TypeEnv,
+        expr_id: NodeId,
+        expr_span: SourceSpan,
+        callee: &mut Box<Expr>,
+        args: &mut [Expr],
+        is_method_call: &mut bool,
+        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
+        resolved_callee: &mut Option<ResolvedCallee>,
+        pending_trait_method: &mut Option<(PendingDictArg, String)>,
+        dict_args: &mut Vec<DictRef>,
+        pending_dict_args: &mut Vec<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        if let ExprKind::AssociatedAccess {
+            target,
+            target_span,
+            member,
+            member_span,
+        } = &callee.kind
+        {
+            if let Type::Ident(trait_name) = target
+                && let Some(trait_def) = self.trait_env.get(trait_name).cloned()
+            {
+                let method = trait_def
+                    .methods
+                    .iter()
+                    .find(|method| method.name == *member)
+                    .ok_or_else(|| {
+                        TypeError::UnknownTraitMethod {
+                            trait_name: trait_name.clone(),
+                            method: member.clone(),
+                        }
+                        .at(*member_span)
+                    })?
+                    .clone();
+
+                return self.resolve_trait_method_call(
+                    env,
+                    args,
+                    arg_wrappers,
+                    resolved_callee,
+                    pending_trait_method,
+                    trait_def,
+                    method,
+                    "trait method call",
+                );
+            }
+
+            return self.resolve_associated_call(
+                env,
+                expr_id,
+                callee.id,
+                target,
+                *target_span,
+                member,
+                *member_span,
+                args,
+                arg_wrappers,
+                resolved_callee,
+                dict_args,
+                pending_dict_args,
+            );
+        }
+
+        if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind {
+            return self.resolve_receiver_call(
+                env,
+                expr_id,
+                callee.id,
+                expr,
+                field,
+                args,
+                is_method_call,
+                arg_wrappers,
+                resolved_callee,
+                dict_args,
+                pending_dict_args,
+                None,
+            );
+        }
+
+        if let ExprKind::Ident(method_name) = &callee.kind
+            && env.get(method_name.as_str()).is_none()
+            && let Some(resolved) = self.bare_trait_method(method_name)?
+        {
+            return self.resolve_trait_method_call(
+                env,
+                args,
+                arg_wrappers,
+                resolved_callee,
+                pending_trait_method,
+                resolved.trait_def,
+                resolved.method,
+                "bare trait method call",
+            );
+        }
+
+        if let ExprKind::Ident(callee_name) = &callee.kind
+            && let Some(info) = env.get(callee_name.as_str())
+        {
+            let scheme = info.scheme.clone();
+            if !scheme.constraints.is_empty() {
+                if callee.id != NO_NODE_ID {
+                    let instantiated = self.instantiate_value(&scheme);
+                    self.metadata
+                        .record_symbol_type(callee.id, instantiated, &self.subst);
+                }
+                let applied = self.apply_scheme_callable(
+                    env,
+                    args,
+                    arg_wrappers,
+                    &scheme,
+                    Vec::new(),
+                    0,
+                    dict_args,
+                    pending_dict_args,
+                )?;
+                return Ok(applied.ret_ty);
+            }
+        }
+
+        let mut callee_ty = self.infer_expr(env, callee)?;
+        callee_ty = self.subst.apply(&callee_ty);
+        let callee_constraints = if let Ty::Qualified(constraints, inner) = callee_ty {
+            callee_ty = *inner;
+            constraints
+        } else {
+            Vec::new()
+        };
+        let param_capabilities = match &callee_ty {
+            Ty::Func(params, _) => func_param_capabilities(params),
+            _ => self.callable_capabilities_for(callee.id),
+        };
+        let applied = self.apply_callable_type(
+            env,
+            args,
+            arg_wrappers,
+            callee_ty,
+            callee_constraints,
+            Vec::new(),
+            param_capabilities,
+            0,
+            expr_span,
+            dict_args,
+            pending_dict_args,
+        )?;
+        if applied.fresh_return && expr_id != NO_NODE_ID {
+            self.metadata.mark_fresh_place(expr_id);
+        }
+        Ok(applied.ret_ty)
+    }
+
+    fn infer_record_expr(
+        &mut self,
+        env: &TypeEnv,
+        entries: &mut [RecordEntry],
+        span: SourceSpan,
+    ) -> Result<Ty, SpannedTypeError> {
+        let mut field_tys: Vec<(String, Ty)> = Vec::new();
+        let mut tail = Ty::Unit;
+        for entry in entries {
+            match entry {
+                RecordEntry::Field(name, expr) => {
+                    let ty = self.infer_expr(env, expr)?;
+                    merge_record_field(&mut field_tys, name.clone(), ty);
+                }
+                RecordEntry::Spread(expr) => {
+                    let spread_ty = self.infer_expr(env, expr)?;
+                    let tail_var = self.subst.fresh_var();
+                    unify(
+                        &mut self.subst,
+                        spread_ty.clone(),
+                        Ty::Record(Row {
+                            fields: vec![],
+                            tail: Box::new(tail_var),
+                        }),
+                    )?;
+                    let resolved_spread = self.subst.apply(&spread_ty);
+                    let Ty::Record(row) = resolved_spread else {
+                        return Err(TypeError::Mismatch(
+                            Ty::Record(Row {
+                                fields: vec![],
+                                tail: Box::new(self.subst.fresh_var()),
+                            }),
+                            resolved_spread,
+                        )
+                        .at(span));
+                    };
+                    for (name, ty) in row.fields {
+                        merge_record_field(&mut field_tys, name, ty);
+                    }
+                    tail = merge_record_spread_tail(&mut self.subst, tail, *row.tail)
+                        .map_err(|err| err.at(span))?;
+                }
+            }
+        }
+        field_tys.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(Ty::Record(Row {
+            fields: field_tys,
+            tail: Box::new(tail),
+        }))
+    }
+
+    fn infer_for_expr(
+        &mut self,
+        env: &TypeEnv,
+        pat: &mut Pattern,
+        iterable: &mut Expr,
+        body: &mut Expr,
+        resolved_iter: &mut Option<ResolvedCallee>,
+        pending_iter: &mut Option<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        let iter_ty = self.infer_expr(env, iterable)?;
+
+        let iterable_trait = self
+            .trait_env
+            .get("Iterable")
+            .ok_or_else(|| TypeError::UnknownTrait("Iterable".to_string()))?
+            .clone();
+        let iter_method = iterable_trait
+            .methods
+            .iter()
+            .find(|m| m.name == "iter")
+            .ok_or_else(|| TypeError::UnknownTraitMethod {
+                trait_name: "Iterable".to_string(),
+                method: "iter".to_string(),
+            })?
+            .clone();
+
+        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
+        let target_var = self.fresh_var();
+        param_vars.insert(iterable_trait.param.clone(), target_var);
+
+        let self_ty = self.ast_to_ty_with_vars(&iter_method.params[0].1, &mut param_vars)?;
+        let ret_ty = self.ast_to_ty_with_vars(&iter_method.ret_type, &mut param_vars)?;
+
+        unify(&mut self.subst, iter_ty, self_ty)?;
+
+        let resolved_target = self.subst.apply(&Ty::Var(target_var));
+        self.resolve_iterable_dict(env, resolved_iter, pending_iter, resolved_target)?;
+
+        let elem_ty = match self.subst.apply(&ret_ty) {
+            Ty::App(_, args) if args.len() == 1 => args.into_iter().next().unwrap(), // len == 1 from pattern guard
+            other => other,
+        };
+
+        let mut body_env = env.clone();
+        let elem_ty_applied = self.subst.apply(&elem_ty);
+        self.check_pattern(pat, elem_ty_applied, &mut body_env, false)?;
+
+        self.loop_break_tys.push(Ty::Unit);
+        self.infer_expr(&body_env, body)?;
+        self.loop_break_tys.pop();
+
+        Ok(Ty::Unit)
+    }
+
+    fn resolve_iterable_dict(
+        &mut self,
+        env: &TypeEnv,
+        resolved_iter: &mut Option<ResolvedCallee>,
+        pending_iter: &mut Option<PendingDictArg>,
+        resolved_target: Ty,
+    ) -> Result<(), SpannedTypeError> {
+        let target_keys = trait_impl_target_keys_from_ty(&resolved_target);
+        if target_keys.is_empty() {
+            return match resolved_target {
+                Ty::Var(v) => {
+                    self.pending_constraints.push(TraitConstraint {
+                        var: v,
+                        trait_name: "Iterable".to_string(),
+                    });
+                    *pending_iter = Some(PendingDictArg {
+                        var: v,
+                        trait_name: "Iterable".to_string(),
+                    });
+                    Ok(())
+                }
+                _ => Err(TypeError::UnresolvedTrait {
+                    context: "for loop".to_string(),
+                    trait_name: "Iterable".to_string(),
+                }
+                .into()),
+            };
+        }
+
+        let dict_name = target_keys
+            .into_iter()
+            .map(|key| trait_impl_dict_name("Iterable", &key))
+            .find(|dict_name| {
+                env.get(dict_name).is_some() || self.known_impl_dicts.contains(dict_name)
+            });
+        match dict_name {
+            Some(dict_name) => {
+                *resolved_iter = Some(ResolvedCallee::DictMethod {
+                    dict: DictRef::Concrete(dict_name),
+                    method: "iter".to_string(),
+                });
+                Ok(())
+            }
+            None => Err(TypeError::MissingTraitImpl {
+                trait_name: "Iterable".to_string(),
+                impl_target: format!("{}", resolved_target),
+            }
+            .into()),
+        }
     }
 
     fn infer_array_entries(
@@ -1936,14 +2104,21 @@ impl Infer {
             Some((_, expected_ret)) => ((*expected_ret.ty).clone(), expected_ret.capability),
             None => (self.subst.fresh_var(), ReturnCapability::Value),
         };
-        self.fn_return_tys.push(ret_ty.clone());
+        let fn_ret = FuncReturn {
+            ty: Box::new(ret_ty.clone()),
+            capability: ret_capability,
+        };
+        self.fn_return_tys.push(fn_ret.clone());
         let body_ty = if expected_func.is_some() {
             self.infer_expr_expected(&body_env, body, ret_ty.clone())?
         } else {
             self.infer_expr(&body_env, body)?
         };
         self.fn_return_tys.pop();
-        unify_expr_result(&mut self.subst, body_ty, ret_ty.clone())?;
+        unify_expr_result(&mut self.subst, body_ty.clone(), ret_ty.clone())?;
+        if !matches!(self.subst.apply(&body_ty), Ty::Never) {
+            self.check_fresh_return_expr(body, &fn_ret)?;
+        }
 
         let fn_ty = Ty::Func(
             func_params_from_params(params, param_tys),
@@ -2886,6 +3061,44 @@ mod tests {
             }
             other => panic!("expected concrete checked dict method, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_qualified_trait_method_dot_syntax_is_not_trait_dispatch() {
+        let err = infer_source_error(
+            "trait Show 'a {
+               fn show(x: 'a) -> string
+             }
+
+             impl Show for float {
+               fn show(x) { \"ok\" }
+             }
+
+             Show.show(1.0)\n",
+        );
+
+        assert!(matches!(err.error, TypeError::UnboundVariable(ref name) if name == "Show"));
+    }
+
+    #[test]
+    fn qualified_trait_method_colon_colon_syntax_dispatches_trait_method() {
+        let mut program = parse_source(
+            "trait Show 'a {
+               fn show(x: 'a) -> string
+             }
+
+             impl Show for float {
+               fn show(x) { \"ok\" }
+             }
+
+             Show::show(1.0)\n",
+        )
+        .expect("source should parse");
+        reassociate_standalone(&mut program);
+
+        Infer::new()
+            .infer_program(&mut program)
+            .expect("qualified trait method should infer");
     }
 
     fn infer_source_error(source: &str) -> SpannedTypeError {

@@ -127,6 +127,112 @@ impl Stmt {
     }
 }
 
+/// Visits every expression in a program, including expressions inside nested
+/// blocks, functions, operators, and impl methods.
+pub fn walk_program_exprs(program: &Program, visit: &mut impl FnMut(&Expr)) {
+    for stmt in &program.stmts {
+        walk_stmt_exprs(stmt, visit);
+    }
+}
+
+/// Visits every expression owned by a statement.
+pub fn walk_stmt_exprs(stmt: &Stmt, visit: &mut impl FnMut(&Expr)) {
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Expr(value) => walk_expr(value, visit),
+        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => walk_expr(body, visit),
+        Stmt::Impl(id) => {
+            for method in &id.methods {
+                walk_expr(&method.body, visit);
+            }
+        }
+        Stmt::InherentImpl(id) => {
+            for method in &id.methods {
+                walk_expr(&method.body, visit);
+            }
+        }
+        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
+    }
+}
+
+/// Pre-order expression traversal.
+pub fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+    visit(expr);
+    match &expr.kind {
+        ExprKind::Not(inner)
+        | ExprKind::Loop(inner)
+        | ExprKind::Break(Some(inner))
+        | ExprKind::Return(Some(inner))
+        | ExprKind::FieldAccess { expr: inner, .. }
+        | ExprKind::Lambda { body: inner, .. } => walk_expr(inner, visit),
+        ExprKind::Assign { target, value } => {
+            walk_expr(target, visit);
+            walk_expr(value, visit);
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            walk_expr(lhs, visit);
+            walk_expr(rhs, visit);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            walk_expr(callee, visit);
+            for arg in args {
+                walk_expr(arg, visit);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            walk_expr(cond, visit);
+            walk_expr(then_branch, visit);
+            walk_expr(else_branch, visit);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            walk_expr(scrutinee, visit);
+            for (_, body) in arms {
+                walk_expr(body, visit);
+            }
+        }
+        ExprKind::Block { stmts, final_expr } => {
+            for stmt in stmts {
+                walk_stmt_exprs(stmt, visit);
+            }
+            if let Some(expr) = final_expr {
+                walk_expr(expr, visit);
+            }
+        }
+        ExprKind::Tuple(items) => {
+            for item in items {
+                walk_expr(item, visit);
+            }
+        }
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                walk_expr(entry.expr(), visit);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                walk_expr(entry.expr(), visit);
+            }
+        }
+        ExprKind::For { iterable, body, .. } => {
+            walk_expr(iterable, visit);
+            walk_expr(body, visit);
+        }
+        ExprKind::Break(None)
+        | ExprKind::Return(None)
+        | ExprKind::Continue
+        | ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::AssociatedAccess { .. }
+        | ExprKind::Import(_)
+        | ExprKind::Unit => {}
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TypeBound {
     pub var: String,

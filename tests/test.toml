@@ -165,6 +165,13 @@ output = """
 2
 """
 
+[tests.mut_param_fresh_call_result]
+path = "tests/hern/mut_param_fresh_call_result.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
 [tests.mut_param_immutable_arg]
 path = "tests/hern/mut_param_immutable_arg.hern"
 expect = "error"
@@ -179,6 +186,11 @@ error_contains = "must be a mutable place"
 path = "tests/hern/mut_param_call_result_arg.hern"
 expect = "error"
 error_contains = "must be a mutable place"
+
+[tests.mut_return_alias_rejected]
+path = "tests/hern/mut_return_alias_rejected.hern"
+expect = "error"
+error_contains = "return value must be a fresh mutable place"
 
 [tests.mut_param_higher_order_erasure]
 path = "tests/hern/mut_param_higher_order_erasure.hern"
@@ -224,6 +236,20 @@ expect = "typecheck"
 output = """
 1
 2
+"""
+
+[tests.mut_direct_fresh_constructor_receiver]
+path = "tests/hern/mut_direct_fresh_constructor_receiver.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
+[tests.mut_nested_fresh_constructor_place]
+path = "tests/hern/mut_nested_fresh_constructor_place.hern"
+expect = "typecheck"
+output = """
+1
 """
 
 [tests.mut_map_immutable_set]
@@ -675,6 +701,35 @@ b
 4
 """
 
+[tests.aoc_prelude_helpers]
+path = "tests/hern/aoc_prelude_helpers.hern"
+expect = "typecheck"
+output = """
+19
+3.75
+[[1, 3], [2, 1], [3, 2], [4, 2]]
+[[3, "a"], [1, "b"]]
+[3, 1]
+[2, 2]
+[1, 2]
+2
+1
+12
+[1, 2, 3]
+[3, 2, 1]
+Some(1)
+Some(3)
+1
+0
+2
+0
+1
+2
+Some(10)
+Some(20)
+None
+"""
+
 [tests.module_import]
 path = "tests/hern/module_import.hern"
 fixtures = ["tests/hern/module_math.hern"]
@@ -943,6 +998,23 @@ abc
 3
 rest
 42
+"""
+
+[tests.std_grid]
+path = "tests/hern/std_grid.hern"
+expect = "typecheck"
+output = """
+2
+3
+1
+0
+Some("S")
+None
+[[1, 1], [1, 2], [1, 3], [2, 1], [2, 2], [2, 3]]
+[[2, 1], [1, 2]]
+[[1, 2], [2, 1], [2, 2]]
+Some([2, 2])
+None
 """
 
 [tests.lua_std_tests]

@@ -1,5 +1,7 @@
 use crate::analysis::{CompilerDiagnostic, DiagnosticSource, analyze_prelude};
-use crate::ast::{Expr, ExprKind, NodeId, Param, Pattern, Program, SourceSpan, Stmt, TraitDef};
+use crate::ast::{
+    Expr, ExprKind, NodeId, Param, Pattern, Program, SourceSpan, Stmt, TraitDef, walk_program_exprs,
+};
 use crate::pipeline::{
     AnalysisOutput, parse_source, parse_source_recovering, reassociate_with_program,
 };
@@ -36,13 +38,18 @@ pub struct GraphInference {
     pub envs: HashMap<String, TypeEnv>,
     pub variant_envs: HashMap<String, VariantEnv>,
     pub module_envs: HashMap<String, ModuleEnv>,
-    pub expr_types: HashMap<String, HashMap<NodeId, Ty>>,
-    pub symbol_types: HashMap<String, HashMap<NodeId, Ty>>,
-    pub binding_types: HashMap<String, HashMap<SourceSpan, Ty>>,
-    pub definition_schemes: HashMap<String, HashMap<SourceSpan, Scheme>>,
-    pub binding_capabilities: HashMap<String, HashMap<SourceSpan, BindingCapabilities>>,
-    pub callable_capabilities: HashMap<String, HashMap<NodeId, CallableCapabilities>>,
-    pub fresh_place_exprs: HashMap<String, HashSet<NodeId>>,
+    pub module_metadata: HashMap<String, ModuleInferenceMetadata>,
+}
+
+#[derive(Clone, Default)]
+pub struct ModuleInferenceMetadata {
+    pub expr_types: HashMap<NodeId, Ty>,
+    pub symbol_types: HashMap<NodeId, Ty>,
+    pub binding_types: HashMap<SourceSpan, Ty>,
+    pub definition_schemes: HashMap<SourceSpan, Scheme>,
+    pub binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
+    pub callable_capabilities: HashMap<NodeId, CallableCapabilities>,
+    pub fresh_place_exprs: HashSet<NodeId>,
 }
 
 #[derive(Clone)]
@@ -89,6 +96,12 @@ struct EnvInherentImpl {
 struct ImplKey {
     trait_name: String,
     target: String,
+}
+
+struct InferScope {
+    traits: HashMap<String, TraitDef>,
+    ops: HashMap<String, String>,
+    inherent_methods: HashMap<String, HashMap<String, InherentMethodScheme>>,
 }
 
 impl ModuleGraph {
@@ -486,41 +499,52 @@ fn std_root() -> Result<PathBuf, CompilerDiagnostic> {
 }
 
 impl GraphInference {
+    pub fn metadata_for_module(&self, name: &str) -> Option<&ModuleInferenceMetadata> {
+        self.module_metadata.get(name)
+    }
+
     pub fn expr_types_for_module(&self, name: &str) -> Option<&HashMap<NodeId, Ty>> {
-        self.expr_types.get(name)
+        self.metadata_for_module(name)
+            .map(|metadata| &metadata.expr_types)
     }
 
     pub fn symbol_types_for_module(&self, name: &str) -> Option<&HashMap<NodeId, Ty>> {
-        self.symbol_types.get(name)
+        self.metadata_for_module(name)
+            .map(|metadata| &metadata.symbol_types)
     }
 
     pub fn binding_types_for_module(&self, name: &str) -> Option<&HashMap<SourceSpan, Ty>> {
-        self.binding_types.get(name)
+        self.metadata_for_module(name)
+            .map(|metadata| &metadata.binding_types)
     }
 
     pub fn definition_schemes_for_module(
         &self,
         name: &str,
     ) -> Option<&HashMap<SourceSpan, Scheme>> {
-        self.definition_schemes.get(name)
+        self.metadata_for_module(name)
+            .map(|metadata| &metadata.definition_schemes)
     }
 
     pub fn binding_capabilities_for_module(
         &self,
         name: &str,
     ) -> Option<&HashMap<SourceSpan, BindingCapabilities>> {
-        self.binding_capabilities.get(name)
+        self.metadata_for_module(name)
+            .map(|metadata| &metadata.binding_capabilities)
     }
 
     pub fn callable_capabilities_for_module(
         &self,
         name: &str,
     ) -> Option<&HashMap<NodeId, CallableCapabilities>> {
-        self.callable_capabilities.get(name)
+        self.metadata_for_module(name)
+            .map(|metadata| &metadata.callable_capabilities)
     }
 
     pub fn fresh_place_exprs_for_module(&self, name: &str) -> Option<&HashSet<NodeId>> {
-        self.fresh_place_exprs.get(name)
+        self.metadata_for_module(name)
+            .map(|metadata| &metadata.fresh_place_exprs)
     }
 
     pub fn env_for_module(&self, name: &str) -> Option<&TypeEnv> {
@@ -665,9 +689,9 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
                     continue;
                 }
             };
-        let (traits, ops, inherent_methods) = module_env.to_infer_scope();
-        infer.set_trait_scope(traits, ops);
-        infer.set_inherent_scope(inherent_methods);
+        let infer_scope = module_env.to_infer_scope();
+        infer.set_trait_scope(infer_scope.traits, infer_scope.ops);
+        infer.set_inherent_scope(infer_scope.inherent_methods);
         infer.set_known_impl_dicts(module_env.all_dict_names());
         infer.set_known_impl_schemes(module_env.all_trait_impl_schemes());
         infer.set_import_types(result.import_types.clone());
@@ -711,25 +735,18 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
             .variant_envs
             .insert(name.clone(), inference.variant_env);
         result.module_envs.insert(name.clone(), module_env);
-        result.expr_types.insert(name.clone(), inference.expr_types);
-        result
-            .symbol_types
-            .insert(name.clone(), inference.symbol_types);
-        result
-            .binding_types
-            .insert(name.clone(), inference.binding_types);
-        result
-            .definition_schemes
-            .insert(name.clone(), inference.definition_schemes);
-        result
-            .binding_capabilities
-            .insert(name.clone(), inference.binding_capabilities);
-        result
-            .callable_capabilities
-            .insert(name.clone(), inference.callable_capabilities);
-        result
-            .fresh_place_exprs
-            .insert(name.clone(), inference.fresh_place_exprs);
+        result.module_metadata.insert(
+            name.clone(),
+            ModuleInferenceMetadata {
+                expr_types: inference.expr_types,
+                symbol_types: inference.symbol_types,
+                binding_types: inference.binding_types,
+                definition_schemes: inference.definition_schemes,
+                binding_capabilities: inference.binding_capabilities,
+                callable_capabilities: inference.callable_capabilities,
+                fresh_place_exprs: inference.fresh_place_exprs,
+            },
+        );
 
         if has_errors {
             diagnostics.extend(
@@ -786,22 +803,18 @@ fn export_schemes_from_program(program: &Program, env: &TypeEnv) -> HashMap<Stri
 
 pub fn collect_imports_in_program(program: &Program) -> Vec<String> {
     let mut imports = Vec::new();
-    for stmt in &program.stmts {
-        collect_imports_in_stmt(stmt, &mut imports);
-    }
+    walk_program_exprs(program, &mut |expr| {
+        if let ExprKind::Import(name) = &expr.kind {
+            imports.push(name.clone());
+        }
+    });
     imports.sort();
     imports.dedup();
     imports
 }
 
 impl ModuleEnv {
-    fn to_infer_scope(
-        &self,
-    ) -> (
-        HashMap<String, TraitDef>,
-        HashMap<String, String>,
-        HashMap<String, HashMap<String, InherentMethodScheme>>,
-    ) {
+    fn to_infer_scope(&self) -> InferScope {
         let traits = self
             .traits
             .iter()
@@ -817,7 +830,11 @@ impl ModuleEnv {
             .iter()
             .map(|(target_name, entry)| (target_name.clone(), entry.methods.clone()))
             .collect();
-        (traits, ops, inherent)
+        InferScope {
+            traits,
+            ops,
+            inherent_methods: inherent,
+        }
     }
 
     /// Return all in-scope trait implementation dictionary names.
@@ -1283,102 +1300,6 @@ fn resolve_imports_in_expr_recovering(
                 diagnostics,
             );
             resolve_imports_in_expr_recovering(body, base_dir, graph, source, diagnostics);
-        }
-        ExprKind::Break(None)
-        | ExprKind::Return(None)
-        | ExprKind::Continue
-        | ExprKind::Number(_)
-        | ExprKind::StringLit(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Ident(_)
-        | ExprKind::Unit => {}
-    }
-}
-
-fn collect_imports_in_stmt(stmt: &Stmt, imports: &mut Vec<String>) {
-    match stmt {
-        Stmt::Let { value, .. } | Stmt::Expr(value) => collect_imports_in_expr(value, imports),
-        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => collect_imports_in_expr(body, imports),
-        Stmt::Impl(id) => {
-            for method in &id.methods {
-                collect_imports_in_expr(&method.body, imports);
-            }
-        }
-        Stmt::InherentImpl(id) => {
-            for method in &id.methods {
-                collect_imports_in_expr(&method.body, imports);
-            }
-        }
-        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
-    }
-}
-
-fn collect_imports_in_expr(expr: &Expr, imports: &mut Vec<String>) {
-    match &expr.kind {
-        ExprKind::Import(name) => imports.push(name.clone()),
-        ExprKind::Not(e)
-        | ExprKind::Loop(e)
-        | ExprKind::Break(Some(e))
-        | ExprKind::Return(Some(e))
-        | ExprKind::FieldAccess { expr: e, .. } => collect_imports_in_expr(e, imports),
-        ExprKind::AssociatedAccess { .. } => {}
-        ExprKind::Assign { target, value }
-        | ExprKind::Binary {
-            lhs: target,
-            rhs: value,
-            ..
-        } => {
-            collect_imports_in_expr(target, imports);
-            collect_imports_in_expr(value, imports);
-        }
-        ExprKind::Call { callee, args, .. } => {
-            collect_imports_in_expr(callee, imports);
-            for arg in args {
-                collect_imports_in_expr(arg, imports);
-            }
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            collect_imports_in_expr(cond, imports);
-            collect_imports_in_expr(then_branch, imports);
-            collect_imports_in_expr(else_branch, imports);
-        }
-        ExprKind::Match { scrutinee, arms } => {
-            collect_imports_in_expr(scrutinee, imports);
-            for (_, body) in arms {
-                collect_imports_in_expr(body, imports);
-            }
-        }
-        ExprKind::Block { stmts, final_expr } => {
-            for stmt in stmts {
-                collect_imports_in_stmt(stmt, imports);
-            }
-            if let Some(expr) = final_expr {
-                collect_imports_in_expr(expr, imports);
-            }
-        }
-        ExprKind::Tuple(items) => {
-            for item in items {
-                collect_imports_in_expr(item, imports);
-            }
-        }
-        ExprKind::Array(entries) => {
-            for entry in entries {
-                collect_imports_in_expr(entry.expr(), imports);
-            }
-        }
-        ExprKind::Record(entries) => {
-            for entry in entries {
-                collect_imports_in_expr(entry.expr(), imports);
-            }
-        }
-        ExprKind::Lambda { body, .. } => collect_imports_in_expr(body, imports),
-        ExprKind::For { iterable, body, .. } => {
-            collect_imports_in_expr(iterable, imports);
-            collect_imports_in_expr(body, imports);
         }
         ExprKind::Break(None)
         | ExprKind::Return(None)

@@ -874,8 +874,9 @@ impl Infer {
         param_capabilities: &[ParamCapability],
         param_offset: usize,
     ) -> Result<Vec<Ty>, SpannedTypeError> {
+        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
         self.check_mutable_place_args_from(env, args, param_capabilities, param_offset)?;
-        self.infer_args(env, args, arg_wrappers)
+        Ok(arg_tys)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -13,8 +13,8 @@ let a = Some(21.0);
 let b = None;
 
 // map through the impl dict
-let mapped_a = Functor.map(a, double);
-let mapped_b = Functor.map(b, double);
+let mapped_a = Functor::map(a, double);
+let mapped_b = Functor::map(b, double);
 
 print(unwrap_or(mapped_a, 0.0));
 print(unwrap_or(mapped_b, 0.0));

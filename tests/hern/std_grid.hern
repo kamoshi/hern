@@ -1,0 +1,18 @@
+let grid = import "hern:grid";
+
+let g = grid.new([
+  ["S", ".", "#"],
+  [".", "E", "."],
+]);
+
+print(g.height());
+print(g.width());
+print(g.in_bounds((2, 3)));
+print(g.in_bounds((3, 1)));
+print(json(g.get((1, 1))));
+print(json(g.get((9, 9))));
+print(json(g.positions()));
+print(json(g.neighbors4((1, 1))));
+print(json(g.neighbors8((1, 1))));
+print(json(g.find("E")));
+print(json(g.find("X")));

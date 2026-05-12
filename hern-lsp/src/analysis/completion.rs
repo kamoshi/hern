@@ -8,7 +8,7 @@ use super::workspace::{
     load_workspace_graphs,
 };
 use hern_core::ast::{
-    Expr, ExprKind, NodeId, Program, RecordEntry, SourcePosition, SourceSpan, TraitDef,
+    Expr, ExprKind, NodeId, Program, RecordEntry, SourcePosition, SourceSpan, Stmt, TraitDef,
 };
 use hern_core::module::{
     GraphInference, ModuleGraph, infer_graph_collecting, normalize_overlay_path,
@@ -186,7 +186,7 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
         .collect();
 
     // Add trait names from the module environment. Traits are used in value position
-    // as `TraitName.method(...)`, so they belong in the default completion list.
+    // as `TraitName::method(...)`, so they belong in the default completion list.
     if let Some(module_env) = inference.module_env_for_module(module_name) {
         let trait_items = {
             let existing: std::collections::HashSet<&str> =
@@ -567,15 +567,6 @@ fn member_completion(
         }
     }
 
-    // Trait method completions: `TraitName.` triggers suggestions of the trait's methods.
-    if let Some(receiver) = context.receiver.as_deref()
-        && let Some(module_env) = inference.module_env_for_module(current_module)
-        && let Some(trait_def) = module_env.trait_def(receiver)
-    {
-        let items = trait_method_completion_items(trait_def, replacement_range);
-        return (!items.is_empty()).then_some(items);
-    }
-
     Some(Vec::new())
 }
 
@@ -591,6 +582,9 @@ fn associated_completion(
     let replacement_range = context.replacement_range;
     let mut items = Vec::new();
     if let Some(module_env) = inference.module_env_for_module(current_module) {
+        if let Some(trait_def) = module_env.trait_def(target) {
+            items.extend(trait_method_completion_items(trait_def, replacement_range));
+        }
         for (method_target, methods) in module_env.all_inherent_methods() {
             if method_target == target {
                 items.extend(associated_method_completion_items(
@@ -608,11 +602,23 @@ fn associated_completion(
             replacement_range,
         ));
     }
+    if items.is_empty()
+        && let Some(trait_def) = prelude_trait_def(&state.prelude.program, target)
+    {
+        items.extend(trait_method_completion_items(trait_def, replacement_range));
+    }
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items.dedup_by(|a, b| a.label == b.label);
     // A recognized `Type::` context suppresses general scope completion even when
     // the type has no associated functions; the user explicitly requested members.
     Some(items)
+}
+
+fn prelude_trait_def<'a>(program: &'a Program, name: &str) -> Option<&'a TraitDef> {
+    program.stmts.iter().find_map(|stmt| match stmt {
+        Stmt::Trait(trait_def) if trait_def.name == name => Some(trait_def),
+        _ => None,
+    })
 }
 
 fn associated_method_completion_items(

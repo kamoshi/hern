@@ -129,11 +129,15 @@ impl Infer {
                     .map_err(|err| err.at(impl_method.body.span))?;
             }
 
-            self.fn_return_tys.push(ret_ty.clone());
+            let fn_ret = value_func_return(ret_ty.clone());
+            self.fn_return_tys.push(fn_ret.clone());
             let body_ty = self.infer_expr(&body_env, &mut impl_method.body)?;
             self.fn_return_tys.pop();
-            unify_expr_result(&mut self.subst, body_ty, ret_ty.clone())
+            unify_expr_result(&mut self.subst, body_ty.clone(), ret_ty.clone())
                 .map_err(|err| err.at(impl_method.body.span))?;
+            if !matches!(self.subst.apply(&body_ty), Ty::Never) {
+                self.check_fresh_return_expr(&impl_method.body, &fn_ret)?;
+            }
 
             let method_ty = Ty::Func(value_func_params(param_tys), value_func_return(ret_ty));
             self.metadata
@@ -231,18 +235,22 @@ impl Infer {
                 Some(t) => self.ast_to_ty_with_vars(&t.ty, &mut param_vars)?,
                 None => self.subst.fresh_var(),
             };
+            let fn_ret = func_return_from_annotation(&method.ret_type, ret_ty.clone());
             let fn_ty = Ty::Func(
                 func_params_from_params(&method.params, param_tys.clone()),
-                func_return_from_annotation(&method.ret_type, ret_ty.clone()),
+                fn_ret.clone(),
             );
 
             let saved_pending = std::mem::take(&mut self.pending_constraints);
             self.pending_constraints.extend(initial_constraints);
-            self.fn_return_tys.push(ret_ty.clone());
+            self.fn_return_tys.push(fn_ret.clone());
             let body_ty = self.infer_expr(&body_env, &mut method.body)?;
             self.fn_return_tys.pop();
-            unify_expr_result(&mut self.subst, body_ty, ret_ty)
+            unify_expr_result(&mut self.subst, body_ty.clone(), ret_ty)
                 .map_err(|err| err.at(method.body.span))?;
+            if !matches!(self.subst.apply(&body_ty), Ty::Never) {
+                self.check_fresh_return_expr(&method.body, &fn_ret)?;
+            }
 
             let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
             let finalized = self.finalize_constraints(env, fn_ty.clone(), fn_constraints);

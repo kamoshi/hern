@@ -1,10 +1,11 @@
-use super::state::{ServerState, cached_analysis};
-use super::uri::uri_to_path;
-use super::workspace::{document_source, load_workspace_graphs};
+use super::snapshot::{SnapshotMode, analysis_snapshot};
+use super::state::ServerState;
+use super::uri::{source_span_to_range, uri_to_path};
+use super::workspace::document_source;
 use hern_core::analysis::{PreludeAnalysis, analyze_prelude_source, hover_at};
 use hern_core::ast::{
     BinOp, Expr, ExprKind, Fixity, ImplMethod, InherentMethod, Param, Pattern, Program,
-    SourcePosition, SourceSpan, Stmt, TraitDef, TraitMethod,
+    SourcePosition, SourceSpan, Stmt, TraitDef, TraitMethod, walk_program_exprs,
 };
 use hern_core::module::{GraphInference, ModuleEnv, ModuleGraph};
 use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
@@ -23,14 +24,10 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
     if is_std_prelude_path(&path) {
         return prelude_hover(state, &uri, position);
     }
-    let fallback;
-    let (graph, inference) = if let Some(analysis) = cached_analysis(state, &uri) {
-        (&analysis.graph, &analysis.inference)
-    } else {
-        fallback = load_workspace_graphs(state, &uri)?;
-        (&fallback.graph, &fallback.inference)
-    };
-    let (module_name, program) = graph.module_for_path(&path)?;
+    let snapshot = analysis_snapshot(state, &uri, SnapshotMode::RequireTyped)?;
+    let graph = snapshot.graph();
+    let inference = snapshot.inference()?;
+    let (module_name, program) = snapshot.module()?;
     let expr_types = inference.expr_types_for_module(module_name)?;
     let symbol_types = inference.symbol_types_for_module(module_name)?;
     let binding_capabilities = inference.binding_capabilities_for_module(module_name);
@@ -46,7 +43,7 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
     if let Some(contents) = operator_hover(graph, inference, module_name, program, position) {
         return Some(type_hover(contents, markdown));
     }
-    // Hover for `TraitName.method(...)` call sites: the trait name and the method field.
+    // Hover for `TraitName::method(...)` call sites: the trait name and the method field.
     if let Some(contents) = trait_access_hover(
         program,
         inference.module_env_for_module(module_name),
@@ -63,11 +60,16 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
         .is_some()
     {
         let scheme = Scheme::mono(info.ty.clone());
-        return Some(type_hover(hover_scheme_to_string(&scheme), markdown));
+        return Some(type_hover_with_span(
+            hover_scheme_to_string(&scheme),
+            markdown,
+            info.span,
+        ));
     }
-    Some(type_hover(
+    Some(type_hover_with_span(
         ty_to_display_string_with_place_mutability(&info.ty, place_mutable),
         markdown,
+        info.span,
     ))
 }
 
@@ -110,7 +112,7 @@ fn prelude_hover_from_analysis(
             &prelude.program,
             Some(&prelude.inference.env),
             Some(&prelude.inference.definition_schemes),
-            operator.name,
+            &operator.name,
         )
     {
         return Some(type_hover(contents, markdown));
@@ -133,11 +135,16 @@ fn prelude_hover_from_analysis(
         .is_some()
     {
         let scheme = Scheme::mono(info.ty.clone());
-        return Some(type_hover(hover_scheme_to_string(&scheme), markdown));
+        return Some(type_hover_with_span(
+            hover_scheme_to_string(&scheme),
+            markdown,
+            info.span,
+        ));
     }
-    Some(type_hover(
+    Some(type_hover_with_span(
         ty_to_display_string_with_place_mutability(&info.ty, place_mutable),
         markdown,
+        info.span,
     ))
 }
 
@@ -155,6 +162,14 @@ fn is_std_prelude_path(path: &Path) -> bool {
 /// wrapped in a fenced `hern` code block so editors can syntax-highlight it.
 /// When false, a plain-text response is returned for compatibility with older clients.
 fn type_hover(ty: String, markdown: bool) -> Hover {
+    type_hover_inner(ty, markdown, None)
+}
+
+fn type_hover_with_span(ty: String, markdown: bool, span: SourceSpan) -> Hover {
+    type_hover_inner(ty, markdown, Some(span))
+}
+
+fn type_hover_inner(ty: String, markdown: bool, span: Option<SourceSpan>) -> Hover {
     let contents = if markdown {
         HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -168,7 +183,7 @@ fn type_hover(ty: String, markdown: bool) -> Hover {
     };
     Hover {
         contents,
-        range: None,
+        range: span.map(source_span_to_range),
     }
 }
 
@@ -205,148 +220,42 @@ fn symbol_hover(
 // ── Trait access hover ────────────────────────────────────────────────────────
 
 /// Returns hover text when the cursor is on the trait name or method field in
-/// an explicit `TraitName.method(...)` call expression.
+/// an explicit `TraitName::method(...)` call expression.
 fn trait_access_hover(
     program: &Program,
     module_env: Option<&ModuleEnv>,
     position: SourcePosition,
 ) -> Option<String> {
     let module_env = module_env?;
-    program
-        .stmts
-        .iter()
-        .find_map(|stmt| trait_access_hover_in_stmt(stmt, module_env, position))
-}
-
-fn trait_access_hover_in_stmt(
-    stmt: &Stmt,
-    module_env: &ModuleEnv,
-    position: SourcePosition,
-) -> Option<String> {
-    match stmt {
-        Stmt::Let { value, .. } | Stmt::Expr(value) => {
-            trait_access_hover_in_expr(value, module_env, position)
+    let mut hover = None;
+    walk_program_exprs(program, &mut |expr| {
+        if hover.is_some() || !contains(expr.span, position) {
+            return;
         }
-        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
-            trait_access_hover_in_expr(body, module_env, position)
-        }
-        Stmt::Impl(impl_def) => impl_def
-            .methods
-            .iter()
-            .find_map(|m| trait_access_hover_in_expr(&m.body, module_env, position)),
-        Stmt::InherentImpl(impl_def) => impl_def
-            .methods
-            .iter()
-            .find_map(|m| trait_access_hover_in_expr(&m.body, module_env, position)),
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
-    }
-}
-
-fn trait_access_hover_in_expr(
-    expr: &Expr,
-    module_env: &ModuleEnv,
-    position: SourcePosition,
-) -> Option<String> {
-    if !contains(expr.span, position) {
-        return None;
-    }
-    // Check if this is a `TraitName.method` field access
-    if let ExprKind::FieldAccess {
-        expr: base,
-        field,
-        field_span,
-    } = &expr.kind
-    {
-        if let ExprKind::Ident(trait_name) = &base.kind {
-            if let Some(trait_def) = module_env.trait_def(trait_name) {
-                // Cursor on the trait name itself
-                if contains(base.span, position) {
-                    return Some(format!("trait {} {}", trait_def.name, trait_def.param));
-                }
-                // Cursor on the method field
-                if contains(*field_span, position) {
-                    if let Some(method) = trait_def.methods.iter().find(|m| m.name == *field) {
-                        return Some(trait_method_signature(method));
-                    }
-                }
+        if let ExprKind::AssociatedAccess {
+            target: hern_core::ast::Type::Ident(trait_name),
+            target_span,
+            member,
+            member_span,
+        } = &expr.kind
+            && let Some(trait_def) = module_env.trait_def(trait_name)
+        {
+            if contains(*target_span, position) {
+                hover = Some(format!("trait {} {}", trait_def.name, trait_def.param));
+            } else if contains(*member_span, position)
+                && let Some(method) = trait_def.methods.iter().find(|m| m.name == *member)
+            {
+                hover = Some(trait_method_signature(method));
             }
         }
-        return trait_access_hover_in_expr(base, module_env, position);
-    }
-    // Recurse into sub-expressions
-    match &expr.kind {
-        ExprKind::Call { callee, args, .. } => {
-            trait_access_hover_in_expr(callee, module_env, position).or_else(|| {
-                args.iter()
-                    .find_map(|a| trait_access_hover_in_expr(a, module_env, position))
-            })
-        }
-        ExprKind::Not(inner)
-        | ExprKind::Loop(inner)
-        | ExprKind::Break(Some(inner))
-        | ExprKind::Return(Some(inner))
-        | ExprKind::Lambda { body: inner, .. } => {
-            trait_access_hover_in_expr(inner, module_env, position)
-        }
-        ExprKind::Assign { target, value }
-        | ExprKind::Binary {
-            lhs: target,
-            rhs: value,
-            ..
-        } => trait_access_hover_in_expr(target, module_env, position)
-            .or_else(|| trait_access_hover_in_expr(value, module_env, position)),
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => trait_access_hover_in_expr(cond, module_env, position)
-            .or_else(|| trait_access_hover_in_expr(then_branch, module_env, position))
-            .or_else(|| trait_access_hover_in_expr(else_branch, module_env, position)),
-        ExprKind::Match { scrutinee, arms } => {
-            trait_access_hover_in_expr(scrutinee, module_env, position).or_else(|| {
-                arms.iter()
-                    .find_map(|(_, body)| trait_access_hover_in_expr(body, module_env, position))
-            })
-        }
-        ExprKind::Block { stmts, final_expr } => stmts
-            .iter()
-            .find_map(|s| trait_access_hover_in_stmt(s, module_env, position))
-            .or_else(|| {
-                final_expr
-                    .as_deref()
-                    .and_then(|e| trait_access_hover_in_expr(e, module_env, position))
-            }),
-        ExprKind::Tuple(items) => items
-            .iter()
-            .find_map(|i| trait_access_hover_in_expr(i, module_env, position)),
-        ExprKind::Array(entries) => entries
-            .iter()
-            .find_map(|e| trait_access_hover_in_expr(e.expr(), module_env, position)),
-        ExprKind::Record(entries) => entries
-            .iter()
-            .find_map(|e| trait_access_hover_in_expr(e.expr(), module_env, position)),
-        ExprKind::For { iterable, body, .. } => {
-            trait_access_hover_in_expr(iterable, module_env, position)
-                .or_else(|| trait_access_hover_in_expr(body, module_env, position))
-        }
-        ExprKind::FieldAccess { .. } => unreachable!("handled above"),
-        ExprKind::AssociatedAccess { .. } => None,
-        ExprKind::Ident(_)
-        | ExprKind::Number(_)
-        | ExprKind::StringLit(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Import(_)
-        | ExprKind::Unit
-        | ExprKind::Break(None)
-        | ExprKind::Continue
-        | ExprKind::Return(None) => None,
-    }
+    });
+    hover
 }
 
 // ── Operator hover ────────────────────────────────────────────────────────────
 
-struct OperatorUse<'a> {
-    name: &'a str,
+struct OperatorUse {
+    name: String,
 }
 
 fn operator_hover(
@@ -361,112 +270,25 @@ fn operator_hover(
         program,
         inference.env_for_module(module_name),
         inference.definition_schemes_for_module(module_name),
-        operator.name,
+        &operator.name,
     )
-    .or_else(|| operator_definition_hover_text(&graph.prelude, None, None, operator.name))
+    .or_else(|| operator_definition_hover_text(&graph.prelude, None, None, &operator.name))
 }
 
-fn operator_use_at(program: &Program, position: SourcePosition) -> Option<OperatorUse<'_>> {
-    program
-        .stmts
-        .iter()
-        .find_map(|stmt| operator_use_in_stmt(stmt, position))
-}
-
-fn operator_use_in_stmt(stmt: &Stmt, position: SourcePosition) -> Option<OperatorUse<'_>> {
-    match stmt {
-        Stmt::Let { value, .. } | Stmt::Expr(value) => operator_use_in_expr(value, position),
-        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => operator_use_in_expr(body, position),
-        Stmt::Impl(impl_def) => impl_def
-            .methods
-            .iter()
-            .find_map(|method| operator_use_in_expr(&method.body, position)),
-        Stmt::InherentImpl(impl_def) => impl_def
-            .methods
-            .iter()
-            .find_map(|method| operator_use_in_expr(&method.body, position)),
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
-    }
-}
-
-fn operator_use_in_expr(expr: &Expr, position: SourcePosition) -> Option<OperatorUse<'_>> {
-    if !contains(expr.span, position) {
-        return None;
-    }
-
-    match &expr.kind {
-        ExprKind::Binary {
-            lhs,
-            op,
-            op_span,
-            rhs,
-            ..
-        } => {
-            if contains(*op_span, position)
-                && let BinOp::Custom(name) = op
-            {
-                return Some(OperatorUse { name });
-            }
-            operator_use_in_expr(lhs, position).or_else(|| operator_use_in_expr(rhs, position))
+fn operator_use_at(program: &Program, position: SourcePosition) -> Option<OperatorUse> {
+    let mut operator = None;
+    walk_program_exprs(program, &mut |expr| {
+        if operator.is_some() || !contains(expr.span, position) {
+            return;
         }
-        ExprKind::Not(inner)
-        | ExprKind::Loop(inner)
-        | ExprKind::Break(Some(inner))
-        | ExprKind::Return(Some(inner))
-        | ExprKind::FieldAccess { expr: inner, .. }
-        | ExprKind::Lambda { body: inner, .. } => operator_use_in_expr(inner, position),
-        ExprKind::Assign { target, value } => {
-            operator_use_in_expr(target, position).or_else(|| operator_use_in_expr(value, position))
+        if let ExprKind::Binary { op, op_span, .. } = &expr.kind
+            && contains(*op_span, position)
+            && let BinOp::Custom(name) = op
+        {
+            operator = Some(OperatorUse { name: name.clone() });
         }
-        ExprKind::Call { callee, args, .. } => {
-            operator_use_in_expr(callee, position).or_else(|| {
-                args.iter()
-                    .find_map(|arg| operator_use_in_expr(arg, position))
-            })
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => operator_use_in_expr(cond, position)
-            .or_else(|| operator_use_in_expr(then_branch, position))
-            .or_else(|| operator_use_in_expr(else_branch, position)),
-        ExprKind::Match { scrutinee, arms } => {
-            operator_use_in_expr(scrutinee, position).or_else(|| {
-                arms.iter()
-                    .find_map(|(_, body)| operator_use_in_expr(body, position))
-            })
-        }
-        ExprKind::Block { stmts, final_expr } => stmts
-            .iter()
-            .find_map(|stmt| operator_use_in_stmt(stmt, position))
-            .or_else(|| {
-                final_expr
-                    .as_deref()
-                    .and_then(|expr| operator_use_in_expr(expr, position))
-            }),
-        ExprKind::Tuple(items) => items
-            .iter()
-            .find_map(|item| operator_use_in_expr(item, position)),
-        ExprKind::Array(entries) => entries
-            .iter()
-            .find_map(|e| operator_use_in_expr(e.expr(), position)),
-        ExprKind::Record(entries) => entries
-            .iter()
-            .find_map(|e| operator_use_in_expr(e.expr(), position)),
-        ExprKind::For { iterable, body, .. } => operator_use_in_expr(iterable, position)
-            .or_else(|| operator_use_in_expr(body, position)),
-        ExprKind::AssociatedAccess { .. } => None,
-        ExprKind::Break(None)
-        | ExprKind::Continue
-        | ExprKind::Return(None)
-        | ExprKind::Number(_)
-        | ExprKind::StringLit(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Ident(_)
-        | ExprKind::Import(_)
-        | ExprKind::Unit => None,
-    }
+    });
+    operator
 }
 
 fn operator_definition_hover_text(
@@ -564,6 +386,15 @@ pub(super) fn ty_to_display_string(ty: &Ty) -> String {
         },
         true,
     )
+}
+
+pub(super) fn ty_to_display_string_in_scheme(ty: &Ty, scheme: &Scheme) -> String {
+    let names: HashMap<_, _> = free_type_vars_in_display_order(&scheme.ty)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, var)| (var, type_var_name(idx)))
+        .collect();
+    display_ty_body_for_lsp(ty, &names)
 }
 
 pub(super) fn completion_ty_to_display_string(ty: &Ty) -> String {

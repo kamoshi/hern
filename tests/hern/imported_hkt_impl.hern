@@ -9,4 +9,4 @@ fn to_string_value(x: int) -> string {
 }
 
 let ok: Result(int, string) = Ok(1);
-let mapped: Result(string, string) = Functor.map(ok, to_string_value);
+let mapped: Result(string, string) = Functor::map(ok, to_string_value);

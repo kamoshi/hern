@@ -33,6 +33,23 @@ fn apply_span_to_pattern(pat: Pattern, _span: SourceSpan) -> Pattern {
     }
 }
 
+fn infix_binary_op(token: &Token) -> Option<(BinOp, u8, u8)> {
+    let (op, l_bp, r_bp) = match token {
+        Token::PipeArrow => (BinOp::Pipe, 2, 3),
+        Token::PipePipe => (BinOp::Custom("||".to_string()), 3, 4),
+        Token::AmpAmp => (BinOp::Custom("&&".to_string()), 5, 6),
+        Token::EqEq => (BinOp::Custom("==".to_string()), 4, 5),
+        Token::BangEq => (BinOp::Custom("!=".to_string()), 4, 5),
+        Token::Plus => (BinOp::Custom("+".to_string()), 9, 10),
+        Token::Minus => (BinOp::Custom("-".to_string()), 9, 10),
+        Token::Star => (BinOp::Custom("*".to_string()), 11, 12),
+        Token::Op(op) => (BinOp::Custom(op.clone()), 6, 7),
+        Token::DotDot => (BinOp::Custom("..".to_string()), 6, 7),
+        _ => return None,
+    };
+    Some((op, l_bp, r_bp))
+}
+
 fn recover_stmt_tokens(tokens: &[Spanned]) -> usize {
     let mut parens = 0usize;
     let mut braces = 0usize;
@@ -1686,8 +1703,7 @@ impl<'tokens> Parser<'tokens> {
                         },
                     );
                 }
-                Token::PipeArrow => {
-                    let (l_bp, r_bp) = (2, 3);
+                _ if let Some((op, l_bp, r_bp)) = infix_binary_op(&op_tok.token) => {
                     if l_bp < min_bp {
                         break;
                     }
@@ -1700,224 +1716,7 @@ impl<'tokens> Parser<'tokens> {
                         ptr,
                         ExprKind::Binary {
                             lhs: Box::new(lhs),
-                            op: BinOp::Pipe,
-                            op_span,
-                            rhs: Box::new(rhs),
-                            resolved_op: None,
-                            pending_op: None,
-                            dict_args: vec![],
-                            pending_dict_args: vec![],
-                        },
-                    );
-                }
-                Token::PipePipe => {
-                    let (l_bp, r_bp) = (3, 4);
-                    if l_bp < min_bp {
-                        break;
-                    }
-                    let op_span = SourceSpan::from_lex_span(op_tok.span);
-                    ptr += 1;
-                    let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
-                    ptr += consumed_rhs;
-                    lhs = self.expr_from_tokens(
-                        tokens,
-                        ptr,
-                        ExprKind::Binary {
-                            lhs: Box::new(lhs),
-                            op: BinOp::Custom("||".to_string()),
-                            op_span,
-                            rhs: Box::new(rhs),
-                            resolved_op: None,
-                            pending_op: None,
-                            dict_args: vec![],
-                            pending_dict_args: vec![],
-                        },
-                    );
-                }
-                Token::AmpAmp => {
-                    let (l_bp, r_bp) = (5, 6);
-                    if l_bp < min_bp {
-                        break;
-                    }
-                    let op_span = SourceSpan::from_lex_span(op_tok.span);
-                    ptr += 1;
-                    let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
-                    ptr += consumed_rhs;
-                    lhs = self.expr_from_tokens(
-                        tokens,
-                        ptr,
-                        ExprKind::Binary {
-                            lhs: Box::new(lhs),
-                            op: BinOp::Custom("&&".to_string()),
-                            op_span,
-                            rhs: Box::new(rhs),
-                            resolved_op: None,
-                            pending_op: None,
-                            dict_args: vec![],
-                            pending_dict_args: vec![],
-                        },
-                    );
-                }
-                Token::Plus => {
-                    let (l_bp, r_bp) = (9, 10);
-                    if l_bp < min_bp {
-                        break;
-                    }
-                    let op_span = SourceSpan::from_lex_span(op_tok.span);
-                    ptr += 1;
-                    let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
-                    ptr += consumed_rhs;
-                    lhs = self.expr_from_tokens(
-                        tokens,
-                        ptr,
-                        ExprKind::Binary {
-                            lhs: Box::new(lhs),
-                            op: BinOp::Custom("+".to_string()),
-                            op_span,
-                            rhs: Box::new(rhs),
-                            resolved_op: None,
-                            pending_op: None,
-                            dict_args: vec![],
-                            pending_dict_args: vec![],
-                        },
-                    );
-                }
-                Token::Minus => {
-                    let (l_bp, r_bp) = (9, 10);
-                    if l_bp < min_bp {
-                        break;
-                    }
-                    let op_span = SourceSpan::from_lex_span(op_tok.span);
-                    ptr += 1;
-                    let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
-                    ptr += consumed_rhs;
-                    lhs = self.expr_from_tokens(
-                        tokens,
-                        ptr,
-                        ExprKind::Binary {
-                            lhs: Box::new(lhs),
-                            op: BinOp::Custom("-".to_string()),
-                            op_span,
-                            rhs: Box::new(rhs),
-                            resolved_op: None,
-                            pending_op: None,
-                            dict_args: vec![],
-                            pending_dict_args: vec![],
-                        },
-                    );
-                }
-                Token::Star => {
-                    let (l_bp, r_bp) = (11, 12);
-                    if l_bp < min_bp {
-                        break;
-                    }
-                    let op_span = SourceSpan::from_lex_span(op_tok.span);
-                    ptr += 1;
-                    let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
-                    ptr += consumed_rhs;
-                    lhs = self.expr_from_tokens(
-                        tokens,
-                        ptr,
-                        ExprKind::Binary {
-                            lhs: Box::new(lhs),
-                            op: BinOp::Custom("*".to_string()),
-                            op_span,
-                            rhs: Box::new(rhs),
-                            resolved_op: None,
-                            pending_op: None,
-                            dict_args: vec![],
-                            pending_dict_args: vec![],
-                        },
-                    );
-                }
-                Token::EqEq => {
-                    let (l_bp, r_bp) = (4, 5);
-                    if l_bp < min_bp {
-                        break;
-                    }
-                    let op_span = SourceSpan::from_lex_span(op_tok.span);
-                    ptr += 1;
-                    let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
-                    ptr += consumed_rhs;
-                    lhs = self.expr_from_tokens(
-                        tokens,
-                        ptr,
-                        ExprKind::Binary {
-                            lhs: Box::new(lhs),
-                            op: BinOp::Custom("==".to_string()),
-                            op_span,
-                            rhs: Box::new(rhs),
-                            resolved_op: None,
-                            pending_op: None,
-                            dict_args: vec![],
-                            pending_dict_args: vec![],
-                        },
-                    );
-                }
-                Token::BangEq => {
-                    let (l_bp, r_bp) = (4, 5);
-                    if l_bp < min_bp {
-                        break;
-                    }
-                    let op_span = SourceSpan::from_lex_span(op_tok.span);
-                    ptr += 1;
-                    let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
-                    ptr += consumed_rhs;
-                    lhs = self.expr_from_tokens(
-                        tokens,
-                        ptr,
-                        ExprKind::Binary {
-                            lhs: Box::new(lhs),
-                            op: BinOp::Custom("!=".to_string()),
-                            op_span,
-                            rhs: Box::new(rhs),
-                            resolved_op: None,
-                            pending_op: None,
-                            dict_args: vec![],
-                            pending_dict_args: vec![],
-                        },
-                    );
-                }
-                Token::Op(op) => {
-                    let (l_bp, r_bp) = (6, 7);
-                    if l_bp < min_bp {
-                        break;
-                    }
-                    let op = op.clone();
-                    let op_span = SourceSpan::from_lex_span(op_tok.span);
-                    ptr += 1;
-                    let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
-                    ptr += consumed_rhs;
-                    lhs = self.expr_from_tokens(
-                        tokens,
-                        ptr,
-                        ExprKind::Binary {
-                            lhs: Box::new(lhs),
-                            op: BinOp::Custom(op),
-                            op_span,
-                            rhs: Box::new(rhs),
-                            resolved_op: None,
-                            pending_op: None,
-                            dict_args: vec![],
-                            pending_dict_args: vec![],
-                        },
-                    );
-                }
-                Token::DotDot => {
-                    let (l_bp, r_bp) = (6, 7);
-                    if l_bp < min_bp {
-                        break;
-                    }
-                    let op_span = SourceSpan::from_lex_span(op_tok.span);
-                    ptr += 1;
-                    let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
-                    ptr += consumed_rhs;
-                    lhs = self.expr_from_tokens(
-                        tokens,
-                        ptr,
-                        ExprKind::Binary {
-                            lhs: Box::new(lhs),
-                            op: BinOp::Custom("..".to_string()),
+                            op,
                             op_span,
                             rhs: Box::new(rhs),
                             resolved_op: None,

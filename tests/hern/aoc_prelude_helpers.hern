@@ -1,0 +1,44 @@
+let nums = "x=-2 y=18 z=3".ints();
+print(nums.sum());
+
+let floats = "a=-1.5 b=2 c=3.25".floats();
+print(floats.sum());
+
+let xs = [3, 1, 2, 2];
+print(json(xs.enumerate()));
+print(json(xs.zip(["a", "b"])));
+print(json(xs.take(2)));
+print(json(xs.drop(2)));
+print(json(xs.slice(2, 3)));
+print(xs.count(fn(x) { x == 2 }));
+print(xs.contains(3));
+print(xs.product());
+
+let mut sorted = [3, 1, 2];
+sorted.sort();
+print(json(sorted));
+
+let mut by_score = [1, 2, 3];
+by_score.sort_by(fn(a, b) { a > b });
+print(json(by_score));
+print(json([3, 1, 2].min_by(fn(x) { x })));
+print(json([3, 1, 2].max_by(fn(x) { x })));
+
+let mut seen = Set::new();
+seen.add("aa");
+seen.add("bb");
+seen.add("aa");
+print(seen.has("aa"));
+print(seen.has("cc"));
+print(seen.size());
+seen.remove("aa");
+print(seen.has("aa"));
+
+let mut q = Queue::new();
+print(q.is_empty());
+q.push(10);
+q.push(20);
+print(q.size());
+print(json(q.pop()));
+print(json(q.pop()));
+print(json(q.pop()));

@@ -7,7 +7,7 @@ trait ToString 'a {
 }
 
 fn to_string(value: 'a) -> string where 'a: ToString {
-  ToString.to_string(value)
+  ToString::to_string(value)
 }
 
 type Option('a) = Some('a) | None
@@ -100,7 +100,7 @@ where 'a: ToString
 {
   fn to_string(self) {
     match self {
-      Some(value) -> "Some(" <> ToString.to_string(value) <> ")",
+      Some(value) -> "Some(" <> ToString::to_string(value) <> ")",
       None -> "None",
     }
   }
@@ -111,8 +111,8 @@ where 'a: ToString, 'e: ToString
 {
   fn to_string(self) {
     match self {
-      Ok(value) -> "Ok(" <> ToString.to_string(value) <> ")",
-      Err(error) -> "Err(" <> ToString.to_string(error) <> ")",
+      Ok(value) -> "Ok(" <> ToString::to_string(value) <> ")",
+      Err(error) -> "Err(" <> ToString::to_string(error) <> ")",
     }
   }
 }
@@ -442,6 +442,22 @@ extern __array_min: fn([float]) -> float = "(function(a)
   for _, v in ipairs(a) do if v < m then m = v end end
   return m
 end)";
+extern __array_sort_by: fn(['a], fn('a, 'a) -> bool) -> () = "(function(a, less)
+  table.sort(a, function(x, y) return less(x, y) ~= 0 end)
+  return {}
+end)";
+extern __array_sort_int: fn([int]) -> () = "(function(a)
+  table.sort(a)
+  return {}
+end)";
+extern __array_sort_float: fn([float]) -> () = "(function(a)
+  table.sort(a)
+  return {}
+end)";
+extern __array_sort_string: fn([string]) -> () = "(function(a)
+  table.sort(a)
+  return {}
+end)";
 
 fn range(a: int, b: int) -> [int] { __array_range(a, b) }
 
@@ -502,6 +518,73 @@ impl ['a] {
     __array_reverse(self)
   }
 
+  fn enumerate(self) -> [(int, 'a)] {
+    let mut out = [];
+    let mut i = 1;
+    for item in self {
+      out.push((i, item));
+      i = i + 1;
+    };
+    out
+  }
+
+  fn zip(self, other: ['b]) -> [('a, 'b)] {
+    let mut out = [];
+    let limit = if self.len() < other.len() { self.len() } else { other.len() };
+    for i in range(1, limit) {
+      out.push((self.get(i), other.get(i)));
+    };
+    out
+  }
+
+  fn take(self, n: int) -> ['a] {
+    let mut out = [];
+    let limit = if n < self.len() { n } else { self.len() };
+    if limit >= 1 {
+      for i in range(1, limit) {
+        out.push(self.get(i));
+      };
+    };
+    out
+  }
+
+  fn drop(self, n: int) -> ['a] {
+    let mut out = [];
+    let start = n + 1;
+    if start <= self.len() {
+      for i in range(start, self.len()) {
+        out.push(self.get(i));
+      };
+    };
+    out
+  }
+
+  fn slice(self, start: int, stop: int) -> ['a] {
+    let mut out = [];
+    let first = if start < 1 { 1 } else { start };
+    let last = if stop < self.len() { stop } else { self.len() };
+    if first <= last {
+      for i in range(first, last) {
+        out.push(self.get(i));
+      };
+    };
+    out
+  }
+
+  fn count(self, f: fn('a) -> bool) -> int {
+    let mut total = 0;
+    for item in self {
+      if f(item) {
+        total = total + 1;
+      };
+    };
+    total
+  }
+
+  fn sort_by(mut self, less: fn('a, 'a) -> bool) -> () {
+    __array_sort_by(self, less)
+  }
+
   fn any(self, f: fn('a) -> bool) -> bool {
     let mut found = false;
     for item in self {
@@ -536,6 +619,14 @@ impl ['a] {
   }
 }
 
+impl ['a]
+where 'a: Eq
+{
+  fn contains(self, needle: 'a) -> bool {
+    self.any(fn(item) { item == needle })
+  }
+}
+
 impl ToString for ['a]
 where 'a: ToString
 {
@@ -548,7 +639,7 @@ where 'a: ToString
       } else {
         out = out <> ", ";
       };
-      out = out <> ToString.to_string(item);
+      out = out <> ToString::to_string(item);
     };
     out <> "]"
   }
@@ -559,6 +650,10 @@ impl [float] {
     __array_sum_float(self)
   }
 
+  fn product(self) -> float {
+    self.fold(1.0, fn(acc, item) { acc * item })
+  }
+
   fn max(self) -> float {
     __array_max(self)
   }
@@ -566,11 +661,105 @@ impl [float] {
   fn min(self) -> float {
     __array_min(self)
   }
+
+  fn sort(mut self) -> () {
+    __array_sort_float(self)
+  }
+
+  fn min_by(self, score: fn(float) -> float) -> Option(float) {
+    let mut best = None;
+    let mut best_score = 0.0;
+    for item in self {
+      let item_score = score(item);
+      match best {
+        None -> {
+          best = Some(item);
+          best_score = item_score;
+        },
+        Some(_) -> if item_score < best_score {
+          best = Some(item);
+          best_score = item_score;
+        },
+      }
+    };
+    best
+  }
+
+  fn max_by(self, score: fn(float) -> float) -> Option(float) {
+    let mut best = None;
+    let mut best_score = 0.0;
+    for item in self {
+      let item_score = score(item);
+      match best {
+        None -> {
+          best = Some(item);
+          best_score = item_score;
+        },
+        Some(_) -> if item_score > best_score {
+          best = Some(item);
+          best_score = item_score;
+        },
+      }
+    };
+    best
+  }
 }
 
 impl [int] {
   fn sum(self) -> int {
     __array_sum_int(self)
+  }
+
+  fn product(self) -> int {
+    self.fold(1, fn(acc, item) { acc * item })
+  }
+
+  fn sort(mut self) -> () {
+    __array_sort_int(self)
+  }
+
+  fn min_by(self, score: fn(int) -> int) -> Option(int) {
+    let mut best = None;
+    let mut best_score = 0;
+    for item in self {
+      let item_score = score(item);
+      match best {
+        None -> {
+          best = Some(item);
+          best_score = item_score;
+        },
+        Some(_) -> if item_score < best_score {
+          best = Some(item);
+          best_score = item_score;
+        },
+      }
+    };
+    best
+  }
+
+  fn max_by(self, score: fn(int) -> int) -> Option(int) {
+    let mut best = None;
+    let mut best_score = 0;
+    for item in self {
+      let item_score = score(item);
+      match best {
+        None -> {
+          best = Some(item);
+          best_score = item_score;
+        },
+        Some(_) -> if item_score > best_score {
+          best = Some(item);
+          best_score = item_score;
+        },
+      }
+    };
+    best
+  }
+}
+
+impl [string] {
+  fn sort(mut self) -> () {
+    __array_sort_string(self)
   }
 }
 
@@ -682,6 +871,27 @@ impl Map('k, 'v) {
   fn is_empty(self) -> bool { self.size() == 0 }
 }
 
+// --- Sets ---
+
+type Set('a) = *
+
+extern __set_new: fn() -> mut Set('a) = "(function() return {} end)";
+extern __set_add: fn(Set('a), 'a) -> () = "(function(s, v) s[v] = true; return {} end)";
+extern __set_remove: fn(Set('a), 'a) -> () = "(function(s, v) s[v] = nil; return {} end)";
+extern __set_has: fn(Set('a), 'a) -> bool = "(function(s, v) return s[v] ~= nil and 1 or 0 end)";
+extern __set_values: fn(Set('a)) -> ['a] = "(function(s) local values = {}; for v in pairs(s) do values[#values + 1] = v end; return values end)";
+extern __set_size: fn(Set('a)) -> int = "(function(s) local n = 0; for _ in pairs(s) do n = n + 1 end; return n end)";
+
+impl Set('a) {
+  fn new() -> mut Self { __set_new() }
+  fn add(mut self, value: 'a) -> () { __set_add(self, value) }
+  fn remove(mut self, value: 'a) -> () { __set_remove(self, value) }
+  fn has(self, value: 'a) -> bool { __set_has(self, value) }
+  fn values(self) -> ['a] { __set_values(self) }
+  fn size(self) -> int { __set_size(self) }
+  fn is_empty(self) -> bool { self.size() == 0 }
+}
+
 // --- Strings ---
 
 extern __str_len: fn(string) -> int = #[template] "#($1)";
@@ -731,6 +941,20 @@ extern __str_to_float: fn(string) -> float = "(function(s)
   if not n then _G.error(\"float: cannot parse \" .. _G.tostring(s)) end
   return n
 end)";
+extern __str_ints: fn(string) -> [int] = "(function(s)
+  local r = {}
+  for token in s:gmatch(\"[%+%-]?%d+\") do
+  r[#r+1] = bit.tobit(_G.tonumber(token))
+  end
+  return r
+end)";
+extern __str_floats: fn(string) -> [float] = "(function(s)
+  local r = {}
+  for token in s:gmatch(\"[%+%-]?%d+%.?%d*\") do
+  r[#r+1] = _G.tonumber(token)
+  end
+  return r
+end)";
 
 impl string {
   fn len(self) -> int { __str_len(self) }
@@ -753,6 +977,8 @@ impl string {
   fn ends_with(self, suffix: string) -> bool { __str_ends_with(self, suffix) }
   fn to_int(self) -> int { __str_to_int(self) }
   fn to_float(self) -> float { __str_to_float(self) }
+  fn ints(self) -> [int] { __str_ints(self) }
+  fn floats(self) -> [float] { __str_floats(self) }
 }
 
 // --- Iteration ---
@@ -945,6 +1171,34 @@ impl Heap('a) {
   fn pop(mut self) -> (float, 'a) { __heap_pop(self) }
   fn size(self) -> int { __heap_size(self) }
   fn is_empty(self) -> bool { __heap_is_empty(self) }
+}
+
+// --- Queues ---
+
+type Queue('a) = *
+
+extern __queue_new: fn() -> mut Queue('a) = "(function() return { head = 1, tail = 0 } end)";
+extern __queue_push: fn(Queue('a), 'a) -> () = "(function(q, value)
+  q.tail = q.tail + 1
+  q[q.tail] = value
+  return {}
+end)";
+extern __queue_pop: fn(Queue('a)) -> Option('a) = "(function(q)
+  if q.head > q.tail then return { _tag = \"None\" } end
+  local value = q[q.head]
+  q[q.head] = nil
+  q.head = q.head + 1
+  return { _tag = \"Some\", _0 = value }
+end)";
+extern __queue_size: fn(Queue('a)) -> int = "(function(q) return q.tail - q.head + 1 end)";
+extern __queue_is_empty: fn(Queue('a)) -> bool = "(function(q) return q.head > q.tail and 1 or 0 end)";
+
+impl Queue('a) {
+  fn new() -> mut Self { __queue_new() }
+  fn push(mut self, value: 'a) -> () { __queue_push(self, value) }
+  fn pop(mut self) -> Option('a) { __queue_pop(self) }
+  fn size(self) -> int { __queue_size(self) }
+  fn is_empty(self) -> bool { __queue_is_empty(self) }
 }
 
 // --- Debugging ---

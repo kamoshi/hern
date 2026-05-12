@@ -3,4 +3,4 @@ fn to_len(x: string) -> float {
 }
 
 let ok: Result(string, float) = Ok("value");
-let mapped = Functor.map(ok, to_len);
+let mapped = Functor::map(ok, to_len);

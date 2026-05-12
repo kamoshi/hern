@@ -7,7 +7,8 @@ mod analysis;
 use analysis::{
     DiagnosticsByUri, ServerState, code_actions, combined_diagnostics_for_uri, completion,
     definition, diagnostics_for_document, document_highlights, document_symbols, hover,
-    prepare_rename, references, rename, semantic_tokens, semantic_tokens_legend, signature_help,
+    inlay_hints, prepare_rename, references, rename, semantic_tokens, semantic_tokens_legend,
+    semantic_tokens_range, signature_help, workspace_symbols,
 };
 use lsp_server::{Connection, Message, Notification, RequestId, Response};
 use lsp_types::notification::{
@@ -16,19 +17,22 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, GotoDefinition,
-    HoverRequest, PrepareRenameRequest, References, Rename, Request as _,
+    HoverRequest, InlayHintRequest, PrepareRenameRequest, References, Rename, Request as _,
     SemanticTokensFullRequest, SemanticTokensRangeRequest, SignatureHelpRequest,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CodeActionOrCommand, CodeActionParams, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DocumentHighlightParams, DocumentSymbolParams, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverParams, HoverProviderCapability, InitializeParams, MarkupKind,
-    OneOf, PublishDiagnosticsParams, ReferenceParams, RenameOptions, RenameParams,
+    GotoDefinitionResponse, HoverParams, HoverProviderCapability, InitializeParams, InlayHint,
+    InlayHintOptions, InlayHintParams, InlayHintServerCapabilities, MarkupKind, OneOf,
+    PublishDiagnosticsParams, ReferenceParams, RenameOptions, RenameParams,
     SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
     SignatureHelpParams, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri,
+    TextDocumentSyncKind, Uri, WorkspaceSymbolOptions, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 use serde::de::DeserializeOwned;
 use std::collections::HashSet;
@@ -74,6 +78,10 @@ fn server_capabilities() -> Result<serde_json::Value, serde_json::Error> {
         references_provider: Some(OneOf::Left(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
+        workspace_symbol_provider: Some(OneOf::Right(WorkspaceSymbolOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: Default::default(),
+        })),
         code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(true)),
         rename_provider: Some(OneOf::Right(RenameOptions {
             prepare_provider: Some(true),
@@ -102,6 +110,12 @@ fn server_capabilities() -> Result<serde_json::Value, serde_json::Error> {
                 ..Default::default()
             },
         )),
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            InlayHintOptions {
+                resolve_provider: Some(false),
+                work_done_progress_options: Default::default(),
+            },
+        ))),
         ..Default::default()
     })
 }
@@ -241,12 +255,13 @@ fn handle_request(
         SemanticTokensRangeRequest::METHOD => {
             let params: SemanticTokensRangeParams =
                 decode_params!(conn, req, SemanticTokensRangeParams);
-            let result = semantic_tokens(state, params.text_document.uri).and_then(|result| {
-                let SemanticTokensResult::Tokens(tokens) = result else {
-                    return None;
-                };
-                Some(SemanticTokensRangeResult::Tokens(tokens))
-            });
+            let result = semantic_tokens_range(state, params.text_document.uri, params.range)
+                .and_then(|result| {
+                    let SemanticTokensResult::Tokens(tokens) = result else {
+                        return None;
+                    };
+                    Some(SemanticTokensRangeResult::Tokens(tokens))
+                });
             conn.sender
                 .send(Message::Response(Response::new_ok(req.id, result)))?;
         }
@@ -274,6 +289,19 @@ fn handle_request(
                 params.range,
                 params.context,
             );
+            conn.sender
+                .send(Message::Response(Response::new_ok(req.id, result)))?;
+        }
+        InlayHintRequest::METHOD => {
+            let params: InlayHintParams = decode_params!(conn, req, InlayHintParams);
+            let result: Option<Vec<InlayHint>> =
+                inlay_hints(state, params.text_document.uri, params.range);
+            conn.sender
+                .send(Message::Response(Response::new_ok(req.id, result)))?;
+        }
+        WorkspaceSymbolRequest::METHOD => {
+            let params: WorkspaceSymbolParams = decode_params!(conn, req, WorkspaceSymbolParams);
+            let result: Option<WorkspaceSymbolResponse> = workspace_symbols(state, params);
             conn.sender
                 .send(Message::Response(Response::new_ok(req.id, result)))?;
         }

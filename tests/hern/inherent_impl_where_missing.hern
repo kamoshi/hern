@@ -6,7 +6,7 @@ where 'a: ToString
 {
   fn show(self) -> string {
     match self {
-      Box(value) -> ToString.to_string(value),
+      Box(value) -> ToString::to_string(value),
     }
   }
 }

@@ -5,5 +5,5 @@ trait Functor 'f {
 }
 
 fn fmap(x: 'f(int), f: fn(int) -> string) -> 'f(string) where 'f: Functor {
-    Functor.map(x, f)
+    Functor::map(x, f)
 }

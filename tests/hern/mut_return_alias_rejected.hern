@@ -1,0 +1,7 @@
+fn fake(r: #{ x: int }) -> mut #{ x: int } {
+  r
+}
+
+let r = #{ x: 1 };
+let mut alias = fake(r);
+alias.x = 2;

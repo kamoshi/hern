@@ -1,8 +1,11 @@
 use hern_core::ast::{Expr, ExprKind, Program, SourceSpan, Stmt};
 use hern_core::lex::{Lexer, Token};
 use hern_core::module::GraphInference;
+#[cfg(test)]
+use hern_core::module::ModuleInferenceMetadata;
 use hern_core::source_index::{DefinitionKind, SourceIndex, index_program};
 use hern_core::types::Ty;
+use lsp_types::Range;
 use lsp_types::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensLegend,
     SemanticTokensResult,
@@ -95,9 +98,30 @@ pub(crate) fn semantic_tokens_for_source(
     program: Option<&Program>,
     context: Option<SemanticContext<'_>>,
 ) -> SemanticTokensResult {
+    semantic_tokens_for_source_inner(source, program, context, None)
+}
+
+pub(crate) fn semantic_tokens_for_source_range(
+    source: &str,
+    program: Option<&Program>,
+    context: Option<SemanticContext<'_>>,
+    range: Range,
+) -> SemanticTokensResult {
+    semantic_tokens_for_source_inner(source, program, context, Some(range))
+}
+
+fn semantic_tokens_for_source_inner(
+    source: &str,
+    program: Option<&Program>,
+    context: Option<SemanticContext<'_>>,
+    range: Option<Range>,
+) -> SemanticTokensResult {
     let mut raw = lex_tokens(source);
     if let Some(program) = program {
         apply_semantic_overrides(&mut raw, program, &index_program(program), source, context);
+    }
+    if let Some(range) = range {
+        raw.retain(|token| raw_token_intersects_range(token, range));
     }
     raw.sort_by_key(|token| (token.line, token.col, token.len));
     raw.dedup_by_key(|token| (token.line, token.col, token.len));
@@ -105,6 +129,14 @@ pub(crate) fn semantic_tokens_for_source(
         result_id: None,
         data: delta_encode(raw),
     })
+}
+
+fn raw_token_intersects_range(token: &RawToken, range: Range) -> bool {
+    let token_start = (token.line, token.col);
+    let token_end = (token.line, token.col.saturating_add(token.len));
+    let range_start = (range.start.line, range.start.character);
+    let range_end = (range.end.line, range.end.character);
+    token_start < range_end && range_start < token_end
 }
 
 pub(crate) struct SemanticContext<'a> {
@@ -700,6 +732,28 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn semantic_token_range_filters_to_requested_lines() {
+        let source = "let first = 1;\nlet second = 2;\nlet third = 3;\n";
+        let tokens = token_tuples(semantic_tokens_for_source_range(
+            source,
+            None,
+            None,
+            Range::new(
+                lsp_types::Position::new(1, 0),
+                lsp_types::Position::new(2, 0),
+            ),
+        ));
+
+        assert!(!tokens.is_empty());
+        assert!(tokens.iter().all(|token| token.0 == 1), "{tokens:?}");
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.1 == 0 && token.3 == TY_KEYWORD)
+        );
+    }
+
     fn graph_inference_for_test(
         module: &str,
         inference: hern_core::types::infer::InferenceResult,
@@ -707,10 +761,16 @@ mod tests {
         GraphInference {
             envs: HashMap::from([(module.to_string(), inference.env)]),
             variant_envs: HashMap::from([(module.to_string(), inference.variant_env)]),
-            expr_types: HashMap::from([(module.to_string(), inference.expr_types)]),
-            symbol_types: HashMap::from([(module.to_string(), inference.symbol_types)]),
-            binding_types: HashMap::from([(module.to_string(), inference.binding_types)]),
-            definition_schemes: HashMap::from([(module.to_string(), inference.definition_schemes)]),
+            module_metadata: HashMap::from([(
+                module.to_string(),
+                ModuleInferenceMetadata {
+                    expr_types: inference.expr_types,
+                    symbol_types: inference.symbol_types,
+                    binding_types: inference.binding_types,
+                    definition_schemes: inference.definition_schemes,
+                    ..ModuleInferenceMetadata::default()
+                },
+            )]),
             ..GraphInference::default()
         }
     }

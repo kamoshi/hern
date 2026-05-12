@@ -678,73 +678,13 @@ impl LuaCodegen {
                 resolved_op,
                 dict_args,
                 ..
-            } => {
-                let l = self.gen_expr(lhs, pre);
-                let r = self.gen_expr(rhs, pre);
-                match op {
-                    BinOp::Pipe => {
-                        let mut all_args = gen_dict_refs(dict_args);
-                        all_args.push(l);
-                        format!("{}({})", r, all_args.join(", "))
-                    }
-                    BinOp::Custom(op) => match resolved_op {
-                        Some(resolved) => {
-                            let resolved = gen_resolved_callee(resolved);
-                            if dict_args.is_empty()
-                                && let Some(inlined) =
-                                    self.gen_inline_call(&resolved, &[l.clone(), r.clone()], pre)
-                            {
-                                return inlined;
-                            }
-                            if dict_args.is_empty() {
-                                format!("{}({}, {})", resolved, l, r)
-                            } else {
-                                let dict_args = gen_dict_refs(dict_args);
-                                format!("{}({}, {}, {})", resolved, dict_args.join(", "), l, r)
-                            }
-                        }
-                        None => format!("{}({}, {})", mangle_op(op), l, r),
-                    },
-                }
-            }
-            ExprKind::Assign { target, value } => {
-                let t = self.gen_expr(target, pre);
-                let v = self.gen_expr(value, pre);
-                if !expr_always_exits(target, true) && !expr_always_exits(value, true) {
-                    pre.push_str(&format!("{}{} = {}\n", self.ind(), t, v));
-                }
-                "{}".to_string()
-            }
+            } => self.gen_binary_expr(lhs, op, rhs, resolved_op, dict_args, pre),
+            ExprKind::Assign { target, value } => self.gen_assign_expr(target, value, pre),
             ExprKind::Lambda {
                 params,
                 body,
                 dict_params,
-            } => {
-                let mut param_names: Vec<String> = dict_params.clone();
-                let mut pattern_destructures = String::new();
-                for (i, param) in params.iter().enumerate() {
-                    match &param.pat {
-                        Pattern::Variable(n, _) => param_names.push(n.clone()),
-                        Pattern::Wildcard => param_names.push("_".to_string()),
-                        _ => {
-                            let placeholder = format!("__p{}", i);
-                            param_names.push(placeholder.clone());
-                            self.indent += 2;
-                            pattern_destructures
-                                .push_str(&self.gen_for_pattern_bindings(&param.pat, &placeholder));
-                            self.indent -= 2;
-                        }
-                    }
-                }
-                let params_s = param_names.join(", ");
-                let mut out = format!("(function({})\n", params_s);
-                self.indent += 2;
-                out.push_str(&pattern_destructures);
-                out.push_str(&self.gen_expr_as_body(body));
-                self.indent -= 2;
-                out.push_str(&format!("{}end)", self.ind()));
-                out
-            }
+            } => self.gen_lambda_expr(params, body, dict_params),
             ExprKind::Call {
                 callee,
                 args,
@@ -753,31 +693,15 @@ impl LuaCodegen {
                 resolved_callee,
                 dict_args,
                 ..
-            } => {
-                let callee_s = resolved_callee
-                    .as_ref()
-                    .map(gen_resolved_callee)
-                    .unwrap_or_else(|| self.gen_expr(callee, pre));
-                let mut all_args: Vec<String> = gen_dict_refs(dict_args);
-                if let Some(receiver) = method_receiver(callee, *is_method_call) {
-                    all_args.push(self.gen_expr(receiver, pre));
-                }
-                all_args.extend(args.iter().enumerate().map(|(idx, arg)| {
-                    let arg_s = self.gen_expr(arg, pre);
-                    wrap_call_argument(arg_s, arg_wrappers.get(idx).and_then(Option::as_ref))
-                }));
-                if dict_args.is_empty()
-                    && let Some(inlined) = self.gen_inline_call(&callee_s, &all_args, pre)
-                {
-                    return inlined;
-                }
-                if dict_args.is_empty()
-                    && let Some(expanded) = self.gen_template_call(&callee_s, &all_args)
-                {
-                    return expanded;
-                }
-                format!("{}({})", callee_s, all_args.join(", "))
-            }
+            } => self.gen_call_expr(
+                callee,
+                args,
+                *is_method_call,
+                arg_wrappers,
+                resolved_callee,
+                dict_args,
+                pre,
+            ),
             ExprKind::Tuple(items) => {
                 let items_s = items
                     .iter()
@@ -785,76 +709,8 @@ impl LuaCodegen {
                     .collect::<Vec<_>>();
                 format!("{{ {} }}", items_s.join(", "))
             }
-            ExprKind::Array(entries) => {
-                if entries.iter().all(|e| matches!(e, ArrayEntry::Elem(_))) {
-                    let items_s = entries
-                        .iter()
-                        .map(|e| self.gen_expr(e.expr(), pre))
-                        .collect::<Vec<_>>();
-                    format!("{{ {} }}", items_s.join(", "))
-                } else {
-                    let tmp = self.fresh_tmp();
-                    let ind = self.ind();
-                    pre.push_str(&format!("{}local {} = {{}}\n", ind, tmp));
-                    for entry in entries {
-                        match entry {
-                            ArrayEntry::Elem(expr) => {
-                                let v = self.gen_expr(expr, pre);
-                                pre.push_str(&format!("{}{}[#{}+1] = {}\n", ind, tmp, tmp, v));
-                            }
-                            ArrayEntry::Spread(expr) => {
-                                let v = self.gen_expr(expr, pre);
-                                let iter_var = self.fresh_tmp();
-                                pre.push_str(&format!(
-                                    "{}for _, {} in ipairs({}) do {}[#{}+1] = {} end\n",
-                                    ind, iter_var, v, tmp, tmp, iter_var
-                                ));
-                            }
-                        }
-                    }
-                    tmp
-                }
-            }
-            ExprKind::Record(entries) => {
-                if entries
-                    .iter()
-                    .all(|e| matches!(e, RecordEntry::Field(_, _)))
-                {
-                    let fields_s = entries
-                        .iter()
-                        .map(|e| {
-                            if let RecordEntry::Field(n, expr) = e {
-                                format!("{} = {}", n, self.gen_expr(expr, pre))
-                            } else {
-                                unreachable!()
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    format!("{{ {} }}", fields_s.join(", "))
-                } else {
-                    let tmp = self.fresh_tmp();
-                    let ind = self.ind();
-                    pre.push_str(&format!("{}local {} = {{}}\n", ind, tmp));
-                    for entry in entries {
-                        match entry {
-                            RecordEntry::Field(name, expr) => {
-                                let v = self.gen_expr(expr, pre);
-                                pre.push_str(&format!("{}{}[\"{}\"] = {}\n", ind, tmp, name, v));
-                            }
-                            RecordEntry::Spread(expr) => {
-                                let v = self.gen_expr(expr, pre);
-                                let k_var = self.fresh_tmp();
-                                let v_var = self.fresh_tmp();
-                                pre.push_str(&format!(
-                                    "{}for {}, {} in pairs({}) do {}[{}] = {} end\n",
-                                    ind, k_var, v_var, v, tmp, k_var, v_var
-                                ));
-                            }
-                        }
-                    }
-                    tmp
-                }
-            }
+            ExprKind::Array(entries) => self.gen_array_expr(entries, pre),
+            ExprKind::Record(entries) => self.gen_record_expr(entries, pre),
             ExprKind::FieldAccess { expr, field, .. } => {
                 let e = self.gen_expr(expr, pre);
                 format!("{}.{}", e, field)
@@ -867,32 +723,7 @@ impl LuaCodegen {
             // reaches the enclosing Lua function. `break`/`continue` use `goto` so
             // the continue label can sit at the loop bottom without conflicting with
             // Lua's "break must be the last statement in a block" restriction.
-            ExprKind::Loop(body) => {
-                self.loop_counter += 1;
-                let loop_id = self.loop_counter;
-                let tmp = self.fresh_tmp();
-                let break_label = format!("_break_{}", loop_id);
-
-                let prev_loop_id = std::mem::replace(&mut self.current_loop_id, loop_id);
-                let prev_loop_tmp = std::mem::replace(&mut self.current_loop_tmp, tmp.clone());
-                let prev_break =
-                    std::mem::replace(&mut self.current_break_label, break_label.clone());
-
-                let ind = self.ind();
-                pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
-                pre.push_str(&format!("{}while true do\n", ind));
-                self.indent += 2;
-                pre.push_str(&self.gen_expr_as_stmt(body));
-                pre.push_str(&format!("{}::_continue_{}::\n", self.ind(), loop_id));
-                self.indent -= 2;
-                pre.push_str(&format!("{}end\n", ind));
-                pre.push_str(&format!("{}::{}::\n", ind, break_label));
-
-                self.current_loop_id = prev_loop_id;
-                self.current_loop_tmp = prev_loop_tmp;
-                self.current_break_label = prev_break;
-                tmp
-            }
+            ExprKind::Loop(body) => self.gen_loop_expr(body, pre),
 
             ExprKind::For {
                 pat,
@@ -900,122 +731,13 @@ impl LuaCodegen {
                 body,
                 resolved_iter,
                 ..
-            } => {
-                self.loop_counter += 1;
-                let loop_id = self.loop_counter;
-                let break_label = format!("_break_{}", loop_id);
-                let tmp = self.fresh_tmp();
-
-                let prev_loop_id = std::mem::replace(&mut self.current_loop_id, loop_id);
-                let prev_loop_tmp = std::mem::replace(&mut self.current_loop_tmp, tmp.clone());
-                let prev_break =
-                    std::mem::replace(&mut self.current_break_label, break_label.clone());
-
-                let iter_fn = resolved_iter
-                    .as_ref()
-                    .map(gen_resolved_callee)
-                    .unwrap_or_else(|| "nil".to_string());
-                let mut iter_pre = String::new();
-                let iter_s = self.gen_expr(iterable, &mut iter_pre);
-                let ind = self.ind();
-                pre.push_str(&iter_pre);
-
-                pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
-                if iter_fn == ARRAY_ITER_METHOD {
-                    let arr = self.fresh_tmp();
-                    let idx = self.fresh_tmp();
-                    pre.push_str(&format!("{}local {} = {}\n", ind, arr, iter_s));
-                    pre.push_str(&format!("{}for {} = 1, #{} do\n", ind, idx, arr));
-                    self.indent += 2;
-                    match pat {
-                        Pattern::Variable(name, _) => {
-                            pre.push_str(&format!(
-                                "{}local {} = {}[{}]\n",
-                                self.ind(),
-                                name,
-                                arr,
-                                idx
-                            ));
-                        }
-                        Pattern::Wildcard => {}
-                        _ => {
-                            let loop_var = self.fresh_tmp();
-                            pre.push_str(&format!(
-                                "{}local {} = {}[{}]\n",
-                                self.ind(),
-                                loop_var,
-                                arr,
-                                idx
-                            ));
-                            let bindings = self.gen_for_pattern_bindings(pat, &loop_var);
-                            pre.push_str(&bindings);
-                        }
-                    }
-                } else {
-                    let (loop_var, needs_bindings) = match pat {
-                        Pattern::Variable(name, _) => (name.clone(), false),
-                        Pattern::Wildcard => ("_".to_string(), false),
-                        _ => (self.fresh_tmp(), true),
-                    };
-
-                    pre.push_str(&format!(
-                        "{}for {} in {}({}) do\n",
-                        ind, loop_var, iter_fn, iter_s
-                    ));
-                    self.indent += 2;
-                    if needs_bindings {
-                        let bindings = self.gen_for_pattern_bindings(pat, &loop_var);
-                        pre.push_str(&bindings);
-                    }
-                }
-                pre.push_str(&self.gen_expr_as_stmt(body));
-                pre.push_str(&format!("{}::_continue_{}::\n", self.ind(), loop_id));
-                self.indent -= 2;
-                pre.push_str(&format!("{}end\n", ind));
-                pre.push_str(&format!("{}::{}::\n", ind, break_label));
-
-                self.current_loop_id = prev_loop_id;
-                self.current_loop_tmp = prev_loop_tmp;
-                self.current_break_label = prev_break;
-                tmp
-            }
+            } => self.gen_for_expr(pat, iterable, body, resolved_iter, pre),
 
             // Diverging expressions: emit the control-flow jump into `pre` and
             // return a dead placeholder — any code using the "value" is unreachable.
-            ExprKind::Break(val) => {
-                if let Some(e) = val {
-                    let v = self.gen_expr(e, pre);
-                    pre.push_str(&format!(
-                        "{}{} = {}\n",
-                        self.ind(),
-                        self.current_loop_tmp,
-                        v
-                    ));
-                }
-                pre.push_str(&format!(
-                    "{}goto {}\n",
-                    self.ind(),
-                    self.current_break_label
-                ));
-                "nil".to_string()
-            }
-            ExprKind::Continue => {
-                pre.push_str(&format!(
-                    "{}goto _continue_{}\n",
-                    self.ind(),
-                    self.current_loop_id
-                ));
-                "nil".to_string()
-            }
-            ExprKind::Return(val) => {
-                if let Some(e) = val {
-                    let v = self.gen_expr(e, pre);
-                    pre.push_str(&format!("{}return {}\n", self.ind(), v));
-                } else {
-                    pre.push_str(&format!("{}return {{}}\n", self.ind()));
-                }
-                "nil".to_string()
-            }
+            ExprKind::Break(val) => self.gen_break_expr(val.as_deref(), pre),
+            ExprKind::Continue => self.gen_continue_expr(pre),
+            ExprKind::Return(val) => self.gen_return_expr(val.as_deref(), pre),
 
             // Structural expressions materialize through pre-statements instead of
             // IIFEs. This avoids closure allocation in expression position, which is
@@ -1024,71 +746,440 @@ impl LuaCodegen {
                 cond,
                 then_branch,
                 else_branch,
-            } => {
-                let cond_s = self.gen_expr(cond, pre);
-                let tmp = self.fresh_tmp();
-                let ind = self.ind();
-                pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
-                pre.push_str(&format!("{}if {} ~= 0 then\n", ind, cond_s));
-                self.indent += 2;
-                let then_s = self.gen_expr_as_assign(then_branch, &tmp);
-                pre.push_str(&then_s);
-                self.indent -= 2;
-                pre.push_str(&format!("{}else\n", ind));
-                self.indent += 2;
-                let else_s = self.gen_expr_as_assign(else_branch, &tmp);
-                pre.push_str(&else_s);
-                self.indent -= 2;
-                pre.push_str(&format!("{}end\n", ind));
-                tmp
-            }
-            ExprKind::Match { scrutinee, arms } => {
-                let scrutinee_s = self.gen_expr(scrutinee, pre);
-                let tmp = self.fresh_tmp();
-                let ind = self.ind();
-                pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
-                pre.push_str(&format!("{}do\n", ind));
-                self.indent += 2;
-                if matches!(scrutinee.kind, ExprKind::Ident(_)) {
-                    let arms_s = self.gen_match_arms(arms, Tail::Assign(&tmp), &scrutinee_s);
-                    pre.push_str(&arms_s);
-                } else {
-                    pre.push_str(&format!("{}local _s = {}\n", self.ind(), scrutinee_s));
-                    let arms_s = self.gen_match_arms(arms, Tail::Assign(&tmp), "_s");
-                    pre.push_str(&arms_s);
-                }
-                self.indent -= 2;
-                pre.push_str(&format!("{}end\n", ind));
-                tmp
-            }
+            } => self.gen_if_expr(cond, then_branch, else_branch, pre),
+            ExprKind::Match { scrutinee, arms } => self.gen_match_expr(scrutinee, arms, pre),
             ExprKind::Block { stmts, final_expr } => {
-                let tmp = self.fresh_tmp();
-                let ind = self.ind();
-                pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
-                pre.push_str(&format!("{}do\n", ind));
-                self.indent += 2;
-                let mut reachable = true;
-                for stmt in stmts {
-                    if !reachable {
-                        break;
-                    }
-                    pre.push_str(&self.gen_stmt(stmt));
-                    pre.push('\n');
-                    reachable = !stmt_always_exits(stmt, true);
-                }
-                if reachable {
-                    if let Some(e) = final_expr {
-                        let assign_s = self.gen_expr_as_assign(e, &tmp);
-                        pre.push_str(&assign_s);
-                    } else {
-                        pre.push_str(&format!("{}{} = {{}}\n", self.ind(), tmp));
-                    }
-                }
-                self.indent -= 2;
-                pre.push_str(&format!("{}end\n", ind));
-                tmp
+                self.gen_block_expr(stmts, final_expr.as_deref(), pre)
             }
         }
+    }
+
+    fn gen_binary_expr(
+        &mut self,
+        lhs: &Expr,
+        op: &BinOp,
+        rhs: &Expr,
+        resolved_op: &Option<ResolvedCallee>,
+        dict_args: &[DictRef],
+        pre: &mut String,
+    ) -> String {
+        let l = self.gen_expr(lhs, pre);
+        let r = self.gen_expr(rhs, pre);
+        match op {
+            BinOp::Pipe => {
+                let mut all_args = gen_dict_refs(dict_args);
+                all_args.push(l);
+                format!("{}({})", r, all_args.join(", "))
+            }
+            BinOp::Custom(op) => match resolved_op {
+                Some(resolved) => {
+                    let resolved = gen_resolved_callee(resolved);
+                    if dict_args.is_empty()
+                        && let Some(inlined) =
+                            self.gen_inline_call(&resolved, &[l.clone(), r.clone()], pre)
+                    {
+                        return inlined;
+                    }
+                    if dict_args.is_empty() {
+                        format!("{}({}, {})", resolved, l, r)
+                    } else {
+                        let dict_args = gen_dict_refs(dict_args);
+                        format!("{}({}, {}, {})", resolved, dict_args.join(", "), l, r)
+                    }
+                }
+                None => format!("{}({}, {})", mangle_op(op), l, r),
+            },
+        }
+    }
+
+    fn gen_assign_expr(&mut self, target: &Expr, value: &Expr, pre: &mut String) -> String {
+        let t = self.gen_expr(target, pre);
+        let v = self.gen_expr(value, pre);
+        if !expr_always_exits(target, true) && !expr_always_exits(value, true) {
+            pre.push_str(&format!("{}{} = {}\n", self.ind(), t, v));
+        }
+        "{}".to_string()
+    }
+
+    fn gen_lambda_expr(&mut self, params: &[Param], body: &Expr, dict_params: &[String]) -> String {
+        let mut param_names: Vec<String> = dict_params.to_vec();
+        let mut pattern_destructures = String::new();
+        for (i, param) in params.iter().enumerate() {
+            match &param.pat {
+                Pattern::Variable(n, _) => param_names.push(n.clone()),
+                Pattern::Wildcard => param_names.push("_".to_string()),
+                _ => {
+                    let placeholder = format!("__p{}", i);
+                    param_names.push(placeholder.clone());
+                    self.indent += 2;
+                    pattern_destructures
+                        .push_str(&self.gen_for_pattern_bindings(&param.pat, &placeholder));
+                    self.indent -= 2;
+                }
+            }
+        }
+        let params_s = param_names.join(", ");
+        let mut out = format!("(function({})\n", params_s);
+        self.indent += 2;
+        out.push_str(&pattern_destructures);
+        out.push_str(&self.gen_expr_as_body(body));
+        self.indent -= 2;
+        out.push_str(&format!("{}end)", self.ind()));
+        out
+    }
+
+    fn gen_call_expr(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        is_method_call: bool,
+        arg_wrappers: &[Option<ArgWrapper>],
+        resolved_callee: &Option<ResolvedCallee>,
+        dict_args: &[DictRef],
+        pre: &mut String,
+    ) -> String {
+        let callee_s = resolved_callee
+            .as_ref()
+            .map(gen_resolved_callee)
+            .unwrap_or_else(|| self.gen_expr(callee, pre));
+        let mut all_args: Vec<String> = gen_dict_refs(dict_args);
+        if let Some(receiver) = method_receiver(callee, is_method_call) {
+            all_args.push(self.gen_expr(receiver, pre));
+        }
+        all_args.extend(args.iter().enumerate().map(|(idx, arg)| {
+            let arg_s = self.gen_expr(arg, pre);
+            wrap_call_argument(arg_s, arg_wrappers.get(idx).and_then(Option::as_ref))
+        }));
+        if dict_args.is_empty()
+            && let Some(inlined) = self.gen_inline_call(&callee_s, &all_args, pre)
+        {
+            return inlined;
+        }
+        if dict_args.is_empty()
+            && let Some(expanded) = self.gen_template_call(&callee_s, &all_args)
+        {
+            return expanded;
+        }
+        format!("{}({})", callee_s, all_args.join(", "))
+    }
+
+    fn gen_array_expr(&mut self, entries: &[ArrayEntry], pre: &mut String) -> String {
+        if entries.iter().all(|e| matches!(e, ArrayEntry::Elem(_))) {
+            let items_s = entries
+                .iter()
+                .map(|e| self.gen_expr(e.expr(), pre))
+                .collect::<Vec<_>>();
+            return format!("{{ {} }}", items_s.join(", "));
+        }
+
+        let tmp = self.fresh_tmp();
+        let ind = self.ind();
+        pre.push_str(&format!("{}local {} = {{}}\n", ind, tmp));
+        for entry in entries {
+            match entry {
+                ArrayEntry::Elem(expr) => {
+                    let v = self.gen_expr(expr, pre);
+                    pre.push_str(&format!("{}{}[#{}+1] = {}\n", ind, tmp, tmp, v));
+                }
+                ArrayEntry::Spread(expr) => {
+                    let v = self.gen_expr(expr, pre);
+                    let iter_var = self.fresh_tmp();
+                    pre.push_str(&format!(
+                        "{}for _, {} in ipairs({}) do {}[#{}+1] = {} end\n",
+                        ind, iter_var, v, tmp, tmp, iter_var
+                    ));
+                }
+            }
+        }
+        tmp
+    }
+
+    fn gen_record_expr(&mut self, entries: &[RecordEntry], pre: &mut String) -> String {
+        if entries
+            .iter()
+            .all(|e| matches!(e, RecordEntry::Field(_, _)))
+        {
+            let fields_s = entries
+                .iter()
+                .map(|e| {
+                    if let RecordEntry::Field(n, expr) = e {
+                        format!("{} = {}", n, self.gen_expr(expr, pre))
+                    } else {
+                        unreachable!()
+                    }
+                })
+                .collect::<Vec<_>>();
+            return format!("{{ {} }}", fields_s.join(", "));
+        }
+
+        let tmp = self.fresh_tmp();
+        let ind = self.ind();
+        pre.push_str(&format!("{}local {} = {{}}\n", ind, tmp));
+        for entry in entries {
+            match entry {
+                RecordEntry::Field(name, expr) => {
+                    let v = self.gen_expr(expr, pre);
+                    pre.push_str(&format!("{}{}[\"{}\"] = {}\n", ind, tmp, name, v));
+                }
+                RecordEntry::Spread(expr) => {
+                    let v = self.gen_expr(expr, pre);
+                    let k_var = self.fresh_tmp();
+                    let v_var = self.fresh_tmp();
+                    pre.push_str(&format!(
+                        "{}for {}, {} in pairs({}) do {}[{}] = {} end\n",
+                        ind, k_var, v_var, v, tmp, k_var, v_var
+                    ));
+                }
+            }
+        }
+        tmp
+    }
+
+    fn gen_loop_expr(&mut self, body: &Expr, pre: &mut String) -> String {
+        self.loop_counter += 1;
+        let loop_id = self.loop_counter;
+        let tmp = self.fresh_tmp();
+        let break_label = format!("_break_{}", loop_id);
+
+        let prev_loop_id = std::mem::replace(&mut self.current_loop_id, loop_id);
+        let prev_loop_tmp = std::mem::replace(&mut self.current_loop_tmp, tmp.clone());
+        let prev_break = std::mem::replace(&mut self.current_break_label, break_label.clone());
+
+        let ind = self.ind();
+        pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
+        pre.push_str(&format!("{}while true do\n", ind));
+        self.indent += 2;
+        pre.push_str(&self.gen_expr_as_stmt(body));
+        pre.push_str(&format!("{}::_continue_{}::\n", self.ind(), loop_id));
+        self.indent -= 2;
+        pre.push_str(&format!("{}end\n", ind));
+        pre.push_str(&format!("{}::{}::\n", ind, break_label));
+
+        self.current_loop_id = prev_loop_id;
+        self.current_loop_tmp = prev_loop_tmp;
+        self.current_break_label = prev_break;
+        tmp
+    }
+
+    fn gen_for_expr(
+        &mut self,
+        pat: &Pattern,
+        iterable: &Expr,
+        body: &Expr,
+        resolved_iter: &Option<ResolvedCallee>,
+        pre: &mut String,
+    ) -> String {
+        self.loop_counter += 1;
+        let loop_id = self.loop_counter;
+        let break_label = format!("_break_{}", loop_id);
+        let tmp = self.fresh_tmp();
+
+        let prev_loop_id = std::mem::replace(&mut self.current_loop_id, loop_id);
+        let prev_loop_tmp = std::mem::replace(&mut self.current_loop_tmp, tmp.clone());
+        let prev_break = std::mem::replace(&mut self.current_break_label, break_label.clone());
+
+        let iter_fn = resolved_iter
+            .as_ref()
+            .map(gen_resolved_callee)
+            .unwrap_or_else(|| "nil".to_string());
+        let mut iter_pre = String::new();
+        let iter_s = self.gen_expr(iterable, &mut iter_pre);
+        let ind = self.ind();
+        pre.push_str(&iter_pre);
+
+        pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
+        if iter_fn == ARRAY_ITER_METHOD {
+            self.gen_array_for_header(pat, &iter_s, pre, &ind);
+        } else {
+            self.gen_generic_for_header(pat, &iter_fn, &iter_s, pre, &ind);
+        }
+        pre.push_str(&self.gen_expr_as_stmt(body));
+        pre.push_str(&format!("{}::_continue_{}::\n", self.ind(), loop_id));
+        self.indent -= 2;
+        pre.push_str(&format!("{}end\n", ind));
+        pre.push_str(&format!("{}::{}::\n", ind, break_label));
+
+        self.current_loop_id = prev_loop_id;
+        self.current_loop_tmp = prev_loop_tmp;
+        self.current_break_label = prev_break;
+        tmp
+    }
+
+    fn gen_array_for_header(&mut self, pat: &Pattern, iter_s: &str, pre: &mut String, ind: &str) {
+        let arr = self.fresh_tmp();
+        let idx = self.fresh_tmp();
+        pre.push_str(&format!("{}local {} = {}\n", ind, arr, iter_s));
+        pre.push_str(&format!("{}for {} = 1, #{} do\n", ind, idx, arr));
+        self.indent += 2;
+        match pat {
+            Pattern::Variable(name, _) => {
+                pre.push_str(&format!(
+                    "{}local {} = {}[{}]\n",
+                    self.ind(),
+                    name,
+                    arr,
+                    idx
+                ));
+            }
+            Pattern::Wildcard => {}
+            _ => {
+                let loop_var = self.fresh_tmp();
+                pre.push_str(&format!(
+                    "{}local {} = {}[{}]\n",
+                    self.ind(),
+                    loop_var,
+                    arr,
+                    idx
+                ));
+                let bindings = self.gen_for_pattern_bindings(pat, &loop_var);
+                pre.push_str(&bindings);
+            }
+        }
+    }
+
+    fn gen_generic_for_header(
+        &mut self,
+        pat: &Pattern,
+        iter_fn: &str,
+        iter_s: &str,
+        pre: &mut String,
+        ind: &str,
+    ) {
+        let (loop_var, needs_bindings) = match pat {
+            Pattern::Variable(name, _) => (name.clone(), false),
+            Pattern::Wildcard => ("_".to_string(), false),
+            _ => (self.fresh_tmp(), true),
+        };
+
+        pre.push_str(&format!(
+            "{}for {} in {}({}) do\n",
+            ind, loop_var, iter_fn, iter_s
+        ));
+        self.indent += 2;
+        if needs_bindings {
+            let bindings = self.gen_for_pattern_bindings(pat, &loop_var);
+            pre.push_str(&bindings);
+        }
+    }
+
+    fn gen_break_expr(&mut self, val: Option<&Expr>, pre: &mut String) -> String {
+        if let Some(e) = val {
+            let v = self.gen_expr(e, pre);
+            pre.push_str(&format!(
+                "{}{} = {}\n",
+                self.ind(),
+                self.current_loop_tmp,
+                v
+            ));
+        }
+        pre.push_str(&format!(
+            "{}goto {}\n",
+            self.ind(),
+            self.current_break_label
+        ));
+        "nil".to_string()
+    }
+
+    fn gen_continue_expr(&self, pre: &mut String) -> String {
+        pre.push_str(&format!(
+            "{}goto _continue_{}\n",
+            self.ind(),
+            self.current_loop_id
+        ));
+        "nil".to_string()
+    }
+
+    fn gen_return_expr(&mut self, val: Option<&Expr>, pre: &mut String) -> String {
+        if let Some(e) = val {
+            let v = self.gen_expr(e, pre);
+            pre.push_str(&format!("{}return {}\n", self.ind(), v));
+        } else {
+            pre.push_str(&format!("{}return {{}}\n", self.ind()));
+        }
+        "nil".to_string()
+    }
+
+    fn gen_if_expr(
+        &mut self,
+        cond: &Expr,
+        then_branch: &Expr,
+        else_branch: &Expr,
+        pre: &mut String,
+    ) -> String {
+        let cond_s = self.gen_expr(cond, pre);
+        let tmp = self.fresh_tmp();
+        let ind = self.ind();
+        pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
+        pre.push_str(&format!("{}if {} ~= 0 then\n", ind, cond_s));
+        self.indent += 2;
+        let then_s = self.gen_expr_as_assign(then_branch, &tmp);
+        pre.push_str(&then_s);
+        self.indent -= 2;
+        pre.push_str(&format!("{}else\n", ind));
+        self.indent += 2;
+        let else_s = self.gen_expr_as_assign(else_branch, &tmp);
+        pre.push_str(&else_s);
+        self.indent -= 2;
+        pre.push_str(&format!("{}end\n", ind));
+        tmp
+    }
+
+    fn gen_match_expr(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[(Pattern, Expr)],
+        pre: &mut String,
+    ) -> String {
+        let scrutinee_s = self.gen_expr(scrutinee, pre);
+        let tmp = self.fresh_tmp();
+        let ind = self.ind();
+        pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
+        pre.push_str(&format!("{}do\n", ind));
+        self.indent += 2;
+        if matches!(scrutinee.kind, ExprKind::Ident(_)) {
+            let arms_s = self.gen_match_arms(arms, Tail::Assign(&tmp), &scrutinee_s);
+            pre.push_str(&arms_s);
+        } else {
+            pre.push_str(&format!("{}local _s = {}\n", self.ind(), scrutinee_s));
+            let arms_s = self.gen_match_arms(arms, Tail::Assign(&tmp), "_s");
+            pre.push_str(&arms_s);
+        }
+        self.indent -= 2;
+        pre.push_str(&format!("{}end\n", ind));
+        tmp
+    }
+
+    fn gen_block_expr(
+        &mut self,
+        stmts: &[Stmt],
+        final_expr: Option<&Expr>,
+        pre: &mut String,
+    ) -> String {
+        let tmp = self.fresh_tmp();
+        let ind = self.ind();
+        pre.push_str(&format!("{}local {} = nil\n", ind, tmp));
+        pre.push_str(&format!("{}do\n", ind));
+        self.indent += 2;
+        let mut reachable = true;
+        for stmt in stmts {
+            if !reachable {
+                break;
+            }
+            pre.push_str(&self.gen_stmt(stmt));
+            pre.push('\n');
+            reachable = !stmt_always_exits(stmt, true);
+        }
+        if reachable {
+            if let Some(e) = final_expr {
+                let assign_s = self.gen_expr_as_assign(e, &tmp);
+                pre.push_str(&assign_s);
+            } else {
+                pre.push_str(&format!("{}{} = {{}}\n", self.ind(), tmp));
+            }
+        }
+        self.indent -= 2;
+        pre.push_str(&format!("{}end\n", ind));
+        tmp
     }
 
     // ── Tail-position generation ──────────────────────────────────────────────

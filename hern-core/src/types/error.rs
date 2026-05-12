@@ -348,7 +348,7 @@ impl fmt::Display for TypeError {
             TypeError::AmbiguousTraitMethod { method, candidates } => write!(
                 f,
                 "ambiguous method `{}`: defined in multiple traits ({}); \
-                 use explicit TraitName.{}() syntax to disambiguate",
+                 use explicit TraitName::{}() syntax to disambiguate",
                 method,
                 candidates.join(", "),
                 method,

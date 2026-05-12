@@ -1,0 +1,4 @@
+let mut m = Map::new();
+Map::new().set("a", 1);
+m.set("b", 2);
+print(m.get("b").unwrap_or(0));

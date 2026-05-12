@@ -1,0 +1,10 @@
+fn bump(mut r: #{ x: int }) {
+  r.x = 2;
+  print(r.x);
+}
+
+fn make() -> mut #{ x: int } {
+  #{ x: 1 }
+}
+
+bump(make());

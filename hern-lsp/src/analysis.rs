@@ -3,65 +3,79 @@ mod completion;
 mod diagnostics;
 mod document_symbols;
 mod hover;
+mod inlay_hints;
 mod navigation;
 mod rename;
 mod semantic_tokens;
 mod signature_help;
+mod snapshot;
 mod state;
 mod uri;
 mod workspace;
+mod workspace_symbols;
 
 pub(crate) use code_actions::code_actions;
 pub(crate) use completion::completion;
 pub(crate) use diagnostics::DiagnosticsByUri;
 pub(crate) use document_symbols::document_symbols;
 pub(crate) use hover::hover;
+pub(crate) use inlay_hints::inlay_hints;
 pub(crate) use navigation::{definition, document_highlights, references};
 pub(crate) use rename::{prepare_rename, rename};
 pub(crate) use semantic_tokens::legend as semantic_tokens_legend;
 pub(crate) use signature_help::signature_help;
 pub(crate) use state::{ServerState, combined_diagnostics_for_uri, diagnostics_for_document};
-
-use uri::uri_to_path;
+pub(crate) use workspace_symbols::workspace_symbols;
 
 pub(crate) fn semantic_tokens(
     state: &ServerState,
     uri: lsp_types::Uri,
 ) -> Option<lsp_types::SemanticTokensResult> {
-    let source = workspace::document_source(state, &uri)?;
-    let path = uri_to_path(&uri)?;
-    if let Some(analysis) = state::cached_analysis(state, &uri)
-        && let Some((module_name, program)) = analysis.graph.module_for_path(&path)
-    {
-        return Some(state.timed("semantic tokens", || {
-            semantic_tokens::semantic_tokens_for_source(
-                &source,
-                Some(program),
-                semantic_tokens::SemanticContext::new(&analysis.inference, module_name),
-            )
-        }));
-    }
-    if let Some(analysis) = workspace::load_workspace_graphs(state, &uri)
-        && let Some((module_name, program)) = analysis.graph.module_for_path(&path)
-    {
-        return Some(state.timed("semantic tokens", || {
-            semantic_tokens::semantic_tokens_for_source(
-                &source,
-                Some(program),
-                semantic_tokens::SemanticContext::new(&analysis.inference, module_name),
-            )
-        }));
-    }
-    let graph = workspace::load_document_graph_recovering(state, &uri)?;
-    let program = graph.module_for_path(&path).map(|(_, program)| program);
-    Some(state.timed("semantic tokens", || {
-        semantic_tokens::semantic_tokens_for_source(&source, program, None)
+    semantic_tokens_inner(state, uri, None)
+}
+
+pub(crate) fn semantic_tokens_range(
+    state: &ServerState,
+    uri: lsp_types::Uri,
+    range: lsp_types::Range,
+) -> Option<lsp_types::SemanticTokensResult> {
+    semantic_tokens_inner(state, uri, Some(range))
+}
+
+fn semantic_tokens_inner(
+    state: &ServerState,
+    uri: lsp_types::Uri,
+    range: Option<lsp_types::Range>,
+) -> Option<lsp_types::SemanticTokensResult> {
+    let snapshot = snapshot::analysis_snapshot(state, &uri, snapshot::SnapshotMode::PreferTyped)?;
+    let module = snapshot.module();
+    let context = if snapshot.quality() == snapshot::SnapshotQuality::Typed {
+        module.and_then(|(module_name, _)| {
+            snapshot
+                .inference()
+                .and_then(|inference| semantic_tokens::SemanticContext::new(inference, module_name))
+        })
+    } else {
+        None
+    };
+    Some(state.timed("semantic tokens", || match range {
+        Some(range) => semantic_tokens::semantic_tokens_for_source_range(
+            snapshot.source(),
+            module.map(|(_, program)| program),
+            context,
+            range,
+        ),
+        None => semantic_tokens::semantic_tokens_for_source(
+            snapshot.source(),
+            module.map(|(_, program)| program),
+            context,
+        ),
     }))
 }
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::uri::path_to_uri;
+    use super::uri::{path_to_uri, uri_to_path};
     use super::*;
     use hern_core::analysis::analyze_prelude;
     use lsp_types::{
@@ -552,6 +566,42 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn hover_does_not_show_block_result_on_let_keyword() {
+        let project = TestProject::new("hover-let-keyword");
+        let source = concat!(
+            "fn first_basement_index(steps) {\n",
+            "  let mut floor = 0;\n",
+            "  let mut index = 1;\n",
+            "  0 - 1\n",
+            "}\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(1, 2));
+
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn hover_does_not_show_record_block_result_on_let_keyword() {
+        let project = TestProject::new("hover-let-keyword-record-result");
+        let source = concat!(
+            "fn new_counter() {\n",
+            "  let mut count = 0;\n",
+            "  #{\n",
+            "    inc: fn() { count = count + 1 },\n",
+            "    get: fn() { count },\n",
+            "  }\n",
+            "}\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(1, 2));
+
+        assert!(info.is_none());
+    }
+
+    #[test]
     fn hover_normalizes_free_type_vars_for_expressions() {
         let project = TestProject::new("normalized-expression-hover");
         let source = "[]\n";
@@ -743,14 +793,14 @@ pub(super) mod tests {
             "impl Show for float {\n",
             "  fn show(x) { \"ok\" }\n",
             "}\n",
-            "Show.show(1.0)\n",
+            "Show::show(1.0)\n",
         );
         let (state, uri) = project.open("main.hern", source);
 
         let trait_info =
             hover(&state, uri.clone(), Position::new(6, 1)).expect("trait hover should resolve");
         let method_info =
-            hover(&state, uri, Position::new(6, 6)).expect("method hover should resolve");
+            hover(&state, uri, Position::new(6, 7)).expect("method hover should resolve");
 
         assert_eq!(hover_text(trait_info), "trait Show 'a");
         assert_eq!(hover_text(method_info), "fn show(x: 'a) -> string");
@@ -857,6 +907,51 @@ pub(super) mod tests {
             "expected constraints section, got: {callee_text}"
         );
         assert_eq!(hover_text(call), "int");
+    }
+
+    #[test]
+    fn hover_shows_if_expression_type_and_range() {
+        let project = TestProject::new("if-expression-hover");
+        let source = "let value = if true { 1 } else { 2 };\nvalue\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(0, 12)).expect("if hover should resolve");
+
+        assert_eq!(hover_text(info.clone()), "int");
+        assert_eq!(
+            info.range,
+            Some(Range::new(Position::new(0, 12), Position::new(0, 36)))
+        );
+    }
+
+    #[test]
+    fn hover_shows_match_expression_type_and_range() {
+        let project = TestProject::new("match-expression-hover");
+        let source = "let value = match Some(1) { Some(x) -> x, None -> 0 };\nvalue\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(0, 12)).expect("match hover should resolve");
+
+        assert_eq!(hover_text(info.clone()), "int");
+        assert_eq!(
+            info.range,
+            Some(Range::new(Position::new(0, 12), Position::new(0, 53)))
+        );
+    }
+
+    #[test]
+    fn hover_shows_lambda_type_on_fn_keyword_and_range() {
+        let project = TestProject::new("lambda-hover");
+        let source = "let inc = fn(x) { x + 1 };\ninc(1)\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(0, 10)).expect("lambda hover should resolve");
+
+        assert_eq!(hover_text(info.clone()), "fn(int) -> int");
+        assert_eq!(
+            info.range,
+            Some(Range::new(Position::new(0, 10), Position::new(0, 25)))
+        );
     }
 
     #[test]
@@ -1166,6 +1261,19 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn definition_survives_recoverable_parse_errors() {
+        let project = TestProject::new("definition-recovery");
+        let source = "fn value() { 1 }\nlet broken = ;\nvalue()\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let location = definition(&state, uri.clone(), Position::new(2, 1))
+            .expect("definition should resolve from recovering graph");
+
+        assert_eq!(location.uri, uri);
+        assert_eq!(location.range.start, Position::new(0, 3));
+    }
+
+    #[test]
     fn definition_resolves_local_symbol_in_same_module() {
         let project = TestProject::new("definition-local");
         let source = "{ let value = 1; value }\n";
@@ -1195,6 +1303,61 @@ pub(super) mod tests {
 
         assert_eq!(location.uri, dep_uri);
         assert_eq!(location.range.start, Position::new(0, 3));
+    }
+
+    #[test]
+    fn definition_resolves_declaration_site_symbol() {
+        let project = TestProject::new("definition-declaration-site");
+        let source = "type Counter = Counter(float)\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let location = definition(&state, uri.clone(), Position::new(0, 6))
+            .expect("definition should resolve at declaration site");
+
+        assert_eq!(location.uri, uri);
+        assert_eq!(location.range.start, Position::new(0, 5));
+    }
+
+    #[test]
+    fn definition_resolves_trait_associated_access_target_and_method() {
+        let project = TestProject::new("definition-trait-associated");
+        let source = concat!(
+            "trait Show 'a { fn show(x: 'a) -> string }\n",
+            "impl Show for float { fn show(x) { \"ok\" } }\n",
+            "Show::show(1.0)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let trait_location = definition(&state, uri.clone(), Position::new(2, 1))
+            .expect("trait target should resolve");
+        let method_location = definition(&state, uri.clone(), Position::new(2, 7))
+            .expect("trait method should resolve");
+
+        assert_eq!(trait_location.uri, uri);
+        assert_eq!(trait_location.range.start, Position::new(0, 6));
+        assert_eq!(method_location.uri, uri);
+        assert_eq!(method_location.range.start, Position::new(0, 19));
+    }
+
+    #[test]
+    fn definition_resolves_inherent_associated_access_target_and_method() {
+        let project = TestProject::new("definition-inherent-associated");
+        let source = concat!(
+            "type Counter = Counter(float)\n",
+            "impl Counter { fn make(value: float) -> Self { Counter(value) } }\n",
+            "Counter::make(1.0)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let type_location = definition(&state, uri.clone(), Position::new(2, 1))
+            .expect("type target should resolve");
+        let method_location = definition(&state, uri.clone(), Position::new(2, 10))
+            .expect("inherent method should resolve");
+
+        assert_eq!(type_location.uri, uri);
+        assert_eq!(type_location.range.start, Position::new(0, 5));
+        assert_eq!(method_location.uri, uri);
+        assert_eq!(method_location.range.start, Position::new(1, 18));
     }
 
     #[test]
@@ -1471,6 +1634,27 @@ pub(super) mod tests {
         assert!(file_edits.iter().all(|e| e.new_text == "amount"));
         // declaration before use in source order
         assert!(file_edits[0].range.start < file_edits[1].range.start);
+    }
+
+    #[test]
+    fn rename_survives_recoverable_parse_errors() {
+        let project = TestProject::new("rename-recovery");
+        let source = "{ let value = 1; value }\nlet broken = ;\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let edit = rename(
+            &state,
+            uri.clone(),
+            Position::new(0, 6),
+            "amount".to_string(),
+        )
+        .expect("rename should succeed from recovering graph")
+        .expect("rename should return edits");
+
+        let edits = edit.changes.expect("changes should be present");
+        let file_edits = edits.get(&uri).expect("edits for file should be present");
+        assert_eq!(file_edits.len(), 2);
+        assert!(file_edits.iter().all(|edit| edit.new_text == "amount"));
     }
 
     #[test]
@@ -1908,13 +2092,13 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn completion_suggests_trait_methods_after_dot() {
+    fn completion_suggests_trait_methods_after_colon_colon() {
         use lsp_types::CompletionItemKind;
         let project = TestProject::new("completion-trait-method");
-        let source = "trait Show 'a { fn show(x: 'a) -> string }\nShow.\n";
+        let source = "trait Show 'a { fn show(x: 'a) -> string }\nShow::\n";
         let (state, uri) = project.open("main.hern", source);
 
-        let items = completion(&state, uri, Position::new(1, 5));
+        let items = completion(&state, uri, Position::new(1, 6));
 
         let show = items
             .iter()

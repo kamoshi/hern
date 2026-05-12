@@ -5,5 +5,5 @@ trait Applicative 'f {
 }
 
 fn make(x) {
-    Applicative.pure(x)
+    Applicative::pure(x)
 }

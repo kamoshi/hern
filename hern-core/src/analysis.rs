@@ -200,14 +200,14 @@ fn find_hover_in_expr(
     let ty = symbol_types
         .get(&expr.id)
         .or_else(|| expr_types.get(&expr.id));
-    if let Some(ty) = ty
+    if let (Some(ty), Some(span)) = (ty, hover_target_span(expr, pos))
         && best
             .as_ref()
-            .is_none_or(|current| span_len(expr.span) <= span_len(current.span))
+            .is_none_or(|current| span_len(span) <= span_len(current.span))
     {
         *best = Some(HoverInfo {
             node_id: expr.id,
-            span: expr.span,
+            span,
             ty: ty.clone(),
         });
     }
@@ -335,6 +335,39 @@ fn find_hover_in_expr(
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit => {}
+    }
+}
+
+fn hover_target_span(expr: &Expr, pos: SourcePosition) -> Option<SourceSpan> {
+    match &expr.kind {
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Import(_)
+        | ExprKind::Unit
+        | ExprKind::Call { .. }
+        | ExprKind::If { .. }
+        | ExprKind::Match { .. }
+        | ExprKind::Lambda { .. }
+        | ExprKind::Tuple(_)
+        | ExprKind::Array(_)
+        | ExprKind::Record(_) => Some(expr.span).filter(|span| contains(*span, pos)),
+        ExprKind::FieldAccess { field_span, .. } => {
+            Some(*field_span).filter(|span| contains(*span, pos))
+        }
+        ExprKind::AssociatedAccess { member_span, .. } => {
+            Some(*member_span).filter(|span| contains(*span, pos))
+        }
+        ExprKind::Not(_)
+        | ExprKind::Loop(_)
+        | ExprKind::Break(_)
+        | ExprKind::Continue
+        | ExprKind::Return(_)
+        | ExprKind::Assign { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::Block { .. }
+        | ExprKind::For { .. } => None,
     }
 }
 
