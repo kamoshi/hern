@@ -3,7 +3,7 @@ use crate::lex::error::{ParseError, Span};
 use crate::lex::{Spanned, Token};
 use std::cell::{Cell, RefCell};
 
-type FnParamsBody = (usize, Vec<Param>, Option<TypeReturn>, Expr);
+type FnParamsBody = (usize, Vec<Param>, Option<TypeReturn>, Vec<TypeBound>, Expr);
 
 fn consumed_span(tokens: &[Spanned], consumed: usize) -> SourceSpan {
     let start = tokens.first().map(|token| token.span).unwrap_or(Span {
@@ -472,10 +472,8 @@ impl<'tokens> Parser<'tokens> {
             let (c_name, name, name_span) = self.expect_name_with_span(&tokens[ptr..])?;
             ptr += c_name;
 
-            let (c_bounds, type_bounds) = self.parse_type_bounds(&tokens[ptr..])?;
-            ptr += c_bounds;
-
-            let (c_tail, params, ret_type, body) = self.parse_fn_params_body(&tokens[ptr..])?;
+            let (c_tail, params, ret_type, type_bounds, body) =
+                self.parse_fn_params_body(&tokens[ptr..])?;
             ptr += c_tail;
             return Ok((
                 ptr,
@@ -497,10 +495,8 @@ impl<'tokens> Parser<'tokens> {
         let (consumed_name, name, name_span) = self.expect_ident_with_span(&tokens[ptr..])?;
         ptr += consumed_name;
 
-        let (c_bounds, type_bounds) = self.parse_type_bounds(&tokens[ptr..])?;
-        ptr += c_bounds;
-
-        let (c_tail, params, ret_type, body) = self.parse_fn_params_body(&tokens[ptr..])?;
+        let (c_tail, params, ret_type, type_bounds, body) =
+            self.parse_fn_params_body(&tokens[ptr..])?;
         ptr += c_tail;
         Ok((
             ptr,
@@ -517,34 +513,37 @@ impl<'tokens> Parser<'tokens> {
         ))
     }
 
-    fn parse_type_bounds(&self, tokens: &[Spanned]) -> Result<(usize, Vec<TypeBound>), ParseError> {
+    fn parse_where_type_bounds(
+        &self,
+        tokens: &[Spanned],
+    ) -> Result<(usize, Vec<TypeBound>), ParseError> {
         let mut ptr = 0;
         let mut bounds = Vec::new();
-        if tokens.get(ptr).map(|t| &t.token) == Some(&Token::LBracket) {
-            ptr += 1;
+        if tokens.get(ptr).map(|t| &t.token) != Some(&Token::Where) {
+            return Ok((0, bounds));
+        }
+        ptr += 1;
+        loop {
+            let (c_p, p) = self.expect_ident(&tokens[ptr..])?;
+            ptr += c_p;
+            ptr += self.expect(&tokens[ptr..], Token::Colon)?;
+            let mut traits = Vec::new();
             loop {
-                let (c_p, p) = self.expect_ident(&tokens[ptr..])?;
-                ptr += c_p;
-                ptr += self.expect(&tokens[ptr..], Token::Colon)?;
-                let mut traits = Vec::new();
-                loop {
-                    let (c_tr, tr) = self.expect_ident(&tokens[ptr..])?;
-                    ptr += c_tr;
-                    traits.push(tr);
-                    if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Plus) {
-                        ptr += 1;
-                    } else {
-                        break;
-                    }
-                }
-                bounds.push(TypeBound { var: p, traits });
-                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
+                let (c_tr, tr) = self.expect_ident(&tokens[ptr..])?;
+                ptr += c_tr;
+                traits.push(tr);
+                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Plus) {
                     ptr += 1;
                 } else {
                     break;
                 }
             }
-            ptr += self.expect(&tokens[ptr..], Token::RBracket)?;
+            bounds.push(TypeBound { var: p, traits });
+            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
+                ptr += 1;
+            } else {
+                break;
+            }
         }
         Ok((ptr, bounds))
     }
@@ -582,9 +581,11 @@ impl<'tokens> Parser<'tokens> {
                 TypeReturn::value(parsed_ret)
             });
         }
+        let (c_bounds, type_bounds) = self.parse_where_type_bounds(&tokens[ptr..])?;
+        ptr += c_bounds;
         let (consumed_body, body) = self.parse_expr(&tokens[ptr..], 0)?;
         ptr += consumed_body;
-        Ok((ptr, params, ret_type, body))
+        Ok((ptr, params, ret_type, type_bounds, body))
     }
 
     fn parse_param(
@@ -868,7 +869,7 @@ impl<'tokens> Parser<'tokens> {
         ptr += self.expect(&tokens[ptr..], Token::For)?;
         let (c_target, target) = self.parse_type(&tokens[ptr..])?;
         ptr += c_target;
-        let (c_bounds, type_bounds) = self.parse_impl_where_bounds(&tokens[ptr..])?;
+        let (c_bounds, type_bounds) = self.parse_where_type_bounds(&tokens[ptr..])?;
         ptr += c_bounds;
         ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
         let mut methods = Vec::new();
@@ -929,47 +930,14 @@ impl<'tokens> Parser<'tokens> {
         ))
     }
 
-    fn parse_impl_where_bounds(
-        &self,
-        tokens: &[Spanned],
-    ) -> Result<(usize, Vec<TypeBound>), ParseError> {
-        let mut ptr = 0;
-        let mut bounds = Vec::new();
-        if tokens.get(ptr).map(|t| &t.token) != Some(&Token::Where) {
-            return Ok((0, bounds));
-        }
-        ptr += 1;
-        loop {
-            let (c_p, p) = self.expect_ident(&tokens[ptr..])?;
-            ptr += c_p;
-            ptr += self.expect(&tokens[ptr..], Token::Colon)?;
-            let mut traits = Vec::new();
-            loop {
-                let (c_tr, tr) = self.expect_ident(&tokens[ptr..])?;
-                ptr += c_tr;
-                traits.push(tr);
-                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Plus) {
-                    ptr += 1;
-                } else {
-                    break;
-                }
-            }
-            bounds.push(TypeBound { var: p, traits });
-            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
-                ptr += 1;
-            } else {
-                break;
-            }
-        }
-        Ok((ptr, bounds))
-    }
-
     fn parse_inherent_impl_tail(
         &self,
         tokens: &[Spanned],
         mut ptr: usize,
         target: Type,
     ) -> Result<(usize, Stmt), ParseError> {
+        let (c_bounds, type_bounds) = self.parse_where_type_bounds(&tokens[ptr..])?;
+        ptr += c_bounds;
         ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
         let mut methods = Vec::new();
         while tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
@@ -977,9 +945,8 @@ impl<'tokens> Parser<'tokens> {
             ptr += self.expect(&tokens[ptr..], Token::Fn)?;
             let (c_mname, mname, mname_span) = self.expect_ident_with_span(&tokens[ptr..])?;
             ptr += c_mname;
-            let (c_bounds, type_bounds) = self.parse_type_bounds(&tokens[ptr..])?;
-            ptr += c_bounds;
-            let (c_tail, params, ret_type, body) = self.parse_fn_params_body(&tokens[ptr..])?;
+            let (c_tail, params, ret_type, type_bounds, body) =
+                self.parse_fn_params_body(&tokens[ptr..])?;
             ptr += c_tail;
             methods.push(InherentMethod {
                 span: consumed_span(&tokens[method_start..], ptr - method_start),
@@ -998,6 +965,7 @@ impl<'tokens> Parser<'tokens> {
             Stmt::InherentImpl(InherentImplDef {
                 span: consumed_span(tokens, ptr),
                 target,
+                type_bounds,
                 methods,
             }),
         ))

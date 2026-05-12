@@ -198,8 +198,10 @@ impl Infer {
 
             let mut param_vars = HashMap::new();
             let target_ty = self.ast_to_ty_with_vars(&id.target, &mut param_vars)?;
-            let initial_constraints =
-                self.collect_type_bound_constraints(&mut param_vars, &method.type_bounds);
+            let mut initial_constraints =
+                self.collect_type_bound_constraints(&mut param_vars, &id.type_bounds);
+            initial_constraints
+                .extend(self.collect_type_bound_constraints(&mut param_vars, &method.type_bounds));
             let mut param_tys = Vec::new();
             let mut body_env = env.clone();
 

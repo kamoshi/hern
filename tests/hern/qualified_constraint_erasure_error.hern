@@ -1,4 +1,4 @@
-fn double['a: Add](x: 'a) -> 'a {
+fn double(x: 'a) -> 'a where 'a: Add {
     x + x
 }
 

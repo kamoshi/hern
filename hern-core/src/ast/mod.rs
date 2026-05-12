@@ -306,6 +306,7 @@ pub struct InherentMethod {
 pub struct InherentImplDef {
     pub span: SourceSpan,
     pub target: Type,
+    pub type_bounds: Vec<TypeBound>,
     pub methods: Vec<InherentMethod>,
 }
 

@@ -894,6 +894,19 @@ output = """
 1
 """
 
+[tests.inherent_impl_where]
+path = "tests/hern/inherent_impl_where.hern"
+expect = "typecheck"
+output = """
+42
+ok
+"""
+
+[tests.inherent_impl_where_missing]
+path = "tests/hern/inherent_impl_where_missing.hern"
+expect = "error"
+error_contains = "trait `ToString` is not implemented for `Hidden`"
+
 [tests.tuple_eq_import]
 path = "tests/hern/tuple_eq_import.hern"
 fixtures = ["tests/hern/tuple_eq_import_dep.hern"]

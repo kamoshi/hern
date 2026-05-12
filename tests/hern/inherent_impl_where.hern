@@ -1,0 +1,14 @@
+type Box('a) = Box('a)
+
+impl Box('a)
+where 'a: ToString
+{
+  fn show(self) -> string {
+    match self {
+      Box(value) -> ToString.to_string(value),
+    }
+  }
+}
+
+print(Box(42).show());
+print(Box("ok").show());

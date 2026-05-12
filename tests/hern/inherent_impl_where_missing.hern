@@ -1,0 +1,14 @@
+type Box('a) = Box('a)
+type Hidden = Hidden(int)
+
+impl Box('a)
+where 'a: ToString
+{
+  fn show(self) -> string {
+    match self {
+      Box(value) -> ToString.to_string(value),
+    }
+  }
+}
+
+print(Box(Hidden(1)).show());

@@ -6,7 +6,7 @@ trait ToString 'a {
   fn to_string(self: 'a) -> string
 }
 
-fn to_string['a: ToString](value: 'a) -> string {
+fn to_string(value: 'a) -> string where 'a: ToString {
   ToString.to_string(value)
 }
 

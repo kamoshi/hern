@@ -905,7 +905,7 @@ pub(super) mod tests {
             "trait ConstraintB 'a {\n",
             "  fn b(x: 'a) -> 'a\n",
             "}\n",
-            "fn both ['a: ConstraintA + ConstraintB](x: 'a) -> 'a { x }\n",
+            "fn both(x: 'a) -> 'a where 'a: ConstraintA + ConstraintB { x }\n",
         );
         let (state, uri) = project.open("main.hern", source);
 
