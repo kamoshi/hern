@@ -164,6 +164,10 @@ pub fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | ExprKind::Return(Some(inner))
         | ExprKind::FieldAccess { expr: inner, .. }
         | ExprKind::Lambda { body: inner, .. } => walk_expr(inner, visit),
+        ExprKind::Index { receiver, key, .. } => {
+            walk_expr(receiver, visit);
+            walk_expr(key, visit);
+        }
         ExprKind::Assign { target, value } => {
             walk_expr(target, visit);
             walk_expr(value, visit);
@@ -249,6 +253,8 @@ pub enum ExternKind {
 pub struct PendingDictArg {
     pub var: u32,
     pub trait_name: String,
+    pub args: Vec<crate::types::Ty>,
+    pub determinant_indexes: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,8 +377,30 @@ pub struct TraitDef {
     pub span: SourceSpan,
     pub name: String,
     pub name_span: SourceSpan,
+    /// Legacy unary trait parameter. New code must use `params` or
+    /// `primary_param()`; this is only kept while older unary/HKT paths are
+    /// being migrated.
+    #[deprecated(note = "use TraitDef::params or TraitDef::primary_param()")]
     pub param: String,
+    pub params: Vec<String>,
+    pub fundeps: Vec<FunctionalDependency>,
     pub methods: Vec<TraitMethod>,
+}
+
+impl TraitDef {
+    pub fn primary_param(&self) -> Option<&str> {
+        self.params.first().map(String::as_str)
+    }
+
+    pub fn is_unary(&self) -> bool {
+        self.params.len() == 1 && self.fundeps.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionalDependency {
+    pub determinants: Vec<usize>,
+    pub dependents: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -390,10 +418,27 @@ pub struct ImplMethod {
 pub struct ImplDef {
     pub span: SourceSpan,
     pub trait_name: String,
+    /// Legacy unary impl target. New code must use `trait_args`; this is only
+    /// kept while older inherent/unary trait paths are being migrated.
+    #[deprecated(note = "use ImplDef::trait_args")]
     pub target: Type,
+    pub trait_args: Vec<Type>,
+    pub dict_arg_indexes: Vec<usize>,
+    pub used_fundep_arrow: bool,
+    pub fundep_arrow_index: Option<usize>,
     pub type_bounds: Vec<TypeBound>,
     pub dict_params: Vec<String>,
     pub methods: Vec<ImplMethod>,
+}
+
+impl ImplDef {
+    pub fn unary_target(&self) -> Option<&Type> {
+        if self.trait_args.len() == 1 {
+            self.trait_args.first()
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -590,6 +635,14 @@ pub enum ExprKind {
         expr: Box<Expr>,
         field: String,
         field_span: SourceSpan,
+    },
+    Index {
+        receiver: Box<Expr>,
+        key: Box<Expr>,
+        resolved_callee: Option<ResolvedCallee>,
+        pending_trait_method: Option<(PendingDictArg, String)>,
+        dict_args: Vec<DictRef>,
+        pending_dict_args: Vec<PendingDictArg>,
     },
     AssociatedAccess {
         target: Type,

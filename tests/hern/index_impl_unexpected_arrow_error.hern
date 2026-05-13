@@ -1,0 +1,9 @@
+trait Plain 'a 'b {
+  fn pick(self: 'a, key: 'b) -> 'a
+}
+
+impl Plain for string -> int {
+  fn pick(self, key) {
+    self
+  }
+}

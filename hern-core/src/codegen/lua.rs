@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::types::{
-    trait_impl_dict_name, trait_impl_target_key_from_ast,
+    trait_impl_arg_keys_from_ast, trait_impl_dict_name_for_indexes, trait_impl_dict_name_from_keys,
     type_syntax::exact_impl_target_key_from_ast,
 };
 use std::collections::HashMap;
@@ -631,6 +631,19 @@ impl LuaCodegen {
                 let e = self.gen_expr_with_subst(expr, subst, pre)?;
                 Some(format!("{}.{}", e, field))
             }
+            ExprKind::Index {
+                receiver,
+                key,
+                resolved_callee,
+                dict_args,
+                ..
+            } => {
+                let callee = resolved_callee.as_ref().map(gen_resolved_callee)?;
+                let mut all_args = gen_dict_refs(dict_args);
+                all_args.push(self.gen_expr_with_subst(receiver, subst, pre)?);
+                all_args.push(self.gen_expr_with_subst(key, subst, pre)?);
+                Some(format!("{}({})", callee, all_args.join(", ")))
+            }
             ExprKind::AssociatedAccess { target, member, .. } => {
                 Some(associated_access_lua(target, member))
             }
@@ -715,6 +728,13 @@ impl LuaCodegen {
                 let e = self.gen_expr(expr, pre);
                 format!("{}.{}", e, field)
             }
+            ExprKind::Index {
+                receiver,
+                key,
+                resolved_callee,
+                dict_args,
+                ..
+            } => self.gen_index_expr(receiver, key, resolved_callee, dict_args, pre),
             ExprKind::AssociatedAccess { target, member, .. } => {
                 associated_access_lua(target, member)
             }
@@ -790,6 +810,27 @@ impl LuaCodegen {
                 None => format!("{}({}, {})", mangle_op(op), l, r),
             },
         }
+    }
+
+    fn gen_index_expr(
+        &mut self,
+        receiver: &Expr,
+        key: &Expr,
+        resolved_callee: &Option<ResolvedCallee>,
+        dict_args: &[DictRef],
+        pre: &mut String,
+    ) -> String {
+        // Codegen only runs after successful type inference; recovery ASTs must
+        // not reach this path because unresolved dictionary dispatch would be
+        // semantically ambiguous.
+        let callee = resolved_callee
+            .as_ref()
+            .map(gen_resolved_callee)
+            .expect("index expression reached codegen without resolved Index dictionary");
+        let mut all_args = gen_dict_refs(dict_args);
+        all_args.push(self.gen_expr(receiver, pre));
+        all_args.push(self.gen_expr(key, pre));
+        format!("{}({})", callee, all_args.join(", "))
     }
 
     fn gen_assign_expr(&mut self, target: &Expr, value: &Expr, pre: &mut String) -> String {
@@ -1799,6 +1840,9 @@ fn expr_flow(expr: &Expr, include_bc: bool) -> Flow {
             expr_flow(scrutinee, include_bc).seq(arm_flow)
         }
         ExprKind::Not(e) | ExprKind::FieldAccess { expr: e, .. } => expr_flow(e, include_bc),
+        ExprKind::Index { receiver, key, .. } => {
+            expr_flow(receiver, include_bc).seq(expr_flow(key, include_bc))
+        }
         ExprKind::AssociatedAccess { .. } => Flow::FallsThrough,
         ExprKind::Binary { lhs, rhs, .. } => {
             expr_flow(lhs, include_bc).seq(expr_flow(rhs, include_bc))
@@ -1918,9 +1962,19 @@ fn impl_target_name(target: &Type) -> String {
 }
 
 fn trait_impl_dict_name_lua(id: &ImplDef) -> String {
-    let target_key = trait_impl_target_key_from_ast(&id.target)
+    if !id.dict_arg_indexes.is_empty() {
+        return trait_impl_dict_name_for_indexes(
+            &id.trait_name,
+            &id.trait_args,
+            &id.dict_arg_indexes,
+        )
         .expect("invalid trait impl target reached codegen");
-    trait_impl_dict_name(&id.trait_name, &target_key)
+    }
+    // Normal inference populates `dict_arg_indexes`; this fallback keeps
+    // recovery/synthetic impl paths from crashing before diagnostics are emitted.
+    let arg_keys = trait_impl_arg_keys_from_ast(&id.trait_args)
+        .expect("invalid trait impl target reached codegen");
+    trait_impl_dict_name_from_keys(&id.trait_name, &arg_keys)
 }
 
 fn split_module_body(stmts: &[Stmt]) -> (&[Stmt], Option<&Expr>) {

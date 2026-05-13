@@ -7,8 +7,10 @@ mod value;
 
 pub use env::{TypeEnv, VariantEnv, VariantInfo};
 pub use type_syntax::{
-    inherent_impl_target_keys_from_ty, trait_impl_dict_name, trait_impl_target_key_from_ast,
-    trait_impl_target_keys_from_ty,
+    inherent_impl_target_keys_from_ty, trait_dict_indexes, trait_impl_arg_key_candidates_from_ty,
+    trait_impl_arg_keys_from_ast, trait_impl_arg_keys_from_ty, trait_impl_args_key_from_ast,
+    trait_impl_dict_name, trait_impl_dict_name_for_indexes, trait_impl_dict_name_from_keys,
+    trait_impl_target_key_from_ast, trait_impl_target_keys_from_ty,
 };
 pub use value::{is_fresh_mutable_place, is_value};
 
@@ -22,11 +24,41 @@ pub type TyVar = u32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TraitConstraint {
+    /// Compatibility dispatch variable for existing unary trait machinery.
+    /// For multi-parameter traits this is the primary unresolved variable used
+    /// for dictionary parameter naming; `args` carries the full predicate.
     pub var: TyVar,
     pub trait_name: String,
+    pub args: Vec<Ty>,
+    pub determinant_indexes: Vec<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl TraitConstraint {
+    pub fn unary(var: TyVar, trait_name: impl Into<String>) -> Self {
+        Self {
+            var,
+            trait_name: trait_name.into(),
+            args: vec![Ty::Var(var)],
+            determinant_indexes: vec![0],
+        }
+    }
+
+    pub fn predicate(
+        trait_name: impl Into<String>,
+        args: Vec<Ty>,
+        primary_var: TyVar,
+        determinant_indexes: Vec<usize>,
+    ) -> Self {
+        Self {
+            var: primary_var,
+            trait_name: trait_name.into(),
+            args,
+            determinant_indexes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     Int,
     Float,
@@ -43,13 +75,13 @@ pub enum Ty {
     Record(Row),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FuncParam {
     pub ty: Ty,
     pub capability: ParamCapability,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FuncReturn {
     pub ty: Box<Ty>,
     pub capability: ReturnCapability,
@@ -95,7 +127,7 @@ pub fn value_func_return(ret: Ty) -> FuncReturn {
     FuncReturn::value(ret)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Row {
     pub fields: Vec<(String, Ty)>,
     pub tail: Box<Ty>,
@@ -330,13 +362,13 @@ pub struct Scheme {
     pub ty: Ty,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamCapability {
     Value,
     MutPlace,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReturnCapability {
     Value,
     FreshPlace,
@@ -455,6 +487,7 @@ impl EnvInfo {
     }
 }
 
+#[derive(Clone)]
 pub struct Subst {
     map: HashMap<TyVar, Ty>,
     next_var: TyVar,
@@ -523,6 +556,8 @@ impl Subst {
                         Ty::Var(var) => Some(TraitConstraint {
                             var,
                             trait_name: c.trait_name.clone(),
+                            args: c.args.iter().map(|arg| self.apply(arg)).collect(),
+                            determinant_indexes: c.determinant_indexes.clone(),
                         }),
                         _ => None,
                     })
@@ -911,6 +946,8 @@ mod tests {
             constraints: vec![TraitConstraint {
                 var: 90,
                 trait_name: "Iterable".to_string(),
+                args: vec![Ty::Var(90)],
+                determinant_indexes: vec![0],
             }],
             ty: Ty::Func(
                 value_func_params(vec![Ty::App(Box::new(Ty::Var(90)), vec![Ty::Float])]),
@@ -976,6 +1013,8 @@ mod tests {
                 vec![TraitConstraint {
                     var: 1,
                     trait_name: "Add".to_string(),
+                    args: vec![Ty::Var(1)],
+                    determinant_indexes: vec![0],
                 }],
                 Box::new(Ty::Var(1)),
             ),
@@ -1005,6 +1044,8 @@ mod tests {
             constraints: vec![TraitConstraint {
                 var: 99,
                 trait_name: "Debug".to_string(),
+                args: vec![Ty::Var(99)],
+                determinant_indexes: vec![0],
             }],
             ty: Ty::Var(0),
         };

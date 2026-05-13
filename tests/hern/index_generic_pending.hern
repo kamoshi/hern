@@ -1,0 +1,7 @@
+fn first(container, i) {
+  container[i]
+}
+
+let value = first(["a", "b", "c"], 0);
+print(value);
+print(value.len());

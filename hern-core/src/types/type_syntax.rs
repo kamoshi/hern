@@ -1,4 +1,4 @@
-use crate::ast::{Expr, ExprKind, InherentMethod, Param, Pattern, Stmt, Type};
+use crate::ast::{Expr, ExprKind, InherentMethod, Param, Pattern, Stmt, TraitDef, Type};
 use crate::types::{Ty, error::TypeError};
 use std::collections::HashSet;
 
@@ -78,6 +78,51 @@ pub fn trait_impl_dict_name(trait_name: &str, target_key: &str) -> String {
     format!("__{}__{}", trait_name, target_key)
 }
 
+pub fn trait_impl_dict_name_from_keys(trait_name: &str, arg_keys: &[String]) -> String {
+    if arg_keys.len() == 1 {
+        trait_impl_dict_name(trait_name, &arg_keys[0])
+    } else {
+        format!("__{}__{}", trait_name, arg_keys.join("__"))
+    }
+}
+
+pub fn trait_impl_dict_name_for_indexes(
+    trait_name: &str,
+    args: &[Type],
+    indexes: &[usize],
+) -> Result<String, TypeError> {
+    let expected = indexes.iter().copied().max().map_or(0, |index| index + 1);
+    let keys = indexes
+        .iter()
+        .map(|index| {
+            args.get(*index)
+                .ok_or_else(|| TypeError::TraitArityMismatch {
+                    trait_name: trait_name.to_string(),
+                    expected,
+                    got: args.len(),
+                })
+                .and_then(impl_arg_pattern_key_from_ast)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(trait_impl_dict_name_from_keys(trait_name, &keys))
+}
+
+pub fn trait_dict_indexes(trait_def: &TraitDef) -> Vec<usize> {
+    trait_def
+        .fundeps
+        .first()
+        .map(|fundep| fundep.determinants.clone())
+        .unwrap_or_else(|| (0..trait_def.params.len()).collect())
+}
+
+pub fn trait_impl_arg_keys_from_ast(args: &[Type]) -> Result<Vec<String>, TypeError> {
+    args.iter().map(impl_arg_pattern_key_from_ast).collect()
+}
+
+pub fn trait_impl_args_key_from_ast(args: &[Type]) -> Result<String, TypeError> {
+    Ok(trait_impl_arg_keys_from_ast(args)?.join("__"))
+}
+
 pub fn trait_impl_target_key_from_ast(target: &Type) -> Result<String, TypeError> {
     match target {
         Type::Ident(name) => Ok(name.clone()),
@@ -98,6 +143,13 @@ pub fn trait_impl_target_key_from_ast(target: &Type) -> Result<String, TypeError
         _ => Err(TypeError::InvalidTraitImplTarget(type_name_for_error(
             target,
         ))),
+    }
+}
+
+fn impl_arg_pattern_key_from_ast(target: &Type) -> Result<String, TypeError> {
+    match target {
+        Type::Var(_) | Type::Hole => Ok("_".to_string()),
+        _ => trait_impl_target_key_from_ast(target),
     }
 }
 
@@ -248,6 +300,10 @@ fn substitute_self_in_expr_types(expr: &mut Expr, target: &Type) {
         | ExprKind::Break(Some(expr))
         | ExprKind::Return(Some(expr))
         | ExprKind::FieldAccess { expr, .. } => substitute_self_in_expr_types(expr, target),
+        ExprKind::Index { receiver, key, .. } => {
+            substitute_self_in_expr_types(receiver, target);
+            substitute_self_in_expr_types(key, target);
+        }
         ExprKind::Assign { target: lhs, value }
         | ExprKind::Binary {
             lhs, rhs: value, ..
@@ -419,6 +475,18 @@ pub fn trait_impl_target_keys_from_ty(ty: &Ty) -> Vec<String> {
         }
         _ => exact_impl_target_key_from_ty(ty).into_iter().collect(),
     }
+}
+
+pub fn trait_impl_arg_keys_from_ty(args: &[Ty]) -> Vec<Vec<String>> {
+    args.iter().map(trait_impl_target_keys_from_ty).collect()
+}
+
+pub fn trait_impl_arg_key_candidates_from_ty(ty: &Ty) -> Vec<String> {
+    let mut keys = trait_impl_target_keys_from_ty(ty);
+    if !keys.iter().any(|key| key == "_") {
+        keys.push("_".to_string());
+    }
+    keys
 }
 
 pub fn inherent_impl_target_keys_from_ty(ty: &Ty) -> Vec<String> {

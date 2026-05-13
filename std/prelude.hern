@@ -6,8 +6,18 @@ trait ToString 'a {
   fn to_string(self: 'a) -> string
 }
 
+trait Index 'receiver 'key -> 'output {
+  fn index(self: 'receiver, key: 'key) -> 'output
+}
+
 fn to_string(value: 'a) -> string where 'a: ToString {
   ToString::to_string(value)
+}
+
+extern __panic: fn(string) -> 'a = "(function(message) _G.error(message) end)";
+
+fn panic(message: string) -> 'a {
+  __panic(message)
 }
 
 type Option('a) = Some('a) | None
@@ -619,6 +629,17 @@ impl ['a] {
   }
 }
 
+impl Index for ['a], int -> 'a {
+  fn index(self, key) {
+    // Hern indexing is zero-based; array primitives are one-based for Lua.
+    if key >= 0 && key < self.len() {
+      self.get(key + 1)
+    } else {
+      panic("array index out of bounds")
+    }
+  }
+}
+
 impl ['a]
 where 'a: Eq
 {
@@ -864,11 +885,24 @@ impl Map('k, 'v) {
   fn new() -> mut Self { __map_new() }
   fn set(mut self, key: 'k, value: 'v) -> () { __map_set(self, key, value) }
   fn get(self, key: 'k) -> Option('v) { __map_get(self, key) }
+  // Generic over 'k, so the panic message cannot include the key without a string conversion bound.
+  fn must_get(self, key: 'k) -> 'v {
+    match self.get(key) {
+      Some(value) -> value,
+      None -> panic("missing map key"),
+    }
+  }
   fn delete(mut self, key: 'k) -> () { __map_delete(self, key) }
   fn has(self, key: 'k) -> bool { __map_has(self, key) }
   fn keys(self) -> ['k] { __map_keys(self) }
   fn size(self) -> int { __map_size(self) }
   fn is_empty(self) -> bool { self.size() == 0 }
+}
+
+impl Index for Map('k, 'v), 'k -> 'v {
+  fn index(self, key) {
+    self.must_get(key)
+  }
 }
 
 // --- Sets ---
@@ -979,6 +1013,17 @@ impl string {
   fn to_float(self) -> float { __str_to_float(self) }
   fn ints(self) -> [int] { __str_ints(self) }
   fn floats(self) -> [float] { __str_floats(self) }
+}
+
+impl Index for string, int -> string {
+  fn index(self, key) {
+    // Hern indexing is zero-based; string primitives are one-based for Lua.
+    if key >= 0 && key < self.len() {
+      self.char_at(key + 1)
+    } else {
+      panic("string index out of bounds")
+    }
+  }
 }
 
 // --- Iteration ---

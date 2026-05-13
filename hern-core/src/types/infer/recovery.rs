@@ -128,7 +128,9 @@ fn collect_stmt_referenced_names(
             }
         }
         Stmt::Impl(id) => {
-            collect_type_referenced_names(&id.target, refs, type_scope);
+            for arg in &id.trait_args {
+                collect_type_referenced_names(arg, refs, type_scope);
+            }
             for method in &id.methods {
                 let mut method_scope = value_scope.clone();
                 for param in &method.params {
@@ -232,6 +234,10 @@ fn collect_expr_referenced_names(
         }
         ExprKind::AssociatedAccess { target, .. } => {
             collect_type_referenced_names(target, refs, type_scope);
+        }
+        ExprKind::Index { receiver, key, .. } => {
+            collect_expr_referenced_names(receiver, refs, value_scope, type_scope);
+            collect_expr_referenced_names(key, refs, value_scope, type_scope);
         }
         ExprKind::Assign { target, value }
         | ExprKind::Binary {

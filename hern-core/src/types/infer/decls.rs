@@ -219,11 +219,58 @@ fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeEr
             .at(method.span));
         }
     }
+    for fundep in &td.fundeps {
+        for dependent in &fundep.dependents {
+            let Some(param) = td.params.get(*dependent) else {
+                continue;
+            };
+            let reachable = td.methods.iter().any(|method| {
+                method
+                    .params
+                    .iter()
+                    .any(|(_, ty)| ast_type_contains_var(ty, param))
+                    || ast_type_contains_var(&method.ret_type, param)
+            });
+            if !reachable {
+                return Err(TypeError::FunctionalDependencyViolation {
+                    trait_name: td.name.clone(),
+                    message: format!(
+                        "dependent trait parameter `{}` must appear in a method signature",
+                        param
+                    ),
+                }
+                .at(td.span));
+            }
+        }
+    }
     Ok(())
 }
 
+fn ast_type_contains_var(ty: &Type, var_name: &str) -> bool {
+    match ty {
+        Type::Var(name) => name == var_name,
+        Type::App(con, args) => {
+            ast_type_contains_var(con, var_name)
+                || args.iter().any(|arg| ast_type_contains_var(arg, var_name))
+        }
+        Type::Func(params, ret) => {
+            params
+                .iter()
+                .any(|param| ast_type_contains_var(&param.ty, var_name))
+                || ast_type_contains_var(&ret.ty, var_name)
+        }
+        Type::Tuple(items) => items
+            .iter()
+            .any(|item| ast_type_contains_var(item, var_name)),
+        Type::Record(fields, _) => fields
+            .iter()
+            .any(|(_, field_ty)| ast_type_contains_var(field_ty, var_name)),
+        Type::Ident(_) | Type::Unit | Type::Never | Type::Hole => false,
+    }
+}
+
 fn impl_dict_name(impl_def: &ImplDef) -> Option<String> {
-    trait_impl_target_key_from_ast(&impl_def.target)
+    trait_impl_arg_keys_from_ast(&impl_def.trait_args)
         .ok()
-        .map(|target_key| trait_impl_dict_name(&impl_def.trait_name, &target_key))
+        .map(|arg_keys| trait_impl_dict_name_from_keys(&impl_def.trait_name, &arg_keys))
 }

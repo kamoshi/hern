@@ -1,0 +1,5 @@
+let from_string = Index::index("abc", 2);
+let from_array = Index::index([10, 20, 30], 2);
+
+print(from_string);
+print(from_array)

@@ -1,0 +1,9 @@
+match pcall(fn() { [1, 2, 3][10] }) {
+  Ok(_) -> print("array index unexpectedly succeeded"),
+  Err(_) -> print("array index failed"),
+}
+
+match pcall(fn() { "hi"[10] }) {
+  Ok(_) -> print("string index unexpectedly succeeded"),
+  Err(_) -> print("string index failed"),
+}

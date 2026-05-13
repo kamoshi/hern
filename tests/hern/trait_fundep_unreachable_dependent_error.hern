@@ -1,0 +1,3 @@
+trait FnLike 'a -> 'b {
+  fn call(self: 'a) -> int
+}

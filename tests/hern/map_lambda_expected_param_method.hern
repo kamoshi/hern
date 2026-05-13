@@ -1,0 +1,11 @@
+let data = "L10\nR20"
+  .trim()
+  .lines()
+  .map(fn(line) {
+    let dir = line.get(1);
+    let num = ();
+
+    #{ dir, num }
+  });
+
+print(data.len());

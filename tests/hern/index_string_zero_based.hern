@@ -1,0 +1,5 @@
+let first = "abc"[0];
+let second = "abc"[1];
+
+print(first);
+print(second)

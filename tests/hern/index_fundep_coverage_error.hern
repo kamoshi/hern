@@ -1,0 +1,9 @@
+trait BadIndex 'receiver 'key -> 'output {
+  fn index(self: 'receiver, key: 'key) -> 'output
+}
+
+impl BadIndex for ['a], int -> 'b {
+  fn index(self, key) {
+    self.get(key + 1)
+  }
+}

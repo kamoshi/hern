@@ -206,6 +206,10 @@ fn associated_definition_span_in_expr(
             associated_definition_span_in_expr(program, iterable, position)
                 .or_else(|| associated_definition_span_in_expr(program, body, position))
         }
+        ExprKind::Index { receiver, key, .. } => {
+            associated_definition_span_in_expr(program, receiver, position)
+                .or_else(|| associated_definition_span_in_expr(program, key, position))
+        }
         ExprKind::AssociatedAccess { .. }
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)

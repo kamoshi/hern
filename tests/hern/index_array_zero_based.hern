@@ -1,0 +1,5 @@
+let first = [10, 20, 30][0];
+let second = [10, 20, 30][1];
+
+print(first);
+print(second)

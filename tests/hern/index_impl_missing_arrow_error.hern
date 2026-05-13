@@ -1,0 +1,9 @@
+trait BadIndexHead 'receiver 'key -> 'output {
+  fn index(self: 'receiver, key: 'key) -> 'output
+}
+
+impl BadIndexHead for string, int, string {
+  fn index(self, key) {
+    self.char_at(key + 1)
+  }
+}

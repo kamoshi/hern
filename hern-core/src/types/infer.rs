@@ -8,8 +8,8 @@ mod snapshot;
 
 use self::dicts::{
     attach_dict_args, dict_param_name, dict_ref_concrete_name, final_pass_stmt, resolve_concrete,
-    resolve_concrete_dict_ref, resolve_dict_uses_expr, resolve_dict_uses_expr_lenient,
-    resolve_local_or_concrete,
+    resolve_concrete_dict_ref, resolve_concrete_multi_dict_ref, resolve_dict_uses_expr,
+    resolve_dict_uses_expr_lenient, resolve_local_or_concrete,
 };
 use super::{
     patterns::{
@@ -18,7 +18,8 @@ use super::{
     type_syntax::{
         inherent_impl_dict_name, inherent_impl_target_key_from_ast,
         inherent_impl_target_keys_from_ty, is_self_param, record_field_ty, subst_hkt_param,
-        substitute_self_in_inherent_method, trait_impl_dict_name, trait_impl_target_key_from_ast,
+        substitute_self_in_inherent_method, trait_dict_indexes, trait_impl_arg_keys_from_ast,
+        trait_impl_dict_name, trait_impl_dict_name_for_indexes, trait_impl_dict_name_from_keys,
         trait_impl_target_keys_from_ty,
     },
 };
@@ -33,6 +34,8 @@ use crate::types::{
     value_func_return,
 };
 pub use crate::types::{TypeEnv, VariantEnv, VariantInfo, is_fresh_mutable_place, is_value};
+
+const INDEX_TRAIT_ARITY: usize = 3;
 use metadata::{FinalizedTypeMaps, TypeMetadata};
 use recovery::{CollectedNames, stmt_bound_names, stmt_referenced_names};
 use snapshot::InferSnapshot;
@@ -239,6 +242,12 @@ impl Infer {
                 Some(Ty::Var(v)) => Some(TraitConstraint {
                     var: *v,
                     trait_name: c.trait_name.clone(),
+                    args: c
+                        .args
+                        .iter()
+                        .map(|arg| self.apply_inst(arg, &map))
+                        .collect(),
+                    determinant_indexes: c.determinant_indexes.clone(),
                 }),
                 Some(_) => None,
                 None => Some(c.clone()),
@@ -421,6 +430,8 @@ impl Infer {
                         Some(Ty::Var(var)) => Some(TraitConstraint {
                             var: *var,
                             trait_name: c.trait_name.clone(),
+                            args: c.args.iter().map(|arg| self.apply_inst(arg, map)).collect(),
+                            determinant_indexes: c.determinant_indexes.clone(),
                         }),
                         Some(_) => None,
                         None => Some(c.clone()),
@@ -498,15 +509,45 @@ impl Infer {
                 fresh
             };
             for trait_name in &bound.traits {
-                constraints.push(TraitConstraint {
-                    var,
-                    trait_name: trait_name.clone(),
-                });
+                constraints.push(TraitConstraint::unary(var, trait_name.clone()));
             }
         }
         constraints
     }
 
+    fn with_pending_constraints_scope<T>(
+        &mut self,
+        initial_constraints: Vec<TraitConstraint>,
+        f: impl FnOnce(&mut Self) -> Result<T, SpannedTypeError>,
+    ) -> Result<(T, Vec<TraitConstraint>), SpannedTypeError> {
+        let saved_pending = std::mem::take(&mut self.pending_constraints);
+        self.pending_constraints.extend(initial_constraints);
+        let result = f(self);
+        let scoped_pending = std::mem::replace(&mut self.pending_constraints, saved_pending);
+        // Failed scopes are discarded wholesale; constraints collected while
+        // inferring an invalid body should not leak into the enclosing scope.
+        result.map(|value| (value, scoped_pending))
+    }
+
+    fn with_fn_return_scope<T>(
+        &mut self,
+        fn_ret: FuncReturn,
+        f: impl FnOnce(&mut Self) -> Result<T, SpannedTypeError>,
+    ) -> Result<T, SpannedTypeError> {
+        self.fn_return_tys.push(fn_ret);
+        let result = f(self);
+        self.fn_return_tys.pop();
+        result
+    }
+
+    /// Finalizes the constraints collected while inferring a function-like body.
+    ///
+    /// Constraints whose dispatch variable is generalized by this function become
+    /// owned dictionary parameters. Constraints tied to an outer environment
+    /// variable, or to a variable that was not generalized here, bubble back to
+    /// the enclosing inference scope. Constraints already made concrete by
+    /// substitution are intentionally dropped because they need no dictionary
+    /// parameter.
     fn finalize_constraints(
         &self,
         env: &TypeEnv,
@@ -526,6 +567,12 @@ impl Infer {
                     let normalized = TraitConstraint {
                         var,
                         trait_name: constraint.trait_name,
+                        args: constraint
+                            .args
+                            .iter()
+                            .map(|arg| self.subst.apply(arg))
+                            .collect(),
+                        determinant_indexes: constraint.determinant_indexes,
                     };
                     if env_vars.contains(&normalized.var) || !scheme.vars.contains(&normalized.var)
                     {
@@ -594,9 +641,6 @@ impl Infer {
         let fn_ret = func_return_from_annotation(ret_type, ret_ty.clone());
         let fn_ty = Ty::Func(func_params_from_params(params, param_tys), fn_ret.clone());
 
-        let saved_pending = std::mem::take(&mut self.pending_constraints);
-        self.pending_constraints.extend(initial_constraints);
-
         if add_self_binding {
             body_env.insert(
                 name.to_string(),
@@ -604,20 +648,22 @@ impl Infer {
             );
         }
 
-        self.fn_return_tys.push(fn_ret.clone());
-        let body_ty = if ret_type.is_some() {
-            self.infer_expr_expected(&body_env, body, ret_ty.clone())?
-        } else {
-            self.infer_expr(&body_env, body)?
-        };
-        self.fn_return_tys.pop();
-        unify_expr_result(&mut self.subst, body_ty.clone(), ret_ty)
-            .map_err(|err| err.at(body.span))?;
-        if !matches!(self.subst.apply(&body_ty), Ty::Never) {
-            self.check_fresh_return_expr(body, &fn_ret)?;
-        }
-
-        let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
+        let (_, fn_constraints) =
+            self.with_pending_constraints_scope(initial_constraints, |this| {
+                let body_ty = this.with_fn_return_scope(fn_ret.clone(), |this| {
+                    if ret_type.is_some() {
+                        this.infer_expr_expected(&body_env, body, ret_ty.clone())
+                    } else {
+                        this.infer_expr(&body_env, body)
+                    }
+                })?;
+                unify_expr_result(&mut this.subst, body_ty.clone(), ret_ty)
+                    .map_err(|err| err.at(body.span))?;
+                if !matches!(this.subst.apply(&body_ty), Ty::Never) {
+                    this.check_fresh_return_expr(body, &fn_ret)?;
+                }
+                Ok(())
+            })?;
         let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
         self.pending_constraints.extend(finalized.bubbled.clone());
 
@@ -1477,6 +1523,22 @@ impl Infer {
                 }
                 Ok(field_ty)
             }
+            ExprKind::Index {
+                receiver,
+                key,
+                resolved_callee,
+                pending_trait_method,
+                dict_args,
+                pending_dict_args,
+            } => self.infer_index_expr(
+                env,
+                receiver,
+                key,
+                resolved_callee,
+                pending_trait_method,
+                dict_args,
+                pending_dict_args,
+            ),
             ExprKind::Lambda {
                 params,
                 body,
@@ -1497,6 +1559,63 @@ impl Infer {
                 .record_expr_type(expr.id, ty.clone(), &self.subst);
         }
         result.map_err(|err: SpannedTypeError| err.with_span_if_absent(expr.span))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_index_expr(
+        &mut self,
+        env: &TypeEnv,
+        receiver: &mut Expr,
+        key: &mut Expr,
+        resolved_callee: &mut Option<ResolvedCallee>,
+        pending_trait_method: &mut Option<(PendingDictArg, String)>,
+        _dict_args: &mut Vec<DictRef>,
+        _pending_dict_args: &mut Vec<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        let trait_def = self
+            .trait_env
+            .get("Index")
+            .ok_or_else(|| TypeError::UnknownTrait("Index".to_string()))?
+            .clone();
+        if trait_def.params.len() != INDEX_TRAIT_ARITY {
+            return Err(TypeError::TraitArityMismatch {
+                trait_name: "Index".to_string(),
+                expected: INDEX_TRAIT_ARITY,
+                got: trait_def.params.len(),
+            }
+            .into());
+        }
+        let receiver_ty = self.infer_expr(env, receiver)?;
+        let key_ty = self.infer_expr(env, key)?;
+        let output_ty = Ty::Var(self.fresh_var());
+        let args = vec![receiver_ty.clone(), key_ty.clone(), output_ty.clone()];
+        let determinant_indexes = trait_dict_indexes(&trait_def);
+
+        let resolved_args: Vec<Ty> = args.iter().map(|arg| self.subst.apply(arg)).collect();
+        if let Some(output_ty) = self.resolve_multi_param_trait_dispatch(
+            env,
+            "Index",
+            "index",
+            resolved_args,
+            determinant_indexes,
+            vec![receiver_ty, key_ty],
+            output_ty.clone(),
+            resolved_callee,
+            pending_trait_method,
+            "Index dictionaries should be concrete",
+        )? {
+            return Ok(output_ty);
+        }
+
+        Err(TypeError::MissingTraitImpl {
+            trait_name: "Index".to_string(),
+            impl_target: format!(
+                "{}, {}",
+                self.subst.apply(&args[0]),
+                self.subst.apply(&args[1])
+            ),
+        }
+        .into())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1630,7 +1749,8 @@ impl Infer {
 
         let mut param_vars: HashMap<String, TyVar> = HashMap::new();
         let target_var = self.fresh_var();
-        param_vars.insert(trait_def.param.clone(), target_var);
+        let trait_param = primary_param_or_panic(&trait_def);
+        param_vars.insert(trait_param.to_string(), target_var);
 
         let lhs_param_ty = self.ast_to_ty_with_vars(&method.params[0].1, &mut param_vars)?;
         let rhs_param_ty = self.ast_to_ty_with_vars(&method.params[1].1, &mut param_vars)?;
@@ -1926,7 +2046,8 @@ impl Infer {
 
         let mut param_vars: HashMap<String, TyVar> = HashMap::new();
         let target_var = self.fresh_var();
-        param_vars.insert(iterable_trait.param.clone(), target_var);
+        let iterable_param = primary_param_or_panic(&iterable_trait);
+        param_vars.insert(iterable_param.to_string(), target_var);
 
         let self_ty = self.ast_to_ty_with_vars(&iter_method.params[0].1, &mut param_vars)?;
         let ret_ty = self.ast_to_ty_with_vars(&iter_method.ret_type, &mut param_vars)?;
@@ -1963,13 +2084,13 @@ impl Infer {
         if target_keys.is_empty() {
             return match resolved_target {
                 Ty::Var(v) => {
-                    self.pending_constraints.push(TraitConstraint {
-                        var: v,
-                        trait_name: "Iterable".to_string(),
-                    });
+                    self.pending_constraints
+                        .push(TraitConstraint::unary(v, "Iterable".to_string()));
                     *pending_iter = Some(PendingDictArg {
                         var: v,
                         trait_name: "Iterable".to_string(),
+                        args: vec![Ty::Var(v)],
+                        determinant_indexes: vec![0],
                     });
                     Ok(())
                 }
@@ -2098,8 +2219,6 @@ impl Infer {
             self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
         }
 
-        let saved_pending = std::mem::take(&mut self.pending_constraints);
-
         let (ret_ty, ret_capability) = match &expected_func {
             Some((_, expected_ret)) => ((*expected_ret.ty).clone(), expected_ret.capability),
             None => (self.subst.fresh_var(), ReturnCapability::Value),
@@ -2108,17 +2227,20 @@ impl Infer {
             ty: Box::new(ret_ty.clone()),
             capability: ret_capability,
         };
-        self.fn_return_tys.push(fn_ret.clone());
-        let body_ty = if expected_func.is_some() {
-            self.infer_expr_expected(&body_env, body, ret_ty.clone())?
-        } else {
-            self.infer_expr(&body_env, body)?
-        };
-        self.fn_return_tys.pop();
-        unify_expr_result(&mut self.subst, body_ty.clone(), ret_ty.clone())?;
-        if !matches!(self.subst.apply(&body_ty), Ty::Never) {
-            self.check_fresh_return_expr(body, &fn_ret)?;
-        }
+        let (_, fn_constraints) = self.with_pending_constraints_scope(Vec::new(), |this| {
+            let body_ty = this.with_fn_return_scope(fn_ret.clone(), |this| {
+                if expected_func.is_some() {
+                    this.infer_expr_expected(&body_env, body, ret_ty.clone())
+                } else {
+                    this.infer_expr(&body_env, body)
+                }
+            })?;
+            unify_expr_result(&mut this.subst, body_ty.clone(), ret_ty.clone())?;
+            if !matches!(this.subst.apply(&body_ty), Ty::Never) {
+                this.check_fresh_return_expr(body, &fn_ret)?;
+            }
+            Ok(())
+        })?;
 
         let fn_ty = Ty::Func(
             func_params_from_params(params, param_tys),
@@ -2127,7 +2249,6 @@ impl Infer {
                 capability: ret_capability,
             },
         );
-        let fn_constraints = std::mem::replace(&mut self.pending_constraints, saved_pending);
         let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
         self.pending_constraints.extend(finalized.bubbled.clone());
         *dict_params = finalized.owned.iter().map(dict_param_name).collect();
@@ -2515,9 +2636,9 @@ fn combine_branch_types(subst: &mut Subst, left: Ty, right: Ty) -> Result<Ty, Ty
     let left = subst.apply(&left);
     let right = subst.apply(&right);
     match (&left, &right) {
-        (Ty::Never, Ty::Never) => Ok(Ty::Never),
-        (Ty::Never, _) => Ok(right),
-        (_, Ty::Never) => Ok(left),
+        _ if is_never(&left) && is_never(&right) => Ok(Ty::Never),
+        _ if is_never(&left) => Ok(right),
+        _ if is_never(&right) => Ok(left),
         _ => {
             unify(subst, left.clone(), right)?;
             Ok(subst.apply(&left))
@@ -2526,10 +2647,14 @@ fn combine_branch_types(subst: &mut Subst, left: Ty, right: Ty) -> Result<Ty, Ty
 }
 
 fn unify_expr_result(subst: &mut Subst, actual: Ty, expected: Ty) -> Result<(), TypeError> {
-    if matches!(subst.apply(&actual), Ty::Never) {
+    if is_never(&subst.apply(&actual)) {
         return Ok(());
     }
     unify(subst, actual, expected)
+}
+
+fn is_never(ty: &Ty) -> bool {
+    matches!(ty, Ty::Never)
 }
 
 fn merge_record_field(fields: &mut Vec<(String, Ty)>, name: String, ty: Ty) {
@@ -2589,13 +2714,6 @@ fn scheme_param_capability(scheme: &Scheme, idx: usize) -> ParamCapability {
         .unwrap_or(ParamCapability::Value)
 }
 
-fn scheme_return_capability(scheme: &Scheme) -> ReturnCapability {
-    match &scheme.ty {
-        Ty::Func(_, ret) => ret.capability,
-        _ => ReturnCapability::Value,
-    }
-}
-
 fn expected_func_params(callee_ty: &Ty, arg_tys: Vec<Ty>) -> Vec<FuncParam> {
     match callee_ty {
         Ty::Func(params, _) if params.len() == arg_tys.len() => params
@@ -2622,6 +2740,48 @@ fn expected_func_return(callee_ty: &Ty, ret_ty: Ty) -> FuncReturn {
 
 fn has_mut_place_func_params(ty: &Ty) -> bool {
     matches!(ty, Ty::Func(params, _) if params.iter().any(|param| param.capability.is_mut_place()))
+}
+
+pub(super) fn primary_param_or_panic(trait_def: &TraitDef) -> &str {
+    trait_def
+        .primary_param()
+        .expect("parser rejects zero-parameter traits")
+}
+
+fn primary_trait_var(args: &[Ty], determinant_indexes: &[usize]) -> Option<TyVar> {
+    // Pending dictionary parameters are named by the first unresolved determinant.
+    // Other determinants remain in the full predicate and are checked again when
+    // final-pass dictionary resolution has more substitution information.
+    determinant_indexes
+        .iter()
+        .filter_map(|index| args.get(*index))
+        .find_map(first_ty_var)
+        .or_else(|| args.iter().find_map(first_ty_var))
+}
+
+fn first_ty_var(ty: &Ty) -> Option<TyVar> {
+    match ty {
+        Ty::Var(var) => Some(*var),
+        Ty::Qualified(constraints, inner) => first_ty_var(inner).or_else(|| {
+            constraints
+                .iter()
+                .flat_map(|constraint| constraint.args.iter())
+                .find_map(first_ty_var)
+        }),
+        Ty::Tuple(items) => items.iter().find_map(first_ty_var),
+        Ty::Func(params, ret) => params
+            .iter()
+            .find_map(|param| first_ty_var(&param.ty))
+            .or_else(|| first_ty_var(&ret.ty)),
+        // Prefer the constructor first so HKT-shaped targets like `'f('a)` dispatch on `'f`.
+        Ty::App(con, args) => first_ty_var(con).or_else(|| args.iter().find_map(first_ty_var)),
+        Ty::Record(row) => row
+            .fields
+            .iter()
+            .find_map(|(_, ty)| first_ty_var(ty))
+            .or_else(|| first_ty_var(&row.tail)),
+        Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => None,
+    }
 }
 
 /// Returns true if the AST `Type` mentions `var_name` as a type variable.
@@ -2907,12 +3067,148 @@ mod tests {
             vec![TraitConstraint {
                 var: 0,
                 trait_name: "Add".to_string(),
+                args: vec![Ty::Var(0)],
+                determinant_indexes: vec![0],
             }],
         );
 
         assert!(finalized.owned.is_empty());
         assert!(finalized.bubbled.is_empty());
         assert!(finalized.scheme.constraints.is_empty());
+    }
+
+    #[test]
+    fn constraint_on_outer_env_var_bubbles_from_function_scope() {
+        let infer = Infer::new();
+        let mut env = TypeEnv::new();
+        env.insert(
+            "outer".to_string(),
+            EnvInfo::immutable(Scheme::mono(Ty::Var(0))),
+        );
+
+        let finalized = infer.finalize_constraints(
+            &env,
+            Ty::Func(
+                value_func_params(vec![Ty::Var(0)]),
+                value_func_return(Ty::Int),
+            ),
+            vec![TraitConstraint::unary(0, "Show".to_string())],
+        );
+
+        assert!(finalized.owned.is_empty());
+        assert_eq!(
+            finalized.bubbled,
+            vec![TraitConstraint::unary(0, "Show".to_string())]
+        );
+        assert!(finalized.scheme.constraints.is_empty());
+    }
+
+    #[test]
+    fn constraint_on_non_generalized_var_bubbles_from_function_scope() {
+        let infer = Infer::new();
+        let constraint = TraitConstraint::predicate(
+            "Index",
+            vec![Ty::Var(0), Ty::Var(1), Ty::Var(2)],
+            2,
+            vec![0, 1],
+        );
+
+        let finalized = infer.finalize_constraints(
+            &TypeEnv::new(),
+            Ty::Func(
+                value_func_params(vec![Ty::Var(0), Ty::Var(1)]),
+                value_func_return(Ty::Int),
+            ),
+            vec![constraint.clone()],
+        );
+
+        assert!(finalized.owned.is_empty());
+        assert_eq!(finalized.bubbled, vec![constraint]);
+        assert!(finalized.scheme.constraints.is_empty());
+    }
+
+    #[test]
+    fn scoped_inference_state_restores_after_error() {
+        let mut infer = Infer::new();
+        infer
+            .pending_constraints
+            .push(TraitConstraint::unary(0, "Outer".to_string()));
+
+        let err = infer
+            .with_pending_constraints_scope(
+                vec![TraitConstraint::unary(1, "Inner".to_string())],
+                |this| {
+                    this.pending_constraints
+                        .push(TraitConstraint::unary(2, "Body".to_string()));
+                    Err::<(), SpannedTypeError>(TypeError::UnknownType("boom".to_string()).into())
+                },
+            )
+            .expect_err("scope body should fail");
+
+        assert!(matches!(err.error, TypeError::UnknownType(_)));
+        assert_eq!(
+            infer.pending_constraints,
+            vec![TraitConstraint::unary(0, "Outer".to_string())]
+        );
+
+        let err = infer
+            .with_fn_return_scope(value_func_return(Ty::Int), |_this| {
+                Err::<(), SpannedTypeError>(TypeError::UnknownType("return".to_string()).into())
+            })
+            .expect_err("return scope body should fail");
+        assert!(matches!(err.error, TypeError::UnknownType(_)));
+        assert!(infer.fn_return_tys.is_empty());
+    }
+
+    #[test]
+    fn collecting_inference_does_not_mutate_failed_inherent_self_types() {
+        let mut program = parse_source(
+            "type Box = Box(int)\n\
+             impl Box {\n\
+               fn bad(self, other: Self) -> int { true }\n\
+             }\n",
+        )
+        .expect("source should parse");
+        reassociate_standalone(&mut program);
+
+        let mut infer = Infer::new();
+        let (_inference, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
+
+        assert_eq!(diagnostics.len(), 1);
+        let Stmt::InherentImpl(id) = &program.stmts[1] else {
+            panic!("second statement should be an inherent impl");
+        };
+        let Some(Type::Ident(name)) = id.methods[0].params[1].ty.as_ref() else {
+            panic!("failed inherent impl method should retain its original Self annotation");
+        };
+        assert_eq!(name, "Self");
+    }
+
+    #[test]
+    fn collecting_inference_does_not_partially_mutate_failed_inherent_impl() {
+        let mut program = parse_source(
+            "type Box = Box(int)\n\
+             impl Box {\n\
+               fn ok(self, other: Self) -> int { 1 }\n\
+               fn bad(self, other: Self) -> int { true }\n\
+             }\n",
+        )
+        .expect("source should parse");
+        reassociate_standalone(&mut program);
+
+        let mut infer = Infer::new();
+        let (_inference, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
+
+        assert_eq!(diagnostics.len(), 1);
+        let Stmt::InherentImpl(id) = &program.stmts[1] else {
+            panic!("second statement should be an inherent impl");
+        };
+        for method in &id.methods {
+            let Some(Type::Ident(name)) = method.params[1].ty.as_ref() else {
+                panic!("failed inherent impl should retain original Self annotations");
+            };
+            assert_eq!(name, "Self");
+        }
     }
 
     #[test]

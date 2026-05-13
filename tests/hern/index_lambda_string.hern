@@ -1,0 +1,9 @@
+let data = ["Left", "Right"]
+  .map(fn(line: string) {
+    let dir = line[0];
+    let num = ();
+
+    #{ dir, num }
+  });
+
+print(data.get(1).dir)

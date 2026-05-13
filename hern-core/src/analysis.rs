@@ -221,6 +221,10 @@ fn find_hover_in_expr(
         | ExprKind::Lambda { body: e, .. } => {
             find_hover_in_expr(e, expr_types, symbol_types, pos, best)
         }
+        ExprKind::Index { receiver, key, .. } => {
+            find_hover_in_expr(receiver, expr_types, symbol_types, pos, best);
+            find_hover_in_expr(key, expr_types, symbol_types, pos, best);
+        }
         ExprKind::AssociatedAccess { member_span, .. } => {
             if contains(*member_span, pos)
                 && let Some(ty) = symbol_types
@@ -350,6 +354,7 @@ fn hover_target_span(expr: &Expr, pos: SourcePosition) -> Option<SourceSpan> {
         | ExprKind::If { .. }
         | ExprKind::Match { .. }
         | ExprKind::Lambda { .. }
+        | ExprKind::Index { .. }
         | ExprKind::Tuple(_)
         | ExprKind::Array(_)
         | ExprKind::Record(_) => Some(expr.span).filter(|span| contains(*span, pos)),
@@ -445,6 +450,9 @@ mod tests {
                     .find_map(|entry| find_in_expr(entry.expr(), method_name)),
                 ExprKind::Lambda { body, .. } | ExprKind::For { body, .. } => {
                     find_in_expr(body, method_name)
+                }
+                ExprKind::Index { receiver, key, .. } => {
+                    find_in_expr(receiver, method_name).or_else(|| find_in_expr(key, method_name))
                 }
                 ExprKind::Number(_)
                 | ExprKind::StringLit(_)

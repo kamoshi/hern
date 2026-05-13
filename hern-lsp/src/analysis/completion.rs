@@ -33,12 +33,12 @@ fn acquire_completion_graphs(
     uri: &Uri,
     recovery_source: Option<String>,
 ) -> Option<WorkspaceAnalysis> {
-    if let Ok(wa) = analyze_document_graph(state, uri) {
-        return Some(wa);
-    }
     if let Some(source) = recovery_source
         && let Some(wa) = analyze_completion_recovery_source(state, uri, source)
     {
+        return Some(wa);
+    }
+    if let Ok(wa) = analyze_document_graph(state, uri) {
         return Some(wa);
     }
     // Partial: graph loaded but type errors prevented full inference.
@@ -82,18 +82,19 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
         return items;
     }
 
+    let recovery_source = member_completion_recovery_source(state, &uri, position);
     let owned;
-    let (graph, inference): (&ModuleGraph, &GraphInference) =
-        if let Some(cached) = cached_analysis(state, &uri) {
-            (&cached.graph, &cached.inference)
-        } else {
-            let recovery_source = member_completion_recovery_source(state, &uri, position);
-            let Some(wa) = acquire_completion_graphs(state, &uri, recovery_source) else {
-                return Vec::new();
-            };
-            owned = wa;
-            (&owned.graph, &owned.inference)
+    let (graph, inference): (&ModuleGraph, &GraphInference) = if recovery_source.is_none()
+        && let Some(cached) = cached_analysis(state, &uri)
+    {
+        (&cached.graph, &cached.inference)
+    } else {
+        let Some(wa) = acquire_completion_graphs(state, &uri, recovery_source) else {
+            return Vec::new();
         };
+        owned = wa;
+        (&owned.graph, &owned.inference)
+    };
 
     let Some((module_name, program)) = graph.module_for_path(&path) else {
         return Vec::new();
@@ -197,7 +198,11 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
                     !is_internal_completion_name(trait_name) && !existing.contains(trait_name)
                 })
                 .map(|(trait_name, trait_def)| {
-                    let detail = Some(format!("trait {} {}", trait_name, trait_def.param));
+                    let detail = Some(format!(
+                        "trait {} {}",
+                        trait_name,
+                        trait_def.params.join(" ")
+                    ));
                     CompletionItem {
                         label: trait_name.to_string(),
                         kind: Some(CompletionItemKind::INTERFACE),
@@ -326,30 +331,25 @@ fn member_completion_context(
     lsp_position: Position,
 ) -> Option<MemberCompletionContext> {
     let source = state.documents.get(uri)?;
-    let line = source.lines().nth(lsp_position.line as usize)?;
-    let cursor_byte = utf16_col_to_byte(line, lsp_position.character).min(line.len());
-    let (dot_byte, partial_start, replacement_end) = member_access_bounds(line, cursor_byte)?;
-    let before_dot = &line[..dot_byte];
-    let receiver_end_byte = before_dot.trim_end().len();
+    let cursor_byte = position_to_byte(source, lsp_position)?;
+    let (dot_byte, partial_start, replacement_end) = member_access_bounds(source, cursor_byte)?;
+    let receiver_end_byte = source[..dot_byte].trim_end().len();
     if receiver_end_byte == 0 {
         return None;
     }
-    let receiver_start = before_dot[..receiver_end_byte]
+    let receiver_start = source[..receiver_end_byte]
         .rfind(|c: char| !is_completion_identifier_char(c))
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    let receiver = &before_dot[receiver_start..receiver_end_byte];
+    let receiver = &source[receiver_start..receiver_end_byte];
     let receiver = (!receiver.is_empty() && receiver.chars().all(is_completion_identifier_char))
         .then(|| receiver.to_string());
     Some(MemberCompletionContext {
         receiver,
-        receiver_end: SourcePosition {
-            line: lsp_position.line as usize + 1,
-            col: byte_to_utf16_col(line, receiver_end_byte) as usize + 1,
-        },
+        receiver_end: byte_to_source_position(source, receiver_end_byte),
         replacement_range: Range::new(
-            Position::new(lsp_position.line, byte_to_utf16_col(line, partial_start)),
-            Position::new(lsp_position.line, byte_to_utf16_col(line, replacement_end)),
+            byte_to_lsp_position(source, partial_start),
+            byte_to_lsp_position(source, replacement_end),
         ),
     })
 }
@@ -360,11 +360,13 @@ fn member_completion_recovery_source(
     lsp_position: Position,
 ) -> Option<String> {
     let source = state.documents.get(uri)?;
-    let (line_start, line_end) = line_byte_range(source, lsp_position.line as usize)?;
-    let line = &source[line_start..line_end];
-    let cursor_byte = utf16_col_to_byte(line, lsp_position.character).min(line.len());
-    let (dot_byte, _, _) = member_access_bounds(line, cursor_byte)?;
-    let mut recovered = source[..line_start + dot_byte].to_string();
+    let cursor_byte = position_to_byte(source, lsp_position)?;
+    let (dot_byte, _, _) = member_access_bounds(source, cursor_byte)?;
+    let mut recovered = source[..dot_byte].to_string();
+    // First terminate the partial member-access statement, then balance any
+    // delimiters that statement sits inside, then terminate again in case the
+    // inserted closers completed an expression instead of a statement.
+    terminate_completion_recovery_statement(&mut recovered);
     close_unmatched_braces_for_completion(&mut recovered);
     terminate_completion_recovery_statement(&mut recovered);
     Some(recovered)
@@ -384,8 +386,7 @@ fn terminate_completion_recovery_statement(source: &mut String) {
 }
 
 fn close_unmatched_braces_for_completion(source: &mut String) {
-    let mut brace_depth = 0usize;
-    let mut paren_depth = 0usize;
+    let mut open_delimiters = Vec::new();
     let mut in_string = false;
     let mut chars = source.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -401,15 +402,32 @@ fn close_unmatched_braces_for_completion(source: &mut String) {
                     }
                 }
             }
-            '(' if !in_string => paren_depth += 1,
-            ')' if !in_string => paren_depth = paren_depth.saturating_sub(1),
-            '{' if !in_string => brace_depth += 1,
-            '}' if !in_string => brace_depth = brace_depth.saturating_sub(1),
+            '(' | '{' | '[' if !in_string => open_delimiters.push(ch),
+            ')' if !in_string => close_delimiter(&mut open_delimiters, '('),
+            '}' if !in_string => close_delimiter(&mut open_delimiters, '{'),
+            ']' if !in_string => close_delimiter(&mut open_delimiters, '['),
             _ => {}
         }
     }
-    source.extend(std::iter::repeat_n(')', paren_depth));
-    source.extend(std::iter::repeat_n('}', brace_depth));
+    for opener in open_delimiters.into_iter().rev() {
+        source.push(match opener {
+            '(' => ')',
+            '{' => '}',
+            '[' => ']',
+            _ => unreachable!("only tracked delimiters are stored"),
+        });
+    }
+}
+
+fn close_delimiter(open_delimiters: &mut Vec<char>, opener: char) {
+    if open_delimiters.last() == Some(&opener) {
+        open_delimiters.pop();
+    } else if let Some(pos) = open_delimiters.iter().rposition(|ch| *ch == opener) {
+        // Completion recovery should salvage as much prefix context as possible.
+        // If the user has mismatched delimiters before the cursor, remove the
+        // nearest matching opener and leave newer openers to be closed below.
+        open_delimiters.remove(pos);
+    }
 }
 
 fn line_byte_range(source: &str, target_line: usize) -> Option<(usize, usize)> {
@@ -427,9 +445,46 @@ fn line_byte_range(source: &str, target_line: usize) -> Option<(usize, usize)> {
     (line == target_line).then_some((start, source.len()))
 }
 
-fn member_access_bounds(line: &str, cursor_byte: usize) -> Option<(usize, usize, usize)> {
-    let cursor_byte = cursor_byte.min(line.len());
-    let before = &line[..cursor_byte];
+fn position_to_byte(source: &str, position: Position) -> Option<usize> {
+    let (line_start, line_end) = line_byte_range(source, position.line as usize)?;
+    let line = &source[line_start..line_end];
+    Some(line_start + utf16_col_to_byte(line, position.character).min(line.len()))
+}
+
+fn byte_to_lsp_position(source: &str, byte: usize) -> Position {
+    let byte = byte.min(source.len());
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    for (idx, ch) in source.char_indices() {
+        if idx >= byte {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = idx + ch.len_utf8();
+        }
+    }
+    let line_end = source[line_start..]
+        .find('\n')
+        .map(|offset| line_start + offset)
+        .unwrap_or(source.len());
+    Position::new(
+        line,
+        byte_to_utf16_col(&source[line_start..line_end], byte - line_start),
+    )
+}
+
+fn byte_to_source_position(source: &str, byte: usize) -> SourcePosition {
+    let position = byte_to_lsp_position(source, byte);
+    SourcePosition {
+        line: position.line as usize + 1,
+        col: position.character as usize + 1,
+    }
+}
+
+fn member_access_bounds(source: &str, cursor_byte: usize) -> Option<(usize, usize, usize)> {
+    let cursor_byte = cursor_byte.min(source.len());
+    let before = &source[..cursor_byte];
     let partial_start = before
         .rfind(|c: char| !is_completion_identifier_char(c))
         .map(|idx| idx + 1)
@@ -437,7 +492,7 @@ fn member_access_bounds(line: &str, cursor_byte: usize) -> Option<(usize, usize,
     if partial_start > 0 && before.as_bytes().get(partial_start - 1) == Some(&b'.') {
         return Some((partial_start - 1, partial_start, cursor_byte));
     }
-    if line.as_bytes().get(cursor_byte) == Some(&b'.') {
+    if source.as_bytes().get(cursor_byte) == Some(&b'.') {
         return Some((cursor_byte, cursor_byte + 1, cursor_byte + 1));
     }
     None
@@ -1068,6 +1123,7 @@ fn expr_children(expr: &Expr) -> Vec<&Expr> {
         ExprKind::Array(items) => items.iter().map(|item| item.expr()).collect(),
         ExprKind::Record(entries) => entries.iter().map(|entry| entry.expr()).collect(),
         ExprKind::FieldAccess { expr, .. } => vec![expr],
+        ExprKind::Index { receiver, key, .. } => vec![receiver, key],
         ExprKind::Lambda { body, .. } => vec![body],
         ExprKind::For { iterable, body, .. } => vec![iterable, body],
         ExprKind::Number(_)
@@ -1457,6 +1513,21 @@ mod tests {
     }
 
     #[test]
+    fn receiver_completion_works_for_multiline_call_result() {
+        let project = TestProject::new("completion-multiline-call-result-dot");
+        let (source, position) =
+            source_with_cursor("let data = read_file(\"input.txt\")\n  .<|>\n");
+        let (state, uri) = project.open("main.hern", &source);
+
+        let labels = labels(completion(&state, uri, position));
+
+        assert!(labels.iter().any(|label| label == "len"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "lines"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "trim"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "read_file"));
+    }
+
+    #[test]
     fn receiver_completion_works_after_chained_method_call_result() {
         let project = TestProject::new("completion-chained-method-result-dot");
         let (source, position) =
@@ -1466,6 +1537,69 @@ mod tests {
         let labels = labels(completion(&state, uri, position));
 
         assert!(labels.iter().any(|label| label == "to_float"), "{labels:?}");
+    }
+
+    #[test]
+    fn receiver_completion_uses_expected_lambda_param_type() {
+        let project = TestProject::new("completion-map-lambda-param-type");
+        let (source, position) = source_with_cursor(concat!(
+            "let data = read_file(\"input.txt\")\n",
+            "  .trim()\n",
+            "  .lines()\n",
+            "  .map(fn(line) {\n",
+            "    let dir = line.<|>;\n",
+            "    #{ dir }\n",
+            "  });\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let labels = labels(completion(&state, uri, position));
+
+        assert!(labels.iter().any(|label| label == "get"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "trim"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "chars"), "{labels:?}");
+        assert!(
+            !labels.iter().any(|label| label == "read_file"),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn receiver_completion_works_after_index_expression() {
+        let project = TestProject::new("completion-index-result-dot");
+        let (source, position) = source_with_cursor(concat!(
+            "let data = [\"Left\", \"Right\"]\n",
+            "  .map(fn(line: string) {\n",
+            "    let dir = line[0].<|>;\n",
+            "    #{ dir }\n",
+            "  });\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let labels = labels(completion(&state, uri, position));
+
+        assert!(labels.iter().any(|label| label == "trim"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "chars"), "{labels:?}");
+        assert!(
+            !labels.iter().any(|label| label == "read_file"),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn receiver_completion_recovery_closes_index_brackets() {
+        let project = TestProject::new("completion-index-recovery-brackets");
+        let (source, position) = source_with_cursor(concat!(
+            "let xs = [\"Left\", \"Right\"];\n",
+            "let prefix = 0;\n",
+            "let value = xs[prefix.<|>\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let labels = labels(completion(&state, uri, position));
+
+        assert!(labels.iter().any(|label| label == "to_float"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "xs"), "{labels:?}");
     }
 
     #[test]

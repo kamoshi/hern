@@ -8,7 +8,7 @@ use crate::pipeline::{
 use crate::types::infer::{Infer, TypeEnv, VariantEnv};
 use crate::types::{
     BindingCapabilities, CallableCapabilities, InherentMethodScheme, Scheme, Ty,
-    trait_impl_dict_name, trait_impl_target_key_from_ast,
+    trait_dict_indexes, trait_impl_arg_keys_from_ast, trait_impl_dict_name_for_indexes,
     type_syntax::exact_impl_target_key_from_ast,
 };
 use std::collections::hash_map::DefaultHasher;
@@ -95,7 +95,7 @@ struct EnvInherentImpl {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ImplKey {
     trait_name: String,
-    target: String,
+    args: Vec<String>,
 }
 
 struct InferScope {
@@ -1071,6 +1071,10 @@ fn resolve_imports_in_expr(
         | ExprKind::Break(Some(e))
         | ExprKind::Return(Some(e))
         | ExprKind::FieldAccess { expr: e, .. } => resolve_imports_in_expr(e, base_dir, graph),
+        ExprKind::Index { receiver, key, .. } => {
+            resolve_imports_in_expr(receiver, base_dir, graph)?;
+            resolve_imports_in_expr(key, base_dir, graph)
+        }
         ExprKind::AssociatedAccess { .. } => Ok(()),
         ExprKind::Assign { target, value }
         | ExprKind::Binary {
@@ -1173,6 +1177,16 @@ fn resolve_imports_in_expr_recovering(
         | ExprKind::Return(Some(e))
         | ExprKind::FieldAccess { expr: e, .. } => {
             resolve_imports_in_expr_recovering(e, base_dir, graph, source, diagnostics);
+        }
+        ExprKind::Index { receiver, key, .. } => {
+            resolve_imports_in_expr_recovering(
+                receiver,
+                base_dir,
+                graph,
+                source.clone(),
+                diagnostics,
+            );
+            resolve_imports_in_expr_recovering(key, base_dir, graph, source, diagnostics);
         }
         ExprKind::AssociatedAccess { .. } => {}
         ExprKind::Assign { target, value }
@@ -1403,17 +1417,44 @@ fn add_own_module_env(
                 }
             }
             Stmt::Impl(id) => {
-                let target = trait_impl_target_key_from_ast(&id.target)
+                let indexes = if let Some(entry) = env.traits.get(&id.trait_name) {
+                    // Keep malformed impls out of the early module-env index.
+                    // The inference pass owns the user-facing diagnostic; this
+                    // pass only registers impls that are safe to name/import.
+                    if id.trait_args.len() != entry.def.params.len() {
+                        continue;
+                    }
+                    if let Some(fundep) = entry.def.fundeps.first() {
+                        if id.fundep_arrow_index != Some(fundep.determinants.len()) {
+                            continue;
+                        }
+                    } else if id.used_fundep_arrow {
+                        continue;
+                    }
+                    trait_dict_indexes(&entry.def)
+                } else {
+                    (0..id.trait_args.len()).collect()
+                };
+                let arg_keys = indexes
+                    .iter()
+                    .map(|index| trait_impl_arg_keys_from_ast(&[id.trait_args[*index].clone()]))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|keys| keys.into_iter().flatten().collect::<Vec<_>>())
                     .map_err(|err| CompilerDiagnostic::error(None, err.to_string()))?;
                 let key = ImplKey {
                     trait_name: id.trait_name.clone(),
-                    target: target.clone(),
+                    args: arg_keys.clone(),
                 };
                 add_impl_env(
                     env,
                     key,
                     EnvImpl {
-                        dict_name: trait_impl_dict_name(&id.trait_name, &target),
+                        dict_name: trait_impl_dict_name_for_indexes(
+                            &id.trait_name,
+                            &id.trait_args,
+                            &indexes,
+                        )
+                        .map_err(|err| CompilerDiagnostic::error(None, err.to_string()))?,
                         scheme: None,
                         owner: owner.to_string(),
                     },
@@ -1531,7 +1572,8 @@ fn add_impl_env(
             None,
             format!(
                 "impl {} for {} is defined in multiple modules",
-                key.trait_name, key.target
+                key.trait_name,
+                key.args.join(", ")
             ),
         ));
     }

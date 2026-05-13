@@ -198,6 +198,10 @@ fn find_call_in_expr<'a>(
             find_call_in_expr(iterable, position, best);
             find_call_in_expr(body, position, best);
         }
+        ExprKind::Index { receiver, key, .. } => {
+            find_call_in_expr(receiver, position, best);
+            find_call_in_expr(key, position, best);
+        }
         ExprKind::AssociatedAccess { .. } => {}
         ExprKind::Number(_)
         | ExprKind::StringLit(_)

@@ -374,6 +374,10 @@ fn collect_expr_hints(
             collect_expr_hints(iterable, range, binding_types, definition_schemes, hints);
             collect_expr_hints(body, range, binding_types, definition_schemes, hints);
         }
+        ExprKind::Index { receiver, key, .. } => {
+            collect_expr_hints(receiver, range, binding_types, definition_schemes, hints);
+            collect_expr_hints(key, range, binding_types, definition_schemes, hints);
+        }
         ExprKind::AssociatedAccess { .. }
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)

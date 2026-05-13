@@ -22,6 +22,19 @@ pub enum TypeError {
         expected: usize,
         got: usize,
     },
+    TraitArityMismatch {
+        trait_name: String,
+        expected: usize,
+        got: usize,
+    },
+    FunctionalDependencyViolation {
+        trait_name: String,
+        message: String,
+    },
+    InvalidTraitImplHead {
+        trait_name: String,
+        message: String,
+    },
     InvalidAssignmentTarget,
     NonExhaustiveMatch {
         missing: String,
@@ -236,7 +249,7 @@ impl fmt::Display for TypeError {
                 write!(f, ": expected `{}`, got `{}`", expected, got)
             }
             TypeError::OccursCheck(v) => {
-                write!(f, "infinite type: '{}  occurs in its own definition", v)
+                write!(f, "infinite type: '{} occurs in its own definition", v)
             }
             TypeError::UnboundVariable(name) => write!(f, "unbound variable: `{}`", name),
             TypeError::ImmutableAssignment(name) => {
@@ -265,6 +278,31 @@ impl fmt::Display for TypeError {
                     expected, got
                 )
             }
+            TypeError::TraitArityMismatch {
+                trait_name,
+                expected,
+                got,
+            } => write!(
+                f,
+                "trait `{}` expects {} type arguments, got {}",
+                trait_name, expected, got
+            ),
+            TypeError::FunctionalDependencyViolation {
+                trait_name,
+                message,
+            } => write!(
+                f,
+                "impl for `{}` violates functional dependency: {}",
+                trait_name, message
+            ),
+            TypeError::InvalidTraitImplHead {
+                trait_name,
+                message,
+            } => write!(
+                f,
+                "invalid impl head for trait `{}`: {}",
+                trait_name, message
+            ),
             TypeError::InvalidAssignmentTarget => write!(f, "invalid assignment target"),
             TypeError::NonExhaustiveMatch { missing } => {
                 write!(f, "non-exhaustive match: {}", missing)

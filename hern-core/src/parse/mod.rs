@@ -195,6 +195,10 @@ fn check_do_control_flow(expr: &Expr, in_explicit_loop: bool) -> Result<(), Pars
             Ok(())
         }
         ExprKind::FieldAccess { expr, .. } => check_do_control_flow(expr, in_explicit_loop),
+        ExprKind::Index { receiver, key, .. } => {
+            check_do_control_flow(receiver, in_explicit_loop)?;
+            check_do_control_flow(key, in_explicit_loop)
+        }
         // Leaves — no sub-expressions to visit.
         // in_explicit_loop == true (already accepted above); recurse into value
         ExprKind::Break(Some(e)) => check_do_control_flow(e, in_explicit_loop),
@@ -784,9 +788,56 @@ impl<'tokens> Parser<'tokens> {
         ptr += self.expect(&tokens[ptr..], Token::Trait)?;
         let (c_name, name, name_span) = self.expect_ident_with_span(&tokens[ptr..])?;
         ptr += c_name;
-        // Parse the HKT type parameter: `'f`
-        let (c_param, param) = self.expect_ident(&tokens[ptr..])?;
-        ptr += c_param;
+        let mut params = Vec::new();
+        let mut determinant_len = None;
+        while tokens.get(ptr).map(|t| &t.token) != Some(&Token::LBrace) {
+            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Arrow) {
+                if params.is_empty() {
+                    return Err(ParseError::new(
+                        "Expected at least one determinant trait parameter before `->`",
+                        tokens[ptr].span,
+                    ));
+                }
+                if determinant_len.is_some() {
+                    return Err(ParseError::new(
+                        "Expected only one functional dependency arrow in trait head",
+                        tokens[ptr].span,
+                    ));
+                }
+                determinant_len = Some(params.len());
+                ptr += 1;
+                continue;
+            }
+            let (c_param, param) = self.expect_ident(&tokens[ptr..])?;
+            ptr += c_param;
+            if params.contains(&param) {
+                return Err(ParseError::new(
+                    format!("Duplicate trait parameter `{}`", param),
+                    tokens[ptr - c_param].span,
+                ));
+            }
+            params.push(param);
+        }
+        if params.is_empty() {
+            return Err(ParseError::new(
+                "Expected at least one trait parameter",
+                tokens[ptr].span,
+            ));
+        }
+        let fundeps = if let Some(det_len) = determinant_len {
+            if det_len == params.len() {
+                return Err(ParseError::new(
+                    "Expected at least one dependent trait parameter after `->`",
+                    tokens[ptr].span,
+                ));
+            }
+            vec![FunctionalDependency {
+                determinants: (0..det_len).collect(),
+                dependents: (det_len..params.len()).collect(),
+            }]
+        } else {
+            vec![]
+        };
         ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
         let mut methods = Vec::new();
         while tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
@@ -859,11 +910,14 @@ impl<'tokens> Parser<'tokens> {
         ptr += self.expect(&tokens[ptr..], Token::RBrace)?;
         Ok((
             ptr,
+            #[allow(deprecated)]
             Stmt::Trait(TraitDef {
                 span: consumed_span(tokens, ptr),
                 name,
                 name_span,
-                param,
+                param: params[0].clone(),
+                params,
+                fundeps,
                 methods,
             }),
         ))
@@ -884,8 +938,9 @@ impl<'tokens> Parser<'tokens> {
             ));
         };
         ptr += self.expect(&tokens[ptr..], Token::For)?;
-        let (c_target, target) = self.parse_type(&tokens[ptr..])?;
-        ptr += c_target;
+        let (c_trait_args, trait_args, fundep_arrow_index) =
+            self.parse_impl_trait_args(&tokens[ptr..])?;
+        ptr += c_trait_args;
         let (c_bounds, type_bounds) = self.parse_where_type_bounds(&tokens[ptr..])?;
         ptr += c_bounds;
         ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
@@ -936,15 +991,49 @@ impl<'tokens> Parser<'tokens> {
         ptr += self.expect(&tokens[ptr..], Token::RBrace)?;
         Ok((
             ptr,
+            #[allow(deprecated)]
             Stmt::Impl(ImplDef {
                 span: consumed_span(tokens, ptr),
                 trait_name,
-                target,
+                target: trait_args[0].clone(),
+                trait_args,
+                dict_arg_indexes: vec![],
+                used_fundep_arrow: fundep_arrow_index.is_some(),
+                fundep_arrow_index,
                 type_bounds,
                 dict_params: vec![],
                 methods,
             }),
         ))
+    }
+
+    fn parse_impl_trait_args(
+        &self,
+        tokens: &[Spanned],
+    ) -> Result<(usize, Vec<Type>, Option<usize>), ParseError> {
+        let mut ptr = 0;
+        let mut args = Vec::new();
+        let mut fundep_arrow_index = None;
+        loop {
+            let (consumed, ty) = self.parse_type(&tokens[ptr..])?;
+            ptr += consumed;
+            args.push(ty);
+            match tokens.get(ptr).map(|t| &t.token) {
+                Some(Token::Comma) => ptr += 1,
+                Some(Token::Arrow) => {
+                    if fundep_arrow_index.is_some() {
+                        return Err(ParseError::new(
+                            "Expected only one `->` in impl target",
+                            tokens[ptr].span,
+                        ));
+                    }
+                    fundep_arrow_index = Some(args.len());
+                    ptr += 1;
+                }
+                _ => break,
+            }
+        }
+        Ok((ptr, args, fundep_arrow_index))
     }
 
     fn parse_inherent_impl_tail(
@@ -1669,6 +1758,28 @@ impl<'tokens> Parser<'tokens> {
                             expr: Box::new(lhs),
                             field,
                             field_span,
+                        },
+                    );
+                }
+                Token::LBracket => {
+                    let (l_bp, _r_bp) = (13, 14);
+                    if l_bp < min_bp {
+                        break;
+                    }
+                    ptr += 1;
+                    let (consumed_key, key) = self.parse_expr(&tokens[ptr..], 0)?;
+                    ptr += consumed_key;
+                    ptr += self.expect(&tokens[ptr..], Token::RBracket)?;
+                    lhs = self.expr_from_tokens(
+                        tokens,
+                        ptr,
+                        ExprKind::Index {
+                            receiver: Box::new(lhs),
+                            key: Box::new(key),
+                            resolved_callee: None,
+                            pending_trait_method: None,
+                            dict_args: vec![],
+                            pending_dict_args: vec![],
                         },
                     );
                 }

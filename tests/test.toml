@@ -415,6 +415,13 @@ output = """
 2
 """
 
+[tests.map_lambda_expected_param_method]
+path = "tests/hern/map_lambda_expected_param_method.hern"
+expect = "typecheck"
+output = """
+2
+"""
+
 [tests.inherent_impls]
 path = "tests/hern/inherent_impls.hern"
 expect = "typecheck"
@@ -1094,3 +1101,88 @@ error_contains = "trait `ToString` is not implemented for `[Boxed]`"
 path = "tests/hern/tostring_result_unresolved_error.hern"
 expect = "error"
 error_contains = "trait `ToString` is not implemented for `Result(int,"
+
+[tests.index_string_zero_based]
+path = "tests/hern/index_string_zero_based.hern"
+expect = "typecheck"
+output = """
+a
+b
+"""
+
+[tests.index_array_zero_based]
+path = "tests/hern/index_array_zero_based.hern"
+expect = "typecheck"
+output = """
+10
+20
+"""
+
+[tests.index_lambda_string]
+path = "tests/hern/index_lambda_string.hern"
+expect = "typecheck"
+output = """
+L
+"""
+
+[tests.index_map]
+path = "tests/hern/index_map.hern"
+expect = "typecheck"
+output = """
+42
+missing map key failed
+"""
+
+[tests.index_oob_panics]
+path = "tests/hern/index_oob_panics.hern"
+expect = "typecheck"
+output = """
+array index failed
+string index failed
+"""
+
+[tests.index_trait_call]
+path = "tests/hern/index_trait_call.hern"
+expect = "typecheck"
+output = """
+c
+30
+"""
+
+[tests.index_generic_pending]
+path = "tests/hern/index_generic_pending.hern"
+expect = "typecheck"
+output = """
+a
+1
+"""
+
+[tests.index_fundep_coverage_error]
+path = "tests/hern/index_fundep_coverage_error.hern"
+expect = "error"
+error_contains = "violates functional dependency"
+
+[tests.index_impl_missing_arrow_error]
+path = "tests/hern/index_impl_missing_arrow_error.hern"
+expect = "error"
+error_contains = "must place `->` after 2 determinant type arguments"
+
+[tests.index_impl_arrow_position_error]
+path = "tests/hern/index_impl_arrow_position_error.hern"
+expect = "error"
+error_contains = "must place `->` after 2 determinant type arguments"
+
+[tests.index_impl_unexpected_arrow_error]
+path = "tests/hern/index_impl_unexpected_arrow_error.hern"
+expect = "error"
+error_contains = "`->` is only valid when the trait declares a functional dependency"
+
+[tests.impl_arity_panic]
+path = "tests/hern/impl_arity_panic.hern"
+expect = "error"
+error_contains = "trait `Index` expects 3 type arguments, got 1"
+
+[tests.trait_fundep_unreachable_dependent_error]
+path = "tests/hern/trait_fundep_unreachable_dependent_error.hern"
+expect = "error"
+error_contains = "dependent trait parameter `'b` must appear in a method signature"

@@ -12,7 +12,7 @@ use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference,
 use hern_core::types::infer::{TypeEnv, VariantEnv};
 use hern_core::types::{
     BindingCapabilities, Scheme, TraitConstraint, Ty, TyVar, display_ty_with_var_names,
-    free_type_vars_in_display_order, trait_impl_dict_name, trait_impl_target_key_from_ast,
+    free_type_vars_in_display_order, trait_impl_arg_keys_from_ast, trait_impl_dict_name_from_keys,
     type_var_name,
 };
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
@@ -241,7 +241,11 @@ fn trait_access_hover(
             && let Some(trait_def) = module_env.trait_def(trait_name)
         {
             if contains(*target_span, position) {
-                hover = Some(format!("trait {} {}", trait_def.name, trait_def.param));
+                hover = Some(format!(
+                    "trait {} {}",
+                    trait_def.name,
+                    trait_def.params.join(" ")
+                ));
             } else if contains(*member_span, position)
                 && let Some(method) = trait_def.methods.iter().find(|m| m.name == *member)
             {
@@ -345,7 +349,11 @@ fn trait_operator_hover_text(trait_def: &TraitDef, method: &TraitMethod) -> Opti
         .join(", ");
     let ty = format!("fn({}) -> {}", params, ast_type_to_string(&method.ret_type));
     let mut result = with_fixity_line(ty, fixity, prec);
-    result.push_str(&format!("\n\n{}: {}", trait_def.param, trait_def.name));
+    result.push_str(&format!(
+        "\n\n{}: {}",
+        trait_def.params.join(" "),
+        trait_def.name
+    ));
     Some(result)
 }
 
@@ -545,9 +553,9 @@ fn type_declaration_hover_text(program: &Program, definition: &Definition) -> Op
             _ => None,
         }),
         DefinitionKind::Trait => program.stmts.iter().find_map(|stmt| match stmt {
-            Stmt::Trait(trait_def) if trait_def.name_span == definition.location.span => {
-                Some(format!("trait {} {}", trait_def.name, trait_def.param))
-            }
+            Stmt::Trait(trait_def) if trait_def.name_span == definition.location.span => Some(
+                format!("trait {} {}", trait_def.name, trait_def.params.join(" ")),
+            ),
             _ => None,
         }),
         DefinitionKind::TraitMethod => program.stmts.iter().find_map(|stmt| match stmt {
@@ -941,9 +949,9 @@ fn param_type_in_stmt(
             ..
         } => param_type_from_fn_scheme(fn_name, params, name, param_span, env, variant_env),
         Stmt::Impl(id) => {
-            let dict_key = trait_impl_target_key_from_ast(&id.target)
+            let dict_key = trait_impl_arg_keys_from_ast(&id.trait_args)
                 .ok()
-                .map(|target| trait_impl_dict_name(&id.trait_name, &target))?;
+                .map(|targets| trait_impl_dict_name_from_keys(&id.trait_name, &targets))?;
             for method in &id.methods {
                 if let Some(ty) =
                     param_type_from_impl_dict(&dict_key, method, name, param_span, env, variant_env)
@@ -1207,10 +1215,10 @@ fn instantiate_variant_template(
                         Some(_) => return None,
                         None => constraint.var,
                     };
-                    Some(hern_core::types::TraitConstraint {
+                    Some(hern_core::types::TraitConstraint::unary(
                         var,
-                        trait_name: constraint.trait_name.clone(),
-                    })
+                        constraint.trait_name.clone(),
+                    ))
                 })
                 .collect(),
             Box::new(instantiate_variant_template(inner, type_param_vars, args)),
@@ -1377,6 +1385,12 @@ fn param_type_in_expr_stmts(
             param_type_in_expr_stmts(iterable, name, param_span, env, expr_types, variant_env)
                 .or_else(|| {
                     param_type_in_expr_stmts(body, name, param_span, env, expr_types, variant_env)
+                })
+        }
+        ExprKind::Index { receiver, key, .. } => {
+            param_type_in_expr_stmts(receiver, name, param_span, env, expr_types, variant_env)
+                .or_else(|| {
+                    param_type_in_expr_stmts(key, name, param_span, env, expr_types, variant_env)
                 })
         }
         ExprKind::AssociatedAccess { .. } => None,
@@ -1679,6 +1693,16 @@ fn local_pattern_binding_type_in_expr(
                 variant_env,
             )
         }),
+        ExprKind::Index { receiver, key, .. } => local_pattern_binding_type_in_expr(
+            receiver,
+            name,
+            binding_span,
+            expr_types,
+            variant_env,
+        )
+        .or_else(|| {
+            local_pattern_binding_type_in_expr(key, name, binding_span, expr_types, variant_env)
+        }),
         ExprKind::AssociatedAccess { .. } => None,
         ExprKind::Break(None)
         | ExprKind::Return(None)
@@ -1812,6 +1836,10 @@ fn declaration_value_type_in_expr<'a>(
         ExprKind::For { iterable, body, .. } => {
             declaration_value_type_in_expr(iterable, span, expr_types)
                 .or_else(|| declaration_value_type_in_expr(body, span, expr_types))
+        }
+        ExprKind::Index { receiver, key, .. } => {
+            declaration_value_type_in_expr(receiver, span, expr_types)
+                .or_else(|| declaration_value_type_in_expr(key, span, expr_types))
         }
         ExprKind::AssociatedAccess { .. } => None,
         ExprKind::Break(None)

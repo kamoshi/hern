@@ -1,0 +1,3 @@
+impl Index for string -> int, string {
+  fn index(self, key) { "x" }
+}

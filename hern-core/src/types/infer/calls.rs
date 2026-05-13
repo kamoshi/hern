@@ -14,6 +14,81 @@ pub(super) struct AppliedSchemeCall {
 
 impl Infer {
     #[allow(clippy::too_many_arguments)]
+    pub(super) fn resolve_multi_param_trait_dispatch(
+        &mut self,
+        env: &TypeEnv,
+        trait_name: &str,
+        method_name: &str,
+        trait_args: Vec<Ty>,
+        determinant_indexes: Vec<usize>,
+        method_arg_tys: Vec<Ty>,
+        ret_ty: Ty,
+        resolved_callee: &mut Option<ResolvedCallee>,
+        pending_trait_method: &mut Option<(PendingDictArg, String)>,
+        concrete_dict_expect: &'static str,
+    ) -> Result<Option<Ty>, SpannedTypeError> {
+        if let Some(dict) = resolve_concrete_multi_dict_ref(
+            trait_name,
+            &trait_args,
+            &determinant_indexes,
+            env,
+            &self.known_impl_dicts,
+            &self.known_impl_schemes,
+        ) {
+            let dict_name = dict_ref_concrete_name(&dict)
+                .expect(concrete_dict_expect)
+                .to_string();
+            if let Some(dict_scheme) = env
+                .get(&dict_name)
+                .map(|info| info.scheme.clone())
+                .or_else(|| self.known_impl_schemes.get(&dict_name).cloned())
+            {
+                let dict_ty = self.instantiate(&dict_scheme);
+                let dict_method_ty = record_field_ty(&self.subst.apply(&dict_ty), method_name)
+                    .ok_or_else(|| TypeError::UnknownTraitMethod {
+                        trait_name: trait_name.to_string(),
+                        method: method_name.to_string(),
+                    })?;
+                let checked_ret = Ty::Var(self.fresh_var());
+                unify(
+                    &mut self.subst,
+                    dict_method_ty,
+                    Ty::Func(
+                        value_func_params(method_arg_tys),
+                        value_func_return(checked_ret.clone()),
+                    ),
+                )?;
+                unify(&mut self.subst, ret_ty.clone(), checked_ret)?;
+            }
+            *resolved_callee = Some(ResolvedCallee::DictMethod {
+                dict,
+                method: method_name.to_string(),
+            });
+            return Ok(Some(self.subst.apply(&ret_ty)));
+        }
+
+        if let Some(var) = primary_trait_var(&trait_args, &determinant_indexes) {
+            let constraint = TraitConstraint::predicate(
+                trait_name,
+                trait_args.clone(),
+                var,
+                determinant_indexes.clone(),
+            );
+            self.pending_constraints.push(constraint);
+            let pending = PendingDictArg {
+                var,
+                trait_name: trait_name.to_string(),
+                args: trait_args,
+                determinant_indexes,
+            };
+            *pending_trait_method = Some((pending, method_name.to_string()));
+            return Ok(Some(self.subst.apply(&ret_ty)));
+        }
+
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_operator_dispatch(
         &mut self,
         env: &TypeEnv,
@@ -50,14 +125,13 @@ impl Infer {
     ) -> Result<DictResolution, TypeError> {
         let target = self.subst.apply(&target);
         if let Ty::Var(var) = target {
-            let constraint = TraitConstraint {
-                var,
-                trait_name: trait_name.to_string(),
-            };
+            let constraint = TraitConstraint::unary(var, trait_name.to_string());
             self.pending_constraints.push(constraint.clone());
             return Ok(DictResolution::Pending(PendingDictArg {
                 var,
                 trait_name: trait_name.to_string(),
+                args: vec![Ty::Var(var)],
+                determinant_indexes: vec![0],
             }));
         }
         if let Some(dict) = self.resolve_structural_dict(env, trait_name, &target)? {
@@ -105,10 +179,7 @@ impl Infer {
                     impl_target: format!("{}", ty),
                 }),
             Ty::Var(var) => {
-                let constraint = TraitConstraint {
-                    var,
-                    trait_name: "Eq".to_string(),
-                };
+                let constraint = TraitConstraint::unary(var, "Eq");
                 self.pending_constraints.push(constraint.clone());
                 Ok(DictRef::Param(dict_param_name(&constraint)))
             }
@@ -153,15 +224,29 @@ impl Infer {
         let trait_name = trait_def.name.clone();
         let method_name = method.name.clone();
 
+        if trait_def.params.len() > 1 || !trait_def.fundeps.is_empty() {
+            return self.resolve_multi_param_trait_method_call(
+                env,
+                args,
+                arg_wrappers,
+                resolved_callee,
+                pending_trait_method,
+                trait_def,
+                method,
+                context,
+            );
+        }
+
         // Decide dispatch strategy based on whether the first parameter's type
         // contains the trait's HKT variable (e.g. `'f` in `map(fa: 'f('a), ...)`).
         // If it does, we can read the impl target directly from the first argument's
         // concrete type.  If not (e.g. `pure(a: 'a)`), the target is only known from
         // context, so we fall back to abstract unification and a pending marker.
+        let trait_param = primary_param_or_panic(&trait_def);
         let first_param_has_trait_var = method
             .params
             .first()
-            .map(|(_, ty)| type_contains_var(ty, &trait_def.param))
+            .map(|(_, ty)| type_contains_var(ty, trait_param))
             .unwrap_or(false);
 
         let arg_tys = self.infer_args(env, args, arg_wrappers)?;
@@ -189,11 +274,13 @@ impl Infer {
                     let pending = PendingDictArg {
                         var: resolved_var.unwrap_or(target_var),
                         trait_name: trait_name.clone(),
+                        args: vec![Ty::Var(resolved_var.unwrap_or(target_var))],
+                        determinant_indexes: vec![0],
                     };
-                    self.pending_constraints.push(TraitConstraint {
-                        var: pending.var,
-                        trait_name: pending.trait_name.clone(),
-                    });
+                    self.pending_constraints.push(TraitConstraint::unary(
+                        pending.var,
+                        pending.trait_name.clone(),
+                    ));
                     *pending_trait_method = Some((pending, method_name));
                     return Ok(self.subst.apply(&ret_ty));
                 }
@@ -259,7 +346,7 @@ impl Infer {
             // pinned the type variable.
             let mut param_vars: HashMap<String, TyVar> = HashMap::new();
             let target_var = self.fresh_var();
-            param_vars.insert(trait_def.param.clone(), target_var);
+            param_vars.insert(trait_param.to_string(), target_var);
 
             let method_param_tys: Vec<Ty> = method
                 .params
@@ -280,11 +367,13 @@ impl Infer {
                         let pending = PendingDictArg {
                             var: v,
                             trait_name: trait_name.clone(),
+                            args: vec![Ty::Var(v)],
+                            determinant_indexes: vec![0],
                         };
-                        self.pending_constraints.push(TraitConstraint {
-                            var: pending.var,
-                            trait_name: pending.trait_name.clone(),
-                        });
+                        self.pending_constraints.push(TraitConstraint::unary(
+                            pending.var,
+                            pending.trait_name.clone(),
+                        ));
                         *pending_trait_method = Some((pending, method_name));
                         Ok(self.subst.apply(&ret_ty))
                     }
@@ -321,6 +410,77 @@ impl Infer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_multi_param_trait_method_call(
+        &mut self,
+        env: &TypeEnv,
+        args: &mut [Expr],
+        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
+        resolved_callee: &mut Option<ResolvedCallee>,
+        pending_trait_method: &mut Option<(PendingDictArg, String)>,
+        trait_def: TraitDef,
+        method: TraitMethod,
+        context: &str,
+    ) -> Result<Ty, SpannedTypeError> {
+        let trait_name = trait_def.name.clone();
+        let method_name = method.name.clone();
+        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
+        if arg_tys.len() != method.params.len() {
+            return Err(TypeError::ArityMismatch {
+                expected: method.params.len(),
+                got: arg_tys.len(),
+            }
+            .into());
+        }
+
+        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
+        let trait_param_vars = trait_def
+            .params
+            .iter()
+            .map(|param| {
+                let var = self.fresh_var();
+                param_vars.insert(param.clone(), var);
+                var
+            })
+            .collect::<Vec<_>>();
+        let method_param_tys: Vec<Ty> = method
+            .params
+            .iter()
+            .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
+            .collect::<Result<_, _>>()?;
+        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
+
+        for (arg_ty, param_ty) in arg_tys.iter().cloned().zip(method_param_tys) {
+            unify(&mut self.subst, arg_ty, param_ty)?;
+        }
+
+        let trait_args = trait_param_vars
+            .iter()
+            .map(|var| self.subst.apply(&Ty::Var(*var)))
+            .collect::<Vec<_>>();
+        let determinant_indexes = trait_dict_indexes(&trait_def);
+        if let Some(ret_ty) = self.resolve_multi_param_trait_dispatch(
+            env,
+            &trait_name,
+            method_name.as_str(),
+            trait_args,
+            determinant_indexes,
+            arg_tys,
+            ret_ty,
+            resolved_callee,
+            pending_trait_method,
+            "multi-parameter trait dictionaries should be concrete",
+        )? {
+            return Ok(ret_ty);
+        }
+
+        Err(TypeError::UnresolvedTrait {
+            context: context.to_string(),
+            trait_name,
+        }
+        .into())
+    }
+
     fn check_trait_method_signature(
         &mut self,
         trait_def: &TraitDef,
@@ -330,7 +490,8 @@ impl Infer {
     ) -> Result<Ty, SpannedTypeError> {
         let mut param_vars = HashMap::new();
         let target_var = self.fresh_var();
-        param_vars.insert(trait_def.param.clone(), target_var);
+        let trait_param = primary_param_or_panic(trait_def);
+        param_vars.insert(trait_param.to_string(), target_var);
         let method_param_tys: Vec<Ty> = method
             .params
             .iter()
@@ -360,7 +521,8 @@ impl Infer {
     ) -> Result<(Ty, Option<TyVar>), SpannedTypeError> {
         let mut param_vars = HashMap::new();
         let target_var = self.fresh_var();
-        param_vars.insert(trait_def.param.clone(), target_var);
+        let trait_param = primary_param_or_panic(trait_def);
+        param_vars.insert(trait_param.to_string(), target_var);
         let method_param_tys: Vec<Ty> = method
             .params
             .iter()
@@ -439,7 +601,7 @@ impl Infer {
             dict_args,
             pending_dict_args,
         )?;
-        let return_capability = scheme_return_capability(&method_info.scheme);
+        let return_capability = func_return_capability(&method_info.scheme.ty);
         self.record_symbol_type(
             callee_id,
             Ty::Func(
@@ -504,7 +666,7 @@ impl Infer {
                     pending_dict_args,
                     &mut self.pending_constraints,
                     &constraints,
-                    &self.subst,
+                    &mut self.subst,
                 )
                 .map_err(|e| e.at(receiver.span))?;
                 field_ty = *inner;
@@ -852,7 +1014,7 @@ impl Infer {
                     &mut wrapper.pending_dict_args,
                     &mut self.pending_constraints,
                     &constraints,
-                    &self.subst,
+                    &mut self.subst,
                 )
                 .map_err(|e| e.at(arg.span))?;
                 arg_ty = *inner;
@@ -866,16 +1028,69 @@ impl Infer {
         Ok(arg_tys)
     }
 
-    pub(super) fn infer_checked_args(
+    fn infer_checked_args_with_expected(
         &mut self,
         env: &TypeEnv,
         args: &mut [Expr],
         arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        param_capabilities: &[ParamCapability],
+        expected_params: &[FuncParam],
         param_offset: usize,
     ) -> Result<Vec<Ty>, SpannedTypeError> {
-        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-        self.check_mutable_place_args_from(env, args, param_capabilities, param_offset)?;
+        arg_wrappers.clear();
+        let mut arg_tys = Vec::with_capacity(args.len());
+        for (idx, arg) in args.iter_mut().enumerate() {
+            let expected_param = expected_params.get(param_offset + idx);
+            let inferred = if let Some(expected_param) = expected_param
+                && matches!(arg.kind, ExprKind::Lambda { .. })
+            {
+                self.infer_expr_expected(env, arg, expected_param.ty.clone())?
+            } else {
+                self.infer_expr(env, arg)?
+            };
+            if has_mut_place_func_params(&self.subst.apply(&inferred))
+                || self
+                    .metadata
+                    .callable_capabilities(arg.id)
+                    .is_some_and(|capabilities| {
+                        capabilities
+                            .param_capabilities
+                            .iter()
+                            .any(|capability| capability.is_mut_place())
+                    })
+            {
+                return Err(TypeError::MutableFunctionCapabilityMismatch.at(arg.span));
+            }
+            let mut arg_ty = self.subst.apply(&inferred);
+            let wrapper = if let Ty::Qualified(constraints, inner) = arg_ty {
+                let mut wrapper = ArgWrapper {
+                    dict_args: Vec::new(),
+                    pending_dict_args: Vec::new(),
+                };
+                attach_dict_args(
+                    env,
+                    &self.known_impl_dicts,
+                    &self.known_impl_schemes,
+                    &mut wrapper.dict_args,
+                    &mut wrapper.pending_dict_args,
+                    &mut self.pending_constraints,
+                    &constraints,
+                    &mut self.subst,
+                )
+                .map_err(|e| e.at(arg.span))?;
+                arg_ty = *inner;
+                Some(wrapper)
+            } else {
+                None
+            };
+            arg_wrappers.push(wrapper);
+            arg_tys.push(arg_ty);
+        }
+        self.check_mutable_place_args_from(
+            env,
+            args,
+            &func_param_capabilities(expected_params),
+            param_offset,
+        )?;
         Ok(arg_tys)
     }
 
@@ -891,25 +1106,52 @@ impl Infer {
         dict_args: &mut Vec<DictRef>,
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<AppliedSchemeCall, SpannedTypeError> {
+        let instantiated = self.instantiate_scheme(scheme);
+        let expected_params = match &instantiated.ty {
+            Ty::Func(params, _) => params.clone(),
+            _ => Vec::new(),
+        };
+        let fresh_return = func_return_capability(&instantiated.ty) == ReturnCapability::FreshPlace;
         let mut arg_tys = leading_arg_tys;
-        arg_tys.extend(self.infer_checked_args(
+        for (idx, leading_ty) in arg_tys.iter().enumerate() {
+            if let Some(expected_param) = expected_params.get(idx) {
+                unify(
+                    &mut self.subst,
+                    leading_ty.clone(),
+                    expected_param.ty.clone(),
+                )?;
+            }
+        }
+        arg_tys.extend(self.infer_checked_args_with_expected(
             env,
             args,
             arg_wrappers,
-            &scheme_param_capabilities(scheme),
+            &expected_params,
             param_offset,
         )?);
-        let ret_ty = self.infer_constrained_apply(
+        let ret_ty = Ty::Var(self.fresh_var());
+        let expected_params = expected_func_params(&instantiated.ty, arg_tys.clone());
+        let expected_ret = expected_func_return(&instantiated.ty, ret_ty.clone());
+        unify(
+            &mut self.subst,
+            instantiated.ty,
+            Ty::Func(expected_params, expected_ret),
+        )?;
+        attach_dict_args(
             env,
-            scheme,
-            arg_tys.clone(),
+            &self.known_impl_dicts,
+            &self.known_impl_schemes,
             dict_args,
             pending_dict_args,
-        )?;
+            &mut self.pending_constraints,
+            &instantiated.constraints,
+            &mut self.subst,
+        )
+        .map_err(TypeError::unspanned)?;
         Ok(AppliedSchemeCall {
-            ret_ty,
+            ret_ty: self.subst.apply(&ret_ty),
             arg_tys,
-            fresh_return: scheme_return_capability(scheme) == ReturnCapability::FreshPlace,
+            fresh_return,
         })
     }
 
@@ -929,14 +1171,30 @@ impl Infer {
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<AppliedCall, SpannedTypeError> {
         let fresh_return = func_return_capability(&callable_ty) == ReturnCapability::FreshPlace;
+        let expected_params = match &callable_ty {
+            Ty::Func(params, _) => params.clone(),
+            _ => Vec::new(),
+        };
         let mut arg_tys = leading_arg_tys;
-        arg_tys.extend(self.infer_checked_args(
+        for (idx, leading_ty) in arg_tys.iter().enumerate() {
+            if let Some(expected_param) = expected_params.get(idx) {
+                unify(
+                    &mut self.subst,
+                    leading_ty.clone(),
+                    expected_param.ty.clone(),
+                )?;
+            }
+        }
+        arg_tys.extend(self.infer_checked_args_with_expected(
             env,
             args,
             arg_wrappers,
-            &param_capabilities,
+            &expected_params,
             param_offset,
         )?);
+        if expected_params.is_empty() {
+            self.check_mutable_place_args_from(env, args, &param_capabilities, param_offset)?;
+        }
         let ret_ty = Ty::Var(self.fresh_var());
         let call_ty = Ty::Func(
             expected_func_params(&callable_ty, arg_tys.clone()),
@@ -951,7 +1209,7 @@ impl Infer {
             pending_dict_args,
             &mut self.pending_constraints,
             &constraints,
-            &self.subst,
+            &mut self.subst,
         )
         .map_err(|err| err.at(dict_error_span))?;
         Ok(AppliedCall {
@@ -986,7 +1244,7 @@ impl Infer {
             pending_dict_args,
             &mut self.pending_constraints,
             &instantiated.constraints,
-            &self.subst,
+            &mut self.subst,
         )
         .map_err(TypeError::unspanned)?;
         Ok(self.subst.apply(&ret_ty))

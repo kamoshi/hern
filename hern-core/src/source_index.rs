@@ -693,6 +693,10 @@ impl IndexBuilder {
                 }
             }
             ExprKind::AssociatedAccess { .. } => {}
+            ExprKind::Index { receiver, key, .. } => {
+                self.index_expr(receiver);
+                self.index_expr(key);
+            }
             ExprKind::For {
                 pat,
                 iterable,

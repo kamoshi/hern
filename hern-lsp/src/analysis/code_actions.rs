@@ -158,6 +158,10 @@ fn collect_code_actions_for_expr(
             collect_code_actions_for_expr(iterable, uri, range, binding_types, actions);
             collect_code_actions_for_expr(body, uri, range, binding_types, actions);
         }
+        ExprKind::Index { receiver, key, .. } => {
+            collect_code_actions_for_expr(receiver, uri, range, binding_types, actions);
+            collect_code_actions_for_expr(key, uri, range, binding_types, actions);
+        }
         ExprKind::AssociatedAccess { .. } => {}
         ExprKind::Number(_)
         | ExprKind::StringLit(_)

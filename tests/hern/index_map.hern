@@ -1,0 +1,9 @@
+let mut present = Map::new();
+present.set("x", 42);
+print(present["x"]);
+
+let missing = Map::new();
+match pcall(fn() { missing["x"] }) {
+  Ok(_) -> print("missing map key unexpectedly succeeded"),
+  Err(_) -> print("missing map key failed"),
+}

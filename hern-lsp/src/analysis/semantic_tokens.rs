@@ -407,6 +407,10 @@ fn push_associated_access_tokens_expr(
             push_associated_access_tokens_expr(raw, pos_to_idx, source, iterable);
             push_associated_access_tokens_expr(raw, pos_to_idx, source, body);
         }
+        ExprKind::Index { receiver, key, .. } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, receiver);
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, key);
+        }
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
