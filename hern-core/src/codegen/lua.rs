@@ -372,7 +372,7 @@ impl LuaCodegen {
     ) -> String {
         let lua_name = mangle_op(name);
         let ind = self.ind();
-        let mut all_params: Vec<String> = dict_params.iter().cloned().collect();
+        let mut all_params: Vec<String> = dict_params.to_vec();
         let mut pattern_destructures = String::new();
         for (i, param) in params.iter().enumerate() {
             match &param.pat {
@@ -869,6 +869,7 @@ impl LuaCodegen {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gen_call_expr(
         &mut self,
         callee: &Expr,

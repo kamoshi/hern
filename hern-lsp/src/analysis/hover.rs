@@ -131,8 +131,7 @@ fn prelude_hover_from_analysis(
     if prelude
         .inference
         .callable_capabilities
-        .get(&info.node_id)
-        .is_some()
+        .contains_key(&info.node_id)
     {
         let scheme = Scheme::mono(info.ty.clone());
         return Some(type_hover_with_span(
@@ -435,7 +434,7 @@ fn scheme_to_display_string(scheme: &Scheme, include_constraints: bool) -> Strin
     if include_constraints {
         let constraints = constraints_by_var(scheme, &names);
         if !constraints.is_empty() {
-            out.push_str("\n");
+            out.push('\n');
             for (name, traits) in constraints {
                 out.push_str(&format!("\n'{}: {}", name, traits.join(" + ")));
             }
@@ -795,14 +794,14 @@ fn imported_member_hover_text(
 
     // Primary path: look up the field from the module's concrete export type.
     // This is correct for all export shapes, including aliased names.
-    if let Some(Ty::Record(row)) = inference.import_types.get(&reference.module_name) {
-        if let Some((_, field_ty)) = row.fields.iter().find(|(f, _)| f == &reference.member_name) {
-            return Some(imported_member_display(
-                import_alias,
-                reference,
-                ty_to_display_string(field_ty),
-            ));
-        }
+    if let Some(Ty::Record(row)) = inference.import_types.get(&reference.module_name)
+        && let Some((_, field_ty)) = row.fields.iter().find(|(f, _)| f == &reference.member_name)
+    {
+        return Some(imported_member_display(
+            import_alias,
+            reference,
+            ty_to_display_string(field_ty),
+        ));
     }
 
     // Fallback: definition-based lookup for non-record or unavailable export shapes.
@@ -831,6 +830,7 @@ fn imported_member_display(
     format!("{}.{}: {}", module, reference.member_name, text)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn definition_hover_text(
     definition: &Definition,
     env: Option<&TypeEnv>,
@@ -883,24 +883,23 @@ fn definition_hover_text(
 
     // For destructured local let/for/match bindings,
     // extract the specific binding type from the RHS via the pattern structure.
-    if definition.kind == DefinitionKind::Let {
-        if let Some(types) = expr_types {
-            if let Some(ty) = local_pattern_binding_type(
-                program,
-                &definition.name,
-                definition.location.span,
-                types,
-                binding_types,
-                variant_env,
-            ) {
-                return Some(ty);
-            }
-        }
+    if definition.kind == DefinitionKind::Let
+        && let Some(types) = expr_types
+        && let Some(ty) = local_pattern_binding_type(
+            program,
+            &definition.name,
+            definition.location.span,
+            types,
+            binding_types,
+            variant_env,
+        )
+    {
+        return Some(ty);
     }
 
     expr_types
         .and_then(|types| declaration_value_type(program, definition.location.span, types))
-        .map(|ty| ty_to_display_string(ty))
+        .map(ty_to_display_string)
         .or_else(|| type_declaration_hover_text(program, definition))
 }
 
@@ -1076,21 +1075,22 @@ fn extract_binding_type(
             }
             // Rest binding `..rest` — its type is the remaining record fields
             // (those not bound by name in this pattern) plus the row's tail.
-            if let Some(Some((rest_name, rest_span))) = rest {
-                if rest_name == target_name && *rest_span == target_span {
-                    let named: std::collections::HashSet<&str> =
-                        fields.iter().map(|(f, _, _)| f.as_str()).collect();
-                    let rest_fields: Vec<(String, Ty)> = row
-                        .fields
-                        .iter()
-                        .filter(|(f, _)| !named.contains(f.as_str()))
-                        .cloned()
-                        .collect();
-                    return Some(Ty::Record(hern_core::types::Row {
-                        fields: rest_fields,
-                        tail: row.tail.clone(),
-                    }));
-                }
+            if let Some(Some((rest_name, rest_span))) = rest
+                && rest_name == target_name
+                && *rest_span == target_span
+            {
+                let named: std::collections::HashSet<&str> =
+                    fields.iter().map(|(f, _, _)| f.as_str()).collect();
+                let rest_fields: Vec<(String, Ty)> = row
+                    .fields
+                    .iter()
+                    .filter(|(f, _)| !named.contains(f.as_str()))
+                    .cloned()
+                    .collect();
+                return Some(Ty::Record(hern_core::types::Row {
+                    fields: rest_fields,
+                    tail: row.tail.clone(),
+                }));
             }
             None
         }
@@ -1112,10 +1112,11 @@ fn extract_binding_type(
                     return Some(ty);
                 }
             }
-            if let Some(Some((rest_name, rest_span))) = rest {
-                if rest_name == target_name && *rest_span == target_span {
-                    return Some(param_ty.clone());
-                }
+            if let Some(Some((rest_name, rest_span))) = rest
+                && rest_name == target_name
+                && *rest_span == target_span
+            {
+                return Some(param_ty.clone());
             }
             None
         }
@@ -1170,16 +1171,15 @@ fn constructor_payload_type(
         _ => &[],
     };
 
-    if let Some(venv) = variant_env {
-        if let Some(info) = venv.0.get(constructor) {
-            if let Some(payload_ty) = &info.payload_ty {
-                return Some(instantiate_variant_template(
-                    payload_ty,
-                    &info.type_param_vars,
-                    args,
-                ));
-            }
-        }
+    if let Some(venv) = variant_env
+        && let Some(info) = venv.0.get(constructor)
+        && let Some(payload_ty) = &info.payload_ty
+    {
+        return Some(instantiate_variant_template(
+            payload_ty,
+            &info.type_param_vars,
+            args,
+        ));
     }
 
     // Fallback when variant_env is unavailable: use the position heuristic
@@ -1484,14 +1484,11 @@ fn local_pattern_binding_type_in_stmt(
         Stmt::Let { pat, value, .. } => {
             if !matches!(pat, Pattern::Variable(_, _) | Pattern::Wildcard)
                 && pattern_has_binding_at(pat, name, binding_span)
+                && let Some(rhs_ty) = expr_types.get(&value.id)
+                && let Some(binding_ty) =
+                    extract_binding_type(pat, name, binding_span, rhs_ty, variant_env)
             {
-                if let Some(rhs_ty) = expr_types.get(&value.id) {
-                    if let Some(binding_ty) =
-                        extract_binding_type(pat, name, binding_span, rhs_ty, variant_env)
-                    {
-                        return Some(ty_to_display_string(&binding_ty));
-                    }
-                }
+                return Some(ty_to_display_string(&binding_ty));
             }
             local_pattern_binding_type_in_expr(value, name, binding_span, expr_types, variant_env)
         }
@@ -1537,16 +1534,13 @@ fn local_pattern_binding_type_in_expr(
             body,
             ..
         } => {
-            if pattern_has_binding_at(pat, name, binding_span) {
-                if let Some(iterable_ty) = expr_types.get(&iterable.id) {
-                    if let Some(elem_ty) = iterable_element_type(iterable_ty) {
-                        if let Some(binding_ty) =
-                            extract_binding_type(pat, name, binding_span, elem_ty, variant_env)
-                        {
-                            return Some(ty_to_display_string(&binding_ty));
-                        }
-                    }
-                }
+            if pattern_has_binding_at(pat, name, binding_span)
+                && let Some(iterable_ty) = expr_types.get(&iterable.id)
+                && let Some(elem_ty) = iterable_element_type(iterable_ty)
+                && let Some(binding_ty) =
+                    extract_binding_type(pat, name, binding_span, elem_ty, variant_env)
+            {
+                return Some(ty_to_display_string(&binding_ty));
             }
             local_pattern_binding_type_in_expr(
                 iterable,
@@ -1645,14 +1639,12 @@ fn local_pattern_binding_type_in_expr(
             }),
         ExprKind::Match { scrutinee, arms } => {
             for (pat, body) in arms {
-                if pattern_has_binding_at(pat, name, binding_span) {
-                    if let Some(scrutinee_ty) = expr_types.get(&scrutinee.id) {
-                        if let Some(binding_ty) =
-                            extract_binding_type(pat, name, binding_span, scrutinee_ty, variant_env)
-                        {
-                            return Some(ty_to_display_string(&binding_ty));
-                        }
-                    }
+                if pattern_has_binding_at(pat, name, binding_span)
+                    && let Some(scrutinee_ty) = expr_types.get(&scrutinee.id)
+                    && let Some(binding_ty) =
+                        extract_binding_type(pat, name, binding_span, scrutinee_ty, variant_env)
+                {
+                    return Some(ty_to_display_string(&binding_ty));
                 }
                 if let Some(ty) = local_pattern_binding_type_in_expr(
                     body,

@@ -178,7 +178,7 @@ fn run_file(path: PathBuf) -> Result<(), CliError> {
     let (graph, inference, entry) = analyze_workspace_for_cli(path)?;
     let lua_code = gen_lua_iife_bundle(&graph, &inference.module_envs, &entry);
     hern_repl::exec_lua(&lua_code)
-        .map_err(|e| CliError::Single(CompilerDiagnostic::error(None, &e.to_string())))
+        .map_err(|e| CliError::Single(CompilerDiagnostic::error(None, e.to_string())))
 }
 
 fn analyze_workspace_for_cli(

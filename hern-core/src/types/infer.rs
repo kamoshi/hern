@@ -1308,11 +1308,28 @@ impl Infer {
             ExprKind::Match { scrutinee, arms } => {
                 let scrutinee_ty = self.infer_expr(env, scrutinee)?;
                 let mut result_ty = None;
+                let match_scrutinee_ty = self.subst.apply(&scrutinee_ty);
                 for (pattern, arm_expr) in &mut *arms {
                     let mut arm_env = env.clone();
-                    let s_ty = self.subst.apply(&scrutinee_ty);
-                    self.check_pattern(pattern, s_ty, &mut arm_env, false)?;
-                    let arm_ty = self.infer_expr_expected(&arm_env, arm_expr, expected.clone())?;
+                    let scrutinee_before_pattern = self.subst.apply(&scrutinee_ty);
+                    self.check_pattern(
+                        pattern,
+                        scrutinee_before_pattern.clone(),
+                        &mut arm_env,
+                        false,
+                    )?;
+                    let scrutinee_after_pattern = self.subst.apply(&scrutinee_ty);
+                    let arm_ty = self
+                        .infer_expr_expected(&arm_env, arm_expr, expected.clone())
+                        .map_err(|err| {
+                            constructor_pattern_refinement_mismatch(
+                                pattern,
+                                match_scrutinee_ty.clone(),
+                                scrutinee_after_pattern.clone(),
+                                err,
+                                arm_expr.span,
+                            )
+                        })?;
                     result_ty = Some(match result_ty {
                         Some(existing) => combine_branch_types(&mut self.subst, existing, arm_ty)?,
                         None => arm_ty,
@@ -1548,11 +1565,26 @@ impl Infer {
             ExprKind::Match { scrutinee, arms } => {
                 let scrutinee_ty = self.infer_expr(env, scrutinee)?;
                 let mut result_ty = None;
+                let match_scrutinee_ty = self.subst.apply(&scrutinee_ty);
                 for (pattern, arm_expr) in &mut *arms {
                     let mut arm_env = env.clone();
-                    let s_ty = self.subst.apply(&scrutinee_ty);
-                    self.check_pattern(pattern, s_ty, &mut arm_env, false)?;
-                    let arm_ty = self.infer_expr(&arm_env, arm_expr)?;
+                    let scrutinee_before_pattern = self.subst.apply(&scrutinee_ty);
+                    self.check_pattern(
+                        pattern,
+                        scrutinee_before_pattern.clone(),
+                        &mut arm_env,
+                        false,
+                    )?;
+                    let scrutinee_after_pattern = self.subst.apply(&scrutinee_ty);
+                    let arm_ty = self.infer_expr(&arm_env, arm_expr).map_err(|err| {
+                        constructor_pattern_refinement_mismatch(
+                            pattern,
+                            match_scrutinee_ty.clone(),
+                            scrutinee_after_pattern.clone(),
+                            err,
+                            arm_expr.span,
+                        )
+                    })?;
                     result_ty = Some(match result_ty {
                         Some(existing) => combine_branch_types(&mut self.subst, existing, arm_ty)?,
                         None => arm_ty,
@@ -1926,6 +1958,7 @@ impl Infer {
         Ok(self.subst.apply(&ret_ty))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn infer_function_operator_expr(
         &mut self,
         env: &TypeEnv,
@@ -2801,6 +2834,23 @@ fn unify_expr_result(subst: &mut Subst, actual: Ty, expected: Ty) -> Result<(), 
     unify(subst, actual, expected)
 }
 
+fn constructor_pattern_refinement_mismatch(
+    pattern: &Pattern,
+    scrutinee_before_pattern: Ty,
+    scrutinee_after_pattern: Ty,
+    err: SpannedTypeError,
+    span: SourceSpan,
+) -> SpannedTypeError {
+    if !matches!(pattern, Pattern::Constructor { .. })
+        || !matches!(err.error.as_ref(), TypeError::OccursCheck(_))
+        || scrutinee_before_pattern == scrutinee_after_pattern
+    {
+        return err;
+    }
+
+    TypeError::Mismatch(scrutinee_after_pattern, scrutinee_before_pattern).at(span)
+}
+
 fn is_never(ty: &Ty) -> bool {
     matches!(ty, Ty::Never)
 }
@@ -3158,7 +3208,10 @@ mod tests {
             .infer_program(&mut program)
             .expect_err("recursive aliases should be rejected");
 
-        assert!(matches!(err.error, TypeError::RecursiveTypeAlias(_)));
+        assert!(matches!(
+            err.error.as_ref(),
+            TypeError::RecursiveTypeAlias(_)
+        ));
     }
 
     #[test]
@@ -3374,7 +3427,7 @@ mod tests {
             )
             .expect_err("scope body should fail");
 
-        assert!(matches!(err.error, TypeError::UnknownType(_)));
+        assert!(matches!(err.error.as_ref(), TypeError::UnknownType(_)));
         assert_eq!(
             infer.pending_constraints,
             vec![TraitConstraint::unary(0, "Outer".to_string())]
@@ -3385,7 +3438,7 @@ mod tests {
                 Err::<(), SpannedTypeError>(TypeError::UnknownType("return".to_string()).into())
             })
             .expect_err("return scope body should fail");
-        assert!(matches!(err.error, TypeError::UnknownType(_)));
+        assert!(matches!(err.error.as_ref(), TypeError::UnknownType(_)));
         assert!(infer.fn_return_tys.is_empty());
     }
 
@@ -3451,10 +3504,10 @@ mod tests {
         );
 
         assert!(matches!(
-            err.error,
+            err.error.as_ref(),
             TypeError::MissingTraitImpl {
-                ref trait_name,
-                ref impl_target,
+                trait_name,
+                impl_target,
             } if trait_name == "Show" && impl_target == "int"
         ));
     }
@@ -3472,10 +3525,10 @@ mod tests {
         );
 
         assert!(matches!(
-            err.error,
+            err.error.as_ref(),
             TypeError::MissingTraitImpl {
-                ref trait_name,
-                ref impl_target,
+                trait_name,
+                impl_target,
             } if trait_name == "Show" && impl_target == "Boxed"
         ));
     }
@@ -3502,7 +3555,7 @@ mod tests {
 
         assert!(diagnostics.iter().any(|diagnostic| {
             matches!(
-                &diagnostic.error,
+                diagnostic.error.as_ref(),
                 TypeError::MissingTraitImpl {
                     trait_name,
                     impl_target,
@@ -3532,10 +3585,10 @@ mod tests {
         );
 
         assert!(matches!(
-            err.error,
+            err.error.as_ref(),
             TypeError::MissingTraitImpl {
-                ref trait_name,
-                ref impl_target,
+                trait_name,
+                impl_target,
             } if trait_name == "Eq" && impl_target == "Boxed"
         ));
     }
@@ -3602,7 +3655,7 @@ mod tests {
              Show.show(1.0)\n",
         );
 
-        assert!(matches!(err.error, TypeError::UnboundVariable(ref name) if name == "Show"));
+        assert!(matches!(err.error.as_ref(), TypeError::UnboundVariable(name) if name == "Show"));
     }
 
     #[test]

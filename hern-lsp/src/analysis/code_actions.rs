@@ -50,18 +50,17 @@ fn collect_code_actions_for_stmt(
             value,
             ..
         } => {
-            if let Pattern::Variable(name, name_span) = pat {
-                if ranges_intersect(source_span_to_range(*name_span), range)
-                    && let Some(ty) = binding_types.get(name_span)
-                    && let Some(type_text) = annotation_type_text(ty)
-                {
-                    actions.push(add_type_annotation_action(
-                        uri.clone(),
-                        name,
-                        *name_span,
-                        type_text,
-                    ));
-                }
+            if let Pattern::Variable(name, name_span) = pat
+                && ranges_intersect(source_span_to_range(*name_span), range)
+                && let Some(ty) = binding_types.get(name_span)
+                && let Some(type_text) = annotation_type_text(ty)
+            {
+                actions.push(add_type_annotation_action(
+                    uri.clone(),
+                    name,
+                    *name_span,
+                    type_text,
+                ));
             }
             collect_code_actions_for_expr(value, uri, range, binding_types, actions);
         }

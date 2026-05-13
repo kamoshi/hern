@@ -1,0 +1,10 @@
+fn reconstruct(came_from: Map('k, 'v), current: 'v, key: fn('v) -> 'k) {
+    let mut path = [current];
+    let k = key(current);
+    let xd = came_from[k];
+
+    match xd {
+        None -> (),
+        Some(parent) -> path.push(parent),
+    }
+}

@@ -550,6 +550,7 @@ fn associated_access_bounds(line: &str, cursor_byte: usize) -> Option<(usize, us
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn member_completion(
     state: &ServerState,
     uri: &Uri,

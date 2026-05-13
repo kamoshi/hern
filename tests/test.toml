@@ -1148,6 +1148,21 @@ output = """
 missing map key failed
 """
 
+[tests.index_map_value_not_option_error]
+path = "tests/hern/index_map_value_not_option_error.hern"
+expect = "error"
+error_contains = "expected `Option"
+
+[tests.index_map_generic_match_error]
+path = "tests/hern/index_map_generic_match_error.hern"
+expect = "error"
+error_contains = "expected `Option('a)`, got `'a`"
+
+[tests.index_map_call_mismatch_error]
+path = "tests/hern/index_map_call_mismatch_error.hern"
+expect = "error"
+error_contains = "got `Option"
+
 [tests.index_oob_panics]
 path = "tests/hern/index_oob_panics.hern"
 expect = "typecheck"

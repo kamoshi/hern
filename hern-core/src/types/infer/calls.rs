@@ -189,8 +189,7 @@ impl Infer {
                     return Err(TypeError::MissingTraitImpl {
                         trait_name: "Eq".to_string(),
                         impl_target: format!("{}", resolved),
-                    }
-                    .into());
+                    });
                 }
                 resolve_concrete_dict_ref(
                     "Eq",
@@ -199,17 +198,15 @@ impl Infer {
                     &self.known_impl_dicts,
                     &self.known_impl_schemes,
                 )
-                .ok_or_else(|| {
-                    TypeError::MissingTraitImpl {
-                        trait_name: "Eq".to_string(),
-                        impl_target: format!("{}", resolved),
-                    }
-                    .into()
+                .ok_or_else(|| TypeError::MissingTraitImpl {
+                    trait_name: "Eq".to_string(),
+                    impl_target: format!("{}", resolved),
                 })
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_trait_method_call(
         &mut self,
         env: &TypeEnv,
@@ -398,13 +395,11 @@ impl Infer {
                         });
                         Ok(self.subst.apply(&ret_ty))
                     }
-                    None => {
-                        return Err(TypeError::MissingTraitImpl {
-                            trait_name: trait_name.clone(),
-                            impl_target: format!("{}", resolved_target),
-                        }
-                        .into());
+                    None => Err(TypeError::MissingTraitImpl {
+                        trait_name: trait_name.clone(),
+                        impl_target: format!("{}", resolved_target),
                     }
+                    .into()),
                 }
             }
         }

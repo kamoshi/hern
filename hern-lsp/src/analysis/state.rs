@@ -180,7 +180,7 @@ impl ServerState {
     fn invalidate_cached_analyses_for_document(&mut self, uri: &Uri) -> HashSet<Uri> {
         let affected = self.entries_affected_by_document(uri);
         for entry in &affected {
-            self.cached_analyses.remove(&entry);
+            self.cached_analyses.remove(entry);
         }
         affected
     }
@@ -260,47 +260,6 @@ fn lsp_config_from_initialize(params: &InitializeParams) -> LspConfig {
         config.debug_timing = debug;
     }
     config
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lsp_types::WorkspaceFolder;
-
-    #[test]
-    fn initialize_configuration_sets_workspace_roots_and_options() {
-        let root = std::env::temp_dir().join("hern-lsp-workspace-root");
-        let root_uri = path_to_uri(&root).expect("root URI should encode");
-        let params = InitializeParams {
-            workspace_folders: Some(vec![WorkspaceFolder {
-                uri: root_uri,
-                name: "root".to_string(),
-            }]),
-            initialization_options: Some(serde_json::json!({
-                "diagnosticsDebounceMs": 25,
-                "maxIndexedFiles": 123,
-                "debugTiming": true
-            })),
-            ..InitializeParams::default()
-        };
-
-        let mut state = ServerState::new().expect("server state should initialize");
-        state.configure_from_initialize(&params);
-
-        assert_eq!(state.workspace_roots, vec![normalize_overlay_path(&root)]);
-        assert_eq!(state.config.diagnostics_debounce, Duration::from_millis(25));
-        assert_eq!(state.config.max_indexed_files, 123);
-        assert!(state.config.debug_timing);
-    }
-
-    #[test]
-    fn path_workspace_check_respects_configured_roots() {
-        let mut state = ServerState::new().expect("server state should initialize");
-        state.workspace_roots = vec![PathBuf::from("/workspace/project")];
-
-        assert!(state.path_is_in_workspace(Path::new("/workspace/project/src/main.hern")));
-        assert!(!state.path_is_in_workspace(Path::new("/workspace/other/main.hern")));
-    }
 }
 
 pub(crate) fn diagnostics_for_document(
@@ -482,4 +441,45 @@ fn file_fingerprint_for_uri(uri: &Uri) -> Option<FileFingerprint> {
         len: metadata.len(),
         modified: metadata.modified().ok(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::WorkspaceFolder;
+
+    #[test]
+    fn initialize_configuration_sets_workspace_roots_and_options() {
+        let root = std::env::temp_dir().join("hern-lsp-workspace-root");
+        let root_uri = path_to_uri(&root).expect("root URI should encode");
+        let params = InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root_uri,
+                name: "root".to_string(),
+            }]),
+            initialization_options: Some(serde_json::json!({
+                "diagnosticsDebounceMs": 25,
+                "maxIndexedFiles": 123,
+                "debugTiming": true
+            })),
+            ..InitializeParams::default()
+        };
+
+        let mut state = ServerState::new().expect("server state should initialize");
+        state.configure_from_initialize(&params);
+
+        assert_eq!(state.workspace_roots, vec![normalize_overlay_path(&root)]);
+        assert_eq!(state.config.diagnostics_debounce, Duration::from_millis(25));
+        assert_eq!(state.config.max_indexed_files, 123);
+        assert!(state.config.debug_timing);
+    }
+
+    #[test]
+    fn path_workspace_check_respects_configured_roots() {
+        let mut state = ServerState::new().expect("server state should initialize");
+        state.workspace_roots = vec![PathBuf::from("/workspace/project")];
+
+        assert!(state.path_is_in_workspace(Path::new("/workspace/project/src/main.hern")));
+        assert!(!state.path_is_in_workspace(Path::new("/workspace/other/main.hern")));
+    }
 }

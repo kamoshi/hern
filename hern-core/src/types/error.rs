@@ -1,5 +1,6 @@
 use crate::ast::SourceSpan;
-use crate::types::Ty;
+use crate::types::{Ty, display_ty_with_var_names, free_type_vars_in_display_order, type_var_name};
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,21 +147,21 @@ pub enum TypeMismatchContext {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpannedTypeError {
     pub span: Option<SourceSpan>,
-    pub error: TypeError,
+    pub error: Box<TypeError>,
 }
 
 impl TypeError {
     pub fn at(self, span: SourceSpan) -> SpannedTypeError {
         SpannedTypeError {
             span: Some(span),
-            error: self,
+            error: Box::new(self),
         }
     }
 
     pub fn unspanned(self) -> SpannedTypeError {
         SpannedTypeError {
             span: None,
-            error: self,
+            error: Box::new(self),
         }
     }
 
@@ -225,11 +226,30 @@ impl fmt::Display for SpannedTypeError {
 
 impl std::error::Error for SpannedTypeError {}
 
+fn display_mismatch_types(expected: &Ty, got: &Ty) -> (String, String) {
+    let mut vars = free_type_vars_in_display_order(expected);
+    for var in free_type_vars_in_display_order(got) {
+        if !vars.contains(&var) {
+            vars.push(var);
+        }
+    }
+    let names: HashMap<_, _> = vars
+        .into_iter()
+        .enumerate()
+        .map(|(index, var)| (var, type_var_name(index)))
+        .collect();
+    (
+        display_ty_with_var_names(expected, &names),
+        display_ty_with_var_names(got, &names),
+    )
+}
+
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypeError::Mismatch(t1, t2) => {
-                write!(f, "type mismatch: expected `{}`, got `{}`", t1, t2)
+                let (expected, got) = display_mismatch_types(t1, t2);
+                write!(f, "type mismatch: expected `{}`, got `{}`", expected, got)
             }
             TypeError::MismatchWithContext {
                 context,
@@ -246,6 +266,7 @@ impl fmt::Display for TypeError {
                         write!(f, "{}", item)?;
                     }
                 }
+                let (expected, got) = display_mismatch_types(expected, got);
                 write!(f, ": expected `{}`, got `{}`", expected, got)
             }
             TypeError::OccursCheck(v) => {

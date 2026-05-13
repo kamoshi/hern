@@ -23,6 +23,7 @@ pub(super) fn dict_ref_concrete_name(dict: &DictRef) -> Option<&str> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn attach_dict_args(
     env: &TypeEnv,
     known_impl_dicts: &HashSet<String>,

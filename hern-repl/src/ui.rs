@@ -355,7 +355,7 @@ fn cursor_metrics(app: &App, height: u16, width: u16) -> (u16, u16, u16) {
     let cursor_logical_col = before_cursor
         .rsplit('\n')
         .next()
-        .map(|l| UnicodeWidthStr::width(l))
+        .map(UnicodeWidthStr::width)
         .unwrap_or(0);
 
     let visual_rows_per_line: Vec<u16> = app
@@ -414,10 +414,10 @@ fn render_history(buf: &mut Buffer, lines: &[Line<'static>]) {
         });
         let Some(bg) = row_bg else { continue };
         for x in area.left()..area.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                if cell.bg == Color::Reset {
-                    cell.bg = bg;
-                }
+            if let Some(cell) = buf.cell_mut((x, y))
+                && cell.bg == Color::Reset
+            {
+                cell.bg = bg;
             }
         }
     }

@@ -29,8 +29,8 @@ pub(super) struct AnalysisSnapshot<'a> {
 
 enum SnapshotKind<'a> {
     BorrowedTyped(&'a CachedAnalysis),
-    OwnedTyped(WorkspaceAnalysis),
-    GraphOnly(ModuleGraph),
+    OwnedTyped(Box<WorkspaceAnalysis>),
+    GraphOnly(Box<ModuleGraph>),
 }
 
 impl<'a> AnalysisSnapshot<'a> {
@@ -90,7 +90,7 @@ pub(super) fn analysis_snapshot<'a>(
         return Some(AnalysisSnapshot {
             source,
             path,
-            kind: SnapshotKind::OwnedTyped(analysis),
+            kind: SnapshotKind::OwnedTyped(Box::new(analysis)),
         });
     }
 
@@ -102,6 +102,6 @@ pub(super) fn analysis_snapshot<'a>(
     Some(AnalysisSnapshot {
         source,
         path,
-        kind: SnapshotKind::GraphOnly(graph),
+        kind: SnapshotKind::GraphOnly(Box::new(graph)),
     })
 }

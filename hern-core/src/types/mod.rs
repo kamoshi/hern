@@ -811,6 +811,9 @@ impl Subst {
             return Ok(());
         }
         if type_contains_var(&t, v) {
+            if option_type_contains_var(&t, v) {
+                return Err(error::TypeError::Mismatch(t, Ty::Var(v)));
+            }
             return Err(error::TypeError::OccursCheck(v));
         }
         let target_level = self
@@ -963,6 +966,19 @@ fn type_contains_var(ty: &Ty, needle: TyVar) -> bool {
     }
 }
 
+fn option_type_contains_var(ty: &Ty, needle: TyVar) -> bool {
+    match ty {
+        Ty::App(con, args)
+            if matches!(con.as_ref(), Ty::Con(name) if name == "Option")
+                && args.iter().any(|arg| type_contains_var(arg, needle)) =>
+        {
+            true
+        }
+        Ty::Qualified(_, inner) => option_type_contains_var(inner, needle),
+        _ => false,
+    }
+}
+
 pub fn free_type_vars(ty: &Ty) -> HashSet<TyVar> {
     let mut vars = HashSet::new();
     free_type_vars_into(ty, &mut vars);
@@ -1034,7 +1050,7 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
                     got: p2.len(),
                 });
             }
-            for (index, (a, b)) in p1.into_iter().zip(p2.into_iter()).enumerate() {
+            for (index, (a, b)) in p1.into_iter().zip(p2).enumerate() {
                 if a.capability != b.capability {
                     return Err(error::TypeError::MutableFunctionCapabilityMismatch);
                 }
@@ -1052,7 +1068,7 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
             if t1s.len() != t2s.len() {
                 return Err(error::TypeError::Mismatch(Ty::Tuple(t1s), Ty::Tuple(t2s)));
             }
-            for (index, (a, b)) in t1s.into_iter().zip(t2s.into_iter()).enumerate() {
+            for (index, (a, b)) in t1s.into_iter().zip(t2s).enumerate() {
                 unify(s, a, b).map_err(|err| {
                     err.with_mismatch_context(TypeMismatchContext::TupleElement(index))
                 })?;
@@ -1064,7 +1080,7 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
             if a1.len() != a2.len() {
                 return Err(error::TypeError::Mismatch(Ty::App(c1, a1), Ty::App(c2, a2)));
             }
-            for (index, (v1, v2)) in a1.into_iter().zip(a2.into_iter()).enumerate() {
+            for (index, (v1, v2)) in a1.into_iter().zip(a2).enumerate() {
                 unify(s, v1, v2).map_err(|err| {
                     err.with_mismatch_context(TypeMismatchContext::TypeArgument(index))
                 })?;
@@ -1622,6 +1638,18 @@ mod tests {
             .expect_err("record field refers to the bound variable");
 
         assert_eq!(err, error::TypeError::OccursCheck(0));
+    }
+
+    #[test]
+    fn bind_ty_reports_option_recursion_as_mismatch() {
+        let mut subst = Subst::new();
+
+        let option_self = Ty::App(Box::new(Ty::Con("Option".to_string())), vec![Ty::Var(0)]);
+        let err = subst
+            .bind_ty(0, option_self.clone())
+            .expect_err("option recursion should be rejected");
+
+        assert_eq!(err, error::TypeError::Mismatch(option_self, Ty::Var(0)));
     }
 
     #[test]

@@ -1,0 +1,9 @@
+let mut came_from = Map::new();
+came_from.set("next", "node");
+
+let xd = came_from["next"];
+
+match xd {
+  None -> print("missing"),
+  Some(parent) -> print(parent),
+}
