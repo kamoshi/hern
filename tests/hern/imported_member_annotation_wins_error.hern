@@ -1,0 +1,5 @@
+let dep = import "imported_polymorphic_member_dep";
+
+let id_int: fn(int) -> int = dep.id;
+
+print(id_int("nope"));

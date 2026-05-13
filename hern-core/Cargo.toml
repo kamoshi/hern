@@ -3,5 +3,8 @@ name = "hern-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+perf-counters = []
+
 [dependencies]
 im-rc = "15.1"

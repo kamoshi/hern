@@ -225,8 +225,10 @@ fn collect_expr_referenced_names(
         ExprKind::Not(expr)
         | ExprKind::Loop(expr)
         | ExprKind::Break(Some(expr))
-        | ExprKind::Return(Some(expr))
-        | ExprKind::FieldAccess { expr, .. } => {
+        | ExprKind::Return(Some(expr)) => {
+            collect_expr_referenced_names(expr, refs, value_scope, type_scope);
+        }
+        ExprKind::FieldAccess { expr, .. } => {
             if let ExprKind::Ident(name) = &expr.kind {
                 refs.traits.insert(name.clone());
             }
@@ -376,5 +378,23 @@ fn collect_pattern_referenced_names(pat: &Pattern, refs: &mut CollectedNames) {
         | Pattern::StringLit(_)
         | Pattern::Variable(_, _)
         | Pattern::Record { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{Expr, ExprKind, Stmt};
+
+    #[test]
+    fn unary_value_expressions_do_not_record_trait_references() {
+        let stmt = Stmt::Expr(Expr::synthetic(ExprKind::Not(Box::new(Expr::synthetic(
+            ExprKind::Ident("foo".to_string()),
+        )))));
+
+        let refs = stmt_referenced_names(&stmt);
+
+        assert!(refs.values.contains("foo"));
+        assert!(!refs.traits.contains("foo"));
     }
 }

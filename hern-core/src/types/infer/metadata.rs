@@ -48,15 +48,15 @@ impl TypeMetadata {
         self.fresh_place_exprs.clear();
     }
 
-    pub(super) fn record_expr_type(&mut self, node_id: NodeId, ty: Ty, subst: &Subst) {
+    pub(super) fn record_expr_type(&mut self, node_id: NodeId, ty: Ty) {
         if node_id != NO_NODE_ID {
-            self.expr_types.insert(node_id, subst.apply(&ty));
+            self.expr_types.insert(node_id, ty);
         }
     }
 
-    pub(super) fn record_symbol_type(&mut self, node_id: NodeId, ty: Ty, subst: &Subst) {
+    pub(super) fn record_symbol_type(&mut self, node_id: NodeId, ty: Ty) {
         if node_id != NO_NODE_ID {
-            self.symbol_types.insert(node_id, subst.apply(&ty));
+            self.symbol_types.insert(node_id, ty);
         }
     }
 
@@ -115,6 +115,12 @@ impl TypeMetadata {
     }
 
     pub(super) fn finalize(&self, subst: &Subst) -> FinalizedTypeMaps {
+        perf::metadata_finalize(
+            self.expr_types.len()
+                + self.symbol_types.len()
+                + self.binding_types.len()
+                + self.definition_schemes.len(),
+        );
         FinalizedTypeMaps {
             expr_types: self
                 .expr_types

@@ -2,6 +2,7 @@ mod env;
 pub mod error;
 pub mod infer;
 mod patterns;
+pub mod perf;
 pub(crate) mod type_syntax;
 mod value;
 
@@ -21,6 +22,8 @@ use std::sync::OnceLock;
 use error::TypeMismatchContext;
 
 pub type TyVar = u32;
+pub type TypeLevel = u32;
+pub const ROOT_LEVEL: TypeLevel = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TraitConstraint {
@@ -321,6 +324,9 @@ pub fn free_type_vars_in_display_order(ty: &Ty) -> Vec<TyVar> {
                     if !vars.contains(&constraint.var) {
                         vars.push(constraint.var);
                     }
+                    for arg in &constraint.args {
+                        collect(arg, vars);
+                    }
                 }
             }
             Ty::Tuple(items) => {
@@ -490,7 +496,22 @@ impl EnvInfo {
 #[derive(Clone)]
 pub struct Subst {
     map: HashMap<TyVar, Ty>,
+    levels: HashMap<TyVar, TypeLevel>,
     next_var: TyVar,
+    journal: Vec<SubstJournalEntry>,
+    active_checkpoints: usize,
+}
+
+#[derive(Clone)]
+enum SubstJournalEntry {
+    Binding { var: TyVar, previous: Option<Ty> },
+    Level { var: TyVar, previous: TypeLevel },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SubstCheckpoint {
+    journal_len: usize,
+    depth: usize,
 }
 
 impl Default for Subst {
@@ -503,20 +524,40 @@ impl Subst {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
+            levels: HashMap::new(),
             next_var: 0,
+            journal: Vec::new(),
+            active_checkpoints: 0,
         }
     }
 
     /// Allocate a fresh type variable ID without wrapping it in `Ty::Var`.
     pub fn fresh_tyvar(&mut self) -> TyVar {
+        self.fresh_tyvar_at(ROOT_LEVEL)
+    }
+
+    pub fn fresh_tyvar_at(&mut self, level: TypeLevel) -> TyVar {
         let v = self.next_var;
         self.next_var += 1;
+        self.levels.insert(v, level);
         v
+    }
+
+    pub fn level_of(&self, var: TyVar) -> TypeLevel {
+        self.levels.get(&var).copied().unwrap_or_else(|| {
+            perf::missing_type_level();
+            ROOT_LEVEL
+        })
+    }
+
+    pub(crate) fn set_level(&mut self, var: TyVar, level: TypeLevel) {
+        self.levels.insert(var, level);
     }
 
     /// Snapshots the unification map so a caller can roll back the substitution after a
     /// failed inference attempt while leaving the fresh-variable counter intact.
     pub fn snapshot_map(&self) -> HashMap<TyVar, Ty> {
+        perf::subst_snapshot(self.map.len());
         self.map.clone()
     }
 
@@ -524,6 +565,74 @@ impl Subst {
     /// so fresh variables allocated since the snapshot remain accounted for.
     pub fn restore_map(&mut self, map: HashMap<TyVar, Ty>) {
         self.map = map;
+        self.journal.clear();
+        self.active_checkpoints = 0;
+    }
+
+    /// Creates a lightweight rollback marker for speculative inference.
+    ///
+    /// Unlike [`snapshot_map`], this does not clone the substitution map. Mutations
+    /// after the checkpoint are recorded by [`bind_ty`] and can be rolled back by
+    /// replaying the journal in reverse.
+    pub(crate) fn checkpoint(&mut self) -> SubstCheckpoint {
+        perf::subst_snapshot(0);
+        let checkpoint = SubstCheckpoint {
+            journal_len: self.journal.len(),
+            depth: self.active_checkpoints,
+        };
+        self.active_checkpoints += 1;
+        checkpoint
+    }
+
+    pub(crate) fn restore_checkpoint(&mut self, checkpoint: SubstCheckpoint) {
+        assert_eq!(
+            self.active_checkpoints,
+            checkpoint.depth + 1,
+            "substitution checkpoints must be restored in LIFO order"
+        );
+        while self.journal.len() > checkpoint.journal_len {
+            let entry = self
+                .journal
+                .pop()
+                .expect("journal length checked before pop");
+            match entry {
+                SubstJournalEntry::Binding { var, previous } => match previous {
+                    Some(previous) => {
+                        self.map.insert(var, previous);
+                    }
+                    None => {
+                        self.map.remove(&var);
+                    }
+                },
+                SubstJournalEntry::Level { var, previous } => {
+                    self.levels.insert(var, previous);
+                }
+            }
+        }
+        self.active_checkpoints = checkpoint.depth;
+    }
+
+    /// Discards rollback history for a successful outer inference scope while
+    /// keeping its substitutions.
+    ///
+    /// Nested speculative checkpoints must be restored instead. Dropping their
+    /// journal entries while an older checkpoint is still active would make the
+    /// older rollback incomplete.
+    pub(crate) fn discard_outermost_checkpoint(&mut self, checkpoint: SubstCheckpoint) {
+        assert_eq!(
+            checkpoint.journal_len, 0,
+            "only the outer collecting-inference checkpoint may be discarded"
+        );
+        assert_eq!(
+            checkpoint.depth, 0,
+            "discard_outermost_checkpoint requires the outermost checkpoint"
+        );
+        assert_eq!(
+            self.active_checkpoints, 1,
+            "discard_outermost_checkpoint requires no nested active checkpoints"
+        );
+        self.journal.clear();
+        self.active_checkpoints = 0;
     }
 
     /// Clears solved substitutions while preserving the fresh-variable counter.
@@ -533,6 +642,9 @@ impl Subst {
     /// avoids reusing IDs that may still appear in exported polymorphic schemes.
     pub fn clear_map_keep_counter(&mut self) {
         self.map.clear();
+        self.levels.clear();
+        self.journal.clear();
+        self.active_checkpoints = 0;
     }
 
     /// Allocate a fresh type variable wrapped as `Ty::Var`.
@@ -541,6 +653,7 @@ impl Subst {
     }
 
     pub fn apply(&self, ty: &Ty) -> Ty {
+        perf::subst_apply_node();
         match ty {
             Ty::Var(v) => {
                 if let Some(t) = self.map.get(v) {
@@ -607,6 +720,81 @@ impl Subst {
         }
     }
 
+    pub(crate) fn would_change(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Var(v) => self.map.contains_key(v),
+            Ty::Qualified(constraints, ty) => {
+                constraints.iter().any(|constraint| {
+                    self.map.contains_key(&constraint.var)
+                        || constraint.args.iter().any(|arg| self.would_change(arg))
+                }) || self.would_change(ty)
+            }
+            Ty::Func(params, ret) => {
+                params.iter().any(|param| self.would_change(&param.ty))
+                    || self.would_change(&ret.ty)
+            }
+            Ty::Tuple(tys) => tys.iter().any(|ty| self.would_change(ty)),
+            Ty::App(con, args) => {
+                self.would_change(con) || args.iter().any(|arg| self.would_change(arg))
+            }
+            Ty::Record(row) => {
+                !record_fields_sorted(&row.fields)
+                    || matches!(&*row.tail, Ty::Record(_))
+                    || row.fields.iter().any(|(_, ty)| self.would_change(ty))
+                    || self.would_change(&row.tail)
+            }
+            Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => false,
+        }
+    }
+
+    pub(crate) fn free_vars_after_apply_into(&self, ty: &Ty, vars: &mut HashSet<TyVar>) {
+        perf::free_type_vars_node();
+        match ty {
+            Ty::Var(v) => {
+                if let Some(ty) = self.map.get(v) {
+                    self.free_vars_after_apply_into(ty, vars);
+                } else {
+                    vars.insert(*v);
+                }
+            }
+            Ty::Qualified(constraints, ty) => {
+                self.free_vars_after_apply_into(ty, vars);
+                for constraint in constraints {
+                    if let Ty::Var(var) = self.apply(&Ty::Var(constraint.var)) {
+                        vars.insert(var);
+                    }
+                    for arg in &constraint.args {
+                        self.free_vars_after_apply_into(arg, vars);
+                    }
+                }
+            }
+            Ty::Func(params, ret) => {
+                for param in params {
+                    self.free_vars_after_apply_into(&param.ty, vars);
+                }
+                self.free_vars_after_apply_into(&ret.ty, vars);
+            }
+            Ty::Tuple(tys) => {
+                for ty in tys {
+                    self.free_vars_after_apply_into(ty, vars);
+                }
+            }
+            Ty::App(con, args) => {
+                self.free_vars_after_apply_into(con, vars);
+                for arg in args {
+                    self.free_vars_after_apply_into(arg, vars);
+                }
+            }
+            Ty::Record(row) => {
+                for (_, ty) in &row.fields {
+                    self.free_vars_after_apply_into(ty, vars);
+                }
+                self.free_vars_after_apply_into(&row.tail, vars);
+            }
+            Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => {}
+        }
+    }
+
     pub fn apply_scheme(&self, scheme: &Scheme) -> Scheme {
         Scheme {
             vars: scheme.vars.clone(),
@@ -625,8 +813,114 @@ impl Subst {
         if type_contains_var(&t, v) {
             return Err(error::TypeError::OccursCheck(v));
         }
+        let target_level = self
+            .min_level_in_ty(&t)
+            .map(|level| self.level_of(v).min(level))
+            .unwrap_or_else(|| self.level_of(v));
+        self.lower_var_level(v, target_level);
+        self.lower_levels_in_ty(&t, target_level);
+        self.journal.push(SubstJournalEntry::Binding {
+            var: v,
+            previous: self.map.get(&v).cloned(),
+        });
         self.map.insert(v, t);
         Ok(())
+    }
+
+    fn min_level_in_ty(&self, ty: &Ty) -> Option<TypeLevel> {
+        match ty {
+            // If a variable is already substituted, the binding itself carries
+            // the meaningful levels. A fully concrete binding contributes no
+            // nested level, so the variable's recorded level is the conservative
+            // floor for the outer binding.
+            Ty::Var(var) => self
+                .map
+                .get(var)
+                .and_then(|ty| self.min_level_in_ty(ty))
+                .or_else(|| Some(self.level_of(*var))),
+            Ty::Qualified(constraints, inner) => constraints
+                .iter()
+                .flat_map(|constraint| {
+                    std::iter::once(Some(self.level_of(constraint.var)))
+                        .chain(constraint.args.iter().map(|arg| self.min_level_in_ty(arg)))
+                })
+                .chain(std::iter::once(self.min_level_in_ty(inner)))
+                .flatten()
+                .min(),
+            Ty::Func(params, ret) => params
+                .iter()
+                .map(|param| self.min_level_in_ty(&param.ty))
+                .chain(std::iter::once(self.min_level_in_ty(&ret.ty)))
+                .flatten()
+                .min(),
+            Ty::Tuple(tys) => tys.iter().filter_map(|ty| self.min_level_in_ty(ty)).min(),
+            Ty::App(con, args) => std::iter::once(self.min_level_in_ty(con))
+                .chain(args.iter().map(|arg| self.min_level_in_ty(arg)))
+                .flatten()
+                .min(),
+            Ty::Record(row) => row
+                .fields
+                .iter()
+                .map(|(_, ty)| self.min_level_in_ty(ty))
+                .chain(std::iter::once(self.min_level_in_ty(&row.tail)))
+                .flatten()
+                .min(),
+            Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => None,
+        }
+    }
+
+    fn lower_levels_in_ty(&mut self, ty: &Ty, target: TypeLevel) {
+        match ty {
+            Ty::Var(var) => {
+                if let Some(ty) = self.map.get(var).cloned() {
+                    self.lower_levels_in_ty(&ty, target);
+                } else {
+                    self.lower_var_level(*var, target);
+                }
+            }
+            Ty::Qualified(constraints, inner) => {
+                self.lower_levels_in_ty(inner, target);
+                for constraint in constraints {
+                    self.lower_var_level(constraint.var, target);
+                    for arg in &constraint.args {
+                        self.lower_levels_in_ty(arg, target);
+                    }
+                }
+            }
+            Ty::Func(params, ret) => {
+                for param in params {
+                    self.lower_levels_in_ty(&param.ty, target);
+                }
+                self.lower_levels_in_ty(&ret.ty, target);
+            }
+            Ty::Tuple(tys) => {
+                for ty in tys {
+                    self.lower_levels_in_ty(ty, target);
+                }
+            }
+            Ty::App(con, args) => {
+                self.lower_levels_in_ty(con, target);
+                for arg in args {
+                    self.lower_levels_in_ty(arg, target);
+                }
+            }
+            Ty::Record(row) => {
+                for (_, ty) in &row.fields {
+                    self.lower_levels_in_ty(ty, target);
+                }
+                self.lower_levels_in_ty(&row.tail, target);
+            }
+            Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => {}
+        }
+    }
+
+    fn lower_var_level(&mut self, var: TyVar, target: TypeLevel) {
+        let old = self.level_of(var);
+        if target < old {
+            self.journal
+                .push(SubstJournalEntry::Level { var, previous: old });
+            self.set_level(var, target);
+        }
     }
 }
 
@@ -671,44 +965,59 @@ fn type_contains_var(ty: &Ty, needle: TyVar) -> bool {
 
 pub fn free_type_vars(ty: &Ty) -> HashSet<TyVar> {
     let mut vars = HashSet::new();
+    free_type_vars_into(ty, &mut vars);
+    vars
+}
+
+pub fn free_type_vars_into(ty: &Ty, vars: &mut HashSet<TyVar>) {
+    perf::free_type_vars_node();
     match ty {
         Ty::Var(v) => {
             vars.insert(*v);
         }
         Ty::Qualified(constraints, ty) => {
-            vars.extend(free_type_vars(ty));
+            free_type_vars_into(ty, vars);
             for constraint in constraints {
                 vars.insert(constraint.var);
+                for arg in &constraint.args {
+                    free_type_vars_into(arg, vars);
+                }
             }
         }
         Ty::Func(params, ret) => {
             for p in params {
-                vars.extend(free_type_vars(&p.ty));
+                free_type_vars_into(&p.ty, vars);
             }
-            vars.extend(free_type_vars(&ret.ty));
+            free_type_vars_into(&ret.ty, vars);
         }
         Ty::Tuple(tys) => {
             for t in tys {
-                vars.extend(free_type_vars(t));
+                free_type_vars_into(t, vars);
             }
         }
         Ty::App(con, args) => {
-            vars.extend(free_type_vars(con));
+            free_type_vars_into(con, vars);
             for a in args {
-                vars.extend(free_type_vars(a));
+                free_type_vars_into(a, vars);
             }
         }
         Ty::Record(row) => {
             for (_, t) in &row.fields {
-                vars.extend(free_type_vars(t));
+                free_type_vars_into(t, vars);
             }
-            vars.extend(free_type_vars(&row.tail));
+            free_type_vars_into(&row.tail, vars);
         }
         _ => {}
     }
-    vars
 }
 
+/// Unifies two plain monotypes.
+///
+/// `Ty::Qualified` carries dictionary obligations and must be handled by the
+/// inference layer that can preserve or reject those constraints. Treating a
+/// qualified type as its inner type here would silently erase required evidence.
+/// The first argument is the actual type and the second is the expected type in
+/// diagnostics.
 pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
     let t1 = s.apply(&t1);
     let t2 = s.apply(&t2);
@@ -768,6 +1077,14 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
 }
 
 fn unify_rows(s: &mut Subst, r1: Row, r2: Row) -> Result<(), error::TypeError> {
+    debug_assert!(
+        record_fields_sorted(&r1.fields),
+        "left record fields must be sorted before row unification"
+    );
+    debug_assert!(
+        record_fields_sorted(&r2.fields),
+        "right record fields must be sorted before row unification"
+    );
     let fields1 = r1.fields;
     let fields2 = r2.fields;
 
@@ -1065,6 +1382,203 @@ mod tests {
     }
 
     #[test]
+    fn fresh_type_vars_record_levels() {
+        let mut subst = Subst::new();
+
+        let root = subst.fresh_tyvar();
+        let nested = subst.fresh_tyvar_at(3);
+
+        assert_eq!(subst.level_of(root), ROOT_LEVEL);
+        assert_eq!(subst.level_of(nested), 3);
+    }
+
+    #[test]
+    fn bind_ty_lowers_inner_var_to_outer_level() {
+        let mut subst = Subst::new();
+        let outer = subst.fresh_tyvar_at(0);
+        let inner = subst.fresh_tyvar_at(2);
+
+        subst
+            .bind_ty(inner, Ty::Var(outer))
+            .expect("binding should succeed");
+
+        assert_eq!(subst.level_of(inner), 0);
+        assert_eq!(subst.level_of(outer), 0);
+    }
+
+    #[test]
+    fn bind_ty_lowers_nested_vars_in_type() {
+        let mut subst = Subst::new();
+        let outer = subst.fresh_tyvar_at(0);
+        let inner_field = subst.fresh_tyvar_at(3);
+        let inner_tail = subst.fresh_tyvar_at(4);
+
+        subst
+            .bind_ty(
+                outer,
+                Ty::Record(Row {
+                    fields: vec![("x".to_string(), Ty::Var(inner_field))],
+                    tail: Box::new(Ty::Var(inner_tail)),
+                }),
+            )
+            .expect("binding should succeed");
+
+        assert_eq!(subst.level_of(outer), 0);
+        assert_eq!(subst.level_of(inner_field), 0);
+        assert_eq!(subst.level_of(inner_tail), 0);
+    }
+
+    #[test]
+    fn checkpoint_restore_rolls_back_level_lowering() {
+        let mut subst = Subst::new();
+        let outer = subst.fresh_tyvar_at(0);
+        let inner = subst.fresh_tyvar_at(2);
+        let checkpoint = subst.checkpoint();
+
+        subst
+            .bind_ty(outer, Ty::Tuple(vec![Ty::Var(inner)]))
+            .expect("binding should succeed");
+        assert_eq!(subst.level_of(inner), 0);
+
+        subst.restore_checkpoint(checkpoint);
+
+        assert_eq!(subst.apply(&Ty::Var(outer)), Ty::Var(outer));
+        assert_eq!(subst.level_of(inner), 2);
+    }
+
+    #[test]
+    fn subst_checkpoint_restore_rolls_back_bindings_but_not_fresh_var_counter() {
+        let mut subst = Subst::new();
+        assert_eq!(subst.fresh_tyvar(), 0);
+
+        let checkpoint = subst.checkpoint();
+        subst.bind_ty(0, Ty::Float).expect("binding should succeed");
+        assert_eq!(subst.fresh_tyvar(), 1);
+
+        subst.restore_checkpoint(checkpoint);
+
+        assert_eq!(subst.apply(&Ty::Var(0)), Ty::Var(0));
+        assert_eq!(subst.fresh_tyvar(), 2);
+    }
+
+    #[test]
+    fn subst_checkpoint_restore_preserves_previous_binding() {
+        let mut subst = Subst::new();
+        subst.bind_ty(0, Ty::Float).expect("binding should succeed");
+
+        let checkpoint = subst.checkpoint();
+        subst.bind_ty(0, Ty::Int).expect("rebinding should succeed");
+        subst.restore_checkpoint(checkpoint);
+
+        assert_eq!(subst.apply(&Ty::Var(0)), Ty::Float);
+    }
+
+    #[test]
+    fn subst_checkpoint_discard_keeps_successful_bindings() {
+        let mut subst = Subst::new();
+
+        let checkpoint = subst.checkpoint();
+        subst.bind_ty(0, Ty::Float).expect("binding should succeed");
+        subst.discard_outermost_checkpoint(checkpoint);
+
+        assert_eq!(subst.apply(&Ty::Var(0)), Ty::Float);
+        let later = subst.checkpoint();
+        subst.bind_ty(1, Ty::Int).expect("binding should succeed");
+        subst.restore_checkpoint(later);
+        assert_eq!(subst.apply(&Ty::Var(0)), Ty::Float);
+        assert_eq!(subst.apply(&Ty::Var(1)), Ty::Var(1));
+    }
+
+    #[test]
+    fn subst_would_change_tracks_substituted_vars_and_record_normalization() {
+        let mut subst = Subst::new();
+        assert!(!subst.would_change(&Ty::Func(
+            value_func_params(vec![Ty::Int]),
+            value_func_return(Ty::Float),
+        )));
+
+        subst.bind_ty(0, Ty::Float).expect("binding should succeed");
+        assert!(subst.would_change(&Ty::Tuple(vec![Ty::Int, Ty::Var(0)])));
+        assert!(!subst.would_change(&Ty::Tuple(vec![Ty::Int, Ty::Var(1)])));
+
+        assert!(subst.would_change(&Ty::Record(Row {
+            fields: vec![("b".to_string(), Ty::Int), ("a".to_string(), Ty::Float)],
+            tail: Box::new(Ty::Unit),
+        })));
+        assert!(subst.would_change(&Ty::Record(Row {
+            fields: vec![("a".to_string(), Ty::Float)],
+            tail: Box::new(Ty::Record(Row {
+                fields: vec![("b".to_string(), Ty::Int)],
+                tail: Box::new(Ty::Unit),
+            })),
+        })));
+    }
+
+    #[test]
+    fn env_free_vars_accumulates_through_substitution_without_quantified_vars() {
+        let mut env = TypeEnv::new();
+        env.insert(
+            "value".to_string(),
+            EnvInfo::immutable(Scheme {
+                vars: vec![0],
+                constraints: vec![TraitConstraint::unary(0, "Show".to_string())],
+                ty: Ty::Tuple(vec![Ty::Var(0), Ty::Var(1)]),
+            }),
+        );
+
+        let mut subst = Subst::new();
+        subst
+            .bind_ty(0, Ty::Var(99))
+            .expect("quantified binding should not leak");
+        subst
+            .bind_ty(1, Ty::Tuple(vec![Ty::Var(2), Ty::Int]))
+            .expect("free binding should resolve");
+
+        assert_eq!(env.free_vars(&subst), HashSet::from([2]));
+    }
+
+    #[test]
+    fn env_free_vars_include_nested_qualified_constraint_args() {
+        let mut env = TypeEnv::new();
+        env.insert(
+            "value".to_string(),
+            EnvInfo::immutable(Scheme {
+                vars: vec![0],
+                constraints: vec![],
+                ty: Ty::Qualified(
+                    vec![TraitConstraint::predicate(
+                        "Index",
+                        vec![Ty::Var(0), Ty::Var(1), Ty::Var(2)],
+                        2,
+                        vec![0, 1],
+                    )],
+                    Box::new(Ty::Var(3)),
+                ),
+            }),
+        );
+
+        let subst = Subst::new();
+
+        assert_eq!(env.free_vars(&subst), HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn free_type_vars_include_multi_param_constraint_args() {
+        let ty = Ty::Qualified(
+            vec![TraitConstraint::predicate(
+                "Index",
+                vec![Ty::Var(1), Ty::Var(2), Ty::Var(3)],
+                3,
+                vec![0, 1],
+            )],
+            Box::new(Ty::Var(4)),
+        );
+
+        assert_eq!(free_type_vars(&ty), HashSet::from([1, 2, 3, 4]));
+        assert_eq!(free_type_vars_in_display_order(&ty), vec![4, 3, 1, 2]);
+    }
+
+    #[test]
     fn subst_clear_map_keeps_fresh_var_counter_advancing() {
         let mut subst = Subst::new();
         assert_eq!(subst.fresh_tyvar(), 0);
@@ -1176,6 +1690,19 @@ mod tests {
                     vec![Ty::Float, Ty::Con("string".to_string())],
                 ),
             )
+        );
+    }
+
+    #[test]
+    fn terminal_mismatch_reports_second_type_as_expected() {
+        let mut subst = Subst::new();
+
+        let err = unify(&mut subst, Ty::Int, Ty::Float).expect_err("int should not unify as float");
+
+        assert_eq!(err, error::TypeError::Mismatch(Ty::Float, Ty::Int));
+        assert_eq!(
+            err.to_string(),
+            "type mismatch: expected `float`, got `int`"
         );
     }
 

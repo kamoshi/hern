@@ -102,16 +102,17 @@ impl Infer {
             }
         }
 
-        let mut impl_param_vars = HashMap::new();
-        for arg in &id.trait_args {
-            // Populate `impl_param_vars` with variables introduced by the impl head.
-            let _ = self.ast_to_ty_with_vars(arg, &mut impl_param_vars)?;
-        }
-        let initial_constraints =
-            self.collect_type_bound_constraints(&mut impl_param_vars, &id.type_bounds);
+        let ambient = self.current_level;
+        let (mut dict_fields, fn_constraints) = self.with_child_level(|this| {
+            let mut impl_param_vars = HashMap::new();
+            for arg in &id.trait_args {
+                // Populate `impl_param_vars` with variables introduced by the impl head.
+                let _ = this.ast_to_ty_with_vars(arg, &mut impl_param_vars)?;
+            }
+            let initial_constraints =
+                this.collect_type_bound_constraints(&mut impl_param_vars, &id.type_bounds);
 
-        let (mut dict_fields, fn_constraints) =
-            self.with_pending_constraints_scope(initial_constraints, |this| {
+            this.with_pending_constraints_scope(initial_constraints, |this| {
                 let mut dict_fields: Vec<(String, Ty)> = Vec::new();
                 for impl_method in &mut id.methods {
                     let Some(trait_method) = trait_def
@@ -199,14 +200,15 @@ impl Infer {
                     dict_fields.push((impl_method.name.clone(), method_ty));
                 }
                 Ok(dict_fields)
-            })?;
+            })
+        })?;
 
         dict_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
         let dict_ty = Ty::Record(Row {
             fields: dict_fields,
             tail: Box::new(Ty::Unit),
         });
-        let finalized = self.finalize_constraints(env, dict_ty, fn_constraints);
+        let finalized = self.finalize_constraints_at(env, dict_ty, fn_constraints, ambient);
         self.pending_constraints.extend(finalized.bubbled.clone());
         id.dict_params = finalized.owned.iter().map(dict_param_name).collect();
         let resolver = |p: &PendingDictArg| {
@@ -242,6 +244,7 @@ impl Infer {
         let mut dict_fields = Vec::new();
         let mut inferred_methods = Vec::with_capacity(id.methods.len());
 
+        let ambient = self.current_level;
         for method in &id.methods {
             if !seen_methods.insert(method.name.clone())
                 || self
@@ -259,61 +262,69 @@ impl Infer {
             let mut inferred_method = method.clone();
             substitute_self_in_inherent_method(&mut inferred_method, &id.target);
 
-            let mut param_vars = HashMap::new();
-            let target_ty = self.ast_to_ty_with_vars(&id.target, &mut param_vars)?;
-            let mut initial_constraints =
-                self.collect_type_bound_constraints(&mut param_vars, &id.type_bounds);
-            initial_constraints.extend(
-                self.collect_type_bound_constraints(&mut param_vars, &inferred_method.type_bounds),
-            );
-            let mut param_tys = Vec::new();
-            let mut body_env = env.clone();
+            let (fn_ty, fn_constraints) = self.with_child_level(|this| {
+                let mut param_vars = HashMap::new();
+                let target_ty = this.ast_to_ty_with_vars(&id.target, &mut param_vars)?;
+                let mut initial_constraints =
+                    this.collect_type_bound_constraints(&mut param_vars, &id.type_bounds);
+                initial_constraints.extend(
+                    this.collect_type_bound_constraints(
+                        &mut param_vars,
+                        &inferred_method.type_bounds,
+                    ),
+                );
+                let mut param_tys = Vec::new();
+                let mut body_env = env.clone();
 
-            for (idx, param) in inferred_method.params.iter().enumerate() {
-                if !is_irrefutable_param(&param.pat, &self.variant_env) {
-                    return Err(TypeError::RefutableParamPattern.at(inferred_method.body.span));
+                for (idx, param) in inferred_method.params.iter().enumerate() {
+                    if !is_irrefutable_param(&param.pat, &this.variant_env) {
+                        return Err(TypeError::RefutableParamPattern.at(inferred_method.body.span));
+                    }
+                    let p_ty = if has_receiver && idx == 0 {
+                        let receiver_ty = target_ty.clone();
+                        if let Some(explicit) = &param.ty {
+                            let explicit_ty =
+                                this.ast_to_ty_with_vars(explicit, &mut param_vars)?;
+                            unify(&mut this.subst, receiver_ty.clone(), explicit_ty)
+                                .map_err(|err| err.at(inferred_method.body.span))?;
+                        }
+                        receiver_ty
+                    } else {
+                        match &param.ty {
+                            Some(t) => this.ast_to_ty_with_vars(t, &mut param_vars)?,
+                            None => this.fresh_ty(),
+                        }
+                    };
+                    param_tys.push(p_ty.clone());
+                    this.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
                 }
-                let p_ty = if has_receiver && idx == 0 {
-                    let receiver_ty = target_ty.clone();
-                    if let Some(explicit) = &param.ty {
-                        let explicit_ty = self.ast_to_ty_with_vars(explicit, &mut param_vars)?;
-                        unify(&mut self.subst, receiver_ty.clone(), explicit_ty)
-                            .map_err(|err| err.at(inferred_method.body.span))?;
-                    }
-                    receiver_ty
-                } else {
-                    match &param.ty {
-                        Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
-                        None => self.subst.fresh_var(),
-                    }
+
+                let ret_ty = match &inferred_method.ret_type {
+                    Some(t) => this.ast_to_ty_with_vars(&t.ty, &mut param_vars)?,
+                    None => this.fresh_ty(),
                 };
-                param_tys.push(p_ty.clone());
-                self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
-            }
+                let fn_ret = func_return_from_annotation(&inferred_method.ret_type, ret_ty.clone());
+                let fn_ty = Ty::Func(
+                    func_params_from_params(&inferred_method.params, param_tys.clone()),
+                    fn_ret.clone(),
+                );
 
-            let ret_ty = match &inferred_method.ret_type {
-                Some(t) => self.ast_to_ty_with_vars(&t.ty, &mut param_vars)?,
-                None => self.subst.fresh_var(),
-            };
-            let fn_ret = func_return_from_annotation(&inferred_method.ret_type, ret_ty.clone());
-            let fn_ty = Ty::Func(
-                func_params_from_params(&inferred_method.params, param_tys.clone()),
-                fn_ret.clone(),
-            );
-
-            let (_, fn_constraints) =
-                self.with_pending_constraints_scope(initial_constraints, |this| {
-                    let body_ty = this.with_fn_return_scope(fn_ret.clone(), |this| {
-                        this.infer_expr(&body_env, &mut inferred_method.body)
+                let (_, fn_constraints) =
+                    this.with_pending_constraints_scope(initial_constraints, |this| {
+                        let body_ty = this.with_fn_return_scope(fn_ret.clone(), |this| {
+                            this.infer_expr(&body_env, &mut inferred_method.body)
+                        })?;
+                        unify_expr_result(&mut this.subst, body_ty.clone(), ret_ty)
+                            .map_err(|err| err.at(inferred_method.body.span))?;
+                        if !matches!(this.subst.apply(&body_ty), Ty::Never) {
+                            this.check_fresh_return_expr(&inferred_method.body, &fn_ret)?;
+                        }
+                        Ok(())
                     })?;
-                    unify_expr_result(&mut this.subst, body_ty.clone(), ret_ty)
-                        .map_err(|err| err.at(inferred_method.body.span))?;
-                    if !matches!(this.subst.apply(&body_ty), Ty::Never) {
-                        this.check_fresh_return_expr(&inferred_method.body, &fn_ret)?;
-                    }
-                    Ok(())
-                })?;
-            let finalized = self.finalize_constraints(env, fn_ty.clone(), fn_constraints);
+                Ok((fn_ty, fn_constraints))
+            })?;
+            let finalized =
+                self.finalize_constraints_at(env, fn_ty.clone(), fn_constraints, ambient);
             self.pending_constraints.extend(finalized.bubbled.clone());
             inferred_method.dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
@@ -354,12 +365,13 @@ impl Infer {
         dict_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
         env.insert(
             dict_name,
-            EnvInfo::immutable(self.generalize(
+            EnvInfo::immutable(self.generalize_at(
                 env,
                 Ty::Record(Row {
                     fields: dict_fields,
                     tail: Box::new(Ty::Unit),
                 }),
+                ambient,
             )),
         );
         Ok(())

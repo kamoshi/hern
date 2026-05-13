@@ -34,7 +34,7 @@ fn astar(start, is_goal, h, neighbors, key) {
     let mut g = Map::new();
 
     let sk = key(start);
-    g.set(sk, 0);
+    g.set(sk, 0.0);
     open.push(h(start), start);
 
     loop {
@@ -84,8 +84,13 @@ fn pos_key((r, c)) {
     tostring(r) <> "," <> tostring(c)
 }
 
-fn manhattan((ar, ac), (br, bc)) {
-    math.abs(ar - br) + math.abs(ac - bc)
+// The tuple annotations keep integer grid coordinates distinct from the
+// floating-point path costs used by A*.
+fn manhattan(a: (int, int), b: (int, int)) {
+    let (ar, ac) = a;
+    let (br, bc) = b;
+
+    math.abs((ar - br).to_float()) + math.abs((ac - bc).to_float())
 }
 
 fn grid_neighbors(grid: [string], (r, c)) {
@@ -100,7 +105,7 @@ fn grid_neighbors(grid: [string], (r, c)) {
         let nc = c + dc;
         if nr >= 1 && nr <= rows && nc >= 1 && nc <= cols {
             if grid.get(nr).char_at(nc) != "#" {
-                result.push(((nr, nc), 1))
+                result.push(((nr, nc), 1.0))
             }
         }
     };
@@ -108,8 +113,8 @@ fn grid_neighbors(grid: [string], (r, c)) {
     result
 }
 
-// Path forced through (r=1..5, c=5) corridor and bottom row:
-// (1,1)→(1,5)→(5,5)→(5,9)  — 12 moves optimal
+// Path forced along the left edge, through the central corridor, then down to E.
+// The demo grid's optimal path has 20 moves.
 let grid = [
     "S.#......",
     ".##..##.#",

@@ -1,0 +1,6 @@
+let dep = import "imported_constrained_member_dep";
+
+let stringify = dep.stringify;
+
+print(stringify(42));
+print(stringify("ok"));

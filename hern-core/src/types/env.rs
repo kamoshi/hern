@@ -1,5 +1,5 @@
 use crate::ast::{Stmt, Type};
-use crate::types::{EnvInfo, Subst, Ty, TyVar, free_type_vars};
+use crate::types::{EnvInfo, Subst, Ty, TyVar, perf};
 use im_rc::HashMap as ImHashMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -34,15 +34,15 @@ impl TypeEnv {
     }
 
     pub(super) fn free_vars(&self, s: &Subst) -> HashSet<TyVar> {
+        perf::type_env_free_vars(self.0.len());
         let mut vars = HashSet::new();
         for info in self.0.values() {
-            for var in scheme_free_vars(&info.scheme) {
-                vars.extend(free_type_vars(&s.apply(&Ty::Var(var))));
-            }
+            scheme_free_vars_after_apply_into(&info.scheme, s, &mut vars);
         }
         vars
     }
 
+    #[cfg(test)]
     pub(super) fn free_vars_syntactic(&self) -> HashSet<TyVar> {
         let mut vars = HashSet::new();
         for info in self.0.values() {
@@ -52,27 +52,111 @@ impl TypeEnv {
     }
 
     pub(super) fn apply_subst(&mut self, subst: &Subst) {
-        self.0 = self
-            .0
-            .iter()
-            .map(|(name, info)| {
-                let mut info = info.clone();
-                info.scheme.ty = subst.apply(&info.scheme.ty);
-                (name.clone(), info)
-            })
-            .collect();
+        perf::type_env_apply_subst(self.0.len());
+        let mut updated = None;
+        let mut changed = 0;
+        for (name, info) in self.0.iter() {
+            // Only normalize the monotype cached in the environment. Scheme
+            // constraints keep referring to their scheme variables; constraint
+            // substitution happens when a scheme is instantiated.
+            if !subst.would_change(&info.scheme.ty) {
+                continue;
+            }
+            let ty = subst.apply(&info.scheme.ty);
+            let mut info = info.clone();
+            info.scheme.ty = ty;
+            updated
+                .get_or_insert_with(|| self.0.clone())
+                .insert(name.clone(), info);
+            changed += 1;
+        }
+        perf::type_env_apply_subst_changed(changed);
+        if let Some(updated) = updated {
+            self.0 = updated;
+        }
     }
 }
 
+#[cfg(test)]
 fn scheme_free_vars(scheme: &crate::types::Scheme) -> HashSet<TyVar> {
-    let mut vars = free_type_vars(&scheme.ty);
+    let mut vars = HashSet::new();
+    crate::types::free_type_vars_into(&scheme.ty, &mut vars);
     for constraint in &scheme.constraints {
         vars.insert(constraint.var);
+        for arg in &constraint.args {
+            crate::types::free_type_vars_into(arg, &mut vars);
+        }
     }
     for quantified in &scheme.vars {
         vars.remove(quantified);
     }
     vars
+}
+
+fn scheme_free_vars_after_apply_into(
+    scheme: &crate::types::Scheme,
+    subst: &Subst,
+    vars: &mut HashSet<TyVar>,
+) {
+    collect_scheme_ty_free_vars_after_apply(&scheme.ty, &scheme.vars, subst, vars);
+    for constraint in &scheme.constraints {
+        if !scheme.vars.contains(&constraint.var) {
+            subst.free_vars_after_apply_into(&Ty::Var(constraint.var), vars);
+        }
+        for arg in &constraint.args {
+            collect_scheme_ty_free_vars_after_apply(arg, &scheme.vars, subst, vars);
+        }
+    }
+}
+
+fn collect_scheme_ty_free_vars_after_apply(
+    ty: &Ty,
+    quantified: &[TyVar],
+    subst: &Subst,
+    vars: &mut HashSet<TyVar>,
+) {
+    match ty {
+        Ty::Var(var) => {
+            if !quantified.contains(var) {
+                subst.free_vars_after_apply_into(ty, vars);
+            }
+        }
+        Ty::Qualified(constraints, ty) => {
+            collect_scheme_ty_free_vars_after_apply(ty, quantified, subst, vars);
+            for constraint in constraints {
+                if !quantified.contains(&constraint.var) {
+                    subst.free_vars_after_apply_into(&Ty::Var(constraint.var), vars);
+                }
+                for arg in &constraint.args {
+                    collect_scheme_ty_free_vars_after_apply(arg, quantified, subst, vars);
+                }
+            }
+        }
+        Ty::Func(params, ret) => {
+            for param in params {
+                collect_scheme_ty_free_vars_after_apply(&param.ty, quantified, subst, vars);
+            }
+            collect_scheme_ty_free_vars_after_apply(&ret.ty, quantified, subst, vars);
+        }
+        Ty::Tuple(tys) => {
+            for ty in tys {
+                collect_scheme_ty_free_vars_after_apply(ty, quantified, subst, vars);
+            }
+        }
+        Ty::App(con, args) => {
+            collect_scheme_ty_free_vars_after_apply(con, quantified, subst, vars);
+            for arg in args {
+                collect_scheme_ty_free_vars_after_apply(arg, quantified, subst, vars);
+            }
+        }
+        Ty::Record(row) => {
+            for (_, ty) in &row.fields {
+                collect_scheme_ty_free_vars_after_apply(ty, quantified, subst, vars);
+            }
+            collect_scheme_ty_free_vars_after_apply(&row.tail, quantified, subst, vars);
+        }
+        Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => {}
+    }
 }
 
 impl fmt::Display for TypeEnv {

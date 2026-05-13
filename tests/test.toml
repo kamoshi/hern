@@ -746,6 +746,21 @@ output = """
 20
 """
 
+[tests.imported_constrained_member_bound]
+path = "tests/hern/imported_constrained_member_bound.hern"
+fixtures = ["tests/hern/imported_constrained_member_dep.hern"]
+expect = "typecheck"
+output = """
+42
+ok
+"""
+
+[tests.imported_member_annotation_wins_error]
+path = "tests/hern/imported_member_annotation_wins_error.hern"
+fixtures = ["tests/hern/imported_polymorphic_member_dep.hern"]
+expect = "error"
+error_contains = "type mismatch in function parameter 1"
+
 [tests.module_trait_import]
 path = "tests/hern/module_trait_import.hern"
 fixtures = ["tests/hern/module_trait.hern"]

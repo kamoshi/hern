@@ -1,0 +1,5 @@
+fn stringify(value: 'a) -> string where 'a: ToString {
+    to_string(value)
+}
+
+#{ stringify: stringify }

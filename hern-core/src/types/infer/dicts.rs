@@ -2,6 +2,7 @@ use crate::ast::*;
 use crate::types::{
     Scheme, Subst, TraitConstraint, Ty, TypeEnv,
     error::TypeError,
+    perf,
     type_syntax::{
         trait_impl_arg_key_candidates_from_ty, trait_impl_dict_name_from_keys,
         trait_impl_target_keys_from_ty,
@@ -248,7 +249,8 @@ pub(super) fn resolve_concrete_dict_ref(
     }
     for target_key in trait_impl_target_keys_from_ty(ty) {
         if has_trait_impl(env, known_impl_dicts, trait_name, &target_key) {
-            let dict_name = trait_impl_dict_name_from_keys(trait_name, &[target_key.clone()]);
+            let dict_name =
+                trait_impl_dict_name_from_keys(trait_name, std::slice::from_ref(&target_key));
             let scheme = env
                 .get(&dict_name)
                 .map(|info| info.scheme.clone())
@@ -316,6 +318,7 @@ fn find_cartesian_key_match<T>(
     candidate_sets: &[Vec<String>],
     mut f: impl FnMut(&[String]) -> Option<T>,
 ) -> Option<T> {
+    perf::cartesian_search_call();
     fn search<T>(
         candidate_sets: &[Vec<String>],
         index: usize,
@@ -323,6 +326,7 @@ fn find_cartesian_key_match<T>(
         f: &mut impl FnMut(&[String]) -> Option<T>,
     ) -> Option<T> {
         if index == candidate_sets.len() {
+            perf::cartesian_search_leaf();
             return f(current);
         }
         for candidate in &candidate_sets[index] {
@@ -365,8 +369,7 @@ fn dict_ref_args_for_scheme_args(
     if scheme.constraints.is_empty() {
         return Some(Vec::new());
     }
-    let mut bindings = HashMap::new();
-    bind_scheme_target_vars(&scheme.ty, actual_args, &mut bindings)?;
+    let bindings = bind_scheme_target_vars(&scheme.ty, actual_args, &scheme.constraints)?;
     scheme
         .constraints
         .iter()
@@ -391,16 +394,23 @@ fn dict_ref_args_for_scheme_args(
 fn bind_scheme_target_vars(
     dict_ty: &Ty,
     actual_args: &[Ty],
-    bindings: &mut HashMap<u32, Ty>,
-) -> Option<()> {
+    constraints: &[TraitConstraint],
+) -> Option<HashMap<u32, Ty>> {
     let Ty::Record(row) = dict_ty else {
         return None;
     };
+    let mut bindings = HashMap::new();
     for (_, field_ty) in &row.fields {
+        // A dictionary can have helper methods that each expose only part of a
+        // constrained impl type. Accumulate compatible bindings across fields
+        // until every constraint can be materialized.
         if let Ty::Func(params, _) = field_ty
-            && bind_func_vars_to_actuals(field_ty, params, actual_args, bindings)
+            && bind_func_vars_to_actuals(field_ty, params, actual_args, &mut bindings)
+            && constraints
+                .iter()
+                .all(|constraint| bindings.contains_key(&constraint.var))
         {
-            return Some(());
+            return Some(bindings);
         }
     }
     None
@@ -464,6 +474,9 @@ fn bind_func_vars_to_actuals(
 fn bind_ty_vars_to_actual(pattern: &Ty, actual: &Ty, bindings: &mut HashMap<u32, Ty>) -> bool {
     match (pattern, actual) {
         (Ty::Var(var), actual) => {
+            if let Some(existing) = bindings.get(var) {
+                return existing == actual;
+            }
             bindings.insert(*var, actual.clone());
             true
         }
@@ -844,4 +857,99 @@ fn drain_pending_lenient(
         }
     }
     *pending = unresolved;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FuncParam, FuncReturn, Row};
+
+    #[test]
+    fn scheme_target_binding_tries_later_methods_when_earlier_method_is_incomplete() {
+        let scheme = Scheme {
+            vars: vec![0],
+            constraints: vec![TraitConstraint::unary(0, "Show".to_string())],
+            ty: Ty::Record(Row {
+                fields: vec![
+                    (
+                        "first".to_string(),
+                        Ty::Func(
+                            vec![FuncParam::value(Ty::Con("Input".to_string()))],
+                            FuncReturn::value(Ty::Int),
+                        ),
+                    ),
+                    (
+                        "second".to_string(),
+                        Ty::Func(
+                            vec![FuncParam::value(Ty::Con("Input".to_string()))],
+                            FuncReturn::value(Ty::Var(0)),
+                        ),
+                    ),
+                ],
+                tail: Box::new(Ty::Unit),
+            }),
+        };
+        let known_impl_dicts = HashSet::from(["__Show__string".to_string()]);
+
+        let dict_args = dict_ref_args_for_scheme_args(
+            &scheme,
+            &[Ty::Con("Input".to_string()), Ty::Con("string".to_string())],
+            &TypeEnv::new(),
+            &known_impl_dicts,
+            &HashMap::new(),
+        )
+        .expect("later method should provide the constrained variable binding");
+
+        assert!(matches!(
+            dict_args.as_slice(),
+            [DictRef::Concrete(name)] if name == "__Show__string"
+        ));
+    }
+
+    #[test]
+    fn scheme_target_binding_combines_compatible_method_bindings() {
+        let scheme = Scheme {
+            vars: vec![0, 1],
+            constraints: vec![
+                TraitConstraint::unary(0, "Show".to_string()),
+                TraitConstraint::unary(1, "Eq".to_string()),
+            ],
+            ty: Ty::Record(Row {
+                fields: vec![
+                    (
+                        "first".to_string(),
+                        Ty::Func(
+                            vec![FuncParam::value(Ty::Con("Input".to_string()))],
+                            FuncReturn::value(Ty::Var(0)),
+                        ),
+                    ),
+                    (
+                        "second".to_string(),
+                        Ty::Func(
+                            vec![FuncParam::value(Ty::Con("Input".to_string()))],
+                            FuncReturn::value(Ty::Var(1)),
+                        ),
+                    ),
+                ],
+                tail: Box::new(Ty::Unit),
+            }),
+        };
+        let known_impl_dicts =
+            HashSet::from(["__Show__string".to_string(), "__Eq__string".to_string()]);
+
+        let dict_args = dict_ref_args_for_scheme_args(
+            &scheme,
+            &[Ty::Con("Input".to_string()), Ty::Con("string".to_string())],
+            &TypeEnv::new(),
+            &known_impl_dicts,
+            &HashMap::new(),
+        )
+        .expect("compatible methods should jointly bind constrained variables");
+
+        assert!(matches!(
+            dict_args.as_slice(),
+            [DictRef::Concrete(show), DictRef::Concrete(eq)]
+                if show == "__Show__string" && eq == "__Eq__string"
+        ));
+    }
 }

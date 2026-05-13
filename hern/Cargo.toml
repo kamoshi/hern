@@ -3,6 +3,9 @@ name = "hern"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+perf-counters = ["hern-core/perf-counters"]
+
 [dependencies]
 hern-core = { path = "../hern-core" }
 hern-lsp = { path = "../hern-lsp" }

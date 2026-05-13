@@ -57,8 +57,14 @@ enum Commands {
 }
 
 fn main() {
-    if let Err(err) = run_cli() {
+    let result = run_cli();
+    if let Err(err) = &result {
         eprintln!("{}", err);
+    }
+    if let Some(report) = hern_core::types::perf::report() {
+        eprintln!("{}", report);
+    }
+    if result.is_err() {
         std::process::exit(1);
     }
 }

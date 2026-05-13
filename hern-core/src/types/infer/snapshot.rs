@@ -1,13 +1,15 @@
 use super::metadata::{FailedStatementMetadata, TypeMetadataSnapshot};
 use super::*;
+use crate::types::SubstCheckpoint;
 
 /// Snapshot of mutable per-statement state inside [`Infer`], taken before each top-level
 /// statement during collecting inference. On statement failure the snapshot is restored so
 /// the next statement starts from a clean baseline.
 ///
-/// Note: only the substitution **map** is snapshotted, not `Subst::next_var`. Fresh type
-/// variable IDs keep advancing across recovery — reusing IDs from a failed statement could
-/// alias new bindings against stale references and silently miscompile.
+/// Note: the substitution checkpoint restores solved substitutions, but not
+/// `Subst::next_var`. Fresh type variable IDs keep advancing across recovery —
+/// reusing IDs from a failed statement could alias new bindings against stale
+/// references and silently miscompile.
 ///
 /// Insert-only editor metadata maps keep only compact key lists here. Their keys are AST node IDs
 /// or source spans, so a top-level statement should only add fresh keys; on rollback we turn those
@@ -18,7 +20,7 @@ use super::*;
 /// and failed type declarations are pruned from it during pre-pass 3, so later statements never
 /// observe variants from declarations whose constructor environment was discarded.
 pub(super) struct InferSnapshot {
-    subst_map: HashMap<TyVar, Ty>,
+    subst_checkpoint: SubstCheckpoint,
     pending_constraints: Vec<TraitConstraint>,
     loop_break_tys: Vec<Ty>,
     fn_return_tys: Vec<FuncReturn>,
@@ -29,9 +31,9 @@ pub(super) struct InferSnapshot {
 }
 
 impl InferSnapshot {
-    pub(super) fn capture(infer: &Infer, env: &TypeEnv) -> Self {
+    pub(super) fn capture(infer: &mut Infer, env: &TypeEnv) -> Self {
         Self {
-            subst_map: infer.subst.snapshot_map(),
+            subst_checkpoint: infer.subst.checkpoint(),
             pending_constraints: infer.pending_constraints.clone(),
             loop_break_tys: infer.loop_break_tys.clone(),
             fn_return_tys: infer.fn_return_tys.clone(),
@@ -49,7 +51,7 @@ impl InferSnapshot {
     }
 
     pub(super) fn restore(self, infer: &mut Infer, env: &mut TypeEnv) {
-        infer.subst.restore_map(self.subst_map);
+        infer.subst.restore_checkpoint(self.subst_checkpoint);
         infer.pending_constraints = self.pending_constraints;
         infer.loop_break_tys = self.loop_break_tys;
         infer.fn_return_tys = self.fn_return_tys;
@@ -57,5 +59,11 @@ impl InferSnapshot {
         infer.record_field_callables = self.record_field_callables;
         infer.inherent_methods = self.inherent_methods;
         *env = self.env;
+    }
+
+    pub(super) fn discard(self, infer: &mut Infer) {
+        infer
+            .subst
+            .discard_outermost_checkpoint(self.subst_checkpoint);
     }
 }

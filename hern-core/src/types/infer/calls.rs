@@ -637,23 +637,65 @@ impl Infer {
     ) -> Result<Ty, SpannedTypeError> {
         let inferred_receiver_ty = self.infer_expr(env, receiver)?;
         let receiver_ty = self.subst.apply(&inferred_receiver_ty);
-        if let ExprKind::Ident(base_name) = &receiver.kind {
-            if let Some(module_name) = self.import_bindings.get(base_name)
-                && let Some(scheme) = self
-                    .import_schemes
-                    .get(module_name)
-                    .and_then(|members| members.get(method_name))
-                && matches!(scheme.ty, Ty::Func(_, _))
-            {
+        let imported_member_scheme = self.imported_member_scheme(receiver, method_name);
+        if let Some(scheme) = &imported_member_scheme {
+            if matches!(scheme.ty, Ty::Func(_, _)) {
                 self.record_callable_capabilities(callee_id, scheme_param_capabilities(scheme));
-            } else if let Some(param_capabilities) = self
+            }
+        } else if let ExprKind::Ident(base_name) = &receiver.kind
+            && let Some(param_capabilities) = self
                 .record_field_callables
                 .get(base_name)
                 .and_then(|fields| fields.get(method_name))
                 .cloned()
-            {
-                self.record_callable_capabilities(callee_id, param_capabilities);
+        {
+            self.record_callable_capabilities(callee_id, param_capabilities);
+        }
+
+        if let Some(scheme) = imported_member_scheme {
+            let instantiated = self.instantiate_scheme(&scheme);
+            let mut field_ty = instantiated.ty;
+            let mut constraints = instantiated.constraints;
+            if let Ty::Qualified(existing, inner) = field_ty {
+                constraints.extend(existing);
+                field_ty = *inner;
             }
+            if !constraints.is_empty() {
+                attach_dict_args(
+                    env,
+                    &self.known_impl_dicts,
+                    &self.known_impl_schemes,
+                    dict_args,
+                    pending_dict_args,
+                    &mut self.pending_constraints,
+                    &constraints,
+                    &mut self.subst,
+                )
+                .map_err(|e| e.at(receiver.span))?;
+            }
+            self.record_symbol_type(callee_id, field_ty.clone());
+            let param_capabilities = match &field_ty {
+                Ty::Func(params, _) => func_param_capabilities(params),
+                _ => self.callable_capabilities_for(callee_id),
+            };
+            let applied = self.apply_callable_type(
+                env,
+                args,
+                arg_wrappers,
+                field_ty,
+                Vec::new(),
+                Vec::new(),
+                param_capabilities,
+                0,
+                receiver.span,
+                dict_args,
+                pending_dict_args,
+            )?;
+            self.record_symbol_type(callee_id, applied.call_ty);
+            if applied.fresh_return && call_expr_id != NO_NODE_ID {
+                self.metadata.mark_fresh_place(call_expr_id);
+            }
+            return Ok(applied.ret_ty);
         }
 
         if let Some(mut field_ty) = record_field_ty(&receiver_ty, method_name) {
@@ -934,9 +976,9 @@ impl Infer {
             let Some(method_ret) = scheme_return_ty(&method_info.scheme) else {
                 continue;
             };
-            let snapshot = self.subst.snapshot_map();
+            let snapshot = self.subst.checkpoint();
             let matched = unify(&mut self.subst, method_ret, expected_ret.clone()).is_ok();
-            self.subst.restore_map(snapshot);
+            self.subst.restore_checkpoint(snapshot);
             if matched {
                 matches.push((target, method_info, receiver_ty));
             }

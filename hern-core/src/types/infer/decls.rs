@@ -77,11 +77,13 @@ impl Infer {
                     ty,
                     ..
                 } => {
-                    let mut param_vars = HashMap::new();
-                    let t = self
-                        .ast_to_ty_with_vars(ty, &mut param_vars)
-                        .map_err(|err| err.at(span))?;
-                    let scheme = self.generalize(env, t);
+                    let ambient = self.current_level;
+                    let t = self.with_child_level(|this| {
+                        let mut param_vars = HashMap::new();
+                        this.ast_to_ty_with_vars(ty, &mut param_vars)
+                            .map_err(|err| err.at(span))
+                    })?;
+                    let scheme = self.generalize_at(env, t, ambient);
                     self.metadata
                         .record_definition_scheme(*name_span, scheme.clone());
                     env.insert(name.clone(), EnvInfo::immutable(scheme));
@@ -94,10 +96,10 @@ impl Infer {
 
     pub(super) fn register_impl_dict_names<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
         for stmt in stmts {
-            if let Stmt::Impl(impl_def) = stmt {
-                if let Some(dict_name) = impl_dict_name(impl_def) {
-                    self.known_impl_dicts.insert(dict_name);
-                }
+            if let Stmt::Impl(impl_def) = stmt
+                && let Some(dict_name) = impl_dict_name(impl_def)
+            {
+                self.known_impl_dicts.insert(dict_name);
             }
         }
     }
@@ -107,10 +109,10 @@ impl Infer {
         stmts: impl Iterator<Item = &'a Stmt>,
     ) {
         for stmt in stmts {
-            if let Stmt::Impl(impl_def) = stmt {
-                if let Some(dict_name) = impl_dict_name(impl_def) {
-                    self.known_impl_dicts.remove(&dict_name);
-                }
+            if let Stmt::Impl(impl_def) = stmt
+                && let Some(dict_name) = impl_dict_name(impl_def)
+            {
+                self.known_impl_dicts.remove(&dict_name);
             }
         }
     }

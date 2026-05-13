@@ -26,14 +26,16 @@ use super::{
 use crate::ast::*;
 use crate::types::{
     BindingCapabilities, CallableCapabilities, EnvInfo, FuncParam, FuncReturn,
-    InherentMethodScheme, ParamCapability, ReturnCapability, Row, Scheme, Subst, TraitConstraint,
-    Ty, TyVar, display_ty_with_var_names,
+    InherentMethodScheme, ParamCapability, ROOT_LEVEL, ReturnCapability, Row, Scheme, Subst,
+    TraitConstraint, Ty, TyVar, TypeLevel, display_ty_with_var_names,
     env::build_variant_env_from_stmts,
     error::{SpannedTypeError, TypeError},
-    free_type_vars, free_type_vars_in_display_order, type_var_name, unify, value_func_params,
-    value_func_return,
+    free_type_vars, free_type_vars_in_display_order, free_type_vars_into, perf, type_var_name,
+    unify, value_func_params, value_func_return,
 };
 pub use crate::types::{TypeEnv, VariantEnv, VariantInfo, is_fresh_mutable_place, is_value};
+#[cfg(debug_assertions)]
+use std::sync::OnceLock;
 
 const INDEX_TRAIT_ARITY: usize = 3;
 use metadata::{FinalizedTypeMaps, TypeMetadata};
@@ -76,6 +78,7 @@ pub struct Infer {
     pending_constraints: Vec<TraitConstraint>,
     known_impl_schemes: HashMap<String, Scheme>,
     metadata: TypeMetadata,
+    current_level: TypeLevel,
 }
 
 struct InstantiatedScheme {
@@ -88,6 +91,16 @@ struct FinalizedConstraints {
     scheme: Scheme,
     owned: Vec<TraitConstraint>,
     bubbled: Vec<TraitConstraint>,
+}
+
+#[cfg(debug_assertions)]
+fn levels_shadow_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HERN_LEVELS_SHADOW")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+    })
 }
 
 enum DictResolution {
@@ -165,11 +178,30 @@ impl Infer {
             pending_constraints: Vec::new(),
             known_impl_schemes: HashMap::new(),
             metadata: TypeMetadata::default(),
+            current_level: ROOT_LEVEL,
         }
     }
 
     fn fresh_var(&mut self) -> TyVar {
-        self.subst.fresh_tyvar()
+        self.subst.fresh_tyvar_at(self.current_level)
+    }
+
+    fn fresh_ty(&mut self) -> Ty {
+        Ty::Var(self.fresh_var())
+    }
+
+    fn with_child_level<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, SpannedTypeError>,
+    ) -> Result<T, SpannedTypeError> {
+        let saved = self.current_level;
+        self.current_level = self
+            .current_level
+            .checked_add(1)
+            .expect("type inference level overflow");
+        let result = f(self);
+        self.current_level = saved;
+        result
     }
 
     pub fn set_import_types(&mut self, import_types: HashMap<String, Ty>) {
@@ -272,8 +304,29 @@ impl Infer {
         }
     }
 
+    fn imported_member_scheme_for_expr(&self, expr: &Expr) -> Option<Scheme> {
+        let ExprKind::FieldAccess {
+            expr: base, field, ..
+        } = &expr.kind
+        else {
+            return None;
+        };
+        self.imported_member_scheme(base, field)
+    }
+
+    pub(super) fn imported_member_scheme(&self, base: &Expr, field: &str) -> Option<Scheme> {
+        let ExprKind::Ident(base_name) = &base.kind else {
+            return None;
+        };
+        let module_name = self.import_bindings.get(base_name)?;
+        self.import_schemes
+            .get(module_name)
+            .and_then(|members| members.get(field))
+            .cloned()
+    }
+
     fn record_symbol_type(&mut self, node_id: NodeId, ty: Ty) {
-        self.metadata.record_symbol_type(node_id, ty, &self.subst);
+        self.metadata.record_symbol_type(node_id, ty);
     }
 
     fn record_callable_capabilities(
@@ -370,6 +423,7 @@ impl Infer {
     }
 
     fn is_fresh_mutable_place_expr(&self, expr: &Expr) -> bool {
+        perf::fresh_place_node();
         if is_fresh_mutable_place(expr) || self.metadata.is_fresh_place_expr(expr.id) {
             return true;
         }
@@ -469,12 +523,13 @@ impl Infer {
         }
     }
 
-    fn generalize(&self, env: &TypeEnv, ty: Ty) -> Scheme {
+    fn generalize_at(&self, env: &TypeEnv, ty: Ty, ambient: TypeLevel) -> Scheme {
         let ty = self.subst.apply(&ty);
-        let env_vars = env.free_vars(&self.subst);
-        let ty_vars = free_type_vars(&ty);
-        let mut vars: Vec<TyVar> = ty_vars.difference(&env_vars).copied().collect();
-        vars.sort();
+        let vars = self.level_generalizable_vars(&ty, ambient);
+        #[cfg(debug_assertions)]
+        self.report_level_generalization_shadow(env, &ty, ambient, &vars);
+        #[cfg(not(debug_assertions))]
+        let _ = env;
         // Constraints are set separately by finalize_constraints for Fn/Op.
         // For other uses (constructors, externs, let-values) there are no constraints.
         Scheme {
@@ -484,6 +539,46 @@ impl Infer {
         }
     }
 
+    fn level_generalizable_vars(&self, ty: &Ty, ambient: TypeLevel) -> Vec<TyVar> {
+        let mut vars: Vec<_> = free_type_vars(ty)
+            .into_iter()
+            .filter(|var| self.subst.level_of(*var) > ambient)
+            .collect();
+        vars.sort();
+        vars
+    }
+
+    #[cfg(debug_assertions)]
+    fn report_level_generalization_shadow(
+        &self,
+        env: &TypeEnv,
+        ty: &Ty,
+        ambient: TypeLevel,
+        level_vars: &[TyVar],
+    ) {
+        if !levels_shadow_enabled() {
+            return;
+        }
+        let env_vars = self.generalizable_vars_by_env_scan(env, ty);
+        if level_vars == env_vars {
+            return;
+        }
+        eprintln!(
+            "Hern levels shadow mismatch: ambient={}, env-scan={:?}, levels={:?}, ty={}",
+            ambient, env_vars, level_vars, ty
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    fn generalizable_vars_by_env_scan(&self, env: &TypeEnv, ty: &Ty) -> Vec<TyVar> {
+        let env_vars = env.free_vars(&self.subst);
+        let ty_vars = free_type_vars(ty);
+        let mut vars: Vec<TyVar> = ty_vars.difference(&env_vars).copied().collect();
+        vars.sort();
+        vars
+    }
+
+    #[cfg(test)]
     fn normalized_free_vars_syntactic(&self, env: &TypeEnv) -> HashSet<TyVar> {
         env.free_vars_syntactic()
             .into_iter()
@@ -548,45 +643,65 @@ impl Infer {
     /// the enclosing inference scope. Constraints already made concrete by
     /// substitution are intentionally dropped because they need no dictionary
     /// parameter.
+    #[cfg(test)]
     fn finalize_constraints(
         &self,
         env: &TypeEnv,
         fn_ty: Ty,
         fn_constraints: Vec<TraitConstraint>,
     ) -> FinalizedConstraints {
-        let mut scheme = self.generalize(env, fn_ty);
-        let env_vars = self.normalized_free_vars_syntactic(env);
+        self.finalize_constraints_at(env, fn_ty, fn_constraints, self.current_level)
+    }
+
+    fn finalize_constraints_at(
+        &self,
+        env: &TypeEnv,
+        fn_ty: Ty,
+        fn_constraints: Vec<TraitConstraint>,
+        ambient: TypeLevel,
+    ) -> FinalizedConstraints {
+        let mut scheme = self.generalize_at(env, fn_ty, ambient);
         let mut seen = HashSet::new();
         let mut seen_bubbled = HashSet::new();
         let mut owned = Vec::new();
         let mut bubbled = Vec::new();
 
         for constraint in fn_constraints {
-            match self.subst.apply(&Ty::Var(constraint.var)) {
-                Ty::Var(var) => {
-                    let normalized = TraitConstraint {
-                        var,
-                        trait_name: constraint.trait_name,
-                        args: constraint
-                            .args
-                            .iter()
-                            .map(|arg| self.subst.apply(arg))
-                            .collect(),
-                        determinant_indexes: constraint.determinant_indexes,
-                    };
-                    if env_vars.contains(&normalized.var) || !scheme.vars.contains(&normalized.var)
-                    {
-                        if seen_bubbled.insert(normalized.clone()) {
-                            bubbled.push(normalized);
-                        }
-                    } else if seen.insert(normalized.clone()) {
-                        owned.push(normalized);
-                    }
-                }
-                // Concrete constraints do not become callable dictionary
+            let normalized_var_ty = self.subst.apply(&Ty::Var(constraint.var));
+            let normalized_args: Vec<Ty> = constraint
+                .args
+                .iter()
+                .map(|arg| self.subst.apply(arg))
+                .collect();
+            let mut relevant_vars = HashSet::new();
+            free_type_vars_into(&normalized_var_ty, &mut relevant_vars);
+            for arg in &normalized_args {
+                free_type_vars_into(arg, &mut relevant_vars);
+            }
+
+            if relevant_vars.is_empty() {
+                // Fully concrete constraints do not become callable dictionary
                 // parameters. Their pending dict uses are resolved by the
                 // local/concrete resolver after inference has finished.
-                _ => {}
+                continue;
+            }
+
+            let normalized_var = match normalized_var_ty {
+                Ty::Var(var) => var,
+                _ => constraint.var,
+            };
+            let normalized = TraitConstraint {
+                var: normalized_var,
+                trait_name: constraint.trait_name,
+                args: normalized_args,
+                determinant_indexes: constraint.determinant_indexes,
+            };
+            if relevant_vars.iter().all(|var| scheme.vars.contains(var)) {
+                if seen.insert(normalized.clone()) {
+                    owned.push(normalized);
+                }
+            } else if seen_bubbled.insert(normalized.clone()) {
+                bubbled.push(normalized);
             }
         }
 
@@ -616,55 +731,60 @@ impl Infer {
         type_bounds: &[TypeBound],
         add_self_binding: bool,
     ) -> Result<(), SpannedTypeError> {
-        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-        let mut param_tys = Vec::new();
-        let mut body_env = env.clone();
-        let initial_constraints = self.collect_type_bound_constraints(&mut param_vars, type_bounds);
+        let ambient = self.current_level;
+        let (fn_ty, fn_constraints) = self.with_child_level(|this| {
+            let mut param_vars: HashMap<String, TyVar> = HashMap::new();
+            let mut param_tys = Vec::new();
+            let mut body_env = env.clone();
+            let initial_constraints =
+                this.collect_type_bound_constraints(&mut param_vars, type_bounds);
 
-        for param in params {
-            if !is_irrefutable_param(&param.pat, &self.variant_env) {
-                return Err(TypeError::RefutableParamPattern.at(body.span));
-            }
-            let p_ty = match &param.ty {
-                Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
-                None => self.subst.fresh_var(),
-            };
-            param_tys.push(p_ty.clone());
-            self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
-        }
-
-        let ret_ty = match ret_type {
-            Some(t) => self.ast_to_ty_with_vars(&t.ty, &mut param_vars)?,
-            None => self.subst.fresh_var(),
-        };
-
-        let fn_ret = func_return_from_annotation(ret_type, ret_ty.clone());
-        let fn_ty = Ty::Func(func_params_from_params(params, param_tys), fn_ret.clone());
-
-        if add_self_binding {
-            body_env.insert(
-                name.to_string(),
-                EnvInfo::immutable(Scheme::mono(fn_ty.clone())),
-            );
-        }
-
-        let (_, fn_constraints) =
-            self.with_pending_constraints_scope(initial_constraints, |this| {
-                let body_ty = this.with_fn_return_scope(fn_ret.clone(), |this| {
-                    if ret_type.is_some() {
-                        this.infer_expr_expected(&body_env, body, ret_ty.clone())
-                    } else {
-                        this.infer_expr(&body_env, body)
-                    }
-                })?;
-                unify_expr_result(&mut this.subst, body_ty.clone(), ret_ty)
-                    .map_err(|err| err.at(body.span))?;
-                if !matches!(this.subst.apply(&body_ty), Ty::Never) {
-                    this.check_fresh_return_expr(body, &fn_ret)?;
+            for param in params {
+                if !is_irrefutable_param(&param.pat, &this.variant_env) {
+                    return Err(TypeError::RefutableParamPattern.at(body.span));
                 }
-                Ok(())
-            })?;
-        let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
+                let p_ty = match &param.ty {
+                    Some(t) => this.ast_to_ty_with_vars(t, &mut param_vars)?,
+                    None => this.fresh_ty(),
+                };
+                param_tys.push(p_ty.clone());
+                this.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
+            }
+
+            let ret_ty = match ret_type {
+                Some(t) => this.ast_to_ty_with_vars(&t.ty, &mut param_vars)?,
+                None => this.fresh_ty(),
+            };
+
+            let fn_ret = func_return_from_annotation(ret_type, ret_ty.clone());
+            let fn_ty = Ty::Func(func_params_from_params(params, param_tys), fn_ret.clone());
+
+            if add_self_binding {
+                body_env.insert(
+                    name.to_string(),
+                    EnvInfo::immutable(Scheme::mono(fn_ty.clone())),
+                );
+            }
+
+            let (_, fn_constraints) =
+                this.with_pending_constraints_scope(initial_constraints, |this| {
+                    let body_ty = this.with_fn_return_scope(fn_ret.clone(), |this| {
+                        if ret_type.is_some() {
+                            this.infer_expr_expected(&body_env, body, ret_ty.clone())
+                        } else {
+                            this.infer_expr(&body_env, body)
+                        }
+                    })?;
+                    unify_expr_result(&mut this.subst, body_ty.clone(), ret_ty)
+                        .map_err(|err| err.at(body.span))?;
+                    if !matches!(this.subst.apply(&body_ty), Ty::Never) {
+                        this.check_fresh_return_expr(body, &fn_ret)?;
+                    }
+                    Ok(())
+                })?;
+            Ok((fn_ty, fn_constraints))
+        })?;
+        let finalized = self.finalize_constraints_at(env, fn_ty, fn_constraints, ambient);
         self.pending_constraints.extend(finalized.bubbled.clone());
 
         *dict_params = finalized.owned.iter().map(dict_param_name).collect();
@@ -694,13 +814,30 @@ impl Infer {
         env.apply_subst(&self.subst);
     }
 
+    fn infer_let_value_ty(
+        &mut self,
+        env: &TypeEnv,
+        ty: &Option<Type>,
+        value: &mut Expr,
+    ) -> Result<Ty, SpannedTypeError> {
+        if let Some(ast_ty) = ty {
+            let mut param_vars = HashMap::new();
+            let expected_ty = self.ast_to_ty_with_vars(ast_ty, &mut param_vars)?;
+            let value_ty = self.infer_expr_expected(env, value, expected_ty.clone())?;
+            unify_expr_result(&mut self.subst, value_ty, expected_ty.clone())
+                .map_err(|err| err.at(value.span))?;
+            Ok(expected_ty)
+        } else {
+            self.infer_expr(env, value)
+        }
+    }
+
     fn finalized_type_maps(&self) -> FinalizedTypeMaps {
         self.metadata.finalize(&self.subst)
     }
 
     fn record_expr_type_for_node(&mut self, node_id: NodeId, ty: Ty) -> Ty {
-        self.metadata
-            .record_expr_type(node_id, ty.clone(), &self.subst);
+        self.metadata.record_expr_type(node_id, ty.clone());
         ty
     }
 
@@ -850,17 +987,21 @@ impl Infer {
                     ty,
                     ..
                 } => {
-                    let mut param_vars = HashMap::new();
-                    match self.ast_to_ty_with_vars(ty, &mut param_vars) {
+                    let ambient = self.current_level;
+                    match self.with_child_level(|this| {
+                        let mut param_vars = HashMap::new();
+                        this.ast_to_ty_with_vars(ty, &mut param_vars)
+                            .map_err(|err| err.at(span))
+                    }) {
                         Ok(t) => {
-                            let scheme = self.generalize(&env, t);
+                            let scheme = self.generalize_at(&env, t, ambient);
                             self.metadata
                                 .record_definition_scheme(*name_span, scheme.clone());
                             env.insert(name.clone(), EnvInfo::immutable(scheme));
                         }
                         Err(err) => {
                             unavailable.extend(bound);
-                            diagnostics.push(err.at(span));
+                            diagnostics.push(err);
                         }
                     }
                 }
@@ -891,6 +1032,7 @@ impl Infer {
                     } else {
                         Ty::Unit
                     };
+                    snapshot.discard(self);
                     // A successful redefinition shadows any prior failure of the same name.
                     unavailable.remove_all(&bound);
                     succeeded[idx] = true;
@@ -965,6 +1107,7 @@ impl Infer {
         self.metadata.clear();
         self.import_bindings.clear();
         self.record_field_callables.clear();
+        self.current_level = ROOT_LEVEL;
     }
 
     fn infer_stmt(&mut self, env: &mut TypeEnv, stmt: &mut Stmt) -> Result<Ty, SpannedTypeError> {
@@ -977,15 +1120,12 @@ impl Infer {
                 value,
                 ..
             } => {
-                let inferred_ty = if let Some(ast_ty) = ty {
-                    let mut param_vars = HashMap::new();
-                    let expected_ty = self.ast_to_ty_with_vars(ast_ty, &mut param_vars)?;
-                    let value_ty = self.infer_expr_expected(env, value, expected_ty.clone())?;
-                    unify_expr_result(&mut self.subst, value_ty, expected_ty.clone())
-                        .map_err(|err| err.at(value.span))?;
-                    expected_ty
+                let generalizable_value = !*is_mutable && is_value(&*value);
+                let ambient = self.current_level;
+                let inferred_ty = if generalizable_value {
+                    self.with_child_level(|this| this.infer_let_value_ty(env, ty, value))?
                 } else {
-                    self.infer_expr(env, value)?
+                    self.infer_let_value_ty(env, ty, value)?
                 };
 
                 // Reject refutable patterns in let position.
@@ -997,10 +1137,15 @@ impl Infer {
                 if let Pattern::Variable(name, span) = pat {
                     self.metadata
                         .record_binding_type(*span, inferred_ty.clone());
-                    let scheme = if *is_mutable || !is_value(&*value) {
+                    let scheme = if !*is_mutable
+                        && ty.is_none()
+                        && let Some(imported_scheme) = self.imported_member_scheme_for_expr(value)
+                    {
+                        imported_scheme
+                    } else if !generalizable_value {
                         Scheme::mono(inferred_ty)
                     } else {
-                        self.generalize(env, inferred_ty)
+                        self.generalize_at(env, inferred_ty, ambient)
                     };
                     let place_mutable = *is_mutable && self.is_fresh_mutable_place_expr(value);
                     self.metadata
@@ -1028,13 +1173,13 @@ impl Infer {
                     //
                     // Snapshot env free vars BEFORE inserting new bindings so that
                     // sibling bindings don't prevent each other from being generalized.
-                    let pre_let_env_vars: HashSet<TyVar> = if !*is_mutable && is_value(&*value) {
+                    let pre_let_env_vars: HashSet<TyVar> = if generalizable_value {
                         env.free_vars(&self.subst)
                     } else {
                         HashSet::new()
                     };
                     self.check_pattern(pat, inferred_ty, env, *is_mutable)?;
-                    if !*is_mutable && is_value(&*value) {
+                    if generalizable_value {
                         let mut bound = std::collections::HashSet::new();
                         insert_pattern_bindings(&mut bound, pat);
                         let updates: Vec<(String, Ty, bool)> = bound
@@ -1047,7 +1192,8 @@ impl Infer {
                             .collect();
                         for (name, ty, is_mut) in updates {
                             let applied = self.subst.apply(&ty);
-                            let ty_vars = free_type_vars(&applied);
+                            let mut ty_vars = HashSet::new();
+                            free_type_vars_into(&applied, &mut ty_vars);
                             let mut vars: Vec<TyVar> =
                                 ty_vars.difference(&pre_let_env_vars).copied().collect();
                             vars.sort();
@@ -1267,8 +1413,7 @@ impl Infer {
                         Ty::Qualified(instantiated.constraints, Box::new(instantiated.ty))
                     };
                     if expr.id != NO_NODE_ID {
-                        self.metadata
-                            .record_symbol_type(expr.id, ty.clone(), &self.subst);
+                        self.metadata.record_symbol_type(expr.id, ty.clone());
                         self.metadata.record_binding_capability(
                             expr.span,
                             BindingCapabilities {
@@ -1296,8 +1441,7 @@ impl Infer {
                         }
                         let ty = self.instantiate(&info.scheme);
                         if target.id != NO_NODE_ID {
-                            self.metadata
-                                .record_symbol_type(target.id, ty.clone(), &self.subst);
+                            self.metadata.record_symbol_type(target.id, ty.clone());
                         }
                         ty
                     }
@@ -1419,7 +1563,7 @@ impl Infer {
                 Ok(result_ty.unwrap_or(Ty::Never))
             }
             ExprKind::Loop(body) => {
-                let break_ty = self.subst.fresh_var();
+                let break_ty = self.fresh_ty();
                 self.loop_break_tys.push(break_ty.clone());
                 let _body_ty = self.infer_expr(env, body)?;
                 self.loop_break_tys.pop();
@@ -1466,7 +1610,7 @@ impl Infer {
                 for stmt in stmts.iter_mut() {
                     self.infer_stmt(&mut block_env, stmt)?;
                     if stmt_always_exits(stmt, true) {
-                        return Ok(self.subst.fresh_var());
+                        return Ok(self.fresh_ty());
                     }
                 }
                 match final_expr {
@@ -1487,18 +1631,11 @@ impl Infer {
                 expr: base, field, ..
             } => {
                 let field_access_id = expr_id;
-                let imported_callable_capabilities = if let ExprKind::Ident(base_name) = &base.kind
-                    && let Some(module_name) = self.import_bindings.get(base_name)
-                    && let Some(scheme) = self
-                        .import_schemes
-                        .get(module_name)
-                        .and_then(|members| members.get(field))
-                    && matches!(scheme.ty, Ty::Func(_, _))
-                {
-                    Some(scheme_param_capabilities(scheme))
-                } else {
-                    None
-                };
+                let imported_member_scheme = self.imported_member_scheme(base, field);
+                let imported_callable_capabilities = imported_member_scheme
+                    .as_ref()
+                    .filter(|scheme| matches!(scheme.ty, Ty::Func(_, _)))
+                    .map(scheme_param_capabilities);
                 let local_field_callable_capabilities =
                     if let ExprKind::Ident(base_name) = &base.kind {
                         self.record_field_callables
@@ -1508,9 +1645,24 @@ impl Infer {
                     } else {
                         None
                     };
+                // Keep base inference before the imported-member fast path so
+                // hover/signature metadata for the module binding is still
+                // recorded and an invalid receiver is rejected normally.
                 let expr_ty = self.infer_expr(env, base)?;
-                let field_ty = self.subst.fresh_var();
-                let tail = self.subst.fresh_var();
+                if let Some(scheme) = imported_member_scheme {
+                    let instantiated = self.instantiate_scheme(&scheme);
+                    let ty = if instantiated.constraints.is_empty() {
+                        instantiated.ty
+                    } else {
+                        Ty::Qualified(instantiated.constraints, Box::new(instantiated.ty))
+                    };
+                    if let Some(param_capabilities) = imported_callable_capabilities {
+                        self.record_callable_capabilities(field_access_id, param_capabilities);
+                    }
+                    return Ok(ty);
+                }
+                let field_ty = self.fresh_ty();
+                let tail = self.fresh_ty();
                 let expected = Ty::Record(Row {
                     fields: vec![(field.clone(), field_ty.clone())],
                     tail: Box::new(tail),
@@ -1555,8 +1707,7 @@ impl Infer {
         if let Ok(ty) = &result
             && expr.id != NO_NODE_ID
         {
-            self.metadata
-                .record_expr_type(expr.id, ty.clone(), &self.subst);
+            self.metadata.record_expr_type(expr.id, ty.clone());
         }
         result.map_err(|err: SpannedTypeError| err.with_span_if_absent(expr.span))
     }
@@ -1588,7 +1739,7 @@ impl Infer {
         let receiver_ty = self.infer_expr(env, receiver)?;
         let key_ty = self.infer_expr(env, key)?;
         let output_ty = Ty::Var(self.fresh_var());
-        let args = vec![receiver_ty.clone(), key_ty.clone(), output_ty.clone()];
+        let args = [receiver_ty.clone(), key_ty.clone(), output_ty.clone()];
         let determinant_indexes = trait_dict_indexes(&trait_def);
 
         let resolved_args: Vec<Ty> = args.iter().map(|arg| self.subst.apply(arg)).collect();
@@ -1919,8 +2070,7 @@ impl Infer {
             if !scheme.constraints.is_empty() {
                 if callee.id != NO_NODE_ID {
                     let instantiated = self.instantiate_value(&scheme);
-                    self.metadata
-                        .record_symbol_type(callee.id, instantiated, &self.subst);
+                    self.metadata.record_symbol_type(callee.id, instantiated);
                 }
                 let applied = self.apply_scheme_callable(
                     env,
@@ -1983,7 +2133,7 @@ impl Infer {
                 }
                 RecordEntry::Spread(expr) => {
                     let spread_ty = self.infer_expr(env, expr)?;
-                    let tail_var = self.subst.fresh_var();
+                    let tail_var = self.fresh_ty();
                     unify(
                         &mut self.subst,
                         spread_ty.clone(),
@@ -1997,7 +2147,7 @@ impl Infer {
                         return Err(TypeError::Mismatch(
                             Ty::Record(Row {
                                 fields: vec![],
-                                tail: Box::new(self.subst.fresh_var()),
+                                tail: Box::new(self.fresh_ty()),
                             }),
                             resolved_spread,
                         )
@@ -2132,9 +2282,7 @@ impl Infer {
         span: SourceSpan,
     ) -> Result<Ty, SpannedTypeError> {
         let expected_element = expected.as_ref().and_then(array_element_ty);
-        let elt_ty = expected_element
-            .clone()
-            .unwrap_or_else(|| self.subst.fresh_var());
+        let elt_ty = expected_element.clone().unwrap_or_else(|| self.fresh_ty());
         for entry in entries {
             match entry {
                 ArrayEntry::Elem(expr) => {
@@ -2174,82 +2322,86 @@ impl Infer {
         dict_params: &mut Vec<String>,
         expected_func: Option<(Vec<FuncParam>, FuncReturn)>,
     ) -> Result<Ty, SpannedTypeError> {
-        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-        let mut param_tys = Vec::new();
-        let mut body_env = env.clone();
+        let ambient = self.current_level;
+        let (fn_ty, fn_constraints) = self.with_child_level(|this| {
+            let mut param_vars: HashMap<String, TyVar> = HashMap::new();
+            let mut param_tys = Vec::new();
+            let mut body_env = env.clone();
 
-        if let Some((expected_params, _)) = &expected_func
-            && expected_params.len() != params.len()
-        {
-            return Err(TypeError::ArityMismatch {
-                expected: expected_params.len(),
-                got: params.len(),
-            }
-            .at(body.span));
-        }
-
-        for (idx, param) in params.iter().enumerate() {
-            if !is_irrefutable_param(&param.pat, &self.variant_env) {
-                return Err(TypeError::RefutableParamPattern.at(body.span));
-            }
-            let expected_param = expected_func
-                .as_ref()
-                .and_then(|(expected_params, _)| expected_params.get(idx));
-            if let Some(expected_param) = expected_param
-                && expected_param.capability.is_mut_place() != param.mut_place
+            if let Some((expected_params, _)) = &expected_func
+                && expected_params.len() != params.len()
             {
-                return Err(TypeError::MutableFunctionCapabilityMismatch.at(body.span));
-            }
-            let p_ty = match (&param.ty, expected_param) {
-                (Some(t), Some(expected_param)) => {
-                    let annotated = self.ast_to_ty_with_vars(t, &mut param_vars)?;
-                    unify(
-                        &mut self.subst,
-                        annotated.clone(),
-                        expected_param.ty.clone(),
-                    )
-                    .map_err(|err| err.at(body.span))?;
-                    annotated
+                return Err(TypeError::ArityMismatch {
+                    expected: expected_params.len(),
+                    got: params.len(),
                 }
-                (Some(t), None) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
-                (None, Some(expected_param)) => expected_param.ty.clone(),
-                (None, None) => self.subst.fresh_var(),
+                .at(body.span));
+            }
+
+            for (idx, param) in params.iter().enumerate() {
+                if !is_irrefutable_param(&param.pat, &this.variant_env) {
+                    return Err(TypeError::RefutableParamPattern.at(body.span));
+                }
+                let expected_param = expected_func
+                    .as_ref()
+                    .and_then(|(expected_params, _)| expected_params.get(idx));
+                if let Some(expected_param) = expected_param
+                    && expected_param.capability.is_mut_place() != param.mut_place
+                {
+                    return Err(TypeError::MutableFunctionCapabilityMismatch.at(body.span));
+                }
+                let p_ty = match (&param.ty, expected_param) {
+                    (Some(t), Some(expected_param)) => {
+                        let annotated = this.ast_to_ty_with_vars(t, &mut param_vars)?;
+                        unify(
+                            &mut this.subst,
+                            annotated.clone(),
+                            expected_param.ty.clone(),
+                        )
+                        .map_err(|err| err.at(body.span))?;
+                        annotated
+                    }
+                    (Some(t), None) => this.ast_to_ty_with_vars(t, &mut param_vars)?,
+                    (None, Some(expected_param)) => expected_param.ty.clone(),
+                    (None, None) => this.fresh_ty(),
+                };
+                param_tys.push(p_ty.clone());
+                this.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
+            }
+
+            let (ret_ty, ret_capability) = match &expected_func {
+                Some((_, expected_ret)) => ((*expected_ret.ty).clone(), expected_ret.capability),
+                None => (this.fresh_ty(), ReturnCapability::Value),
             };
-            param_tys.push(p_ty.clone());
-            self.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
-        }
-
-        let (ret_ty, ret_capability) = match &expected_func {
-            Some((_, expected_ret)) => ((*expected_ret.ty).clone(), expected_ret.capability),
-            None => (self.subst.fresh_var(), ReturnCapability::Value),
-        };
-        let fn_ret = FuncReturn {
-            ty: Box::new(ret_ty.clone()),
-            capability: ret_capability,
-        };
-        let (_, fn_constraints) = self.with_pending_constraints_scope(Vec::new(), |this| {
-            let body_ty = this.with_fn_return_scope(fn_ret.clone(), |this| {
-                if expected_func.is_some() {
-                    this.infer_expr_expected(&body_env, body, ret_ty.clone())
-                } else {
-                    this.infer_expr(&body_env, body)
-                }
-            })?;
-            unify_expr_result(&mut this.subst, body_ty.clone(), ret_ty.clone())?;
-            if !matches!(this.subst.apply(&body_ty), Ty::Never) {
-                this.check_fresh_return_expr(body, &fn_ret)?;
-            }
-            Ok(())
-        })?;
-
-        let fn_ty = Ty::Func(
-            func_params_from_params(params, param_tys),
-            FuncReturn {
-                ty: Box::new(self.subst.apply(&ret_ty)),
+            let fn_ret = FuncReturn {
+                ty: Box::new(ret_ty.clone()),
                 capability: ret_capability,
-            },
-        );
-        let finalized = self.finalize_constraints(env, fn_ty, fn_constraints);
+            };
+            let (_, fn_constraints) = this.with_pending_constraints_scope(Vec::new(), |this| {
+                let body_ty = this.with_fn_return_scope(fn_ret.clone(), |this| {
+                    if expected_func.is_some() {
+                        this.infer_expr_expected(&body_env, body, ret_ty.clone())
+                    } else {
+                        this.infer_expr(&body_env, body)
+                    }
+                })?;
+                unify_expr_result(&mut this.subst, body_ty.clone(), ret_ty.clone())?;
+                if !matches!(this.subst.apply(&body_ty), Ty::Never) {
+                    this.check_fresh_return_expr(body, &fn_ret)?;
+                }
+                Ok(())
+            })?;
+
+            let fn_ty = Ty::Func(
+                func_params_from_params(params, param_tys),
+                FuncReturn {
+                    ty: Box::new(this.subst.apply(&ret_ty)),
+                    capability: ret_capability,
+                },
+            );
+            Ok((fn_ty, fn_constraints))
+        })?;
+        let finalized = self.finalize_constraints_at(env, fn_ty, fn_constraints, ambient);
         self.pending_constraints.extend(finalized.bubbled.clone());
         *dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
@@ -2350,7 +2502,7 @@ impl Infer {
                 // Build sorted field-type pairs for unification.
                 let mut field_tys: Vec<(String, Ty)> = fields
                     .iter()
-                    .map(|(field_name, _, _)| (field_name.clone(), self.subst.fresh_var()))
+                    .map(|(field_name, _, _)| (field_name.clone(), self.fresh_ty()))
                     .collect();
                 field_tys.sort_by(|(a, _), (b, _)| a.cmp(b));
 
@@ -2388,7 +2540,7 @@ impl Infer {
                 Ok(())
             }
             Pattern::List { elements, rest } => {
-                let elt_ty = self.subst.fresh_var();
+                let elt_ty = self.fresh_ty();
                 let arr_ty = Ty::App(Box::new(Ty::Con("Array".to_string())), vec![elt_ty.clone()]);
                 unify(&mut self.subst, scrutinee_ty, arr_ty.clone())?;
 
@@ -2403,7 +2555,7 @@ impl Infer {
                 Ok(())
             }
             Pattern::Tuple(pats) => {
-                let elem_tys: Vec<Ty> = pats.iter().map(|_| self.subst.fresh_var()).collect();
+                let elem_tys: Vec<Ty> = pats.iter().map(|_| self.fresh_ty()).collect();
                 unify(&mut self.subst, scrutinee_ty, Ty::Tuple(elem_tys.clone()))?;
                 for (p, t) in pats.iter().zip(elem_tys.iter()) {
                     let resolved = self.subst.apply(t);
@@ -2564,18 +2716,14 @@ impl Infer {
                     })
                     .collect::<Result<_, _>>()?;
                 field_tys.sort_by(|(a, _), (b, _)| a.cmp(b));
-                let tail = if *is_open {
-                    self.subst.fresh_var()
-                } else {
-                    Ty::Unit
-                };
+                let tail = if *is_open { self.fresh_ty() } else { Ty::Unit };
                 Ty::Record(Row {
                     fields: field_tys,
                     tail: Box::new(tail),
                 })
             }
             Type::Unit => Ty::Unit,
-            Type::Hole => self.subst.fresh_var(),
+            Type::Hole => self.fresh_ty(),
         })
     }
 
@@ -3031,31 +3179,66 @@ mod tests {
     }
 
     #[test]
-    fn generalization_ignores_quantified_env_vars_before_substitution() {
+    fn level_generalization_quantifies_child_vars_only() {
         let mut infer = Infer::new();
+        let outer = infer.subst.fresh_tyvar_at(ROOT_LEVEL);
+        let local = infer.subst.fresh_tyvar_at(ROOT_LEVEL + 1);
         let mut env = TypeEnv::new();
         env.insert(
-            "poly".to_string(),
-            EnvInfo::immutable(Scheme {
-                vars: vec![0],
-                constraints: vec![],
-                ty: Ty::Var(0),
-            }),
+            "outer".to_string(),
+            EnvInfo::immutable(Scheme::mono(Ty::Var(outer))),
         );
 
-        infer.subst.bind_ty(0, Ty::Var(1)).expect("valid alias");
+        let scheme = infer.generalize_at(
+            &env,
+            Ty::Tuple(vec![Ty::Var(outer), Ty::Var(local)]),
+            ROOT_LEVEL,
+        );
 
-        let scheme = infer.generalize(&env, Ty::Var(1));
+        assert_eq!(scheme.vars, vec![local]);
+    }
 
-        assert_eq!(scheme.vars, vec![1]);
+    #[test]
+    fn child_level_scope_restores_after_success_and_error() {
+        let mut infer = Infer::new();
+        assert_eq!(infer.current_level, ROOT_LEVEL);
+
+        let var = infer
+            .with_child_level(|infer| {
+                assert_eq!(infer.current_level, ROOT_LEVEL + 1);
+                Ok(infer.fresh_var())
+            })
+            .expect("scope should succeed");
+
+        assert_eq!(infer.current_level, ROOT_LEVEL);
+        assert_eq!(infer.subst.level_of(var), ROOT_LEVEL + 1);
+
+        let result: Result<(), SpannedTypeError> = infer.with_child_level(|infer| {
+            assert_eq!(infer.current_level, ROOT_LEVEL + 1);
+            Err(TypeError::UnboundVariable("boom".to_string()).at(SourceSpan::synthetic()))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(infer.current_level, ROOT_LEVEL);
+    }
+
+    #[test]
+    fn level_generalizable_vars_use_ambient_level() {
+        let mut infer = Infer::new();
+        let outer = infer.subst.fresh_tyvar_at(ROOT_LEVEL);
+        let inner = infer.subst.fresh_tyvar_at(ROOT_LEVEL + 1);
+        let ty = Ty::Tuple(vec![Ty::Var(outer), Ty::Var(inner)]);
+
+        assert_eq!(infer.level_generalizable_vars(&ty, ROOT_LEVEL), vec![inner]);
     }
 
     #[test]
     fn concrete_constraints_are_resolved_without_callable_dict_params() {
         let mut infer = Infer::new();
+        let var = infer.subst.fresh_tyvar_at(ROOT_LEVEL + 1);
         infer
             .subst
-            .bind_ty(0, Ty::Float)
+            .bind_ty(var, Ty::Float)
             .expect("valid concrete type");
 
         let finalized = infer.finalize_constraints(
@@ -3065,9 +3248,9 @@ mod tests {
                 value_func_return(Ty::Float),
             ),
             vec![TraitConstraint {
-                var: 0,
+                var,
                 trait_name: "Add".to_string(),
-                args: vec![Ty::Var(0)],
+                args: vec![Ty::Var(var)],
                 determinant_indexes: vec![0],
             }],
         );
@@ -3105,18 +3288,21 @@ mod tests {
 
     #[test]
     fn constraint_on_non_generalized_var_bubbles_from_function_scope() {
-        let infer = Infer::new();
+        let mut infer = Infer::new();
+        let receiver = infer.subst.fresh_tyvar_at(ROOT_LEVEL + 1);
+        let key = infer.subst.fresh_tyvar_at(ROOT_LEVEL + 1);
+        let output = infer.subst.fresh_tyvar_at(ROOT_LEVEL + 1);
         let constraint = TraitConstraint::predicate(
             "Index",
-            vec![Ty::Var(0), Ty::Var(1), Ty::Var(2)],
-            2,
+            vec![Ty::Var(receiver), Ty::Var(key), Ty::Var(output)],
+            output,
             vec![0, 1],
         );
 
         let finalized = infer.finalize_constraints(
             &TypeEnv::new(),
             Ty::Func(
-                value_func_params(vec![Ty::Var(0), Ty::Var(1)]),
+                value_func_params(vec![Ty::Var(receiver), Ty::Var(key)]),
                 value_func_return(Ty::Int),
             ),
             vec![constraint.clone()],
@@ -3125,6 +3311,49 @@ mod tests {
         assert!(finalized.owned.is_empty());
         assert_eq!(finalized.bubbled, vec![constraint]);
         assert!(finalized.scheme.constraints.is_empty());
+    }
+
+    #[test]
+    fn constraint_with_concrete_primary_and_local_args_is_owned() {
+        let mut infer = Infer::new();
+        let receiver = infer.subst.fresh_tyvar_at(ROOT_LEVEL + 1);
+        let key = infer.subst.fresh_tyvar_at(ROOT_LEVEL + 1);
+        let output = infer.subst.fresh_tyvar_at(ROOT_LEVEL + 1);
+        infer
+            .subst
+            .bind_ty(output, Ty::Con("string".to_string()))
+            .expect("valid concrete output");
+
+        let constraint = TraitConstraint::predicate(
+            "Index",
+            vec![Ty::Var(receiver), Ty::Var(key), Ty::Var(output)],
+            output,
+            vec![0, 1],
+        );
+        let finalized = infer.finalize_constraints(
+            &TypeEnv::new(),
+            Ty::Func(
+                value_func_params(vec![Ty::Var(receiver), Ty::Var(key)]),
+                value_func_return(Ty::Con("string".to_string())),
+            ),
+            vec![constraint],
+        );
+
+        assert_eq!(
+            finalized.owned,
+            vec![TraitConstraint::predicate(
+                "Index",
+                vec![
+                    Ty::Var(receiver),
+                    Ty::Var(key),
+                    Ty::Con("string".to_string())
+                ],
+                output,
+                vec![0, 1],
+            )]
+        );
+        assert!(finalized.bubbled.is_empty());
+        assert_eq!(finalized.scheme.constraints, finalized.owned);
     }
 
     #[test]
