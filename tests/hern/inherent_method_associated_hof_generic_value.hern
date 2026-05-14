@@ -1,0 +1,18 @@
+type Box('a) = Box('a)
+
+impl Box('a) {
+  fn get(self) -> 'a {
+    match self {
+      Box(value) -> value,
+    }
+  }
+}
+
+fn apply(f, x) {
+  f(x)
+}
+
+let get = Box::get;
+
+print(apply(get, Box(1)));
+print(apply(get, Box("x")));

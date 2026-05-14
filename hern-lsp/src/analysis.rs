@@ -234,6 +234,24 @@ pub(super) mod tests {
         assert!(diagnostics.get(&entry).is_some_and(Vec::is_empty));
         assert_eq!(diagnostics[&dep].len(), 1);
         assert_eq!(diagnostics[&dep][0].message, "dep failed");
+        assert_eq!(diagnostics[&dep][0].source.as_deref(), Some("hern"));
+    }
+
+    #[test]
+    fn spanless_diagnostics_have_visible_range() {
+        use diagnostics::diagnostics_from_compiler_diagnostics;
+        use hern_core::analysis::CompilerDiagnostic;
+
+        let entry = uri("file:///workspace/main.hern");
+        let diagnostics = diagnostics_from_compiler_diagnostics(
+            &entry,
+            vec![CompilerDiagnostic::error(None, "workspace failed")],
+        );
+        let diagnostic = &diagnostics[&entry][0];
+
+        assert_eq!(diagnostic.range.start, Position::new(0, 0));
+        assert_eq!(diagnostic.range.end, Position::new(0, 1));
+        assert_eq!(diagnostic.source.as_deref(), Some("hern"));
     }
 
     #[test]
@@ -1589,6 +1607,77 @@ pub(super) mod tests {
                     && message.contains("available candidates: [float].sum, [int].sum")),
             "expected candidate-rich method diagnostic, got {messages:?}"
         );
+    }
+
+    #[test]
+    fn associated_trait_method_diagnostic_reaches_lsp() {
+        let project = TestProject::new("associated-trait-method-diagnostic");
+        let source = "Functor::mapp(Some(1), fn(x) { x });\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let messages = diagnostics
+            .values()
+            .flat_map(|items| items.iter())
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        let diagnostic = diagnostics
+            .values()
+            .flat_map(|items| items.iter())
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("trait `Functor` has no method `mapp`")
+            })
+            .unwrap_or_else(|| {
+                panic!("associated trait method error should be reported, got {messages:?}")
+            });
+
+        // Character 9 is the start of `mapp` in `Functor::mapp`.
+        assert_eq!(diagnostic.range.start.character, 9);
+        assert!(diagnostic.range.end.character > diagnostic.range.start.character);
+    }
+
+    #[test]
+    fn associated_trait_target_arity_diagnostic_points_at_target() {
+        let project = TestProject::new("associated-trait-arity-diagnostic");
+        let source = "Functor(Option, string)::map(Some(1), fn(x) { x });\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics
+            .values()
+            .flat_map(|items| items.iter())
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("trait `Functor` expects 1 type argument, got 2")
+            })
+            .expect("associated trait arity error should be reported");
+
+        assert_eq!(diagnostic.range.start.character, 0);
+        assert!(diagnostic.range.end.character > diagnostic.range.start.character);
+    }
+
+    #[test]
+    fn associated_trait_missing_impl_diagnostic_points_at_target() {
+        let project = TestProject::new("associated-trait-missing-impl-diagnostic");
+        let source = "Functor(Set)::map(Set::new(), fn(x) { x });\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics
+            .values()
+            .flat_map(|items| items.iter())
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("trait `Functor` is not implemented for `Set`")
+            })
+            .expect("associated trait missing impl error should be reported");
+
+        assert_eq!(diagnostic.range.start.character, 0);
+        assert!(diagnostic.range.end.character > diagnostic.range.start.character);
     }
 
     #[test]

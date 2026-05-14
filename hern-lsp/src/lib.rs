@@ -35,7 +35,10 @@ use lsp_types::{
     WorkspaceSymbolResponse,
 };
 use serde::de::DeserializeOwned;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+const MAX_VALIDATIONS_PER_FLUSH: usize = 4;
 /// Decode request params or immediately send an `InvalidParams` response and return.
 /// Requires `conn` and `req` to be in scope.
 macro_rules! decode_params {
@@ -124,12 +127,11 @@ fn main_loop(
     conn: &Connection,
     state: &mut ServerState,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-    let mut pending_validations = HashSet::new();
+    let mut pending_validations = PendingValidations::default();
     loop {
-        match conn
-            .receiver
-            .recv_timeout(state.config.diagnostics_debounce)
-        {
+        match conn.receiver.recv_timeout(
+            pending_validations.timeout_until_next_flush(state.config.diagnostics_debounce),
+        ) {
             Ok(msg) => match msg {
                 Message::Request(req) => {
                     if conn.handle_shutdown(&req)? {
@@ -139,6 +141,9 @@ fn main_loop(
                 }
                 Message::Notification(notif) => {
                     handle_notification(conn, state, notif, &mut pending_validations)?;
+                    if pending_validations.should_flush(state.config.diagnostics_debounce) {
+                        flush_pending_validations(conn, state, &mut pending_validations)?;
+                    }
                 }
                 Message::Response(_) => {}
             },
@@ -359,7 +364,7 @@ fn handle_notification(
     conn: &Connection,
     state: &mut ServerState,
     notif: lsp_server::Notification,
-    pending_validations: &mut HashSet<Uri>,
+    pending_validations: &mut PendingValidations,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     match notif.method.as_str() {
         DidOpenTextDocument::METHOD => {
@@ -440,8 +445,70 @@ fn handle_notification(
     Ok(())
 }
 
+#[derive(Default)]
+struct PendingValidations {
+    entries: HashSet<Uri>,
+    recent_first: VecDeque<Uri>,
+    first_queued_at: Option<Instant>,
+}
+
+impl PendingValidations {
+    fn insert(&mut self, uri: Uri) {
+        if self.entries.is_empty() {
+            self.first_queued_at = Some(Instant::now());
+        }
+        self.entries.insert(uri.clone());
+        self.recent_first.retain(|existing| existing != &uri);
+        self.recent_first.push_front(uri);
+    }
+
+    fn extend(&mut self, uris: impl IntoIterator<Item = Uri>) {
+        for uri in uris {
+            self.insert(uri);
+        }
+    }
+
+    fn remove(&mut self, uri: &Uri) {
+        self.entries.remove(uri);
+        self.recent_first.retain(|existing| existing != uri);
+        if self.entries.is_empty() {
+            self.first_queued_at = None;
+        }
+    }
+
+    fn should_flush(&self, debounce: Duration) -> bool {
+        self.first_queued_at
+            .is_some_and(|queued_at| queued_at.elapsed() >= debounce)
+    }
+
+    fn timeout_until_next_flush(&self, debounce: Duration) -> Duration {
+        let Some(queued_at) = self.first_queued_at else {
+            return debounce;
+        };
+        debounce.saturating_sub(queued_at.elapsed())
+    }
+
+    fn drain_next_batch(&mut self, max: usize) -> Vec<Uri> {
+        let mut batch = Vec::new();
+        while batch.len() < max {
+            let Some(uri) = self.recent_first.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&uri) {
+                batch.push(uri);
+            }
+        }
+        if self.entries.is_empty() {
+            self.first_queued_at = None;
+        } else {
+            self.first_queued_at = Some(Instant::now());
+        }
+        batch
+    }
+}
+
 fn schedule_dependent_validations(
-    pending_validations: &mut HashSet<Uri>,
+    pending_validations: &mut PendingValidations,
     changed_uri: &Uri,
     affected_entries: HashSet<Uri>,
 ) {
@@ -455,9 +522,9 @@ fn schedule_dependent_validations(
 fn flush_pending_validations(
     conn: &Connection,
     state: &mut ServerState,
-    pending_validations: &mut HashSet<Uri>,
+    pending_validations: &mut PendingValidations,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-    let uris: Vec<_> = pending_validations.drain().collect();
+    let uris = pending_validations.drain_next_batch(MAX_VALIDATIONS_PER_FLUSH);
     for uri in uris {
         publish_diagnostics(conn, state, uri)?;
     }
@@ -485,6 +552,7 @@ fn clear_entry_diagnostics(
         .map(|diagnostics| diagnostics.into_keys().collect())
         .unwrap_or_default();
     state.remove_entry_tracking(entry_uri);
+    // Clear the entry's own URI even when no per-URI diagnostics were stored.
     affected.insert(entry_uri.clone());
     for uri in affected {
         send_diagnostics(conn, uri.clone(), combined_diagnostics_for_uri(state, &uri))?;
@@ -578,7 +646,7 @@ mod tests {
     fn opening_dependency_schedules_dependent_entries_but_not_opened_uri() {
         let dep = uri("file:///workspace/dep.hern");
         let entry = uri("file:///workspace/main.hern");
-        let mut pending = HashSet::new();
+        let mut pending = PendingValidations::default();
 
         schedule_dependent_validations(
             &mut pending,
@@ -586,8 +654,24 @@ mod tests {
             HashSet::from([dep.clone(), entry.clone()]),
         );
 
-        assert!(pending.contains(&entry));
-        assert!(!pending.contains(&dep));
+        assert!(pending.entries.contains(&entry));
+        assert!(!pending.entries.contains(&dep));
+    }
+
+    #[test]
+    fn pending_validations_flush_most_recent_entries_first() {
+        let first = uri("file:///workspace/first.hern");
+        let second = uri("file:///workspace/second.hern");
+        let third = uri("file:///workspace/third.hern");
+        let mut pending = PendingValidations::default();
+
+        pending.insert(first.clone());
+        pending.insert(second.clone());
+        pending.insert(third.clone());
+        let batch = pending.drain_next_batch(2);
+
+        assert_eq!(batch, vec![third, second]);
+        assert!(pending.entries.contains(&first));
     }
 
     #[test]

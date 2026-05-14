@@ -164,7 +164,7 @@ fn resolve_concrete_from_args(
     )
 }
 
-fn resolve_concrete_from_args_unifying(
+pub(super) fn resolve_concrete_from_args_unifying(
     trait_name: &str,
     args: &[Ty],
     determinant_indexes: &[usize],

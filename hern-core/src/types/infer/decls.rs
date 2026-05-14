@@ -1,6 +1,61 @@
 use super::*;
 
 impl Infer {
+    pub(super) fn validate_type_trait_name_collisions(
+        &self,
+        seed_stmts: &[Stmt],
+        stmts: &[Stmt],
+    ) -> Result<(), SpannedTypeError> {
+        let mut in_scope_type_names = self.declared_types.clone();
+        let mut in_scope_trait_names: HashSet<String> = self.trait_env.keys().cloned().collect();
+        for stmt in seed_stmts {
+            match stmt {
+                Stmt::Type(td) => {
+                    in_scope_type_names.insert(td.name.clone());
+                }
+                Stmt::TypeAlias { name, .. } => {
+                    in_scope_type_names.insert(name.clone());
+                }
+                Stmt::Trait(td) => {
+                    in_scope_trait_names.insert(td.name.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let mut type_names: HashMap<&str, SourceSpan> = HashMap::new();
+        for stmt in stmts {
+            match stmt {
+                Stmt::Type(td) => {
+                    if in_scope_trait_names.contains(&td.name) {
+                        return Err(
+                            TypeError::DuplicateTypeTraitName(td.name.clone()).at(td.name_span)
+                        );
+                    }
+                    type_names.entry(&td.name).or_insert(td.name_span);
+                }
+                Stmt::TypeAlias {
+                    name, name_span, ..
+                } => {
+                    if in_scope_trait_names.contains(name) {
+                        return Err(TypeError::DuplicateTypeTraitName(name.clone()).at(*name_span));
+                    }
+                    type_names.entry(name).or_insert(*name_span);
+                }
+                _ => {}
+            }
+        }
+        for stmt in stmts {
+            let Stmt::Trait(td) = stmt else {
+                continue;
+            };
+            if in_scope_type_names.contains(&td.name) || type_names.contains_key(td.name.as_str()) {
+                return Err(TypeError::DuplicateTypeTraitName(td.name.clone()).at(td.name_span));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn register_type_declarations<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
         for stmt in stmts {
             match stmt {

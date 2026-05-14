@@ -60,10 +60,16 @@ pub struct LoadedModuleGraph {
 
 #[derive(Clone, Default)]
 pub struct ModuleEnv {
+    types: HashMap<String, EnvType>,
     traits: HashMap<String, EnvTrait>,
     ops: HashMap<String, EnvOp>,
     impls: HashMap<ImplKey, EnvImpl>,
     inherent_impls: HashMap<String, EnvInherentImpl>,
+}
+
+#[derive(Clone)]
+struct EnvType {
+    owner: String,
 }
 
 #[derive(Clone)]
@@ -99,6 +105,7 @@ struct ImplKey {
 }
 
 struct InferScope {
+    type_names: HashSet<String>,
     traits: HashMap<String, TraitDef>,
     ops: HashMap<String, String>,
     inherent_methods: HashMap<String, HashMap<String, InherentMethodScheme>>,
@@ -690,6 +697,7 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
                 }
             };
         let infer_scope = module_env.to_infer_scope();
+        infer.set_type_scope(infer_scope.type_names);
         infer.set_trait_scope(infer_scope.traits, infer_scope.ops);
         infer.set_inherent_scope(infer_scope.inherent_methods);
         infer.set_known_impl_dicts(module_env.all_dict_names());
@@ -802,14 +810,37 @@ fn export_schemes_from_program(program: &Program, env: &TypeEnv) -> HashMap<Stri
 }
 
 pub fn collect_imports_in_program(program: &Program) -> Vec<String> {
+    let mut imports = collect_imports_with_spans(program)
+        .into_iter()
+        .map(|import| import.module)
+        .collect::<Vec<_>>();
+    imports.sort();
+    imports.dedup();
+    imports
+}
+
+struct ImportRef {
+    module: String,
+    span: SourceSpan,
+}
+
+fn collect_imports_with_spans(program: &Program) -> Vec<ImportRef> {
     let mut imports = Vec::new();
     walk_program_exprs(program, &mut |expr| {
         if let ExprKind::Import(name) = &expr.kind {
-            imports.push(name.clone());
+            imports.push(ImportRef {
+                module: name.clone(),
+                span: expr.span,
+            });
         }
     });
-    imports.sort();
-    imports.dedup();
+    imports.sort_by(|a, b| {
+        a.module
+            .cmp(&b.module)
+            .then(a.span.start_line.cmp(&b.span.start_line))
+            .then(a.span.start_col.cmp(&b.span.start_col))
+    });
+    imports.dedup_by(|a, b| a.module == b.module);
     imports
 }
 
@@ -831,6 +862,7 @@ impl ModuleEnv {
             .map(|(target_name, entry)| (target_name.clone(), entry.methods.clone()))
             .collect();
         InferScope {
+            type_names: self.types.keys().cloned().collect(),
             traits,
             ops,
             inherent_methods: inherent,
@@ -1342,18 +1374,18 @@ fn build_module_env(
         )
     })?;
     let mut env = prelude_env.clone();
-    for import in collect_imports_in_program(program) {
-        let imported_env = module_envs.get(&import).ok_or_else(|| {
+    for import in collect_imports_with_spans(program) {
+        let imported_env = module_envs.get(&import.module).ok_or_else(|| {
             CompilerDiagnostic::error_in(
                 diagnostic_source_for_module(graph, name),
                 None,
                 format!(
                     "internal error: imported module `{}` not inferred yet",
-                    import
+                    import.module
                 ),
             )
         })?;
-        merge_module_env(&mut env, imported_env)?;
+        merge_module_env(&mut env, imported_env, Some(import.span))?;
     }
     add_own_module_env(&mut env, program, name)
         .map_err(|err| err.with_source_if_absent(diagnostic_source_for_module(graph, name)))?;
@@ -1369,9 +1401,16 @@ fn module_env_from_program(
     Ok(env)
 }
 
-fn merge_module_env(dst: &mut ModuleEnv, src: &ModuleEnv) -> Result<(), CompilerDiagnostic> {
+fn merge_module_env(
+    dst: &mut ModuleEnv,
+    src: &ModuleEnv,
+    import_span: Option<SourceSpan>,
+) -> Result<(), CompilerDiagnostic> {
+    for (name, entry) in &src.types {
+        add_type_env(dst, name.clone(), entry.clone(), true, import_span)?;
+    }
     for (name, entry) in &src.traits {
-        add_trait_env(dst, name.clone(), entry.clone(), true)?;
+        add_trait_env(dst, name.clone(), entry.clone(), true, import_span)?;
     }
     for (op, entry) in &src.ops {
         add_op_env(dst, op.clone(), entry.clone(), true)?;
@@ -1392,6 +1431,32 @@ fn add_own_module_env(
 ) -> Result<(), CompilerDiagnostic> {
     for stmt in program.stmts.iter() {
         match stmt {
+            Stmt::Type(td) => {
+                add_type_env(
+                    env,
+                    td.name.clone(),
+                    EnvType {
+                        owner: owner.to_string(),
+                    },
+                    false,
+                    Some(td.name_span),
+                )
+                .map_err(|err| err.with_span_if_absent(td.name_span))?;
+            }
+            Stmt::TypeAlias {
+                name, name_span, ..
+            } => {
+                add_type_env(
+                    env,
+                    name.clone(),
+                    EnvType {
+                        owner: owner.to_string(),
+                    },
+                    false,
+                    Some(*name_span),
+                )
+                .map_err(|err| err.with_span_if_absent(*name_span))?;
+            }
             Stmt::Trait(td) => {
                 add_trait_env(
                     env,
@@ -1401,8 +1466,9 @@ fn add_own_module_env(
                         owner: owner.to_string(),
                     },
                     false,
+                    Some(td.name_span),
                 )
-                .map_err(|err| err.with_span_if_absent(td.span))?;
+                .map_err(|err| err.with_span_if_absent(td.name_span))?;
                 for method in &td.methods {
                     if method.fixity.is_some() {
                         add_op_env(
@@ -1442,7 +1508,7 @@ fn add_own_module_env(
                     .map(|index| trait_impl_arg_keys_from_ast(&[id.trait_args[*index].clone()]))
                     .collect::<Result<Vec<_>, _>>()
                     .map(|keys| keys.into_iter().flatten().collect::<Vec<_>>())
-                    .map_err(|err| CompilerDiagnostic::error(None, err.to_string()))?;
+                    .map_err(|err| CompilerDiagnostic::error(Some(id.span), err.to_string()))?;
                 let key = ImplKey {
                     trait_name: id.trait_name.clone(),
                     args: arg_keys.clone(),
@@ -1456,7 +1522,7 @@ fn add_own_module_env(
                             &id.trait_args,
                             &indexes,
                         )
-                        .map_err(|err| CompilerDiagnostic::error(None, err.to_string()))?,
+                        .map_err(|err| CompilerDiagnostic::error(Some(id.span), err.to_string()))?,
                         scheme: None,
                         owner: owner.to_string(),
                     },
@@ -1466,7 +1532,7 @@ fn add_own_module_env(
             }
             Stmt::InherentImpl(id) => {
                 let target = module_inherent_impl_target_key(&id.target)
-                    .map_err(|err| CompilerDiagnostic::error(None, err.to_string()))?;
+                    .map_err(|err| CompilerDiagnostic::error(Some(id.span), err.to_string()))?;
                 add_inherent_impl_env(
                     env,
                     target.clone(),
@@ -1524,12 +1590,36 @@ fn module_inherent_impl_generic_target_name(target: &crate::ast::Type) -> String
     }
 }
 
+fn add_type_env(
+    env: &mut ModuleEnv,
+    name: String,
+    entry: EnvType,
+    _allow_same_owner: bool,
+    span: Option<SourceSpan>,
+) -> Result<(), CompilerDiagnostic> {
+    if let Some(existing) = env.traits.get(&name) {
+        return Err(CompilerDiagnostic::error(
+            span,
+            type_trait_collision_message(&name, "type", "trait", &existing.owner),
+        ));
+    }
+    env.types.entry(name).or_insert(entry);
+    Ok(())
+}
+
 fn add_trait_env(
     env: &mut ModuleEnv,
     name: String,
     entry: EnvTrait,
     allow_same_owner: bool,
+    span: Option<SourceSpan>,
 ) -> Result<(), CompilerDiagnostic> {
+    if let Some(existing) = env.types.get(&name) {
+        return Err(CompilerDiagnostic::error(
+            span,
+            type_trait_collision_message(&name, "trait", "type", &existing.owner),
+        ));
+    }
     if let Some(existing) = env.traits.get(&name)
         && (!allow_same_owner || existing.owner != entry.owner)
     {
@@ -1540,6 +1630,29 @@ fn add_trait_env(
     }
     env.traits.entry(name).or_insert(entry);
     Ok(())
+}
+
+fn type_trait_collision_message(
+    name: &str,
+    new_kind: &str,
+    existing_kind: &str,
+    existing_owner: &str,
+) -> String {
+    format!(
+        "{} `{}` collides with {} `{}` from {}",
+        new_kind,
+        name,
+        existing_kind,
+        name,
+        owner_for_diagnostic(existing_owner)
+    )
+}
+
+fn owner_for_diagnostic(owner: &str) -> String {
+    match owner {
+        PRELUDE_OWNER => "prelude".to_string(),
+        other => format!("module `{}`", other),
+    }
 }
 
 fn add_op_env(

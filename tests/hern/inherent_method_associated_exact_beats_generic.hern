@@ -1,0 +1,12 @@
+type Box('a) = Box('a)
+
+impl Box('a) {
+  fn tag(self) { "generic" }
+}
+
+impl Box(int) {
+  fn tag(self) { "int" }
+}
+
+print(Box(int)::tag(Box(1)));
+print(Box(string)::tag(Box("x")));

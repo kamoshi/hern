@@ -1,0 +1,9 @@
+let map_option = Functor(Option)::map;
+let map_array = Functor(Array)::map;
+
+let a = map_option(Some(2), fn(x) { x + 3 });
+let b = map_array([2, 3], fn(x) { x + 4 });
+
+print(a.unwrap_or(0));
+print(b[0]);
+print(b[1]);

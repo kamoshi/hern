@@ -1,0 +1,5 @@
+#![no_implicit_prelude]
+
+let dep = import "type_trait_imported_trait_dep";
+
+type Clash = Clash(int)

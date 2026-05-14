@@ -286,6 +286,15 @@ pub enum ResolvedCallee {
 }
 
 #[derive(Debug, Clone)]
+pub enum AssociatedAccessResolution {
+    Inherent(ResolvedCallee),
+    TraitMethod {
+        method: String,
+        dict: Option<DictRef>,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct ArgWrapper {
     pub dict_args: Vec<DictRef>,
     pub pending_dict_args: Vec<PendingDictArg>,
@@ -656,6 +665,7 @@ pub enum ExprKind {
         target_span: SourceSpan,
         member: String,
         member_span: SourceSpan,
+        resolution: Option<AssociatedAccessResolution>,
     },
     Import(String),
     Lambda {

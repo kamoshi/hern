@@ -9,10 +9,302 @@ pub(super) struct AppliedCall {
 pub(super) struct AppliedSchemeCall {
     pub(super) ret_ty: Ty,
     pub(super) arg_tys: Vec<Ty>,
-    pub(super) fresh_return: bool,
+}
+
+pub(super) struct AssociatedInherentMethodInstance {
+    pub(super) callable_ty: Ty,
+    pub(super) constraints: Vec<TraitConstraint>,
+    pub(super) value_ty: Ty,
+    pub(super) resolved_callee: ResolvedCallee,
+}
+
+pub(super) struct AssociatedTraitMethodInstance {
+    pub(super) callable_ty: Ty,
+    pub(super) constraints: Vec<TraitConstraint>,
+    pub(super) value_ty: Ty,
+    pub(super) dict: Option<DictRef>,
+    pub(super) method: String,
+}
+
+pub(super) struct AssociatedTraitMethodLookup {
+    pub(super) trait_def: TraitDef,
+    pub(super) method: TraitMethod,
+    pub(super) explicit_args: Option<Vec<Type>>,
 }
 
 impl Infer {
+    pub(super) fn associated_inherent_method(
+        &self,
+        target: &Type,
+        target_span: SourceSpan,
+        member: &str,
+        member_span: SourceSpan,
+    ) -> Result<(String, InherentMethodInfo), SpannedTypeError> {
+        let target_names = inherent_impl_target_keys_from_ast(target, &self.declared_types)
+            .map_err(|err| err.at(target_span))?;
+        for target_name in &target_names {
+            let method_info = self
+                .inherent_methods
+                .get(target_name)
+                .and_then(|methods| methods.get(member))
+                .or_else(|| {
+                    self.scoped_inherent_methods
+                        .get(target_name)
+                        .and_then(|methods| methods.get(member))
+                })
+                .cloned();
+            if let Some(method_info) = method_info {
+                return Ok((target_name.clone(), method_info));
+            }
+        }
+        Err(TypeError::UnknownAssociatedFunction {
+            target: target_names[0].clone(),
+            function: member.to_string(),
+        }
+        .at(member_span))
+    }
+
+    pub(super) fn instantiate_associated_inherent_method(
+        &mut self,
+        target: &Type,
+        target_span: SourceSpan,
+        method_info: &InherentMethodInfo,
+    ) -> Result<AssociatedInherentMethodInstance, SpannedTypeError> {
+        let instantiated = self.instantiate_scheme(&method_info.scheme);
+        let mut callable_ty = instantiated.ty;
+        let mut constraints = instantiated.constraints;
+        if let Ty::Qualified(existing, inner) = callable_ty {
+            constraints.extend(existing);
+            callable_ty = *inner;
+        }
+        if method_info.has_receiver && matches!(target, Type::App(..)) {
+            // Bare `Type::method` stays generic; its receiver is pinned when the
+            // function value is called. Explicit `Type(Args)::method` should
+            // specialize the receiver immediately.
+            let receiver_ty = self
+                .ast_to_ty_with_vars(target, &mut HashMap::new())
+                .map_err(|err| err.at(target_span))?;
+            let Some(receiver_param) = func_receiver_param(&callable_ty) else {
+                return Err(TypeError::NotAFunction(callable_ty).at(target_span));
+            };
+            unify(&mut self.subst, receiver_param, receiver_ty)
+                .map_err(|err| err.at(target_span))?;
+            callable_ty = self.subst.apply(&callable_ty);
+        }
+        let value_ty = if constraints.is_empty() {
+            callable_ty.clone()
+        } else {
+            Ty::Qualified(constraints.clone(), Box::new(callable_ty.clone()))
+        };
+        Ok(AssociatedInherentMethodInstance {
+            callable_ty,
+            constraints,
+            value_ty,
+            resolved_callee: method_info.resolved_callee.clone(),
+        })
+    }
+
+    pub(super) fn associated_trait_method(
+        &self,
+        target: &Type,
+        member: &str,
+        member_span: SourceSpan,
+    ) -> Result<Option<AssociatedTraitMethodLookup>, SpannedTypeError> {
+        let Type::Ident(trait_name) = target else {
+            if let Type::App(con, args) = target
+                && let Type::Ident(trait_name) = con.as_ref()
+                && let Some(trait_def) = self.trait_env.get(trait_name).cloned()
+            {
+                let method = trait_def
+                    .methods
+                    .iter()
+                    .find(|method| method.name == member)
+                    .ok_or_else(|| {
+                        TypeError::UnknownTraitMethod {
+                            trait_name: trait_name.clone(),
+                            method: member.to_string(),
+                        }
+                        .at(member_span)
+                    })?
+                    .clone();
+                return Ok(Some(AssociatedTraitMethodLookup {
+                    trait_def,
+                    method,
+                    explicit_args: Some(args.clone()),
+                }));
+            }
+            return Ok(None);
+        };
+        let Some(trait_def) = self.trait_env.get(trait_name).cloned() else {
+            return Ok(None);
+        };
+        let method = trait_def
+            .methods
+            .iter()
+            .find(|method| method.name == member)
+            .ok_or_else(|| {
+                TypeError::UnknownTraitMethod {
+                    trait_name: trait_name.clone(),
+                    method: member.to_string(),
+                }
+                .at(member_span)
+            })?
+            .clone();
+        Ok(Some(AssociatedTraitMethodLookup {
+            trait_def,
+            method,
+            explicit_args: None,
+        }))
+    }
+
+    pub(super) fn instantiate_associated_trait_method(
+        &mut self,
+        env: &TypeEnv,
+        trait_def: &TraitDef,
+        method: &TraitMethod,
+        explicit_args: Option<&[Type]>,
+        target_span: SourceSpan,
+    ) -> Result<AssociatedTraitMethodInstance, SpannedTypeError> {
+        let mut param_vars = HashMap::new();
+        let trait_arg_tys = if let Some(args) = explicit_args {
+            if args.len() != trait_def.params.len() {
+                return Err(TypeError::TraitArityMismatch {
+                    trait_name: trait_def.name.clone(),
+                    expected: trait_def.params.len(),
+                    got: args.len(),
+                }
+                .at(target_span));
+            }
+            trait_def
+                .params
+                .iter()
+                .zip(args)
+                .map(|(param, arg)| {
+                    let ty = self.ast_to_ty_with_vars(arg, &mut param_vars)?;
+                    if let Ty::Var(var) = ty {
+                        param_vars.insert(param.clone(), var);
+                    }
+                    Ok(ty)
+                })
+                .collect::<Result<Vec<_>, TypeError>>()
+                .map_err(|err| err.at(target_span))?
+        } else {
+            trait_def
+                .params
+                .iter()
+                .map(|param| {
+                    let var = self.fresh_var();
+                    param_vars.insert(param.clone(), var);
+                    Ty::Var(var)
+                })
+                .collect()
+        };
+
+        let method_param_types = if let Some(args) = explicit_args {
+            method
+                .params
+                .iter()
+                .map(|(_, ty)| {
+                    trait_def
+                        .params
+                        .iter()
+                        .zip(args)
+                        .fold(ty.clone(), |acc, (param, arg)| {
+                            subst_hkt_param(&acc, param, arg)
+                        })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            method
+                .params
+                .iter()
+                .map(|(_, ty)| ty.clone())
+                .collect::<Vec<_>>()
+        };
+        let method_ret_type = if let Some(args) = explicit_args {
+            trait_def
+                .params
+                .iter()
+                .zip(args)
+                .fold(method.ret_type.clone(), |acc, (param, arg)| {
+                    subst_hkt_param(&acc, param, arg)
+                })
+        } else {
+            method.ret_type.clone()
+        };
+
+        let method_param_tys = method_param_types
+            .iter()
+            .map(|ty| self.ast_to_ty_with_vars(ty, &mut param_vars))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.at(target_span))?;
+        let ret_ty = self
+            .ast_to_ty_with_vars(&method_ret_type, &mut param_vars)
+            .map_err(|err| err.at(target_span))?;
+        let callable_ty = Ty::Func(
+            value_func_params(method_param_tys),
+            value_func_return(ret_ty),
+        );
+        let determinant_indexes = trait_dict_indexes(trait_def);
+        let dict = if explicit_args.is_some() {
+            Some(
+                resolve_concrete_from_args_unifying(
+                    &trait_def.name,
+                    &trait_arg_tys,
+                    &determinant_indexes,
+                    env,
+                    &self.known_impl_dicts,
+                    &self.known_impl_schemes,
+                    &mut self.subst,
+                )
+                .ok_or_else(|| {
+                    TypeError::MissingTraitImpl {
+                        trait_name: trait_def.name.clone(),
+                        impl_target: trait_arg_tys
+                            .iter()
+                            .map(|ty| ty.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    }
+                    .at(target_span)
+                })?,
+            )
+        } else {
+            None
+        };
+        let constraints = if dict.is_none() {
+            let var = primary_trait_var(&trait_arg_tys, &determinant_indexes)
+                .or_else(|| trait_arg_tys.iter().find_map(first_ty_var))
+                .ok_or_else(|| {
+                    TypeError::UnresolvedTrait {
+                        context: "trait method value".to_string(),
+                        trait_name: trait_def.name.clone(),
+                    }
+                    .at(target_span)
+                })?;
+            vec![TraitConstraint::predicate(
+                &trait_def.name,
+                trait_arg_tys,
+                var,
+                determinant_indexes,
+            )]
+        } else {
+            Vec::new()
+        };
+        let value_ty = if constraints.is_empty() {
+            callable_ty.clone()
+        } else {
+            Ty::Qualified(constraints.clone(), Box::new(callable_ty.clone()))
+        };
+        Ok(AssociatedTraitMethodInstance {
+            callable_ty,
+            constraints,
+            value_ty,
+            dict,
+            method: method.name.clone(),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_multi_param_trait_dispatch(
         &mut self,
@@ -556,58 +848,31 @@ impl Infer {
         dict_args: &mut Vec<DictRef>,
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<Ty, SpannedTypeError> {
-        let target_name = inherent_impl_target_key_from_ast(target, &self.declared_types)
-            .map_err(|err| err.at(target_span))?;
-        let method_info = self
-            .inherent_methods
-            .get(&target_name)
-            .and_then(|methods| methods.get(member))
-            .or_else(|| {
-                self.scoped_inherent_methods
-                    .get(&target_name)
-                    .and_then(|methods| methods.get(member))
-            })
-            .cloned()
-            .ok_or_else(|| {
-                TypeError::UnknownAssociatedFunction {
-                    target: target_name.clone(),
-                    function: member.to_string(),
-                }
-                .at(member_span)
-            })?;
-        let method_ty = self.instantiate_value(&method_info.scheme);
-        self.record_symbol_type(callee_id, method_ty.clone());
+        let (_target_name, method_info) =
+            self.associated_inherent_method(target, target_span, member, member_span)?;
+        let instance =
+            self.instantiate_associated_inherent_method(target, target_span, &method_info)?;
+        self.record_symbol_type(callee_id, instance.value_ty.clone());
 
-        if method_info.has_receiver {
-            return Err(TypeError::MethodRequiresReceiver {
-                target: target_name,
-                method: member.to_string(),
-            }
-            .at(member_span));
-        }
-
-        let applied = self.apply_scheme_callable(
+        let param_capabilities = match &instance.callable_ty {
+            Ty::Func(params, _) => func_param_capabilities(params),
+            _ => Vec::new(),
+        };
+        let applied = self.apply_callable_type(
             env,
             args,
             arg_wrappers,
-            &method_info.scheme,
+            instance.callable_ty.clone(),
+            instance.constraints,
             Vec::new(),
+            param_capabilities,
             0,
+            member_span,
             dict_args,
             pending_dict_args,
         )?;
-        let return_capability = func_return_capability(&method_info.scheme.ty);
-        self.record_symbol_type(
-            callee_id,
-            Ty::Func(
-                expected_func_params(&method_ty, applied.arg_tys),
-                FuncReturn {
-                    ty: Box::new(applied.ret_ty.clone()),
-                    capability: return_capability,
-                },
-            ),
-        );
-        *resolved_callee = Some(method_info.resolved_callee);
+        self.record_symbol_type(callee_id, applied.call_ty);
+        *resolved_callee = Some(instance.resolved_callee);
         if applied.fresh_return && call_expr_id != NO_NODE_ID {
             self.metadata.mark_fresh_place(call_expr_id);
         }
@@ -1037,8 +1302,9 @@ impl Infer {
             {
                 return Err(TypeError::MutableFunctionCapabilityMismatch.at(arg.span));
             }
-            let mut arg_ty = self.subst.apply(&inferred);
-            let wrapper = if let Ty::Qualified(constraints, inner) = arg_ty {
+            let (constraints, inner) = split_qualified(inferred);
+            let arg_ty = self.subst.apply(&inner);
+            let wrapper = if !constraints.is_empty() {
                 let mut wrapper = ArgWrapper {
                     dict_args: Vec::new(),
                     pending_dict_args: Vec::new(),
@@ -1054,7 +1320,6 @@ impl Infer {
                     &mut self.subst,
                 )
                 .map_err(|e| e.at(arg.span))?;
-                arg_ty = *inner;
                 Some(wrapper)
             } else {
                 None
@@ -1097,8 +1362,9 @@ impl Infer {
             {
                 return Err(TypeError::MutableFunctionCapabilityMismatch.at(arg.span));
             }
-            let mut arg_ty = self.subst.apply(&inferred);
-            let wrapper = if let Ty::Qualified(constraints, inner) = arg_ty {
+            let (constraints, inner) = split_qualified(inferred);
+            let arg_ty = self.subst.apply(&inner);
+            let wrapper = if !constraints.is_empty() {
                 let mut wrapper = ArgWrapper {
                     dict_args: Vec::new(),
                     pending_dict_args: Vec::new(),
@@ -1114,7 +1380,6 @@ impl Infer {
                     &mut self.subst,
                 )
                 .map_err(|e| e.at(arg.span))?;
-                arg_ty = *inner;
                 Some(wrapper)
             } else {
                 None
@@ -1148,7 +1413,6 @@ impl Infer {
             Ty::Func(params, _) => params.clone(),
             _ => Vec::new(),
         };
-        let fresh_return = func_return_capability(&instantiated.ty) == ReturnCapability::FreshPlace;
         let mut arg_tys = leading_arg_tys;
         for (idx, leading_ty) in arg_tys.iter().enumerate() {
             if let Some(expected_param) = expected_params.get(idx) {
@@ -1188,7 +1452,6 @@ impl Infer {
         Ok(AppliedSchemeCall {
             ret_ty: self.subst.apply(&ret_ty),
             arg_tys,
-            fresh_return,
         })
     }
 
@@ -1317,6 +1580,21 @@ fn scheme_return_ty(scheme: &Scheme) -> Option<Ty> {
     match &scheme.ty {
         Ty::Func(_, ret) => Some((*ret.ty).clone()),
         _ => None,
+    }
+}
+
+fn func_receiver_param(ty: &Ty) -> Option<Ty> {
+    match ty {
+        Ty::Func(params, _) => params.first().map(|param| param.ty.clone()),
+        Ty::Qualified(_, inner) => func_receiver_param(inner),
+        _ => None,
+    }
+}
+
+fn split_qualified(ty: Ty) -> (Vec<TraitConstraint>, Ty) {
+    match ty {
+        Ty::Qualified(constraints, inner) => (constraints, *inner),
+        other => (Vec::new(), other),
     }
 }
 

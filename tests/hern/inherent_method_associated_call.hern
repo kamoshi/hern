@@ -1,0 +1,26 @@
+type Foo = Foo(int)
+type Baz = Baz(int)
+
+impl Foo {
+  fn bar(self, baz: Baz) {
+    match self {
+      Foo(n) -> match baz {
+        Baz(m) -> n + m,
+      },
+    }
+  }
+
+  fn value(self) {
+    match self {
+      Foo(n) -> n,
+    }
+  }
+}
+
+let foo = Foo(3);
+print(foo.bar(Baz(4)));
+print(Foo::bar(foo, Baz(5)));
+
+let values = [Foo(10), Foo(20), Foo(30)].map(Foo::value);
+print(values[0]);
+print(values[2]);

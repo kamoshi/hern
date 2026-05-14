@@ -1,0 +1,23 @@
+type Foo('a, 'b) = Foo(#{ left: 'a, right: 'b })
+
+impl Foo('a, 'b) {
+  fn right(self) -> 'b {
+    match self {
+      Foo(parts) -> parts.right,
+    }
+  }
+
+  fn replace_right(self, right: 'b) -> Foo('a, 'b) {
+    match self {
+      Foo(parts) -> Foo(#{ left: parts.left, right }),
+    }
+  }
+}
+
+let foo = Foo(#{ left: 1, right: "old" });
+print(Foo(int, string)::right(foo));
+print(Foo(int, string)::right(Foo(int, string)::replace_right(foo, "new")));
+
+let rights = [Foo(#{ left: 1, right: "a" }), Foo(#{ left: 2, right: "b" })].map(Foo(int, string)::right);
+print(rights[0]);
+print(rights[1]);

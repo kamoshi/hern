@@ -56,6 +56,7 @@ pub enum TypeError {
         trait_name: String,
         method: String,
     },
+    DuplicateTypeTraitName(String),
     ExtraTraitMethod {
         trait_name: String,
         method: String,
@@ -305,8 +306,11 @@ impl fmt::Display for TypeError {
                 got,
             } => write!(
                 f,
-                "trait `{}` expects {} type arguments, got {}",
-                trait_name, expected, got
+                "trait `{}` expects {} type argument{}, got {}",
+                trait_name,
+                expected,
+                if *expected == 1 { "" } else { "s" },
+                got
             ),
             TypeError::FunctionalDependencyViolation {
                 trait_name,
@@ -354,6 +358,11 @@ impl fmt::Display for TypeError {
                 f,
                 "trait method `{}` in trait `{}` must have at least one parameter",
                 method, trait_name
+            ),
+            TypeError::DuplicateTypeTraitName(name) => write!(
+                f,
+                "name `{}` is already defined as both a type and a trait in this scope",
+                name
             ),
             TypeError::ExtraTraitMethod { trait_name, method } => {
                 write!(

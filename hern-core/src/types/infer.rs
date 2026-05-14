@@ -8,8 +8,9 @@ mod snapshot;
 
 use self::dicts::{
     attach_dict_args, dict_param_name, dict_ref_concrete_name, final_pass_stmt, resolve_concrete,
-    resolve_concrete_dict_ref, resolve_concrete_multi_dict_ref, resolve_dict_uses_expr,
-    resolve_dict_uses_expr_lenient, resolve_local_or_concrete,
+    resolve_concrete_dict_ref, resolve_concrete_from_args_unifying,
+    resolve_concrete_multi_dict_ref, resolve_dict_uses_expr, resolve_dict_uses_expr_lenient,
+    resolve_local_or_concrete,
 };
 use super::{
     patterns::{
@@ -17,10 +18,10 @@ use super::{
     },
     type_syntax::{
         inherent_impl_dict_name, inherent_impl_target_key_from_ast,
-        inherent_impl_target_keys_from_ty, is_self_param, record_field_ty, subst_hkt_param,
-        substitute_self_in_inherent_method, trait_dict_indexes, trait_impl_arg_keys_from_ast,
-        trait_impl_dict_name, trait_impl_dict_name_for_indexes, trait_impl_dict_name_from_keys,
-        trait_impl_target_keys_from_ty,
+        inherent_impl_target_keys_from_ast, inherent_impl_target_keys_from_ty, is_self_param,
+        record_field_ty, subst_hkt_param, substitute_self_in_inherent_method, trait_dict_indexes,
+        trait_impl_arg_keys_from_ast, trait_impl_dict_name, trait_impl_dict_name_for_indexes,
+        trait_impl_dict_name_from_keys, trait_impl_target_keys_from_ty,
     },
 };
 use crate::ast::*;
@@ -65,6 +66,7 @@ pub struct Infer {
     variant_env: VariantEnv,
     type_aliases: HashMap<String, (Vec<String>, Type)>,
     declared_types: HashSet<String>,
+    scoped_declared_types: HashSet<String>,
     op_trait_map: HashMap<String, String>,
     inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
     scoped_inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
@@ -165,6 +167,7 @@ impl Infer {
             variant_env: VariantEnv::default(),
             type_aliases: HashMap::new(),
             declared_types: HashSet::new(),
+            scoped_declared_types: HashSet::new(),
             op_trait_map: HashMap::new(),
             inherent_methods: HashMap::new(),
             scoped_inherent_methods: HashMap::new(),
@@ -227,6 +230,10 @@ impl Infer {
     ) {
         self.trait_env = traits;
         self.op_trait_map = op_trait_map;
+    }
+
+    pub fn set_type_scope(&mut self, type_names: HashSet<String>) {
+        self.scoped_declared_types = type_names;
     }
 
     pub fn set_inherent_scope(
@@ -877,6 +884,7 @@ impl Infer {
         self.variant_env = build_variant_env_from_stmts(seed_stmts, &program.stmts);
 
         let mut env = seed_env.cloned().unwrap_or_else(TypeEnv::new);
+        self.validate_type_trait_name_collisions(seed_stmts, &program.stmts)?;
         self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()));
         self.register_traits_and_ops(seed_stmts.iter().chain(program.stmts.iter()))?;
         // Fail-fast inference may resolve calls before reaching a later impl statement.
@@ -955,6 +963,9 @@ impl Infer {
         self.variant_env = build_variant_env_from_stmts(seed_stmts, &program.stmts);
 
         let mut env = seed_env.cloned().unwrap_or_else(TypeEnv::new);
+        if let Err(err) = self.validate_type_trait_name_collisions(seed_stmts, &program.stmts) {
+            return (ModuleInference::default(), vec![err]);
+        }
         self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()));
         if let Err(err) =
             self.register_traits_and_ops(seed_stmts.iter().chain(program.stmts.iter()))
@@ -1101,6 +1112,8 @@ impl Infer {
         self.declared_types.clear();
         self.declared_types
             .extend(["string", "bool", "int", "float", "Array", "Iter"].map(str::to_string));
+        self.declared_types
+            .extend(self.scoped_declared_types.iter().cloned());
         self.inherent_methods.clear();
         self.pending_constraints.clear();
         self.loop_break_tys.clear();
@@ -1527,33 +1540,65 @@ impl Infer {
                 dict_args,
                 pending_dict_args,
             ),
-            ExprKind::AssociatedAccess { target, member, .. } => {
-                let target_name = inherent_impl_target_key_from_ast(target, &self.declared_types)
-                    .map_err(|err| err.at(expr.span))?;
-                let method_info = self
-                    .inherent_methods
-                    .get(&target_name)
-                    .and_then(|methods| methods.get(member))
-                    .or_else(|| {
-                        self.scoped_inherent_methods
-                            .get(&target_name)
-                            .and_then(|methods| methods.get(member))
-                    })
-                    .ok_or_else(|| {
-                        TypeError::UnknownAssociatedFunction {
-                            target: target_name.clone(),
-                            function: member.clone(),
-                        }
-                        .at(expr.span)
-                    })?;
-                if method_info.has_receiver {
-                    return Err(TypeError::MethodRequiresReceiver {
-                        target: target_name,
-                        method: member.clone(),
+            ExprKind::AssociatedAccess {
+                target,
+                target_span,
+                member,
+                member_span,
+                resolution,
+            } => {
+                match self.associated_trait_method(target, member, *member_span) {
+                    Ok(Some(lookup)) => {
+                        let instance = self.instantiate_associated_trait_method(
+                            env,
+                            &lookup.trait_def,
+                            &lookup.method,
+                            lookup.explicit_args.as_deref(),
+                            *target_span,
+                        )?;
+                        *resolution = Some(AssociatedAccessResolution::TraitMethod {
+                            method: instance.method,
+                            dict: instance.dict,
+                        });
+                        let ty = instance.value_ty;
+                        self.record_symbol_type(expr.id, ty.clone());
+                        return Ok(ty);
                     }
-                    .at(expr.span));
+                    Ok(None) => {}
+                    Err(trait_err) if is_unknown_trait_method_error(&trait_err) => {
+                        if let Ok((_, method_info)) = self.associated_inherent_method(
+                            target,
+                            *target_span,
+                            member,
+                            *member_span,
+                        ) {
+                            let instance = self.instantiate_associated_inherent_method(
+                                target,
+                                *target_span,
+                                &method_info,
+                            )?;
+                            *resolution = Some(AssociatedAccessResolution::Inherent(
+                                instance.resolved_callee,
+                            ));
+                            let ty = instance.value_ty;
+                            self.record_symbol_type(expr.id, ty.clone());
+                            return Ok(ty);
+                        }
+                        return Err(trait_err);
+                    }
+                    Err(err) => return Err(err),
                 }
-                let ty = self.instantiate_value(&method_info.scheme.clone());
+                let (_, method_info) =
+                    self.associated_inherent_method(target, *target_span, member, *member_span)?;
+                let instance = self.instantiate_associated_inherent_method(
+                    target,
+                    *target_span,
+                    &method_info,
+                )?;
+                *resolution = Some(AssociatedAccessResolution::Inherent(
+                    instance.resolved_callee,
+                ));
+                let ty = instance.value_ty;
                 self.record_symbol_type(expr.id, ty.clone());
                 Ok(ty)
             }
@@ -2023,34 +2068,80 @@ impl Infer {
             target_span,
             member,
             member_span,
+            ..
         } = &callee.kind
         {
-            if let Type::Ident(trait_name) = target
-                && let Some(trait_def) = self.trait_env.get(trait_name).cloned()
-            {
-                let method = trait_def
-                    .methods
-                    .iter()
-                    .find(|method| method.name == *member)
-                    .ok_or_else(|| {
-                        TypeError::UnknownTraitMethod {
-                            trait_name: trait_name.clone(),
-                            method: member.clone(),
-                        }
-                        .at(*member_span)
-                    })?
-                    .clone();
-
-                return self.resolve_trait_method_call(
-                    env,
-                    args,
-                    arg_wrappers,
-                    resolved_callee,
-                    pending_trait_method,
-                    trait_def,
-                    method,
-                    "trait method call",
-                );
+            match self.associated_trait_method(target, member, *member_span) {
+                Ok(Some(lookup)) => {
+                    if lookup.explicit_args.is_none() {
+                        return self.resolve_trait_method_call(
+                            env,
+                            args,
+                            arg_wrappers,
+                            resolved_callee,
+                            pending_trait_method,
+                            lookup.trait_def,
+                            lookup.method,
+                            "trait method call",
+                        );
+                    }
+                    let instance = self.instantiate_associated_trait_method(
+                        env,
+                        &lookup.trait_def,
+                        &lookup.method,
+                        lookup.explicit_args.as_deref(),
+                        *target_span,
+                    )?;
+                    let param_capabilities = match &instance.callable_ty {
+                        Ty::Func(params, _) => func_param_capabilities(params),
+                        _ => Vec::new(),
+                    };
+                    let applied = self.apply_callable_type(
+                        env,
+                        args,
+                        arg_wrappers,
+                        instance.callable_ty,
+                        instance.constraints,
+                        Vec::new(),
+                        param_capabilities,
+                        0,
+                        *member_span,
+                        dict_args,
+                        pending_dict_args,
+                    )?;
+                    self.record_symbol_type(callee.id, applied.call_ty);
+                    if let Some(dict) = instance.dict {
+                        *resolved_callee = Some(ResolvedCallee::DictMethod {
+                            dict,
+                            method: instance.method,
+                        });
+                    }
+                    if applied.fresh_return && expr_id != NO_NODE_ID {
+                        self.metadata.mark_fresh_place(expr_id);
+                    }
+                    return Ok(applied.ret_ty);
+                }
+                Ok(None) => {}
+                Err(trait_err) if is_unknown_trait_method_error(&trait_err) => {
+                    match self.resolve_associated_call(
+                        env,
+                        expr_id,
+                        callee.id,
+                        target,
+                        *target_span,
+                        member,
+                        *member_span,
+                        args,
+                        arg_wrappers,
+                        resolved_callee,
+                        dict_args,
+                        pending_dict_args,
+                    ) {
+                        Ok(ty) => return Ok(ty),
+                        Err(_) => return Err(trait_err),
+                    }
+                }
+                Err(err) => return Err(err),
             }
 
             return self.resolve_associated_call(
@@ -2944,6 +3035,10 @@ fn expected_func_return(callee_ty: &Ty, ret_ty: Ty) -> FuncReturn {
 
 fn has_mut_place_func_params(ty: &Ty) -> bool {
     matches!(ty, Ty::Func(params, _) if params.iter().any(|param| param.capability.is_mut_place()))
+}
+
+fn is_unknown_trait_method_error(err: &SpannedTypeError) -> bool {
+    matches!(err.error.as_ref(), TypeError::UnknownTraitMethod { .. })
 }
 
 pub(super) fn primary_param_or_panic(trait_def: &TraitDef) -> &str {

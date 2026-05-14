@@ -1,0 +1,8 @@
+let map = Functor::map;
+
+let a = map(Some(2), fn(x) { x + 3 });
+let b = map([2, 3], fn(x) { x + 4 });
+
+print(a.unwrap_or(0));
+print(b[0]);
+print(b[1]);

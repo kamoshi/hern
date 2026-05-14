@@ -645,9 +645,12 @@ impl LuaCodegen {
                 all_args.push(self.gen_expr_with_subst(key, subst, pre)?);
                 Some(format!("{}({})", callee, all_args.join(", ")))
             }
-            ExprKind::AssociatedAccess { target, member, .. } => {
-                Some(associated_access_lua(target, member))
-            }
+            ExprKind::AssociatedAccess {
+                target,
+                member,
+                resolution,
+                ..
+            } => Some(gen_associated_access(target, member, resolution.as_ref())),
             ExprKind::Block { stmts, final_expr } if stmts.is_empty() => final_expr
                 .as_ref()
                 .map(|expr| self.gen_expr_with_subst(expr, subst, pre))
@@ -737,9 +740,12 @@ impl LuaCodegen {
                 dict_args,
                 ..
             } => self.gen_index_expr(receiver, key, resolved_callee, dict_args, pre),
-            ExprKind::AssociatedAccess { target, member, .. } => {
-                associated_access_lua(target, member)
-            }
+            ExprKind::AssociatedAccess {
+                target,
+                member,
+                resolution,
+                ..
+            } => gen_associated_access(target, member, resolution.as_ref()),
 
             // Loops use a temp variable (not an IIFE) so `return` inside the body
             // reaches the enclosing Lua function. `break`/`continue` use `goto` so
@@ -2094,6 +2100,28 @@ fn gen_resolved_callee(callee: &ResolvedCallee) -> String {
         ResolvedCallee::DictMethod { dict, method } => {
             format!("{}.{}", gen_dict_ref(dict), mangle_op(method))
         }
+    }
+}
+
+fn gen_associated_access(
+    target: &Type,
+    member: &str,
+    resolution: Option<&AssociatedAccessResolution>,
+) -> String {
+    match resolution {
+        Some(AssociatedAccessResolution::Inherent(callee)) => gen_resolved_callee(callee),
+        Some(AssociatedAccessResolution::TraitMethod {
+            method,
+            dict: Some(dict),
+        }) => format!("{}.{}", gen_dict_ref(dict), mangle_op(method)),
+        Some(AssociatedAccessResolution::TraitMethod { method, dict: None }) => {
+            // Qualified trait-method values receive their dictionary through the
+            // same hidden first argument that call inference inserts for other
+            // constrained function values.
+            let method = mangle_op(method);
+            format!("(function(__dict, ...) return __dict.{}(...) end)", method)
+        }
+        None => associated_access_lua(target, member),
     }
 }
 

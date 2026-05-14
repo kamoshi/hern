@@ -1,0 +1,1 @@
+type Functor = Functor(int)

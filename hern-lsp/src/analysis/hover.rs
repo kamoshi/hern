@@ -236,6 +236,7 @@ fn trait_access_hover(
             target_span,
             member,
             member_span,
+            ..
         } = &expr.kind
             && let Some(trait_def) = module_env.trait_def(trait_name)
         {

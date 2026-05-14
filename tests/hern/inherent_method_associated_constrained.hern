@@ -1,0 +1,17 @@
+type Box('a) = Box('a)
+
+impl Box('a)
+where 'a: ToString
+{
+  fn show(self) -> string {
+    match self {
+      Box(value) -> ToString::to_string(value),
+    }
+  }
+}
+
+print(Box::show(Box(42)));
+
+let labels = [Box(7), Box(8)].map(Box::show);
+print(labels[0]);
+print(labels[1]);

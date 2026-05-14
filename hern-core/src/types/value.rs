@@ -8,6 +8,7 @@ pub fn is_value(expr: &Expr) -> bool {
         | ExprKind::Ident(_)
         | ExprKind::Lambda { .. }
         | ExprKind::Import(_)
+        | ExprKind::AssociatedAccess { .. }
         | ExprKind::Unit => true,
         ExprKind::Grouped(expr) => is_value(expr),
         ExprKind::Tuple(exprs) => exprs.iter().all(is_value),

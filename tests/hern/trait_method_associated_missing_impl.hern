@@ -1,0 +1,1 @@
+Functor(Set)::map(Set::new(), fn(x) { x });

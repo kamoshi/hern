@@ -1,0 +1,15 @@
+type Counter = Counter(int)
+
+impl Counter {
+  fn value(self) -> int {
+    match self {
+      Counter(value) -> value,
+    }
+  }
+
+  fn value_via_self(self) -> int {
+    Self::value(self)
+  }
+}
+
+print(Counter::value_via_self(Counter(9)));

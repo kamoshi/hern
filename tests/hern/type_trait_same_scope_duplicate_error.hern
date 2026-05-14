@@ -1,0 +1,5 @@
+type Foo = Foo(int)
+
+trait Foo 'a {
+  fn other(x: 'a) -> 'a
+}

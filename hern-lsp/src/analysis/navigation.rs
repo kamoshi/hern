@@ -138,6 +138,7 @@ fn associated_definition_span_in_expr(
         target_span,
         member,
         member_span,
+        ..
     } = &expr.kind
     {
         if contains(*target_span, position) {

@@ -1,0 +1,12 @@
+let a = Functor(Option)::map(Some(1), fn(x) { x + 1 });
+let b = Functor(Array)::map([1, 2], fn(x) { x + 10 });
+let c = Functor(Result(_, string))::map(Ok(5), fn(x) { x + 1 });
+
+print(a.unwrap_or(0));
+print(b[0]);
+print(b[1]);
+
+match c {
+  Ok(value) -> print(value),
+  Err(_) -> print(0),
+}

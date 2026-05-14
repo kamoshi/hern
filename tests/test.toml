@@ -289,10 +289,12 @@ path = "tests/hern/associated_function_no_receiver_error.hern"
 expect = "error"
 error_contains = "must be called with `Map::new`"
 
-[tests.receiver_method_coloncolon_error]
-path = "tests/hern/receiver_method_coloncolon_error.hern"
-expect = "error"
-error_contains = "requires a receiver"
+[tests.receiver_method_coloncolon_call]
+path = "tests/hern/receiver_method_coloncolon_call.hern"
+expect = "typecheck"
+output = """
+1
+"""
 
 [tests.unknown_associated_function_error]
 path = "tests/hern/unknown_associated_function_error.hern"
@@ -435,6 +437,67 @@ output = """
 10
 hello
 10
+"""
+
+[tests.inherent_method_associated_call]
+path = "tests/hern/inherent_method_associated_call.hern"
+expect = "typecheck"
+output = """
+7
+8
+10
+30
+"""
+
+[tests.inherent_method_associated_constrained]
+path = "tests/hern/inherent_method_associated_constrained.hern"
+expect = "typecheck"
+output = """
+42
+7
+8
+"""
+
+[tests.inherent_method_associated_explicit_target]
+path = "tests/hern/inherent_method_associated_explicit_target.hern"
+expect = "typecheck"
+output = """
+old
+new
+a
+b
+"""
+
+[tests.inherent_method_associated_explicit_constrained]
+path = "tests/hern/inherent_method_associated_explicit_constrained.hern"
+expect = "typecheck"
+output = """
+42
+7
+8
+"""
+
+[tests.inherent_self_associated_call]
+path = "tests/hern/inherent_self_associated_call.hern"
+expect = "typecheck"
+output = """
+9
+"""
+
+[tests.inherent_method_associated_exact_beats_generic]
+path = "tests/hern/inherent_method_associated_exact_beats_generic.hern"
+expect = "typecheck"
+output = """
+int
+generic
+"""
+
+[tests.inherent_method_associated_hof_generic_value]
+path = "tests/hern/inherent_method_associated_hof_generic_value.hern"
+expect = "typecheck"
+output = """
+1
+x
 """
 
 [tests.inherent_applied_array_float_sum]
@@ -855,6 +918,28 @@ path = "tests/hern/unknown_type_error.hern"
 expect = "error"
 error_contains = "unknown type: `MissingType`"
 
+[tests.type_trait_same_scope_duplicate_error]
+path = "tests/hern/type_trait_same_scope_duplicate_error.hern"
+expect = "error"
+error_contains = "trait `Foo` collides with type `Foo` from module"
+
+[tests.type_trait_prelude_collision_error]
+path = "tests/hern/type_trait_prelude_collision_error.hern"
+expect = "error"
+error_contains = "type `Functor` collides with trait `Functor` from prelude"
+
+[tests.type_trait_imported_trait_collision]
+path = "tests/hern/type_trait_imported_trait_collision.hern"
+fixtures = ["tests/hern/type_trait_imported_trait_dep.hern"]
+expect = "error"
+error_contains = "type `Clash` collides with trait `Clash` from module"
+
+[tests.type_trait_imported_type_collision]
+path = "tests/hern/type_trait_imported_type_collision.hern"
+fixtures = ["tests/hern/type_trait_imported_type_dep.hern"]
+expect = "error"
+error_contains = "trait `Clash` collides with type `Clash` from module"
+
 [tests.functor_result_left]
 path = "tests/hern/functor_result_left.hern"
 expect = "typecheck"
@@ -867,6 +952,81 @@ output = """
 42
 0
 """
+
+[tests.trait_method_associated_explicit_target]
+path = "tests/hern/trait_method_associated_explicit_target.hern"
+expect = "typecheck"
+output = """
+2
+11
+12
+6
+"""
+
+[tests.trait_method_associated_explicit_value]
+path = "tests/hern/trait_method_associated_explicit_value.hern"
+expect = "typecheck"
+output = """
+5
+6
+7
+"""
+
+[tests.trait_method_associated_bare_value]
+path = "tests/hern/trait_method_associated_bare_value.hern"
+expect = "typecheck"
+output = """
+5
+6
+7
+"""
+
+[tests.trait_method_associated_bare_first_class_value]
+path = "tests/hern/trait_method_associated_bare_first_class_value.hern"
+expect = "typecheck"
+output = """
+5
+6
+7
+"""
+
+[tests.trait_method_associated_hof_value]
+path = "tests/hern/trait_method_associated_hof_value.hern"
+expect = "typecheck"
+output = """
+5
+6
+7
+"""
+
+[tests.trait_method_associated_explicit_pure_value]
+path = "tests/hern/trait_method_associated_explicit_pure_value.hern"
+expect = "typecheck"
+output = """
+7
+8
+9
+"""
+
+[tests.trait_method_associated_unknown_method]
+path = "tests/hern/trait_method_associated_unknown_method.hern"
+expect = "error"
+error_contains = "trait `Functor` has no method `mapp`"
+
+[tests.trait_method_associated_target_arity_error]
+path = "tests/hern/trait_method_associated_target_arity_error.hern"
+expect = "error"
+error_contains = "trait `Functor` expects 1 type argument, got 2"
+
+[tests.trait_method_associated_missing_impl]
+path = "tests/hern/trait_method_associated_missing_impl.hern"
+expect = "error"
+error_contains = "trait `Functor` is not implemented for `Set`"
+
+[tests.associated_top_level_hole_error]
+path = "tests/hern/associated_top_level_hole_error.hern"
+expect = "error"
+error_contains = "`_` is only allowed inside an explicit associated type target"
 
 [tests.bare_trait_method]
 path = "tests/hern/bare_trait_method.hern"

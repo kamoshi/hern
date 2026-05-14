@@ -1,0 +1,15 @@
+let pure_option = Applicative(Option)::pure;
+let pure_array = Applicative(Array)::pure;
+let pure_result = Applicative(Result(_, string))::pure;
+
+let a = pure_option(7);
+let b = pure_array(8);
+let c = pure_result(9);
+
+print(a.unwrap_or(0));
+print(b[0]);
+
+match c {
+  Ok(value) -> print(value),
+  Err(_) -> print(0),
+}

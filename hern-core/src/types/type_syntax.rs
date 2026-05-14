@@ -235,6 +235,21 @@ pub(crate) fn inherent_impl_target_key_from_ast(
     }
 }
 
+pub(crate) fn inherent_impl_target_keys_from_ast(
+    target: &Type,
+    declared_types: &HashSet<String>,
+) -> Result<Vec<String>, TypeError> {
+    let primary = inherent_impl_target_key_from_ast(target, declared_types)?;
+    let mut keys = vec![primary.clone()];
+    if let Type::App(con, _) = target {
+        let generic = inherent_impl_target_key_from_ast(con, declared_types)?;
+        if generic != primary {
+            keys.push(generic);
+        }
+    }
+    Ok(keys)
+}
+
 pub(super) fn is_self_param(param: &Param) -> bool {
     matches!(&param.pat, Pattern::Variable(name, _) if name == "self")
 }

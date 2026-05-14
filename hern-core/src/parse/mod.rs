@@ -50,6 +50,34 @@ fn infix_binary_op(token: &Token) -> Option<(BinOp, u8, u8)> {
     Some((op, l_bp, r_bp))
 }
 
+fn associated_target_from_expr(
+    expr: &Expr,
+    op_span: Span,
+    allow_hole: bool,
+) -> Result<Type, ParseError> {
+    match &expr.kind {
+        ExprKind::Ident(name) if name == "_" && allow_hole => Ok(Type::Hole),
+        ExprKind::Ident(name) if name == "_" => Err(ParseError::new(
+            "`_` is only allowed inside an explicit associated type target",
+            op_span,
+        )),
+        ExprKind::Ident(name) if name.starts_with('\'') => Ok(Type::Var(name.clone())),
+        ExprKind::Ident(name) => Ok(Type::Ident(name.clone())),
+        ExprKind::Call { callee, args, .. } => {
+            let con = associated_target_from_expr(callee, op_span, false)?;
+            let args = args
+                .iter()
+                .map(|arg| associated_target_from_expr(arg, op_span, true))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Type::App(Box::new(con), args))
+        }
+        _ => Err(ParseError::new(
+            "`::` expects a type name or applied type on the left",
+            op_span,
+        )),
+    }
+}
+
 fn recover_stmt_tokens(tokens: &[Spanned]) -> usize {
     let mut parens = 0usize;
     let mut braces = 0usize;
@@ -1788,17 +1816,7 @@ impl<'tokens> Parser<'tokens> {
                     if l_bp < min_bp {
                         break;
                     }
-                    let ExprKind::Ident(target_name) = &lhs.kind else {
-                        return Err(ParseError::new(
-                            "`::` expects a type name on the left",
-                            op_tok.span,
-                        ));
-                    };
-                    let target = if target_name == "Self" {
-                        Type::Ident("Self".to_string())
-                    } else {
-                        Type::Ident(target_name.clone())
-                    };
+                    let target = associated_target_from_expr(&lhs, op_tok.span, false)?;
                     ptr += 1;
                     let (c_name, member, member_span) =
                         self.expect_ident_with_span(&tokens[ptr..])?;
@@ -1811,6 +1829,7 @@ impl<'tokens> Parser<'tokens> {
                             target_span: lhs.span,
                             member,
                             member_span,
+                            resolution: None,
                         },
                     );
                 }

@@ -1,0 +1,5 @@
+#![no_implicit_prelude]
+
+type Clash = Clash(int)
+
+Clash(1)

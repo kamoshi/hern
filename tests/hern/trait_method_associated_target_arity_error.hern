@@ -1,0 +1,1 @@
+Functor(Option, string)::map(Some(1), fn(x) { x });
