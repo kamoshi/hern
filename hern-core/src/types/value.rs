@@ -9,6 +9,7 @@ pub fn is_value(expr: &Expr) -> bool {
         | ExprKind::Lambda { .. }
         | ExprKind::Import(_)
         | ExprKind::Unit => true,
+        ExprKind::Grouped(expr) => is_value(expr),
         ExprKind::Tuple(exprs) => exprs.iter().all(is_value),
         ExprKind::Array(entries) => entries.iter().all(|e| is_value(e.expr())),
         ExprKind::Record(entries) => entries.iter().all(|e| is_value(e.expr())),
@@ -39,6 +40,7 @@ fn is_fresh_mutable_component(expr: &Expr) -> bool {
         | ExprKind::Bool(_)
         | ExprKind::Lambda { .. }
         | ExprKind::Unit => true,
+        ExprKind::Grouped(expr) => is_fresh_mutable_component(expr),
         ExprKind::Tuple(exprs) => exprs.iter().all(is_fresh_mutable_component),
         ExprKind::Record(entries) => entries.iter().all(|e| is_fresh_mutable_component(e.expr())),
         ExprKind::Array(entries) => entries.iter().all(|e| is_fresh_array_element(e.expr())),

@@ -101,7 +101,8 @@ fn collect_code_actions_for_expr(
                 collect_code_actions_for_expr(expr, uri, range, binding_types, actions);
             }
         }
-        ExprKind::Not(inner)
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
         | ExprKind::Loop(inner)
         | ExprKind::Break(Some(inner))
         | ExprKind::Return(Some(inner))

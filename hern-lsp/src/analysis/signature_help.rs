@@ -142,7 +142,8 @@ fn find_call_in_expr<'a>(
                 find_call_in_expr(arg, position, best);
             }
         }
-        ExprKind::Not(inner)
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
         | ExprKind::Loop(inner)
         | ExprKind::Break(Some(inner))
         | ExprKind::Return(Some(inner))

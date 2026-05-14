@@ -222,7 +222,8 @@ fn collect_expr_referenced_names(
                 refs.values.insert(name.clone());
             }
         }
-        ExprKind::Not(expr)
+        ExprKind::Grouped(expr)
+        | ExprKind::Not(expr)
         | ExprKind::Loop(expr)
         | ExprKind::Break(Some(expr))
         | ExprKind::Return(Some(expr)) => {

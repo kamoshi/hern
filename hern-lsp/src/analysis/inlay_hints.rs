@@ -299,7 +299,8 @@ fn collect_expr_hints(
                 collect_expr_hints(expr, range, binding_types, definition_schemes, hints);
             }
         }
-        ExprKind::Not(inner)
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
         | ExprKind::Loop(inner)
         | ExprKind::Break(Some(inner))
         | ExprKind::Return(Some(inner))

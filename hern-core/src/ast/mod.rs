@@ -158,7 +158,8 @@ pub fn walk_stmt_exprs(stmt: &Stmt, visit: &mut impl FnMut(&Expr)) {
 pub fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     visit(expr);
     match &expr.kind {
-        ExprKind::Not(inner)
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
         | ExprKind::Loop(inner)
         | ExprKind::Break(Some(inner))
         | ExprKind::Return(Some(inner))
@@ -584,6 +585,12 @@ pub enum ExprKind {
     StringLit(String),
     Bool(bool),
     Ident(String),
+    /// A parenthesized expression whose grouping must survive AST rewrites.
+    ///
+    /// This is semantically transparent for type checking and code generation,
+    /// but it is a hard boundary for precedence-sensitive rewrites such as
+    /// custom operator reassociation.
+    Grouped(Box<Expr>),
     Not(Box<Expr>),
     Assign {
         target: Box<Expr>,

@@ -594,7 +594,8 @@ impl IndexBuilder {
     fn index_expr(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Ident(name) => self.reference(name, expr.span),
-            ExprKind::Not(expr)
+            ExprKind::Grouped(expr)
+            | ExprKind::Not(expr)
             | ExprKind::Loop(expr)
             | ExprKind::Break(Some(expr))
             | ExprKind::Return(Some(expr)) => self.index_expr(expr),

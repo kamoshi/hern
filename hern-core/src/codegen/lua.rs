@@ -501,6 +501,7 @@ impl LuaCodegen {
         pre: &mut String,
     ) -> Option<String> {
         match &expr.kind {
+            ExprKind::Grouped(expr) => self.gen_expr_with_subst(expr, subst, pre),
             ExprKind::Ident(name) => Some(subst.get(name).cloned().unwrap_or_else(|| name.clone())),
             ExprKind::Number(n) => Some(n.as_lua_source()),
             ExprKind::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
@@ -670,6 +671,7 @@ impl LuaCodegen {
     /// before using the returned string.
     fn gen_expr(&mut self, expr: &Expr, pre: &mut String) -> String {
         match &expr.kind {
+            ExprKind::Grouped(expr) => self.gen_expr(expr, pre),
             ExprKind::Number(n) => n.as_lua_source(),
             ExprKind::Bool(b) => if *b { "1" } else { "0" }.to_string(),
             ExprKind::Unit => "{}".to_string(),
@@ -1840,7 +1842,9 @@ fn expr_flow(expr: &Expr, include_bc: bool) -> Flow {
             };
             expr_flow(scrutinee, include_bc).seq(arm_flow)
         }
-        ExprKind::Not(e) | ExprKind::FieldAccess { expr: e, .. } => expr_flow(e, include_bc),
+        ExprKind::Grouped(e) | ExprKind::Not(e) | ExprKind::FieldAccess { expr: e, .. } => {
+            expr_flow(e, include_bc)
+        }
         ExprKind::Index { receiver, key, .. } => {
             expr_flow(receiver, include_bc).seq(expr_flow(key, include_bc))
         }

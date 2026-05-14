@@ -295,7 +295,8 @@ fn substitute_self_in_expr_types(expr: &mut Expr, target: &Type) {
             target: access_target,
             ..
         } => substitute_self_in_type(access_target, target),
-        ExprKind::Not(expr)
+        ExprKind::Grouped(expr)
+        | ExprKind::Not(expr)
         | ExprKind::Loop(expr)
         | ExprKind::Break(Some(expr))
         | ExprKind::Return(Some(expr))

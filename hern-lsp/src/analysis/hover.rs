@@ -1308,7 +1308,8 @@ fn param_type_in_expr_stmts(
                 param_type_in_expr_stmts(e, name, param_span, env, expr_types, variant_env)
             })
         }
-        ExprKind::Not(e)
+        ExprKind::Grouped(e)
+        | ExprKind::Not(e)
         | ExprKind::Loop(e)
         | ExprKind::Break(Some(e))
         | ExprKind::Return(Some(e))
@@ -1575,7 +1576,8 @@ fn local_pattern_binding_type_in_expr(
                 local_pattern_binding_type_in_expr(e, name, binding_span, expr_types, variant_env)
             })
         }
-        ExprKind::Not(e)
+        ExprKind::Grouped(e)
+        | ExprKind::Not(e)
         | ExprKind::Loop(e)
         | ExprKind::Break(Some(e))
         | ExprKind::Return(Some(e))
@@ -1782,7 +1784,8 @@ fn declaration_value_type_in_expr<'a>(
                 .as_deref()
                 .and_then(|expr| declaration_value_type_in_expr(expr, span, expr_types))
         }
-        ExprKind::Not(expr)
+        ExprKind::Grouped(expr)
+        | ExprKind::Not(expr)
         | ExprKind::Loop(expr)
         | ExprKind::Break(Some(expr))
         | ExprKind::Return(Some(expr))

@@ -213,7 +213,8 @@ fn find_hover_in_expr(
     }
 
     match &expr.kind {
-        ExprKind::Not(e)
+        ExprKind::Grouped(e)
+        | ExprKind::Not(e)
         | ExprKind::Loop(e)
         | ExprKind::Break(Some(e))
         | ExprKind::Return(Some(e))
@@ -364,7 +365,8 @@ fn hover_target_span(expr: &Expr, pos: SourcePosition) -> Option<SourceSpan> {
         ExprKind::AssociatedAccess { member_span, .. } => {
             Some(*member_span).filter(|span| contains(*span, pos))
         }
-        ExprKind::Not(_)
+        ExprKind::Grouped(_)
+        | ExprKind::Not(_)
         | ExprKind::Loop(_)
         | ExprKind::Break(_)
         | ExprKind::Continue
@@ -407,7 +409,8 @@ mod tests {
                     find_in_expr(callee, method_name)
                         .or_else(|| args.iter().find_map(|arg| find_in_expr(arg, method_name)))
                 }
-                ExprKind::FieldAccess { expr, .. }
+                ExprKind::Grouped(expr)
+                | ExprKind::FieldAccess { expr, .. }
                 | ExprKind::Not(expr)
                 | ExprKind::Loop(expr)
                 | ExprKind::Break(Some(expr))

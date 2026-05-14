@@ -1097,7 +1097,7 @@ fn find_expr_ending_at_in_expr(expr: &Expr, end: SourcePosition) -> Option<&Expr
 
 fn expr_children(expr: &Expr) -> Vec<&Expr> {
     match &expr.kind {
-        ExprKind::Not(expr) | ExprKind::Loop(expr) => vec![expr],
+        ExprKind::Grouped(expr) | ExprKind::Not(expr) | ExprKind::Loop(expr) => vec![expr],
         ExprKind::Assign { target, value } => vec![target, value],
         ExprKind::Binary { lhs, rhs, .. } => vec![lhs, rhs],
         ExprKind::Call { callee, args, .. } => std::iter::once(callee.as_ref())

@@ -148,7 +148,7 @@ fn check_do_control_flow(expr: &Expr, in_explicit_loop: bool) -> Result<(), Pars
         }
 
         // All other expression forms: recurse with the same loop context.
-        ExprKind::Not(e) => check_do_control_flow(e, in_explicit_loop),
+        ExprKind::Grouped(e) | ExprKind::Not(e) => check_do_control_flow(e, in_explicit_loop),
         ExprKind::Assign { target, value } => {
             check_do_control_flow(target, in_explicit_loop)?;
             check_do_control_flow(value, in_explicit_loop)
@@ -2245,7 +2245,14 @@ impl<'tokens> Parser<'tokens> {
         ptr += self.expect(&tokens[ptr..], Token::RParen)?;
         if exprs.len() == 1 && !matches!(tokens.get(ptr - 2).map(|t| &t.token), Some(Token::Comma))
         {
-            Ok((ptr, exprs.pop().unwrap())) // len == 1 checked above
+            Ok((
+                ptr,
+                self.expr_from_tokens(
+                    tokens,
+                    ptr,
+                    ExprKind::Grouped(Box::new(exprs.pop().unwrap())),
+                ),
+            ))
         } else {
             Ok((
                 ptr,

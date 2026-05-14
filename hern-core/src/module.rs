@@ -1066,7 +1066,8 @@ fn resolve_imports_in_expr(
             *spec = graph.load_module(&path)?;
             Ok(())
         }
-        ExprKind::Not(e)
+        ExprKind::Grouped(e)
+        | ExprKind::Not(e)
         | ExprKind::Loop(e)
         | ExprKind::Break(Some(e))
         | ExprKind::Return(Some(e))
@@ -1171,7 +1172,8 @@ fn resolve_imports_in_expr_recovering(
             *spec = name;
             diagnostics.extend(module_diagnostics);
         }
-        ExprKind::Not(e)
+        ExprKind::Grouped(e)
+        | ExprKind::Not(e)
         | ExprKind::Loop(e)
         | ExprKind::Break(Some(e))
         | ExprKind::Return(Some(e))

@@ -347,7 +347,8 @@ fn push_associated_access_tokens_expr(
                 push_associated_access_tokens_expr(raw, pos_to_idx, source, arg);
             }
         }
-        ExprKind::Not(inner)
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
         | ExprKind::Loop(inner)
         | ExprKind::Break(Some(inner))
         | ExprKind::Return(Some(inner))

@@ -68,7 +68,7 @@ fn reassoc_expr(expr: &mut Expr, table: &FixityTable) {
 
     // Otherwise recurse into sub-expressions.
     match &mut expr.kind {
-        ExprKind::Not(e) => reassoc_expr(e, table),
+        ExprKind::Grouped(e) | ExprKind::Not(e) => reassoc_expr(e, table),
         ExprKind::Assign { target, value } => {
             reassoc_expr(target, table);
             reassoc_expr(value, table);
@@ -269,4 +269,61 @@ fn pratt(
         );
     }
     lhs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(name: &str) -> Expr {
+        Expr::synthetic(ExprKind::Ident(name.to_string()))
+    }
+
+    fn binary(lhs: Expr, op: &str, rhs: Expr) -> Expr {
+        Expr::synthetic(ExprKind::Binary {
+            lhs: Box::new(lhs),
+            op: BinOp::Custom(op.to_string()),
+            op_span: SourceSpan::synthetic(),
+            rhs: Box::new(rhs),
+            resolved_op: None,
+            pending_op: None,
+            dict_args: vec![],
+            pending_dict_args: vec![],
+        })
+    }
+
+    fn grouped(expr: Expr) -> Expr {
+        Expr::synthetic(ExprKind::Grouped(Box::new(expr)))
+    }
+
+    #[test]
+    fn grouped_expression_is_reassociation_boundary() {
+        let mut expr = binary(
+            ident("a"),
+            "**",
+            grouped(binary(ident("b"), "++", ident("c"))),
+        );
+        let table = HashMap::from([
+            ("**".to_string(), (Fixity::Left, 9)),
+            ("++".to_string(), (Fixity::Left, 1)),
+        ]);
+
+        reassoc_expr(&mut expr, &table);
+
+        let ExprKind::Binary { lhs, op, rhs, .. } = &expr.kind else {
+            panic!("expected outer binary expression");
+        };
+        assert!(matches!(lhs.kind, ExprKind::Ident(ref name) if name == "a"));
+        assert!(matches!(op, BinOp::Custom(name) if name == "**"));
+        let ExprKind::Grouped(grouped) = &rhs.kind else {
+            panic!("expected grouped right-hand side to remain grouped");
+        };
+        assert!(matches!(
+            &grouped.kind,
+            ExprKind::Binary {
+                op: BinOp::Custom(name),
+                ..
+            } if name == "++"
+        ));
+    }
 }

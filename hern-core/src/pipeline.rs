@@ -179,6 +179,7 @@ fn parse_diagnostic(err: ParseError) -> CompilerDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::ExprKind;
 
     #[test]
     fn parse_source_reports_lex_span() {
@@ -197,6 +198,16 @@ mod tests {
 
         assert!(!program.stmts.is_empty());
         assert!(!result.expr_types.is_empty());
+    }
+
+    #[test]
+    fn parse_source_preserves_parenthesized_grouping() {
+        let program = parse_source("let x = (a ++ b);\n").expect("source should parse");
+        let Stmt::Let { value, .. } = &program.stmts[0] else {
+            panic!("expected let statement");
+        };
+
+        assert!(matches!(value.kind, ExprKind::Grouped(_)));
     }
 
     #[test]

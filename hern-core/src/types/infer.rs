@@ -428,6 +428,7 @@ impl Infer {
             return true;
         }
         match &expr.kind {
+            ExprKind::Grouped(expr) => self.is_fresh_mutable_place_expr(expr),
             ExprKind::Tuple(exprs) => exprs
                 .iter()
                 .all(|expr| self.is_fresh_mutable_place_expr(expr)),
@@ -1286,6 +1287,10 @@ impl Infer {
         let expr_span = expr.span;
         let expr_id = expr.id;
         match &mut expr.kind {
+            ExprKind::Grouped(inner) => {
+                let ty = self.infer_expr_expected(env, inner, expected)?;
+                return Ok(self.record_expr_type_for_node(expr_id, ty));
+            }
             ExprKind::Array(entries) => {
                 let ty = self.infer_array_entries(env, entries, Some(expected), expr_span)?;
                 return Ok(self.record_expr_type_for_node(expr_id, ty));
@@ -1403,6 +1408,7 @@ impl Infer {
     fn infer_expr(&mut self, env: &TypeEnv, expr: &mut Expr) -> Result<Ty, SpannedTypeError> {
         let expr_id = expr.id;
         let result: Result<Ty, SpannedTypeError> = match &mut expr.kind {
+            ExprKind::Grouped(inner) => self.infer_expr(env, inner),
             ExprKind::Number(n) => match n {
                 crate::lex::NumberLiteral::Int(_) => Ok(Ty::Int),
                 crate::lex::NumberLiteral::Float(_) => Ok(Ty::Float),
@@ -3004,6 +3010,7 @@ fn type_contains_var(ty: &Type, var_name: &str) -> bool {
 
 fn find_assignment_base_name(expr: &Expr) -> Option<String> {
     match &expr.kind {
+        ExprKind::Grouped(expr) => find_assignment_base_name(expr),
         ExprKind::FieldAccess { expr, .. } => find_assignment_base_name(expr),
         ExprKind::Ident(name) => Some(name.clone()),
         _ => None,
@@ -3014,7 +3021,7 @@ fn expr_always_exits(expr: &Expr, include_bc: bool) -> bool {
     match &expr.kind {
         ExprKind::Return(_) => true,
         ExprKind::Break(_) | ExprKind::Continue => include_bc,
-        ExprKind::Not(e) | ExprKind::FieldAccess { expr: e, .. } => {
+        ExprKind::Grouped(e) | ExprKind::Not(e) | ExprKind::FieldAccess { expr: e, .. } => {
             expr_always_exits(e, include_bc)
         }
         ExprKind::Binary { lhs, rhs, .. } => {
