@@ -608,6 +608,14 @@ impl IndexBuilder {
                 self.index_expr(target);
                 self.index_expr(value);
             }
+            ExprKind::Range { start, end, .. } => {
+                if let Some(start) = start {
+                    self.index_expr(start);
+                }
+                if let Some(end) = end {
+                    self.index_expr(end);
+                }
+            }
             ExprKind::Call { callee, args, .. } => {
                 self.index_expr(callee);
                 for arg in args {

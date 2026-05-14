@@ -1118,6 +1118,15 @@ fn resolve_imports_in_expr(
             resolve_imports_in_expr(target, base_dir, graph)?;
             resolve_imports_in_expr(value, base_dir, graph)
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                resolve_imports_in_expr(start, base_dir, graph)?;
+            }
+            if let Some(end) = end {
+                resolve_imports_in_expr(end, base_dir, graph)?;
+            }
+            Ok(())
+        }
         ExprKind::Call { callee, args, .. } => {
             resolve_imports_in_expr(callee, base_dir, graph)?;
             for arg in args {
@@ -1237,6 +1246,20 @@ fn resolve_imports_in_expr_recovering(
                 diagnostics,
             );
             resolve_imports_in_expr_recovering(value, base_dir, graph, source, diagnostics);
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                resolve_imports_in_expr_recovering(
+                    start,
+                    base_dir,
+                    graph,
+                    source.clone(),
+                    diagnostics,
+                );
+            }
+            if let Some(end) = end {
+                resolve_imports_in_expr_recovering(end, base_dir, graph, source, diagnostics);
+            }
         }
         ExprKind::Call { callee, args, .. } => {
             resolve_imports_in_expr_recovering(

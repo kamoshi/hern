@@ -553,6 +553,21 @@ impl LuaCodegen {
                     },
                 }
             }
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let start = match start {
+                    Some(expr) => Some(self.gen_expr_with_subst(expr, subst, pre)?),
+                    None => None,
+                };
+                let end = match end {
+                    Some(expr) => Some(self.gen_expr_with_subst(expr, subst, pre)?),
+                    None => None,
+                };
+                Some(gen_range_literal(start, end, *inclusive))
+            }
             ExprKind::Call {
                 callee,
                 args,
@@ -697,6 +712,11 @@ impl LuaCodegen {
                 dict_args,
                 ..
             } => self.gen_binary_expr(lhs, op, rhs, resolved_op, dict_args, pre),
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => self.gen_range_expr(start.as_deref(), end.as_deref(), *inclusive, pre),
             ExprKind::Assign { target, value } => self.gen_assign_expr(target, value, pre),
             ExprKind::Lambda {
                 params,
@@ -839,6 +859,18 @@ impl LuaCodegen {
         all_args.push(self.gen_expr(receiver, pre));
         all_args.push(self.gen_expr(key, pre));
         format!("{}({})", callee, all_args.join(", "))
+    }
+
+    fn gen_range_expr(
+        &mut self,
+        start: Option<&Expr>,
+        end: Option<&Expr>,
+        inclusive: bool,
+        pre: &mut String,
+    ) -> String {
+        let start = start.map(|expr| self.gen_expr(expr, pre));
+        let end = end.map(|expr| self.gen_expr(expr, pre));
+        gen_range_literal(start, end, inclusive)
     }
 
     fn gen_assign_expr(&mut self, target: &Expr, value: &Expr, pre: &mut String) -> String {
@@ -1858,6 +1890,17 @@ fn expr_flow(expr: &Expr, include_bc: bool) -> Flow {
         ExprKind::Binary { lhs, rhs, .. } => {
             expr_flow(lhs, include_bc).seq(expr_flow(rhs, include_bc))
         }
+        ExprKind::Range { start, end, .. } => {
+            let start_flow = start
+                .as_deref()
+                .map(|expr| expr_flow(expr, include_bc))
+                .unwrap_or(Flow::FallsThrough);
+            let end_flow = end
+                .as_deref()
+                .map(|expr| expr_flow(expr, include_bc))
+                .unwrap_or(Flow::FallsThrough);
+            start_flow.seq(end_flow)
+        }
         ExprKind::Assign { target, value } => {
             expr_flow(target, include_bc).seq(expr_flow(value, include_bc))
         }
@@ -1908,6 +1951,23 @@ fn method_receiver(callee: &Expr, is_method_call: bool) -> Option<&Expr> {
         return None;
     };
     Some(expr)
+}
+
+fn gen_range_literal(start: Option<String>, end: Option<String>, inclusive: bool) -> String {
+    match (start, end, inclusive) {
+        (Some(start), Some(end), false) => {
+            format!("Range({{ start = {}, finish = {} }})", start, end)
+        }
+        (Some(start), Some(end), true) => {
+            format!("RangeInclusive({{ start = {}, finish = {} }})", start, end)
+        }
+        (Some(start), None, false) => format!("RangeFrom({})", start),
+        (Some(_), None, true) => unreachable!("parser rejects inclusive ranges without end bounds"),
+        (None, Some(end), false) => format!("RangeTo({})", end),
+        (None, Some(end), true) => format!("RangeToInclusive({})", end),
+        (None, None, false) => "RangeFull".to_string(),
+        (None, None, true) => unreachable!("parser rejects inclusive ranges without end bounds"),
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

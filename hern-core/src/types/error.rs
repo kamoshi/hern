@@ -143,6 +143,8 @@ pub enum TypeMismatchContext {
     TupleElement(usize),
     TypeArgument(usize),
     RecordField(String),
+    RangeStart,
+    RangeEnd,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,6 +202,8 @@ impl fmt::Display for TypeMismatchContext {
             TypeMismatchContext::TupleElement(index) => write!(f, "tuple element {}", index + 1),
             TypeMismatchContext::TypeArgument(index) => write!(f, "type argument {}", index + 1),
             TypeMismatchContext::RecordField(name) => write!(f, "record field `{}`", name),
+            TypeMismatchContext::RangeStart => write!(f, "range start bound"),
+            TypeMismatchContext::RangeEnd => write!(f, "range end bound"),
         }
     }
 }

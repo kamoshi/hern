@@ -167,6 +167,13 @@ fn associated_definition_span_in_expr(
             associated_definition_span_in_expr(program, lhs, position)
                 .or_else(|| associated_definition_span_in_expr(program, rhs, position))
         }
+        ExprKind::Range { start, end, .. } => start
+            .as_deref()
+            .and_then(|expr| associated_definition_span_in_expr(program, expr, position))
+            .or_else(|| {
+                end.as_deref()
+                    .and_then(|expr| associated_definition_span_in_expr(program, expr, position))
+            }),
         ExprKind::Call { callee, args, .. } => {
             associated_definition_span_in_expr(program, callee, position).or_else(|| {
                 args.iter()

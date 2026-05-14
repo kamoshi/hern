@@ -661,6 +661,15 @@ fn resolve_dict_uses_expr_with_mode(
             resolve_dict_uses_expr_with_mode(value, resolve, process_fn, hard_unresolved)?;
             Ok(())
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                resolve_dict_uses_expr_with_mode(start, resolve, process_fn, hard_unresolved)?;
+            }
+            if let Some(end) = end {
+                resolve_dict_uses_expr_with_mode(end, resolve, process_fn, hard_unresolved)?;
+            }
+            Ok(())
+        }
         ExprKind::Not(e) => {
             resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)
         }

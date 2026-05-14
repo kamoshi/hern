@@ -1028,6 +1028,13 @@ impl Index for string, int -> string {
 
 // --- Iteration ---
 
+type Range('a) = Range(#{ start: 'a, finish: 'a })
+type RangeInclusive('a) = RangeInclusive(#{ start: 'a, finish: 'a })
+type RangeFrom('a) = RangeFrom('a)
+type RangeTo('a) = RangeTo('a)
+type RangeToInclusive('a) = RangeToInclusive('a)
+type RangeFull = RangeFull
+
 trait Iterable 'f {
   fn iter(self: 'f('a)) -> Iter('a)
 }
@@ -1043,6 +1050,128 @@ end)";
 
 impl Iterable for Array {
   fn iter(self) { __array_iter(self) }
+}
+
+extern __range_iter: fn(Range(int)) -> Iter(int) = "(function(r)
+  local current = bit.tobit(r._0.start - 1)
+  local finish = r._0.finish
+  return function()
+    current = bit.tobit(current + 1)
+    if current < finish then return current else return nil end
+  end
+end)";
+
+extern __range_inclusive_iter: fn(RangeInclusive(int)) -> Iter(int) = "(function(r)
+  local current = bit.tobit(r._0.start - 1)
+  local finish = r._0.finish
+  return function()
+    current = bit.tobit(current + 1)
+    if current <= finish then return current else return nil end
+  end
+end)";
+
+extern __range_from_iter: fn(RangeFrom(int)) -> Iter(int) = "(function(r)
+  local current = bit.tobit(r._0 - 1)
+  return function()
+    current = bit.tobit(current + 1)
+    return current
+  end
+end)";
+
+extern __array_slice: fn(['a], int, int) -> ['a] = "(function(a, start, finish)
+  if start < 0 or finish < start or finish > #a then _G.error('array slice out of bounds') end
+  local r = {}
+  for i = start + 1, finish do r[#r+1] = a[i] end
+  return r
+end)";
+
+extern __str_slice: fn(string, int, int) -> string = "(function(s, start, finish)
+  if start < 0 or finish < start or finish > #s then _G.error('string slice out of bounds') end
+  return s:sub(start + 1, finish)
+end)";
+
+impl Iterable for Range {
+  fn iter(self) { __range_iter(self) }
+}
+
+impl Iterable for RangeInclusive {
+  fn iter(self) { __range_inclusive_iter(self) }
+}
+
+impl Iterable for RangeFrom {
+  fn iter(self) { __range_from_iter(self) }
+}
+
+impl Index for ['a], Range(int) -> ['a] {
+  fn index(self, key) {
+    match key { Range(bounds) -> __array_slice(self, bounds.start, bounds.finish) }
+  }
+}
+
+impl Index for ['a], RangeInclusive(int) -> ['a] {
+  fn index(self, key) {
+    match key { RangeInclusive(bounds) -> __array_slice(self, bounds.start, bounds.finish + 1) }
+  }
+}
+
+impl Index for ['a], RangeFrom(int) -> ['a] {
+  fn index(self, key) {
+    match key { RangeFrom(start) -> __array_slice(self, start, self.len()) }
+  }
+}
+
+impl Index for ['a], RangeTo(int) -> ['a] {
+  fn index(self, key) {
+    match key { RangeTo(finish) -> __array_slice(self, 0, finish) }
+  }
+}
+
+impl Index for ['a], RangeToInclusive(int) -> ['a] {
+  fn index(self, key) {
+    match key { RangeToInclusive(finish) -> __array_slice(self, 0, finish + 1) }
+  }
+}
+
+impl Index for ['a], RangeFull -> ['a] {
+  fn index(self, key) {
+    match key { RangeFull -> __array_slice(self, 0, self.len()) }
+  }
+}
+
+impl Index for string, Range(int) -> string {
+  fn index(self, key) {
+    match key { Range(bounds) -> __str_slice(self, bounds.start, bounds.finish) }
+  }
+}
+
+impl Index for string, RangeInclusive(int) -> string {
+  fn index(self, key) {
+    match key { RangeInclusive(bounds) -> __str_slice(self, bounds.start, bounds.finish + 1) }
+  }
+}
+
+impl Index for string, RangeFrom(int) -> string {
+  fn index(self, key) {
+    match key { RangeFrom(start) -> __str_slice(self, start, self.len()) }
+  }
+}
+
+impl Index for string, RangeTo(int) -> string {
+  fn index(self, key) {
+    match key { RangeTo(finish) -> __str_slice(self, 0, finish) }
+  }
+}
+
+impl Index for string, RangeToInclusive(int) -> string {
+  fn index(self, key) {
+    match key { RangeToInclusive(finish) -> __str_slice(self, 0, finish + 1) }
+  }
+}
+
+impl Index for string, RangeFull -> string {
+  fn index(self, key) {
+    match key { RangeFull -> __str_slice(self, 0, self.len()) }
+  }
 }
 
 // --- Lua interop ---

@@ -323,6 +323,14 @@ fn collect_expr_hints(
             collect_expr_hints(lhs, range, binding_types, definition_schemes, hints);
             collect_expr_hints(rhs, range, binding_types, definition_schemes, hints);
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                collect_expr_hints(start, range, binding_types, definition_schemes, hints);
+            }
+            if let Some(end) = end {
+                collect_expr_hints(end, range, binding_types, definition_schemes, hints);
+            }
+        }
         ExprKind::Call { callee, args, .. } => {
             collect_expr_hints(callee, range, binding_types, definition_schemes, hints);
             for arg in args {

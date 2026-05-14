@@ -118,6 +118,14 @@ fn collect_code_actions_for_expr(
             collect_code_actions_for_expr(lhs, uri, range, binding_types, actions);
             collect_code_actions_for_expr(rhs, uri, range, binding_types, actions);
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                collect_code_actions_for_expr(start, uri, range, binding_types, actions);
+            }
+            if let Some(end) = end {
+                collect_code_actions_for_expr(end, uri, range, binding_types, actions);
+            }
+        }
         ExprKind::Call { callee, args, .. } => {
             collect_code_actions_for_expr(callee, uri, range, binding_types, actions);
             for arg in args {

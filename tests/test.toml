@@ -651,6 +651,11 @@ output = """
 42
 """
 
+[tests.lambda_arrow_error]
+path = "tests/hern/lambda_arrow_error.hern"
+expect = "error"
+error_contains = "anonymous functions must use `fn(...) { ... }`"
+
 [tests.constrained_lambdas]
 path = "tests/hern/constrained_lambdas.hern"
 expect = "typecheck"
@@ -685,6 +690,48 @@ output = """
 2
 3
 60
+"""
+
+[tests.ranges]
+path = "tests/hern/ranges.hern"
+expect = "typecheck"
+output = """
+2
+3
+4
+2
+3
+4
+5
+42
+"""
+
+[tests.range_to_not_iterable_error]
+path = "tests/hern/range_to_not_iterable_error.hern"
+expect = "error"
+error_contains = "trait `Iterable` is not implemented for `RangeTo`"
+
+[tests.range_inclusive_missing_end_error]
+path = "tests/hern/range_inclusive_missing_end_error.hern"
+expect = "error"
+error_contains = "`..=` requires an end bound"
+
+[tests.range_index]
+path = "tests/hern/range_index.hern"
+expect = "typecheck"
+output = """
+[20, 30, 40]
+[20, 30, 40]
+[30, 40, 50]
+[10, 20]
+[10, 20, 30]
+[10, 20, 30, 40, 50]
+bcd
+bcd
+cdef
+ab
+abc
+abcdef
 """
 
 [tests.for_patterns]

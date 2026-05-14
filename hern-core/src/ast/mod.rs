@@ -177,6 +177,14 @@ pub fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             walk_expr(lhs, visit);
             walk_expr(rhs, visit);
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                walk_expr(start, visit);
+            }
+            if let Some(end) = end {
+                walk_expr(end, visit);
+            }
+        }
         ExprKind::Call { callee, args, .. } => {
             walk_expr(callee, visit);
             for arg in args {
@@ -615,6 +623,11 @@ pub enum ExprKind {
         pending_op: Option<PendingDictArg>,
         dict_args: Vec<DictRef>,
         pending_dict_args: Vec<PendingDictArg>,
+    },
+    Range {
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        inclusive: bool,
     },
     Call {
         callee: Box<Expr>,

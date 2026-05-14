@@ -1,0 +1,15 @@
+let xs = [10, 20, 30, 40, 50];
+print(ToString::to_string(xs[1..4]));
+print(ToString::to_string(xs[1..=3]));
+print(ToString::to_string(xs[2..]));
+print(ToString::to_string(xs[..2]));
+print(ToString::to_string(xs[..=2]));
+print(ToString::to_string(xs[..]));
+
+let s = "abcdef";
+print(s[1..4]);
+print(s[1..=3]);
+print(s[2..]);
+print(s[..2]);
+print(s[..=2]);
+print(s[..]);

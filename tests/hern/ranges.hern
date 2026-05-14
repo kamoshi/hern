@@ -1,0 +1,14 @@
+for i in 2..5 {
+  print(i);
+};
+
+for i in 2..=5 {
+  print(i);
+};
+
+let from: RangeFrom(int) = 2..;
+let to: RangeTo(int) = ..5;
+let to_inclusive: RangeToInclusive(int) = ..=5;
+let full: RangeFull = ..;
+
+print(42);

@@ -44,10 +44,23 @@ fn infix_binary_op(token: &Token) -> Option<(BinOp, u8, u8)> {
         Token::Minus => (BinOp::Custom("-".to_string()), 9, 10),
         Token::Star => (BinOp::Custom("*".to_string()), 11, 12),
         Token::Op(op) => (BinOp::Custom(op.clone()), 6, 7),
-        Token::DotDot => (BinOp::Custom("..".to_string()), 6, 7),
         _ => return None,
     };
     Some((op, l_bp, r_bp))
+}
+
+fn can_end_range(tokens: &[Spanned], ptr: usize) -> bool {
+    matches!(
+        tokens.get(ptr).map(|t| &t.token),
+        None | Some(
+            Token::Eof
+                | Token::Semicolon
+                | Token::Comma
+                | Token::RParen
+                | Token::RBracket
+                | Token::RBrace
+        )
+    )
 }
 
 fn associated_target_from_expr(
@@ -184,6 +197,15 @@ fn check_do_control_flow(expr: &Expr, in_explicit_loop: bool) -> Result<(), Pars
         ExprKind::Binary { lhs, rhs, .. } => {
             check_do_control_flow(lhs, in_explicit_loop)?;
             check_do_control_flow(rhs, in_explicit_loop)
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                check_do_control_flow(start, in_explicit_loop)?;
+            }
+            if let Some(end) = end {
+                check_do_control_flow(end, in_explicit_loop)?;
+            }
+            Ok(())
         }
         ExprKind::Call { callee, args, .. } => {
             check_do_control_flow(callee, in_explicit_loop)?;
@@ -1746,6 +1768,29 @@ impl<'tokens> Parser<'tokens> {
                 ptr += consumed;
                 lambda
             }
+            Token::DotDot | Token::DotDotEq => {
+                let inclusive = tok.token == Token::DotDotEq;
+                ptr += 1;
+                if inclusive && can_end_range(tokens, ptr) {
+                    return Err(ParseError::new("`..=` requires an end bound", tok.span));
+                }
+                let end = if can_end_range(tokens, ptr) {
+                    None
+                } else {
+                    let (consumed, end) = self.parse_expr(&tokens[ptr..], 3)?;
+                    ptr += consumed;
+                    Some(Box::new(end))
+                };
+                self.expr_from_tokens(
+                    tokens,
+                    ptr,
+                    ExprKind::Range {
+                        start: None,
+                        end,
+                        inclusive,
+                    },
+                )
+            }
             Token::Do => {
                 let (consumed, do_expr) = self.parse_do_expr(tokens)?;
                 ptr += consumed;
@@ -1830,6 +1875,39 @@ impl<'tokens> Parser<'tokens> {
                             member,
                             member_span,
                             resolution: None,
+                        },
+                    );
+                }
+                Token::DotDot | Token::DotDotEq => {
+                    let (l_bp, r_bp) = (2, 3);
+                    if l_bp < min_bp {
+                        break;
+                    }
+                    if matches!(lhs.kind, ExprKind::Range { .. }) {
+                        return Err(ParseError::new(
+                            "ranges cannot be chained; add parentheses to disambiguate",
+                            op_tok.span,
+                        ));
+                    }
+                    let inclusive = op_tok.token == Token::DotDotEq;
+                    ptr += 1;
+                    if inclusive && can_end_range(tokens, ptr) {
+                        return Err(ParseError::new("`..=` requires an end bound", op_tok.span));
+                    }
+                    let end = if can_end_range(tokens, ptr) {
+                        None
+                    } else {
+                        let (consumed_rhs, rhs) = self.parse_expr(&tokens[ptr..], r_bp)?;
+                        ptr += consumed_rhs;
+                        Some(Box::new(rhs))
+                    };
+                    lhs = self.expr_from_tokens(
+                        tokens,
+                        ptr,
+                        ExprKind::Range {
+                            start: Some(Box::new(lhs)),
+                            end,
+                            inclusive,
                         },
                     );
                 }
@@ -2360,16 +2438,16 @@ impl<'tokens> Parser<'tokens> {
             }
         }
         ptr += self.expect(&tokens[ptr..], Token::RParen)?;
-        let body = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Arrow) {
-            ptr += 1;
-            let (c_body, body) = self.parse_expr(&tokens[ptr..], 0)?;
-            ptr += c_body;
-            body
-        } else {
-            let (c_body, body) = self.parse_block(&tokens[ptr..])?;
-            ptr += c_body;
-            body
-        };
+        if let Some(tok) = tokens.get(ptr)
+            && tok.token == Token::Arrow
+        {
+            return Err(ParseError::new(
+                "anonymous functions must use `fn(...) { ... }`",
+                tok.span,
+            ));
+        }
+        let (c_body, body) = self.parse_block(&tokens[ptr..])?;
+        ptr += c_body;
         Ok((
             ptr,
             self.expr_from_tokens(

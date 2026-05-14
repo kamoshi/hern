@@ -327,6 +327,14 @@ fn substitute_self_in_expr_types(expr: &mut Expr, target: &Type) {
             substitute_self_in_expr_types(lhs, target);
             substitute_self_in_expr_types(value, target);
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                substitute_self_in_expr_types(start, target);
+            }
+            if let Some(end) = end {
+                substitute_self_in_expr_types(end, target);
+            }
+        }
         ExprKind::Call { callee, args, .. } => {
             substitute_self_in_expr_types(callee, target);
             for arg in args {

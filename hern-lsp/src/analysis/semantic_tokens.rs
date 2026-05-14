@@ -219,6 +219,7 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
         | Token::BangEq
         | Token::Op(_)
         | Token::Pipe
+        | Token::DotDotEq
         | Token::DotDot
         | Token::Dot
         | Token::ColonColon => TY_OPERATOR,
@@ -362,6 +363,14 @@ fn push_associated_access_tokens_expr(
         ExprKind::Binary { lhs, rhs, .. } => {
             push_associated_access_tokens_expr(raw, pos_to_idx, source, lhs);
             push_associated_access_tokens_expr(raw, pos_to_idx, source, rhs);
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, start);
+            }
+            if let Some(end) = end {
+                push_associated_access_tokens_expr(raw, pos_to_idx, source, end);
+            }
         }
         ExprKind::If {
             cond,

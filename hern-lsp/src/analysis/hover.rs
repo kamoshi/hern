@@ -1326,6 +1326,16 @@ fn param_type_in_expr_stmts(
             .or_else(|| {
                 param_type_in_expr_stmts(value, name, param_span, env, expr_types, variant_env)
             }),
+        ExprKind::Range { start, end, .. } => start
+            .as_deref()
+            .and_then(|expr| {
+                param_type_in_expr_stmts(expr, name, param_span, env, expr_types, variant_env)
+            })
+            .or_else(|| {
+                end.as_deref().and_then(|expr| {
+                    param_type_in_expr_stmts(expr, name, param_span, env, expr_types, variant_env)
+                })
+            }),
         ExprKind::Call { callee, args, .. } => {
             param_type_in_expr_stmts(callee, name, param_span, env, expr_types, variant_env)
                 .or_else(|| {
@@ -1603,6 +1613,28 @@ fn local_pattern_binding_type_in_expr(
                     )
                 })
         }
+        ExprKind::Range { start, end, .. } => start
+            .as_deref()
+            .and_then(|expr| {
+                local_pattern_binding_type_in_expr(
+                    expr,
+                    name,
+                    binding_span,
+                    expr_types,
+                    variant_env,
+                )
+            })
+            .or_else(|| {
+                end.as_deref().and_then(|expr| {
+                    local_pattern_binding_type_in_expr(
+                        expr,
+                        name,
+                        binding_span,
+                        expr_types,
+                        variant_env,
+                    )
+                })
+            }),
         ExprKind::Call { callee, args, .. } => {
             local_pattern_binding_type_in_expr(callee, name, binding_span, expr_types, variant_env)
                 .or_else(|| {
@@ -1801,6 +1833,13 @@ fn declaration_value_type_in_expr<'a>(
             ..
         } => declaration_value_type_in_expr(target, span, expr_types)
             .or_else(|| declaration_value_type_in_expr(value, span, expr_types)),
+        ExprKind::Range { start, end, .. } => start
+            .as_deref()
+            .and_then(|expr| declaration_value_type_in_expr(expr, span, expr_types))
+            .or_else(|| {
+                end.as_deref()
+                    .and_then(|expr| declaration_value_type_in_expr(expr, span, expr_types))
+            }),
         ExprKind::Call { callee, args, .. } => {
             declaration_value_type_in_expr(callee, span, expr_types).or_else(|| {
                 args.iter()

@@ -98,6 +98,7 @@ fn token_style(token: &Token) -> Style {
         | Token::Colon
         | Token::ColonColon
         | Token::Semicolon
+        | Token::DotDotEq
         | Token::DotDot
         | Token::Dot
         | Token::Hash => Style::default().fg(Color::DarkGray),

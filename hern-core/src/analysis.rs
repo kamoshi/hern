@@ -283,6 +283,14 @@ fn find_hover_in_expr(
                 }
             }
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                find_hover_in_expr(start, expr_types, symbol_types, pos, best);
+            }
+            if let Some(end) = end {
+                find_hover_in_expr(end, expr_types, symbol_types, pos, best);
+            }
+        }
         ExprKind::Call { callee, args, .. } => {
             find_hover_in_expr(callee, expr_types, symbol_types, pos, best);
             for arg in args {
@@ -356,6 +364,7 @@ fn hover_target_span(expr: &Expr, pos: SourcePosition) -> Option<SourceSpan> {
         | ExprKind::Match { .. }
         | ExprKind::Lambda { .. }
         | ExprKind::Index { .. }
+        | ExprKind::Range { .. }
         | ExprKind::Tuple(_)
         | ExprKind::Array(_)
         | ExprKind::Record(_) => Some(expr.span).filter(|span| contains(*span, pos)),
@@ -422,6 +431,13 @@ mod tests {
                     rhs: value,
                     ..
                 } => find_in_expr(target, method_name).or_else(|| find_in_expr(value, method_name)),
+                ExprKind::Range { start, end, .. } => start
+                    .as_deref()
+                    .and_then(|expr| find_in_expr(expr, method_name))
+                    .or_else(|| {
+                        end.as_deref()
+                            .and_then(|expr| find_in_expr(expr, method_name))
+                    }),
                 ExprKind::If {
                     cond,
                     then_branch,

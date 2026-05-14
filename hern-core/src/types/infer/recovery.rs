@@ -251,6 +251,14 @@ fn collect_expr_referenced_names(
             collect_expr_referenced_names(target, refs, value_scope, type_scope);
             collect_expr_referenced_names(value, refs, value_scope, type_scope);
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                collect_expr_referenced_names(start, refs, value_scope, type_scope);
+            }
+            if let Some(end) = end {
+                collect_expr_referenced_names(end, refs, value_scope, type_scope);
+            }
+        }
         ExprKind::Call { callee, args, .. } => {
             collect_expr_referenced_names(callee, refs, value_scope, type_scope);
             for arg in args {

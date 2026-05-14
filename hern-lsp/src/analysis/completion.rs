@@ -1100,6 +1100,11 @@ fn expr_children(expr: &Expr) -> Vec<&Expr> {
         ExprKind::Grouped(expr) | ExprKind::Not(expr) | ExprKind::Loop(expr) => vec![expr],
         ExprKind::Assign { target, value } => vec![target, value],
         ExprKind::Binary { lhs, rhs, .. } => vec![lhs, rhs],
+        ExprKind::Range { start, end, .. } => start
+            .iter()
+            .chain(end.iter())
+            .map(|expr| expr.as_ref())
+            .collect(),
         ExprKind::Call { callee, args, .. } => std::iter::once(callee.as_ref())
             .chain(args.iter())
             .collect(),

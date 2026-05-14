@@ -55,6 +55,7 @@ pub enum Token {
     ColonColon, // ::
     Semicolon,  // ;
     Comma,      // ,
+    DotDotEq,   // ..=
     DotDot,     // ..
     Dot,        // .
 
@@ -284,6 +285,7 @@ impl<'src> Lexer<'src> {
                     "=" => Token::Equal,
                     "==" => Token::EqEq,
                     "->" => Token::Arrow,
+                    "..=" => Token::DotDotEq,
                     ".." => Token::DotDot,
                     "." => Token::Dot,
                     "|" => Token::Pipe,

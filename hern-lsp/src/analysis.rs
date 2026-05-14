@@ -1681,6 +1681,71 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn range_bound_type_diagnostic_points_at_bad_bound() {
+        let project = TestProject::new("range-bound-diagnostic");
+        let source = "let xs = [1, 2, 3];\nprint(xs[1.5..2]);\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics
+            .values()
+            .flat_map(|items| items.iter())
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("type mismatch in range start bound")
+            })
+            .expect("range start bound type error should be reported");
+
+        let start = source.lines().nth(1).unwrap().find("1.5").unwrap() as u32;
+        assert_eq!(diagnostic.range.start.line, 1);
+        assert_eq!(diagnostic.range.start.character, start);
+        assert!(diagnostic.range.end.character > diagnostic.range.start.character);
+    }
+
+    #[test]
+    fn range_to_for_diagnostic_points_at_iterable_expression() {
+        let project = TestProject::new("range-to-for-diagnostic");
+        let source = "for i in ..5 { print(i); }\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics
+            .values()
+            .flat_map(|items| items.iter())
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("trait `Iterable` is not implemented for `RangeTo`")
+            })
+            .expect("non-iterable range error should be reported");
+
+        let start = source.find("..5").unwrap() as u32;
+        assert_eq!(diagnostic.range.start.line, 0);
+        assert_eq!(diagnostic.range.start.character, start);
+        assert!(diagnostic.range.end.character > diagnostic.range.start.character);
+    }
+
+    #[test]
+    fn range_inclusive_parse_diagnostic_points_at_operator() {
+        let project = TestProject::new("range-inclusive-parse-diagnostic");
+        let source = "let bad = 2..=;\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics
+            .values()
+            .flat_map(|items| items.iter())
+            .find(|diagnostic| diagnostic.message.contains("`..=` requires an end bound"))
+            .expect("dangling inclusive range parse error should be reported");
+
+        let start = source.find("..=").unwrap() as u32;
+        assert_eq!(diagnostic.range.start.line, 0);
+        assert_eq!(diagnostic.range.start.character, start);
+        assert!(diagnostic.range.end.character > diagnostic.range.start.character);
+    }
+
+    #[test]
     fn completion_suggests_exact_applied_inherent_receiver_methods() {
         let project = TestProject::new("completion-exact-applied-inherent");
         let (source, position) = source_with_cursor(concat!(

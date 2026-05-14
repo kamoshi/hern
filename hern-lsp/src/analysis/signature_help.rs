@@ -156,6 +156,14 @@ fn find_call_in_expr<'a>(
             find_call_in_expr(lhs, position, best);
             find_call_in_expr(rhs, position, best);
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                find_call_in_expr(start, position, best);
+            }
+            if let Some(end) = end {
+                find_call_in_expr(end, position, best);
+            }
+        }
         ExprKind::If {
             cond,
             then_branch,

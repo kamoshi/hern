@@ -77,6 +77,14 @@ fn reassoc_expr(expr: &mut Expr, table: &FixityTable) {
             reassoc_expr(lhs, table);
             reassoc_expr(rhs, table);
         }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                reassoc_expr(start, table);
+            }
+            if let Some(end) = end {
+                reassoc_expr(end, table);
+            }
+        }
         ExprKind::Call { callee, args, .. } => {
             reassoc_expr(callee, table);
             for a in args {

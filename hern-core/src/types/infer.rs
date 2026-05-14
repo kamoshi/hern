@@ -30,7 +30,7 @@ use crate::types::{
     InherentMethodScheme, ParamCapability, ROOT_LEVEL, ReturnCapability, Row, Scheme, Subst,
     TraitConstraint, Ty, TyVar, TypeLevel, display_ty_with_var_names,
     env::build_variant_env_from_stmts,
-    error::{SpannedTypeError, TypeError},
+    error::{SpannedTypeError, TypeError, TypeMismatchContext},
     free_type_vars, free_type_vars_in_display_order, free_type_vars_into, perf, type_var_name,
     unify, value_func_params, value_func_return,
 };
@@ -1518,6 +1518,11 @@ impl Infer {
                 dict_args,
                 pending_dict_args,
             ),
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => self.infer_range_expr(env, start.as_deref_mut(), end.as_deref_mut(), *inclusive),
             ExprKind::Call {
                 callee,
                 args,
@@ -1850,6 +1855,75 @@ impl Infer {
             ),
         }
         .into())
+    }
+
+    fn infer_range_expr(
+        &mut self,
+        env: &TypeEnv,
+        start: Option<&mut Expr>,
+        end: Option<&mut Expr>,
+        inclusive: bool,
+    ) -> Result<Ty, SpannedTypeError> {
+        let int_ty = Ty::Int;
+        match (start, end, inclusive) {
+            (Some(start), Some(end), false) => {
+                let start_ty = self.infer_expr(env, start)?;
+                unify(&mut self.subst, start_ty, int_ty.clone()).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::RangeStart)
+                        .at(start.span)
+                })?;
+                let end_ty = self.infer_expr(env, end)?;
+                unify(&mut self.subst, end_ty, int_ty.clone()).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::RangeEnd)
+                        .at(end.span)
+                })?;
+                Ok(range_ty("Range"))
+            }
+            (Some(start), Some(end), true) => {
+                let start_ty = self.infer_expr(env, start)?;
+                unify(&mut self.subst, start_ty, int_ty.clone()).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::RangeStart)
+                        .at(start.span)
+                })?;
+                let end_ty = self.infer_expr(env, end)?;
+                unify(&mut self.subst, end_ty, int_ty.clone()).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::RangeEnd)
+                        .at(end.span)
+                })?;
+                Ok(range_ty("RangeInclusive"))
+            }
+            (Some(start), None, false) => {
+                let start_ty = self.infer_expr(env, start)?;
+                unify(&mut self.subst, start_ty, int_ty).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::RangeStart)
+                        .at(start.span)
+                })?;
+                Ok(range_ty("RangeFrom"))
+            }
+            (Some(_), None, true) => {
+                unreachable!("parser rejects inclusive ranges without end bounds")
+            }
+            (None, Some(end), false) => {
+                let end_ty = self.infer_expr(env, end)?;
+                unify(&mut self.subst, end_ty, int_ty).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::RangeEnd)
+                        .at(end.span)
+                })?;
+                Ok(range_ty("RangeTo"))
+            }
+            (None, Some(end), true) => {
+                let end_ty = self.infer_expr(env, end)?;
+                unify(&mut self.subst, end_ty, int_ty).map_err(|err| {
+                    err.with_mismatch_context(TypeMismatchContext::RangeEnd)
+                        .at(end.span)
+                })?;
+                Ok(range_ty("RangeToInclusive"))
+            }
+            (None, None, false) => Ok(Ty::Con("RangeFull".to_string())),
+            (None, None, true) => {
+                unreachable!("parser rejects inclusive ranges without end bounds")
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2335,7 +2409,8 @@ impl Infer {
         unify(&mut self.subst, iter_ty, self_ty)?;
 
         let resolved_target = self.subst.apply(&Ty::Var(target_var));
-        self.resolve_iterable_dict(env, resolved_iter, pending_iter, resolved_target)?;
+        self.resolve_iterable_dict(env, resolved_iter, pending_iter, resolved_target)
+            .map_err(|err| err.with_span_if_absent(iterable.span))?;
 
         let elem_ty = match self.subst.apply(&ret_ty) {
             Ty::App(_, args) if args.len() == 1 => args.into_iter().next().unwrap(), // len == 1 from pattern guard
@@ -2950,6 +3025,10 @@ fn constructor_pattern_refinement_mismatch(
 
 fn is_never(ty: &Ty) -> bool {
     matches!(ty, Ty::Never)
+}
+
+fn range_ty(name: &str) -> Ty {
+    Ty::App(Box::new(Ty::Con(name.to_string())), vec![Ty::Int])
 }
 
 fn merge_record_field(fields: &mut Vec<(String, Ty)>, name: String, ty: Ty) {
