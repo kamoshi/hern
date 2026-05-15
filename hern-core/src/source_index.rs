@@ -441,6 +441,7 @@ impl IndexBuilder {
             } => {
                 self.define(name, *name_span, DefinitionKind::Extern);
             }
+            Stmt::TestBlock { .. } => {}
             Stmt::Expr(_) => {}
         }
     }
@@ -469,6 +470,19 @@ impl IndexBuilder {
                 for method in &impl_def.methods {
                     self.index_callable_body(&method.params, method.span, &method.body);
                 }
+            }
+            Stmt::TestBlock { span, stmts } => {
+                self.push_scope_with_end(SourcePosition {
+                    line: span.end_line,
+                    col: span.end_col,
+                });
+                for stmt in stmts {
+                    self.define_top_level(stmt);
+                }
+                for stmt in stmts {
+                    self.index_top_level_stmt(stmt);
+                }
+                self.pop_scope();
             }
             Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
         }
@@ -513,6 +527,19 @@ impl IndexBuilder {
                 for method in &impl_def.methods {
                     self.index_callable_body(&method.params, method.span, &method.body);
                 }
+            }
+            Stmt::TestBlock { span, stmts } => {
+                self.push_scope_with_end(SourcePosition {
+                    line: span.end_line,
+                    col: span.end_col,
+                });
+                for stmt in stmts {
+                    self.define_top_level(stmt);
+                }
+                for stmt in stmts {
+                    self.index_top_level_stmt(stmt);
+                }
+                self.pop_scope();
             }
             Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
         }

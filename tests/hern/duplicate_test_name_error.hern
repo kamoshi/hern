@@ -1,0 +1,13 @@
+test {
+  #[test]
+  fn repeats() {
+    ()
+  }
+}
+
+test {
+  #[test]
+  fn repeats() {
+    ()
+  }
+}

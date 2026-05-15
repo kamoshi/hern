@@ -100,6 +100,11 @@ fn collect_code_actions_for_stmt(stmt: &Stmt, ctx: &mut CodeActionCtx<'_>) {
                 collect_code_actions_for_expr(&method.body, ctx);
             }
         }
+        Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                collect_code_actions_for_stmt(stmt, ctx);
+            }
+        }
         Stmt::Expr(expr) => collect_code_actions_for_expr(expr, ctx),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
     }

@@ -221,6 +221,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_source_accepts_test_blocks_with_marked_tests() {
+        let program =
+            parse_source("test { #[test] fn works() { () } }\n").expect("test block should parse");
+        let Stmt::TestBlock { stmts, .. } = &program.stmts[0] else {
+            panic!("expected test block");
+        };
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].is_test_fn());
+    }
+
+    #[test]
     fn parse_source_records_declaration_spans() {
         let program = parse_source("fn answer() { 42 }\n").expect("source should parse");
         let span = program.stmts[0].span();

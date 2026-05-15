@@ -1,6 +1,6 @@
 use clap::{Parser as ClapParser, Subcommand};
 use hern_core::analysis::CompilerDiagnostic;
-use hern_core::codegen::bundle::{gen_lua_bundle, gen_lua_iife_bundle};
+use hern_core::codegen::bundle::{gen_lua_bundle, gen_lua_iife_bundle, gen_lua_iife_test_bundle};
 use hern_core::module::{ModuleGraph, parse_file_recovering};
 use hern_core::workspace::{WorkspaceInputs, analyze_workspace};
 use std::collections::HashMap;
@@ -40,6 +40,11 @@ enum Commands {
     /// Run Hern via Lua
     Run {
         /// Path to the file to run
+        path: PathBuf,
+    },
+    /// Run Hern unit tests
+    Test {
+        /// Path to the file to test
         path: PathBuf,
     },
     /// Bundle Hern and all imports into a single Lua file
@@ -140,6 +145,7 @@ fn run_cli() -> Result<(), CliError> {
             println!("{}", gen_lua_bundle(&graph, &inference.module_envs, &entry));
         }
         (Some(Commands::Run { path }), None) => run_file(path)?,
+        (Some(Commands::Test { path }), None) => test_file(path)?,
         (Some(Commands::Bundle { path }), None) => {
             let (graph, inference, entry) = analyze_workspace_for_cli(path)?;
             print!(
@@ -177,6 +183,13 @@ fn parse_file_for_cli(path: &Path) -> Result<hern_core::ast::Program, CliError> 
 fn run_file(path: PathBuf) -> Result<(), CliError> {
     let (graph, inference, entry) = analyze_workspace_for_cli(path)?;
     let lua_code = gen_lua_iife_bundle(&graph, &inference.module_envs, &entry);
+    hern_repl::exec_lua(&lua_code)
+        .map_err(|e| CliError::Single(CompilerDiagnostic::error(None, e.to_string())))
+}
+
+fn test_file(path: PathBuf) -> Result<(), CliError> {
+    let (graph, inference, entry) = analyze_workspace_for_cli(path)?;
+    let lua_code = gen_lua_iife_test_bundle(&graph, &inference.module_envs, &entry);
     hern_repl::exec_lua(&lua_code)
         .map_err(|e| CliError::Single(CompilerDiagnostic::error(None, e.to_string())))
 }
@@ -232,6 +245,17 @@ mod tests {
         match cli.command {
             Some(Commands::Run { path }) => assert_eq!(path, PathBuf::from("script.hern")),
             _ => panic!("expected run command"),
+        }
+        assert_eq!(cli.path, None);
+    }
+
+    #[test]
+    fn test_subcommand_parses_normally() {
+        let cli = Cli::try_parse_from(["hern", "test", "script.hern"]).expect("test should parse");
+
+        match cli.command {
+            Some(Commands::Test { path }) => assert_eq!(path, PathBuf::from("script.hern")),
+            _ => panic!("expected test command"),
         }
         assert_eq!(cli.path, None);
     }

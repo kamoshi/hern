@@ -1597,6 +1597,9 @@ fn local_pattern_binding_type_in_stmt(
                 variant_env,
             )
         }),
+        Stmt::TestBlock { stmts, .. } => stmts.iter().find_map(|stmt| {
+            local_pattern_binding_type_in_stmt(stmt, name, binding_span, expr_types, variant_env)
+        }),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
     }
 }
@@ -1865,6 +1868,9 @@ fn declaration_value_type_in_stmt<'a>(
                 .then(|| expr_types.get(&method.body.id))
                 .flatten()
         }),
+        Stmt::TestBlock { stmts, .. } => stmts
+            .iter()
+            .find_map(|stmt| declaration_value_type_in_stmt(stmt, span, expr_types)),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
         Stmt::Let { value, .. } => declaration_value_type_in_expr(value, span, expr_types),
         Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {

@@ -46,6 +46,11 @@ fn reassoc_stmt(stmt: &mut Stmt, table: &FixityTable) {
                 reassoc_expr(&mut m.body, table);
             }
         }
+        Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                reassoc_stmt(stmt, table);
+            }
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
     }
 }

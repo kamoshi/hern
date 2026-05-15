@@ -996,7 +996,7 @@ pub(super) mod tests {
     #[test]
     fn hover_renders_fundep_constraint_predicates() {
         let project = TestProject::new("fundep-constraint-hover");
-        let source = "fn test(foo, bar) { foo[bar] }\ntest\n";
+        let source = "fn probe(foo, bar) { foo[bar] }\nprobe\n";
         let (state, uri) = project.open("main.hern", source);
 
         let info = hover(&state, uri, Position::new(1, 1)).expect("test hover should resolve");

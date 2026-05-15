@@ -51,6 +51,18 @@ pub struct Program {
     pub inner_attrs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribute {
+    pub name: String,
+    pub span: SourceSpan,
+}
+
+impl Attribute {
+    pub fn is(&self, name: &str) -> bool {
+        self.name == name
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Fixity {
     Left,
@@ -68,6 +80,7 @@ pub enum Stmt {
         value: Expr,
     },
     Fn {
+        attrs: Vec<Attribute>,
         span: SourceSpan,
         name: String,
         name_span: SourceSpan,
@@ -92,6 +105,10 @@ pub enum Stmt {
     Trait(TraitDef),
     Impl(ImplDef),
     InherentImpl(InherentImplDef),
+    TestBlock {
+        span: SourceSpan,
+        stmts: Vec<Stmt>,
+    },
     Type(TypeDef),
     TypeAlias {
         span: SourceSpan,
@@ -121,8 +138,16 @@ impl Stmt {
             Stmt::Trait(td) => td.span,
             Stmt::Impl(id) => id.span,
             Stmt::InherentImpl(id) => id.span,
+            Stmt::TestBlock { span, .. } => *span,
             Stmt::Type(td) => td.span,
             Stmt::Expr(expr) => expr.span,
+        }
+    }
+
+    pub fn is_test_fn(&self) -> bool {
+        match self {
+            Stmt::Fn { attrs, .. } => attrs.iter().any(|attr| attr.is("test")),
+            _ => false,
         }
     }
 }
@@ -148,6 +173,11 @@ pub fn walk_stmt_exprs(stmt: &Stmt, visit: &mut impl FnMut(&Expr)) {
         Stmt::InherentImpl(id) => {
             for method in &id.methods {
                 walk_expr(&method.body, visit);
+            }
+        }
+        Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                walk_stmt_exprs(stmt, visit);
             }
         }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}

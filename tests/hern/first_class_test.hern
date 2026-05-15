@@ -1,0 +1,14 @@
+fn helper(x: int) -> int {
+  x + 1
+}
+
+test {
+  fn make_value() {
+    Some(helper(1))
+  }
+
+  #[test]
+  fn option_map_some() {
+    assert_eq(Some(1).map(fn(x) { x + 1 }), make_value())
+  }
+}

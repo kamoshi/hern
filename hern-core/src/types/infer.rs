@@ -966,6 +966,7 @@ impl Infer {
 
         let mut env = seed_env.cloned().unwrap_or_else(TypeEnv::new);
         self.validate_type_trait_name_collisions(seed_stmts, &program.stmts)?;
+        self.validate_duplicate_test_function_names(&program.stmts)?;
         self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()));
         self.register_traits_and_ops(seed_stmts.iter().chain(program.stmts.iter()))?;
         // Fail-fast inference may resolve calls before reaching a later impl statement.
@@ -1047,6 +1048,7 @@ impl Infer {
         if let Err(err) = self.validate_type_trait_name_collisions(seed_stmts, &program.stmts) {
             return (ModuleInference::default(), vec![err]);
         }
+        let duplicate_test_name_error = self.validate_duplicate_test_function_names(&program.stmts);
         self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()));
         if let Err(err) =
             self.register_traits_and_ops(seed_stmts.iter().chain(program.stmts.iter()))
@@ -1059,7 +1061,8 @@ impl Infer {
         // only this program's impl names while preserving imported/prelude impls.
         self.remove_program_impl_dict_names(program.stmts.iter());
 
-        let mut diagnostics: Vec<SpannedTypeError> = Vec::new();
+        let mut diagnostics: Vec<SpannedTypeError> =
+            duplicate_test_name_error.err().into_iter().collect();
         let mut unavailable = CollectedNames::default();
 
         // Pre-pass 3: constructor types and externs (per-stmt recovery).
@@ -1381,9 +1384,83 @@ impl Infer {
                 self.infer_inherent_impl(env, id)?;
                 Ok(Ty::Unit)
             }
+            Stmt::TestBlock { stmts, .. } => {
+                let mut test_env = env.clone();
+                for stmt in stmts.iter_mut() {
+                    self.infer_stmt(&mut test_env, stmt)?;
+                    self.validate_test_stmt_shape(&test_env, stmt)?;
+                }
+                Ok(Ty::Unit)
+            }
             Stmt::Expr(expr) => self.infer_expr(env, expr),
         })();
         result.map_err(|err| err.with_span_if_absent(span))
+    }
+
+    fn validate_test_stmt_shape(&self, env: &TypeEnv, stmt: &Stmt) -> Result<(), SpannedTypeError> {
+        let Stmt::Fn {
+            name,
+            name_span,
+            params,
+            ..
+        } = stmt
+        else {
+            return Ok(());
+        };
+        if !stmt.is_test_fn() {
+            return Ok(());
+        }
+        if !params.is_empty() {
+            return Err(TypeError::ArityMismatch {
+                expected: 0,
+                got: params.len(),
+            }
+            .at(*name_span));
+        }
+        let Some(info) = env.get(name) else {
+            return Ok(());
+        };
+        match Self::test_function_return_ty(&info.scheme.ty) {
+            Some(Ty::Unit) => Ok(()),
+            Some(other) => Err(TypeError::Mismatch(Ty::Unit, other.clone()).at(*name_span)),
+            None => Err(TypeError::NotAFunction(info.scheme.ty.clone()).at(*name_span)),
+        }
+    }
+
+    fn validate_duplicate_test_function_names(
+        &self,
+        stmts: &[Stmt],
+    ) -> Result<(), SpannedTypeError> {
+        let mut seen: HashMap<&str, SourceSpan> = HashMap::new();
+        for stmt in stmts {
+            let Stmt::TestBlock { stmts, .. } = stmt else {
+                continue;
+            };
+            for stmt in stmts {
+                let Stmt::Fn {
+                    name, name_span, ..
+                } = stmt
+                else {
+                    continue;
+                };
+                if !stmt.is_test_fn() {
+                    continue;
+                }
+                if seen.insert(name.as_str(), *name_span).is_some() {
+                    return Err(TypeError::DuplicateTestFunction(name.clone()).at(*name_span));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn test_function_return_ty(ty: &Ty) -> Option<&Ty> {
+        match ty {
+            Ty::Qualified(_, inner) => Self::test_function_return_ty(inner),
+            Ty::Func(params, ret) if params.is_empty() => Some(ret.ty.as_ref()),
+            Ty::Func(_, _) => None,
+            _ => None,
+        }
     }
 
     fn infer_expr_expected(

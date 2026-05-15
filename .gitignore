@@ -12,6 +12,7 @@
 !flake.lock
 
 !README.md
+!PLAN_derive.md
 
 # Rust crates
 !hern/

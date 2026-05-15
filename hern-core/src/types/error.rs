@@ -45,6 +45,7 @@ pub enum TypeError {
         missing: String,
     },
     DuplicateOperator(String),
+    DuplicateTestFunction(String),
     MissingTraitMethod {
         trait_name: String,
         impl_target: String,
@@ -350,6 +351,9 @@ impl fmt::Display for TypeError {
             }
             TypeError::DuplicateOperator(op) => {
                 write!(f, "operator `{}` is defined in multiple traits", op)
+            }
+            TypeError::DuplicateTestFunction(name) => {
+                write!(f, "test function `{}` is defined multiple times", name)
             }
             TypeError::MissingTraitMethod {
                 trait_name,

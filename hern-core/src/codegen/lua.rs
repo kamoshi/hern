@@ -36,6 +36,7 @@ pub struct LuaCodegen {
     inline_methods: HashMap<String, InlineMethod>,
     extern_templates: HashMap<String, String>,
     import_mode: ImportMode,
+    test_emit_mode: TestEmitMode,
 }
 
 #[derive(Clone)]
@@ -48,6 +49,12 @@ struct InlineMethod {
 pub enum ImportMode {
     Require,
     Bundle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TestEmitMode {
+    Omit,
+    Include,
 }
 
 impl Default for LuaCodegen {
@@ -68,11 +75,17 @@ impl LuaCodegen {
             inline_methods: HashMap::new(),
             extern_templates: HashMap::new(),
             import_mode: ImportMode::Require,
+            test_emit_mode: TestEmitMode::Omit,
         }
     }
 
     pub fn with_import_mode(mut self, import_mode: ImportMode) -> Self {
         self.import_mode = import_mode;
+        self
+    }
+
+    pub fn with_test_emit_mode(mut self, test_emit_mode: TestEmitMode) -> Self {
+        self.test_emit_mode = test_emit_mode;
         self
     }
 
@@ -215,6 +228,20 @@ impl LuaCodegen {
         }
         self.indent -= 2;
         out.push_str(&format!("{}}},\n", self.ind()));
+        if self.test_emit_mode == TestEmitMode::Include {
+            out.push_str(&format!("{}__hern_tests = {{\n", self.ind()));
+            self.indent += 2;
+            for name in test_function_names_from_stmts(stmts) {
+                out.push_str(&format!(
+                    "{}{{ name = {}, fn = {} }},\n",
+                    self.ind(),
+                    lua_string(&name),
+                    name
+                ));
+            }
+            self.indent -= 2;
+            out.push_str(&format!("{}}},\n", self.ind()));
+        }
         self.indent -= 2;
         out.push_str("}\n");
         out
@@ -377,6 +404,18 @@ impl LuaCodegen {
                 dict_params,
                 ..
             } => self.gen_function(name, params, dict_params, body),
+            Stmt::TestBlock { stmts, .. } => {
+                if self.test_emit_mode == TestEmitMode::Omit {
+                    String::new()
+                } else {
+                    let mut out = String::new();
+                    for stmt in stmts {
+                        out.push_str(&self.gen_stmt(stmt));
+                        out.push('\n');
+                    }
+                    out
+                }
+            }
             Stmt::Trait(_) | Stmt::TypeAlias { .. } => String::new(),
         }
     }
@@ -2175,6 +2214,7 @@ fn prelude_value_names(stmts: &[Stmt]) -> Vec<String> {
                 names.extend(td.variants.iter().map(|variant| variant.name.clone()));
             }
             Stmt::Let { pat, .. } => collect_pattern_names(pat, &mut names),
+            Stmt::TestBlock { .. } => {}
             Stmt::Extern {
                 kind: ExternKind::Template(_),
                 ..
@@ -2188,6 +2228,26 @@ fn prelude_value_names(stmts: &[Stmt]) -> Vec<String> {
     }
     names.sort();
     names.dedup();
+    names
+}
+
+pub fn test_function_names(program: &Program) -> Vec<String> {
+    test_function_names_from_stmts(&program.stmts)
+}
+
+fn test_function_names_from_stmts(stmts: &[Stmt]) -> Vec<String> {
+    let mut names = Vec::new();
+    for stmt in stmts {
+        if let Stmt::TestBlock { stmts, .. } = stmt {
+            for stmt in stmts {
+                if let Stmt::Fn { name, .. } = stmt
+                    && stmt.is_test_fn()
+                {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
     names
 }
 

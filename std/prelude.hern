@@ -435,6 +435,43 @@ impl Eq for Ordering {
   }
 }
 
+// TODO: replace this concrete bridge with Eq for Option('a) where 'a: Eq
+// once generic impl resolution reliably picks that dictionary.
+impl Eq for Option(int)
+{
+  fn ==(lhs, rhs) {
+    match lhs {
+      Some(l) -> match rhs {
+        Some(r) -> l == r,
+        None -> false,
+      },
+      None -> match rhs {
+        Some(_) -> false,
+        None -> true,
+      },
+    }
+  }
+
+  fn !=(lhs, rhs) {
+    match lhs {
+      Some(l) -> match rhs {
+        Some(r) -> l != r,
+        None -> true,
+      },
+      None -> match rhs {
+        Some(_) -> true,
+        None -> false,
+      },
+    }
+  }
+}
+
+fn assert_eq(lhs: 'a, rhs: 'a) -> ()
+where 'a: Eq
+{
+  assert(lhs == rhs, "assert_eq failed")
+}
+
 impl ToString for bool {
   fn to_string(self) {
     if self { "true" } else { "false" }

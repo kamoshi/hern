@@ -57,7 +57,7 @@ pub(super) fn stmt_bound_names(stmt: &Stmt) -> CollectedNames {
         Stmt::Impl(id) => {
             names.traits.insert(id.trait_name.clone());
         }
-        Stmt::InherentImpl(_) | Stmt::Expr(_) => {}
+        Stmt::TestBlock { .. } | Stmt::InherentImpl(_) | Stmt::Expr(_) => {}
     }
     names
 }
@@ -205,6 +205,16 @@ fn collect_stmt_referenced_names(
         }
         Stmt::Extern { ty, .. } => collect_type_referenced_names(ty, refs, type_scope),
         Stmt::Expr(expr) => collect_expr_referenced_names(expr, refs, value_scope, type_scope),
+        Stmt::TestBlock { stmts, .. } => {
+            let mut block_value_scope = value_scope.clone();
+            let mut block_type_scope = type_scope.clone();
+            for stmt in stmts {
+                collect_stmt_referenced_names(stmt, refs, &block_value_scope, &block_type_scope);
+                let bindings = stmt_bound_names(stmt);
+                block_value_scope.extend(bindings.values);
+                block_type_scope.extend(bindings.types);
+            }
+        }
     }
 }
 

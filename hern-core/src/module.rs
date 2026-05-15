@@ -1043,6 +1043,12 @@ fn resolve_imports_in_stmt(
             }
             Ok(())
         }
+        Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                resolve_imports_in_stmt(stmt, base_dir, graph)?;
+            }
+            Ok(())
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => Ok(()),
     }
 }
@@ -1076,6 +1082,17 @@ fn resolve_imports_in_stmt_recovering(
             for method in &mut id.methods {
                 resolve_imports_in_expr_recovering(
                     &mut method.body,
+                    base_dir,
+                    graph,
+                    source.clone(),
+                    diagnostics,
+                );
+            }
+        }
+        Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                resolve_imports_in_stmt_recovering(
+                    stmt,
                     base_dir,
                     graph,
                     source.clone(),

@@ -185,6 +185,7 @@ cargo run -p hern -- typecheck path/to/file.hern
 cargo run -p hern -- typecheck --dump path/to/file.hern
 cargo run -p hern -- lua path/to/file.hern
 cargo run -p hern -- run path/to/file.hern
+cargo run -p hern -- test path/to/file.hern
 cargo run -p hern -- bundle path/to/file.hern
 cargo run -p hern -- repl
 cargo run -p hern -- repl path/to/file.hern
@@ -194,6 +195,23 @@ cargo run -p hern -- lsp
 `lua` prints generated Lua. `bundle` emits a self-contained Lua bundle. `run`
 typechecks, compiles, and executes through the local Lua runtime used by the
 REPL.
+
+Unit tests live in `test` blocks. Functions marked with `#[test]` are run by
+`hern test`; unmarked functions in the block can be used as test helpers.
+Normal `run`, `lua`, and `bundle` output omits test blocks.
+
+```hern
+test {
+  fn expected() {
+    Some(2)
+  }
+
+  #[test]
+  fn option_map_some() {
+    assert_eq(Some(1).map(fn(x) { x + 1 }), expected())
+  }
+}
+```
 
 ## Workspace
 

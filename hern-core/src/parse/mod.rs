@@ -336,7 +336,9 @@ impl<'tokens> Parser<'tokens> {
         let start = ptr;
         let mut inline = false;
 
-        while tokens.get(ptr).map(|t| &t.token) == Some(&Token::Hash) {
+        while tokens.get(ptr).map(|t| &t.token) == Some(&Token::Hash)
+            && tokens.get(ptr + 1).map(|t| &t.token) == Some(&Token::LBracket)
+        {
             ptr += 1;
             ptr += self.expect(&tokens[ptr..], Token::LBracket)?;
             let attr_span = tokens.get(ptr).map(|t| t.span).unwrap_or(Span {
@@ -359,6 +361,52 @@ impl<'tokens> Parser<'tokens> {
         }
 
         Ok((ptr - start, inline))
+    }
+
+    fn parse_outer_attrs(
+        &self,
+        tokens: &[Spanned],
+        mut ptr: usize,
+    ) -> Result<(usize, Vec<Attribute>), ParseError> {
+        let start = ptr;
+        let mut attrs = Vec::new();
+
+        while tokens.get(ptr).map(|t| &t.token) == Some(&Token::Hash)
+            && tokens.get(ptr + 1).map(|t| &t.token) == Some(&Token::LBracket)
+        {
+            let attr_start = ptr;
+            ptr += 1;
+            ptr += self.expect(&tokens[ptr..], Token::LBracket)?;
+            let attr_span = tokens.get(ptr).map(|t| t.span).unwrap_or(Span {
+                line: 0,
+                col: 0,
+                len: 0,
+            });
+            let name = match tokens.get(ptr) {
+                Some(Spanned {
+                    token: Token::Ident(name),
+                    ..
+                }) => name.clone(),
+                Some(Spanned {
+                    token: Token::Test, ..
+                }) => "test".to_string(),
+                Some(tok) => {
+                    return Err(ParseError::new(
+                        format!("Expected attribute name, found {}", tok.token),
+                        tok.span,
+                    ));
+                }
+                None => return Err(ParseError::new("Unexpected EOF", attr_span)),
+            };
+            ptr += 1;
+            ptr += self.expect(&tokens[ptr..], Token::RBracket)?;
+            attrs.push(Attribute {
+                name,
+                span: consumed_span(&tokens[attr_start..], ptr - attr_start),
+            });
+        }
+
+        Ok((ptr - start, attrs))
     }
 
     fn parse_extern_kind_marker(
@@ -445,6 +493,78 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
+        self.parse_stmt_in_context(tokens, false)
+    }
+
+    fn parse_test_block_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
+        self.parse_stmt_in_context(tokens, true)
+    }
+
+    fn parse_stmt_in_context(
+        &self,
+        tokens: &[Spanned],
+        in_test_block: bool,
+    ) -> Result<(usize, Stmt), ParseError> {
+        let (attrs_consumed, attrs) = self.parse_outer_attrs(tokens, 0)?;
+        if attrs_consumed > 0 {
+            if let Some(attr) = attrs.iter().find(|attr| !attr.is("test")) {
+                return Err(ParseError::new(
+                    format!("Unknown attribute `{}`", attr.name),
+                    Span {
+                        line: attr.span.start_line,
+                        col: attr.span.start_col,
+                        len: attr.span.end_col.saturating_sub(attr.span.start_col),
+                    },
+                ));
+            }
+            if !in_test_block {
+                return Err(ParseError::new(
+                    "Attribute `test` can only be used inside a `test` block",
+                    Span {
+                        line: attrs[0].span.start_line,
+                        col: attrs[0].span.start_col,
+                        len: attrs[0]
+                            .span
+                            .end_col
+                            .saturating_sub(attrs[0].span.start_col),
+                    },
+                ));
+            }
+            let Some(tok) = tokens.get(attrs_consumed) else {
+                let attr_span = attrs
+                    .last()
+                    .map(|attr| attr.span)
+                    .unwrap_or_else(SourceSpan::synthetic);
+                return Err(ParseError::new(
+                    "Expected statement after attribute",
+                    Span {
+                        line: attr_span.end_line,
+                        col: attr_span.end_col,
+                        len: 1,
+                    },
+                ));
+            };
+            if tok.token != Token::Fn {
+                return Err(ParseError::new(
+                    format!(
+                        "Attribute `{}` can only be used on functions",
+                        attrs[0].name
+                    ),
+                    Span {
+                        line: attrs[0].span.start_line,
+                        col: attrs[0].span.start_col,
+                        len: attrs[0]
+                            .span
+                            .end_col
+                            .saturating_sub(attrs[0].span.start_col),
+                    },
+                ));
+            }
+            let (consumed, stmt) =
+                self.parse_fn_stmt_with_attrs(&tokens[attrs_consumed..], attrs)?;
+            return Ok((attrs_consumed + consumed, stmt));
+        }
+
         let tok = tokens.first().ok_or_else(|| {
             ParseError::new(
                 "Unexpected EOF",
@@ -458,6 +578,7 @@ impl<'tokens> Parser<'tokens> {
         match &tok.token {
             Token::Let => self.parse_let_stmt(tokens),
             Token::Fn => self.parse_fn_stmt(tokens),
+            Token::Test => self.parse_test_stmt(tokens),
             Token::Trait => self.parse_trait_stmt(tokens),
             Token::Impl => self.parse_impl_stmt(tokens),
             Token::Type => self.parse_type_def_stmt(tokens),
@@ -473,6 +594,52 @@ impl<'tokens> Parser<'tokens> {
                 Ok((total_consumed, Stmt::Expr(expr)))
             }
         }
+    }
+
+    fn parse_test_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
+        let mut ptr = 0;
+        ptr += self.expect(&tokens[ptr..], Token::Test)?;
+        ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
+        let mut stmts = Vec::new();
+        while tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
+            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Eof) {
+                return Err(ParseError::new(
+                    "Expected `}` to close test block",
+                    tokens[ptr].span,
+                ));
+            }
+            match tokens.get(ptr).map(|t| &t.token) {
+                Some(Token::Fn | Token::Hash | Token::Let) => {
+                    let (consumed, stmt) = self.parse_test_block_stmt(&tokens[ptr..])?;
+                    ptr += consumed;
+                    stmts.push(stmt);
+                }
+                Some(Token::Test) => {
+                    return Err(ParseError::new(
+                        "`test` blocks cannot be nested",
+                        tokens[ptr].span,
+                    ));
+                }
+                Some(_) | None => {
+                    return Err(ParseError::new(
+                        "Expected function, helper declaration, or `}` inside test block",
+                        tokens.get(ptr).map(|t| t.span).unwrap_or(Span {
+                            line: 0,
+                            col: 0,
+                            len: 0,
+                        }),
+                    ));
+                }
+            }
+        }
+        ptr += self.expect(&tokens[ptr..], Token::RBrace)?;
+        Ok((
+            ptr,
+            Stmt::TestBlock {
+                span: consumed_span(tokens, ptr),
+                stmts,
+            },
+        ))
     }
 
     fn parse_let_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
@@ -513,6 +680,14 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_fn_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
+        self.parse_fn_stmt_with_attrs(tokens, vec![])
+    }
+
+    fn parse_fn_stmt_with_attrs(
+        &self,
+        tokens: &[Spanned],
+        attrs: Vec<Attribute>,
+    ) -> Result<(usize, Stmt), ParseError> {
         let mut ptr = 0;
         ptr += self.expect(&tokens[ptr..], Token::Fn)?;
 
@@ -520,6 +695,16 @@ impl<'tokens> Parser<'tokens> {
         if let Some(Token::Ident(s)) = tokens.get(ptr).map(|t| &t.token)
             && (s == "infixl" || s == "infixr" || s == "infix")
         {
+            if let Some(attr) = attrs.iter().find(|attr| attr.is("test")) {
+                return Err(ParseError::new(
+                    "Attribute `test` is not supported on operator functions",
+                    Span {
+                        line: attr.span.start_line,
+                        col: attr.span.start_col,
+                        len: attr.span.end_col.saturating_sub(attr.span.start_col),
+                    },
+                ));
+            }
             let fixity = match s.as_str() {
                 "infixl" => Fixity::Left,
                 "infixr" => Fixity::Right,
@@ -574,6 +759,7 @@ impl<'tokens> Parser<'tokens> {
         Ok((
             ptr,
             Stmt::Fn {
+                attrs,
                 span: consumed_span(tokens, ptr),
                 name,
                 name_span,

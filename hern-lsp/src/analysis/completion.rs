@@ -1070,6 +1070,9 @@ fn find_expr_ending_at_in_stmt(stmt: &hern_core::ast::Stmt, end: SourcePosition)
             .methods
             .iter()
             .find_map(|method| find_expr_ending_at_in_expr(&method.body, end)),
+        hern_core::ast::Stmt::TestBlock { stmts, .. } => stmts
+            .iter()
+            .find_map(|stmt| find_expr_ending_at_in_stmt(stmt, end)),
         hern_core::ast::Stmt::Trait(_)
         | hern_core::ast::Stmt::Type(_)
         | hern_core::ast::Stmt::TypeAlias { .. }

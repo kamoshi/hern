@@ -121,6 +121,9 @@ fn associated_definition_span_in_stmt(
             .methods
             .iter()
             .find_map(|method| associated_definition_span_in_expr(program, &method.body, position)),
+        Stmt::TestBlock { stmts, .. } => stmts
+            .iter()
+            .find_map(|stmt| associated_definition_span_in_stmt(program, stmt, position)),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
     }
 }

@@ -1,0 +1,3 @@
+test {
+  type Local = LocalValue
+}

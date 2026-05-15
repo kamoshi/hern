@@ -78,6 +78,13 @@ fn symbols_for_stmt(stmt: &Stmt) -> Vec<DocumentSymbol> {
             *name_span,
             None,
         )],
+        Stmt::TestBlock { span, stmts } => vec![symbol(
+            "test".to_string(),
+            SymbolKind::NAMESPACE,
+            *span,
+            *span,
+            Some(stmts.iter().flat_map(symbols_for_stmt).collect()),
+        )],
         Stmt::Expr(_) => Vec::new(),
     }
 }

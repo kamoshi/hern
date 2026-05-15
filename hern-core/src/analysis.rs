@@ -182,6 +182,11 @@ fn find_hover_in_stmt(
                 find_hover_in_expr(&method.body, expr_types, symbol_types, pos, best);
             }
         }
+        Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                find_hover_in_stmt(stmt, expr_types, symbol_types, pos, best);
+            }
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
     }
 }
@@ -528,6 +533,9 @@ mod tests {
                     .methods
                     .iter()
                     .find_map(|method| find_in_expr(&method.body, method_name)),
+                Stmt::TestBlock { stmts, .. } => stmts
+                    .iter()
+                    .find_map(|stmt| find_in_stmt(stmt, method_name)),
                 Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {
                     None
                 }

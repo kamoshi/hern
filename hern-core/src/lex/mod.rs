@@ -23,6 +23,7 @@ pub enum Token {
     Extern,
     Import,
     Do,
+    Test,
 
     // Punctuation (operators continued)
     Pipe, // |
@@ -95,6 +96,7 @@ impl fmt::Display for Token {
             Token::Extern => write!(f, "`extern`"),
             Token::Import => write!(f, "`import`"),
             Token::Do => write!(f, "`do`"),
+            Token::Test => write!(f, "`test`"),
             Token::Pipe => write!(f, "`|`"),
             Token::True => write!(f, "`true`"),
             Token::False => write!(f, "`false`"),
@@ -522,6 +524,7 @@ impl<'src> Lexer<'src> {
             "false" => Token::False,
             "in" => Token::In,
             "do" => Token::Do,
+            "test" => Token::Test,
             _ => Token::Ident(word.to_string()),
         }
     }

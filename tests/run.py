@@ -10,7 +10,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_TOML_PATH = os.path.join(REPO_ROOT, "tests", "test.toml")
 DEFAULT_LUA = os.environ.get("HERN_TEST_LUA", "luajit")
 
-ALLOWED_EXPECTS = {"typecheck", "error"}
+ALLOWED_EXPECTS = {"typecheck", "error", "test"}
 ALLOWED_KEYS = {
     "path",
     "expect",
@@ -202,7 +202,8 @@ def run_test(name, test, hern_bin, lua_bin):
     path = os.path.join(REPO_ROOT, test["path"])
     expect = test["expect"]
 
-    result = subprocess.run([hern_bin, "lua", path], capture_output=True, text=True)
+    command = "test" if expect == "test" else "lua"
+    result = subprocess.run([hern_bin, command, path], capture_output=True, text=True)
 
     if expect == "error":
         if result.returncode == 0:
@@ -217,16 +218,20 @@ def run_test(name, test, hern_bin, lua_bin):
 
     if "output" in test:
         expected_output = test["output"]
-        rt = subprocess.run(
-            [lua_bin, "-"], input=result.stdout, capture_output=True, text=True
-        )
-        if rt.returncode != 0:
-            return False, f"Runtime error: {rt.stderr}"
-        if rt.stdout.strip() != expected_output.strip():
+        if expect == "test":
+            actual_output = result.stdout
+        else:
+            rt = subprocess.run(
+                [lua_bin, "-"], input=result.stdout, capture_output=True, text=True
+            )
+            if rt.returncode != 0:
+                return False, f"Runtime error: {rt.stderr}"
+            actual_output = rt.stdout
+        if actual_output.strip() != expected_output.strip():
             return (
                 False,
                 "Output mismatch.\n"
-                f"{format_output_mismatch(expected_output, rt.stdout)}",
+                f"{format_output_mismatch(expected_output, actual_output)}",
             )
 
     return True, "Passed"

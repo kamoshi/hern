@@ -1587,3 +1587,26 @@ error_contains = "expected `int`, got `string`"
 path = "tests/hern/trait_fundep_unreachable_dependent_error.hern"
 expect = "error"
 error_contains = "dependent trait parameter `'b` must appear in a method signature"
+
+[tests.first_class_test]
+path = "tests/hern/first_class_test.hern"
+expect = "test"
+output = """
+ok first_class_test::option_map_some
+1 passed; 0 failed
+"""
+
+[tests.test_block_type_decl_error]
+path = "tests/hern/test_block_type_decl_error.hern"
+expect = "error"
+error_contains = "Expected function, helper declaration, or `}` inside test block"
+
+[tests.test_block_extern_decl_error]
+path = "tests/hern/test_block_extern_decl_error.hern"
+expect = "error"
+error_contains = "Expected function, helper declaration, or `}` inside test block"
+
+[tests.duplicate_test_name_error]
+path = "tests/hern/duplicate_test_name_error.hern"
+expect = "error"
+error_contains = "test function `repeats` is defined multiple times"

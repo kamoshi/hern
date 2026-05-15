@@ -113,6 +113,11 @@ fn collect_stmt_hints(
                 );
             }
         }
+        Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                collect_stmt_hints(stmt, range, binding_types, definition_schemes, hints);
+            }
+        }
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
     }
 }
