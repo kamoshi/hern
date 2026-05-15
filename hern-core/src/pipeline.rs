@@ -247,6 +247,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_diagnostics_render_source_tokens_not_debug_names() {
+        let err = parse_source("fn (x) { x }\n").expect_err("source should fail parsing");
+
+        assert_eq!(err.message, "Expected identifier, found `(`");
+    }
+
+    #[test]
     fn collecting_inference_reports_independent_top_level_type_errors() {
         let mut program =
             parse_source("let a: bool = 1;\nlet b: bool = 2;\n").expect("source should parse");

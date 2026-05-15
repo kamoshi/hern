@@ -43,6 +43,7 @@ fn infix_binary_op(token: &Token) -> Option<(BinOp, u8, u8)> {
         Token::Plus => (BinOp::Custom("+".to_string()), 9, 10),
         Token::Minus => (BinOp::Custom("-".to_string()), 9, 10),
         Token::Star => (BinOp::Custom("*".to_string()), 11, 12),
+        Token::Op(op) if op == "**" => (BinOp::Custom(op.clone()), 13, 13),
         Token::Op(op) => (BinOp::Custom(op.clone()), 6, 7),
         _ => return None,
     };
@@ -190,6 +191,7 @@ fn check_do_control_flow(expr: &Expr, in_explicit_loop: bool) -> Result<(), Pars
 
         // All other expression forms: recurse with the same loop context.
         ExprKind::Grouped(e) | ExprKind::Not(e) => check_do_control_flow(e, in_explicit_loop),
+        ExprKind::Neg { operand, .. } => check_do_control_flow(operand, in_explicit_loop),
         ExprKind::Assign { target, value } => {
             check_do_control_flow(target, in_explicit_loop)?;
             check_do_control_flow(value, in_explicit_loop)
@@ -595,8 +597,54 @@ impl<'tokens> Parser<'tokens> {
         }
         ptr += 1;
         loop {
-            let (c_p, p) = self.expect_ident(&tokens[ptr..])?;
-            ptr += c_p;
+            let mut args = Vec::new();
+            let mut fundep_arrow_index = None;
+            loop {
+                match tokens.get(ptr).map(|t| &t.token) {
+                    Some(Token::Colon) => break,
+                    Some(Token::Arrow) => {
+                        if fundep_arrow_index.is_some() {
+                            return Err(ParseError::new(
+                                "Expected only one functional dependency arrow in constraint",
+                                tokens[ptr].span,
+                            ));
+                        }
+                        if args.is_empty() {
+                            return Err(ParseError::new(
+                                "Expected at least one determinant type before `->`",
+                                tokens[ptr].span,
+                            ));
+                        }
+                        fundep_arrow_index = Some(args.len());
+                        ptr += 1;
+                    }
+                    Some(Token::Comma) | Some(Token::LBrace) | Some(Token::Eof) | None => {
+                        let span = self.parse_error_span(tokens, ptr);
+                        return Err(ParseError::new(
+                            "Expected `:`, `->`, or another type argument in trait constraint",
+                            span,
+                        ));
+                    }
+                    _ => {
+                        let (consumed, arg) = self.parse_type(&tokens[ptr..])?;
+                        ptr += consumed;
+                        args.push(arg);
+                    }
+                }
+            }
+            if args.is_empty() {
+                return Err(ParseError::new(
+                    "Expected at least one type argument in trait constraint",
+                    self.parse_error_span(tokens, ptr),
+                ));
+            }
+            if fundep_arrow_index == Some(args.len()) {
+                let span = self.parse_error_span(tokens, ptr);
+                return Err(ParseError::new(
+                    "Expected at least one dependent type after `->`",
+                    span,
+                ));
+            }
             ptr += self.expect(&tokens[ptr..], Token::Colon)?;
             let mut traits = Vec::new();
             loop {
@@ -609,7 +657,11 @@ impl<'tokens> Parser<'tokens> {
                     break;
                 }
             }
-            bounds.push(TypeBound { var: p, traits });
+            bounds.push(TypeBound {
+                args,
+                fundep_arrow_index,
+                traits,
+            });
             if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
                 ptr += 1;
             } else {
@@ -1153,7 +1205,7 @@ impl<'tokens> Parser<'tokens> {
             s.clone()
         } else {
             return Err(ParseError::new(
-                format!("Expected string literal, found {:?}", tok.token),
+                format!("Expected string literal, found {}", tok.token),
                 tok.span,
             ));
         };
@@ -1440,7 +1492,7 @@ impl<'tokens> Parser<'tokens> {
                 Ok((ptr, Pattern::List { elements, rest }))
             }
             _ => Err(ParseError::new(
-                format!("Expected pattern, found {:?}", tok.token),
+                format!("Expected pattern, found {}", tok.token),
                 tok.span,
             )),
         }
@@ -1588,7 +1640,7 @@ impl<'tokens> Parser<'tokens> {
             }
             _ => {
                 return Err(ParseError::new(
-                    format!("Expected type, found {:?}", tok.token),
+                    format!("Expected type, found {}", tok.token),
                     tok.span,
                 ));
             }
@@ -1660,24 +1712,14 @@ impl<'tokens> Parser<'tokens> {
                 let (consumed, operand) = self.parse_expr(&tokens[ptr..], 11)?;
                 ptr += consumed;
                 let op_span = SourceSpan::from_lex_span(tok.span);
-                let zero = match &operand.kind {
-                    ExprKind::Number(crate::lex::NumberLiteral::Float(_)) => {
-                        crate::lex::NumberLiteral::Float(0.0)
-                    }
-                    _ => crate::lex::NumberLiteral::Int(0),
-                };
                 self.expr_from_tokens(
                     tokens,
                     ptr,
-                    ExprKind::Binary {
-                        lhs: Box::new(Expr::synthetic(ExprKind::Number(zero))),
-                        op: BinOp::Custom("-".to_string()),
+                    ExprKind::Neg {
+                        operand: Box::new(operand),
                         op_span,
-                        rhs: Box::new(operand),
                         resolved_op: None,
                         pending_op: None,
-                        dict_args: vec![],
-                        pending_dict_args: vec![],
                     },
                 )
             }
@@ -1754,7 +1796,7 @@ impl<'tokens> Parser<'tokens> {
                 let Token::StringLit(path) = &path_tok.token else {
                     return Err(ParseError::new(
                         format!(
-                            "Expected string literal after import, found {:?}",
+                            "Expected string literal after import, found {}",
                             path_tok.token
                         ),
                         path_tok.span,
@@ -1798,7 +1840,7 @@ impl<'tokens> Parser<'tokens> {
             }
             _ => {
                 return Err(ParseError::new(
-                    format!("Unexpected token in expression: {:?}", tok.token),
+                    format!("Unexpected token in expression: {}", tok.token),
                     tok.span,
                 ));
             }
@@ -2416,10 +2458,23 @@ impl<'tokens> Parser<'tokens> {
             Ok(1)
         } else {
             Err(ParseError::new(
-                format!("Expected {:?}, found {:?}", expected, tok.token),
+                format!("Expected {}, found {}", expected, tok.token),
                 tok.span,
             ))
         }
+    }
+
+    fn parse_error_span(&self, tokens: &[Spanned], ptr: usize) -> Span {
+        tokens
+            .get(ptr)
+            .or_else(|| ptr.checked_sub(1).and_then(|index| tokens.get(index)))
+            .or_else(|| tokens.last())
+            .map(|token| token.span)
+            .unwrap_or(Span {
+                line: 0,
+                col: 0,
+                len: 0,
+            })
     }
 
     fn parse_lambda(&self, tokens: &[Spanned]) -> Result<(usize, Expr), ParseError> {
@@ -2497,7 +2552,7 @@ impl<'tokens> Parser<'tokens> {
             Ok((1, name.clone(), SourceSpan::from_lex_span(tok.span)))
         } else {
             Err(ParseError::new(
-                format!("Expected identifier, found {:?}", tok.token),
+                format!("Expected identifier, found {}", tok.token),
                 tok.span,
             ))
         }
@@ -2532,7 +2587,7 @@ impl<'tokens> Parser<'tokens> {
             Token::PipeArrow => Ok((1, "|>".to_string(), span)),
             Token::In => Ok((1, "in".to_string(), span)),
             _ => Err(ParseError::new(
-                format!("Expected identifier or operator, found {:?}", tok.token),
+                format!("Expected identifier or operator, found {}", tok.token),
                 tok.span,
             )),
         }

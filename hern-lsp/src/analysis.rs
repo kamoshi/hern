@@ -983,8 +983,25 @@ pub(super) mod tests {
         let star =
             hover(&state, uri, Position::new(1, 16)).expect("star operator hover should resolve");
 
-        assert_eq!(hover_text(plus), "fn('a, 'a) -> 'a\ninfixl 6\n\n'a: Add");
-        assert_eq!(hover_text(star), "fn('a, 'a) -> 'a\ninfixl 7\n\n'a: Mul");
+        assert_eq!(
+            hover_text(plus),
+            "fn('lhs, 'rhs) -> 'output\ninfixl 6\n\n'lhs 'rhs -> 'output: Add"
+        );
+        assert_eq!(
+            hover_text(star),
+            "fn('lhs, 'rhs) -> 'output\ninfixl 7\n\n'lhs 'rhs -> 'output: Mul"
+        );
+    }
+
+    #[test]
+    fn hover_renders_fundep_constraint_predicates() {
+        let project = TestProject::new("fundep-constraint-hover");
+        let source = "fn test(foo, bar) { foo[bar] }\ntest\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(1, 1)).expect("test hover should resolve");
+
+        assert_eq!(hover_text(info), "fn('a, 'b) -> 'c\n\n'a 'b -> 'c: Index");
     }
 
     #[test]
@@ -1098,8 +1115,10 @@ pub(super) mod tests {
         let x_info = hover(&state, uri.clone(), Position::new(1, 7)).expect("hover should resolve");
         let y_info = hover(&state, uri, Position::new(1, 10)).expect("hover should resolve");
 
-        assert_eq!(hover_text(x_info), "int");
-        assert_eq!(hover_text(y_info), "int");
+        // Heterogeneous `Add` keeps these loop bindings polymorphic until a
+        // concrete implementation is selected at the call site.
+        assert_eq!(hover_text(x_info), "'a");
+        assert_eq!(hover_text(y_info), "'a");
     }
 
     #[test]

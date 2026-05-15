@@ -1,0 +1,6 @@
+fn bad(xs: [Option(int)]) -> int {
+    match xs {
+        [] -> 0,
+        [Some(_), ..] -> 1,
+    }
+}

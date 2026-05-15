@@ -356,6 +356,9 @@ fn push_associated_access_tokens_expr(
         | ExprKind::FieldAccess { expr: inner, .. } => {
             push_associated_access_tokens_expr(raw, pos_to_idx, source, inner)
         }
+        ExprKind::Neg { operand, .. } => {
+            push_associated_access_tokens_expr(raw, pos_to_idx, source, operand)
+        }
         ExprKind::Assign { target, value } => {
             push_associated_access_tokens_expr(raw, pos_to_idx, source, target);
             push_associated_access_tokens_expr(raw, pos_to_idx, source, value);

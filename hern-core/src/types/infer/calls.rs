@@ -319,13 +319,14 @@ impl Infer {
         pending_trait_method: &mut Option<(PendingDictArg, String)>,
         concrete_dict_expect: &'static str,
     ) -> Result<Option<Ty>, SpannedTypeError> {
-        if let Some(dict) = resolve_concrete_multi_dict_ref(
+        if let Some(dict) = resolve_concrete_from_args_unifying(
             trait_name,
             &trait_args,
             &determinant_indexes,
             env,
             &self.known_impl_dicts,
             &self.known_impl_schemes,
+            &mut self.subst,
         ) {
             let dict_name = dict_ref_concrete_name(&dict)
                 .expect(concrete_dict_expect)

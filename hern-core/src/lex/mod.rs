@@ -1,5 +1,6 @@
 pub mod error;
 use error::{LexError, LexErrorKind, Span};
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -71,6 +72,66 @@ pub enum Token {
     InnerAttr(String), // #![name]
 
     Eof,
+}
+
+impl fmt::Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Token::Let => write!(f, "`let`"),
+            Token::Mut => write!(f, "`mut`"),
+            Token::Fn => write!(f, "`fn`"),
+            Token::If => write!(f, "`if`"),
+            Token::Else => write!(f, "`else`"),
+            Token::Trait => write!(f, "`trait`"),
+            Token::Impl => write!(f, "`impl`"),
+            Token::For => write!(f, "`for`"),
+            Token::Where => write!(f, "`where`"),
+            Token::Type => write!(f, "`type`"),
+            Token::Match => write!(f, "`match`"),
+            Token::Loop => write!(f, "`loop`"),
+            Token::Break => write!(f, "`break`"),
+            Token::Continue => write!(f, "`continue`"),
+            Token::Return => write!(f, "`return`"),
+            Token::Extern => write!(f, "`extern`"),
+            Token::Import => write!(f, "`import`"),
+            Token::Do => write!(f, "`do`"),
+            Token::Pipe => write!(f, "`|`"),
+            Token::True => write!(f, "`true`"),
+            Token::False => write!(f, "`false`"),
+            Token::Ident(name) => write!(f, "identifier `{}`", name),
+            Token::Number(value) => write!(f, "number `{}`", value.as_lua_source()),
+            Token::StringLit(value) => write!(f, "string literal {:?}", value),
+            Token::Equal => write!(f, "`=`"),
+            Token::EqEq => write!(f, "`==`"),
+            Token::Plus => write!(f, "`+`"),
+            Token::Minus => write!(f, "`-`"),
+            Token::Arrow => write!(f, "`->`"),
+            Token::Star => write!(f, "`*`"),
+            Token::AmpAmp => write!(f, "`&&`"),
+            Token::PipePipe => write!(f, "`||`"),
+            Token::PipeArrow => write!(f, "`|>`"),
+            Token::Bang => write!(f, "`!`"),
+            Token::BangEq => write!(f, "`!=`"),
+            Token::Op(op) => write!(f, "operator `{}`", op),
+            Token::In => write!(f, "`in`"),
+            Token::Colon => write!(f, "`:`"),
+            Token::ColonColon => write!(f, "`::`"),
+            Token::Semicolon => write!(f, "`;`"),
+            Token::Comma => write!(f, "`,`"),
+            Token::DotDotEq => write!(f, "`..=`"),
+            Token::DotDot => write!(f, "`..`"),
+            Token::Dot => write!(f, "`.`"),
+            Token::LParen => write!(f, "`(`"),
+            Token::RParen => write!(f, "`)`"),
+            Token::LBrace => write!(f, "`{{`"),
+            Token::RBrace => write!(f, "`}}`"),
+            Token::LBracket => write!(f, "`[`"),
+            Token::RBracket => write!(f, "`]`"),
+            Token::Hash => write!(f, "`#`"),
+            Token::InnerAttr(attr) => write!(f, "inner attribute `#![{}]`", attr),
+            Token::Eof => write!(f, "end of file"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

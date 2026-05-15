@@ -1,4 +1,4 @@
-fn tuple_item(xs) -> int {
+fn tuple_item(xs: [(int, int)]) -> int {
     match xs {
         [(x, y)] -> x + y,
         _ -> 0,

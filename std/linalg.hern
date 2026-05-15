@@ -1,0 +1,333 @@
+type Vector = Vector([float])
+type Matrix = Matrix([[float]])
+
+fn vector(values: [float]) -> Vector {
+  Vector(values)
+}
+
+fn matrix(rows: [[float]]) -> Matrix {
+  Matrix(rows)
+}
+
+fn zeros(n: int) -> Vector {
+  let mut values = [];
+  for _ in range(1, n) {
+    values.push(0.0);
+  };
+  vector(values)
+}
+
+fn identity(n: int) -> Matrix {
+  let mut rows = [];
+  for row in range(1, n) {
+    let mut values = [];
+    for col in range(1, n) {
+      if row == col {
+        values.push(1.0);
+      } else {
+        values.push(0.0);
+      }
+    };
+    rows.push(values);
+  };
+  matrix(rows)
+}
+
+impl Vector {
+  fn values(self) -> [float] {
+    match self {
+      Vector(values) -> values,
+    }
+  }
+
+  fn len(self) -> int {
+    self.values().len()
+  }
+
+  fn get(self, index: int) -> float {
+    self.values()[index]
+  }
+
+  fn to_array(self) -> [float] {
+    self.values()
+  }
+
+  fn dot(self, other: Vector) -> float {
+    if self.len() != other.len() {
+      panic("vector dot dimension mismatch")
+    };
+
+    let mut total = 0.0;
+    for i in range(0, self.len() - 1) {
+      let left = self.get(i);
+      let right = other.get(i);
+      total = total + left * right;
+    };
+    total
+  }
+
+  fn length_squared(self) -> float {
+    self.dot(self)
+  }
+
+  fn length(self) -> float {
+    math.sqrt(self.length_squared())
+  }
+
+  fn normalized(self) -> Vector {
+    let len = self.length();
+    if len == 0.0 {
+      self
+    } else {
+      let scale = 1.0 / len;
+      let mut values = [];
+      for item in self.values() {
+        values.push(item * scale);
+      };
+      vector(values)
+    }
+  }
+}
+
+impl Matrix {
+  fn values(self) -> [[float]] {
+    match self {
+      Matrix(rows) -> rows,
+    }
+  }
+
+  fn rows(self) -> int {
+    self.values().len()
+  }
+
+  fn cols(self) -> int {
+    match self.values().first() {
+      Some(row) -> row.len(),
+      None -> 0,
+    }
+  }
+
+  fn to_array(self) -> [[float]] {
+    self.values()
+  }
+
+  fn validate(self) -> () {
+    let cols = self.cols();
+    for row in self.values() {
+      if row.len() != cols {
+        panic("matrix rows must all have the same length");
+      }
+    }
+  }
+
+  fn get(self, row: int, col: int) -> float {
+    if row < 0 || row >= self.rows() || col < 0 || col >= self.cols() {
+      panic("matrix index out of bounds")
+    };
+    self.values()[row][col]
+  }
+
+  fn row(self, index: int) -> Vector {
+    if index < 0 || index >= self.rows() {
+      panic("matrix row index out of bounds")
+    };
+    vector(self.values()[index])
+  }
+
+  fn col(self, index: int) -> Vector {
+    if index < 0 || index >= self.cols() {
+      panic("matrix column index out of bounds")
+    };
+    let mut values = [];
+    for row in range(0, self.rows() - 1) {
+      values.push(self.get(row, index));
+    };
+    vector(values)
+  }
+
+  fn transpose(self) -> Matrix {
+    let mut rows = [];
+    if self.rows() > 0 {
+      for col in range(0, self.cols() - 1) {
+        let mut values = [];
+        for row in range(0, self.rows() - 1) {
+          values.push(self.get(row, col));
+        };
+        rows.push(values);
+      }
+    };
+    matrix(rows)
+  }
+}
+
+impl Index for Vector, int -> float {
+  fn index(self: Vector, key: int) -> float {
+    self.get(key)
+  }
+}
+
+impl Index for Matrix, (int, int) -> float {
+  fn index(self: Matrix, key: (int, int)) -> float {
+    let (row, col) = key;
+    self.get(row, col)
+  }
+}
+
+impl Add for Vector, Vector -> Vector {
+  fn +(lhs: Vector, rhs: Vector) -> Vector {
+    if lhs.len() != rhs.len() {
+      panic("vector add dimension mismatch")
+    };
+
+    let mut values = [];
+    for i in range(0, lhs.len() - 1) {
+      values.push(lhs.get(i) + rhs.get(i));
+    };
+    vector(values)
+  }
+}
+
+impl Sub for Vector, Vector -> Vector {
+  fn -(lhs: Vector, rhs: Vector) -> Vector {
+    if lhs.len() != rhs.len() {
+      panic("vector subtract dimension mismatch")
+    };
+
+    let mut values = [];
+    for i in range(0, lhs.len() - 1) {
+      values.push(lhs.get(i) - rhs.get(i));
+    };
+    vector(values)
+  }
+}
+
+impl Mul for Vector, float -> Vector {
+  fn *(lhs: Vector, rhs: float) -> Vector {
+    let mut values = [];
+    for item in lhs.values() {
+      values.push(item * rhs);
+    };
+    vector(values)
+  }
+}
+
+impl Mul for float, Vector -> Vector {
+  fn *(lhs: float, rhs: Vector) -> Vector {
+    rhs * lhs
+  }
+}
+
+impl Add for Matrix, Matrix -> Matrix {
+  fn +(lhs: Matrix, rhs: Matrix) -> Matrix {
+    lhs.validate();
+    rhs.validate();
+    if lhs.rows() != rhs.rows() || lhs.cols() != rhs.cols() {
+      panic("matrix add dimension mismatch")
+    };
+
+    let mut rows = [];
+    for row in range(0, lhs.rows() - 1) {
+      let mut values = [];
+      for col in range(0, lhs.cols() - 1) {
+        values.push(lhs.get(row, col) + rhs.get(row, col));
+      };
+      rows.push(values);
+    };
+    matrix(rows)
+  }
+}
+
+impl Sub for Matrix, Matrix -> Matrix {
+  fn -(lhs: Matrix, rhs: Matrix) -> Matrix {
+    lhs.validate();
+    rhs.validate();
+    if lhs.rows() != rhs.rows() || lhs.cols() != rhs.cols() {
+      panic("matrix subtract dimension mismatch")
+    };
+
+    let mut rows = [];
+    for row in range(0, lhs.rows() - 1) {
+      let mut values = [];
+      for col in range(0, lhs.cols() - 1) {
+        values.push(lhs.get(row, col) - rhs.get(row, col));
+      };
+      rows.push(values);
+    };
+    matrix(rows)
+  }
+}
+
+impl Mul for Matrix, float -> Matrix {
+  fn *(lhs: Matrix, rhs: float) -> Matrix {
+    lhs.validate();
+    let mut rows = [];
+    for row in lhs.values() {
+      let mut values = [];
+      for item in row {
+        values.push(item * rhs);
+      };
+      rows.push(values);
+    };
+    matrix(rows)
+  }
+}
+
+impl Mul for float, Matrix -> Matrix {
+  fn *(lhs: float, rhs: Matrix) -> Matrix {
+    rhs * lhs
+  }
+}
+
+impl Mul for Matrix, Vector -> Vector {
+  fn *(lhs: Matrix, rhs: Vector) -> Vector {
+    lhs.validate();
+    if lhs.cols() != rhs.len() {
+      panic("matrix-vector dimension mismatch")
+    };
+
+    let mut values = [];
+    for row in range(0, lhs.rows() - 1) {
+      values.push(lhs.row(row).dot(rhs));
+    };
+    vector(values)
+  }
+}
+
+impl Mul for Matrix, Matrix -> Matrix {
+  fn *(lhs: Matrix, rhs: Matrix) -> Matrix {
+    lhs.validate();
+    rhs.validate();
+    if lhs.cols() != rhs.rows() {
+      panic("matrix-matrix dimension mismatch")
+    };
+
+    let mut rows = [];
+    for row in range(0, lhs.rows() - 1) {
+      let mut values = [];
+      for col in range(0, rhs.cols() - 1) {
+        values.push(lhs.row(row).dot(rhs.col(col)));
+      };
+      rows.push(values);
+    };
+    matrix(rows)
+  }
+}
+
+impl ToString for Vector {
+  fn to_string(self: Vector) -> string {
+    "Vector(" <> self.values().to_string() <> ")"
+  }
+}
+
+impl ToString for Matrix {
+  fn to_string(self: Matrix) -> string {
+    "Matrix(" <> self.values().to_string() <> ")"
+  }
+}
+
+#{
+  vector,
+  matrix,
+  zeros,
+  identity,
+}

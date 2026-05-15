@@ -1,0 +1,9 @@
+fn classify(x: (Option(int), bool)) -> int {
+    match x {
+        (Some(_), _) -> 1,
+        (None, _) -> 0,
+    }
+}
+
+print(classify((Some(1), true)));
+print(classify((None, false)));

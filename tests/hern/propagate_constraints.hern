@@ -1,12 +1,12 @@
-fn add(x, y) {
+fn add(x: 'a, y: 'a) -> 'a where 'a 'a -> 'a: Add {
     x + y
 }
 
-fn mul(x, y) {
+fn mul(x: 'a, y: 'a) -> 'a where 'a 'a -> 'a: Mul {
     x * y
 }
 
-fn math_stuff(a, b, c) {
+fn math_stuff(a: 'a, b: 'a, c: 'a) -> 'a where 'a 'a -> 'a: Add + Mul {
     add(mul(a, b), c)
 }
 

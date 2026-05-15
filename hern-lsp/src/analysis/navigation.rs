@@ -159,6 +159,9 @@ fn associated_definition_span_in_expr(
         | ExprKind::Lambda { body: inner, .. } => {
             associated_definition_span_in_expr(program, inner, position)
         }
+        ExprKind::Neg { operand, .. } => {
+            associated_definition_span_in_expr(program, operand, position)
+        }
         ExprKind::Assign { target, value } => {
             associated_definition_span_in_expr(program, target, position)
                 .or_else(|| associated_definition_span_in_expr(program, value, position))

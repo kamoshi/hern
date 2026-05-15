@@ -222,6 +222,35 @@ fn find_hover_in_expr(
         | ExprKind::Lambda { body: e, .. } => {
             find_hover_in_expr(e, expr_types, symbol_types, pos, best)
         }
+        ExprKind::Neg {
+            operand, op_span, ..
+        } => {
+            find_hover_in_expr(operand, expr_types, symbol_types, pos, best);
+            if contains(*op_span, pos) {
+                let operand_ty = symbol_types
+                    .get(&operand.id)
+                    .or_else(|| expr_types.get(&operand.id));
+                let result_ty = expr_types
+                    .get(&expr.id)
+                    .or_else(|| symbol_types.get(&expr.id));
+                if let (Some(operand_ty), Some(result_ty)) = (operand_ty, result_ty) {
+                    let op_ty = Ty::Func(
+                        crate::types::value_func_params(vec![operand_ty.clone()]),
+                        crate::types::value_func_return(result_ty.clone()),
+                    );
+                    if best
+                        .as_ref()
+                        .is_none_or(|cur| span_len(*op_span) <= span_len(cur.span))
+                    {
+                        *best = Some(HoverInfo {
+                            node_id: expr.id,
+                            span: *op_span,
+                            ty: op_ty,
+                        });
+                    }
+                }
+            }
+        }
         ExprKind::Index { receiver, key, .. } => {
             find_hover_in_expr(receiver, expr_types, symbol_types, pos, best);
             find_hover_in_expr(key, expr_types, symbol_types, pos, best);
@@ -376,6 +405,7 @@ fn hover_target_span(expr: &Expr, pos: SourcePosition) -> Option<SourceSpan> {
         }
         ExprKind::Grouped(_)
         | ExprKind::Not(_)
+        | ExprKind::Neg { .. }
         | ExprKind::Loop(_)
         | ExprKind::Break(_)
         | ExprKind::Continue
@@ -424,6 +454,7 @@ mod tests {
                 | ExprKind::Loop(expr)
                 | ExprKind::Break(Some(expr))
                 | ExprKind::Return(Some(expr)) => find_in_expr(expr, method_name),
+                ExprKind::Neg { operand, .. } => find_in_expr(operand, method_name),
                 ExprKind::AssociatedAccess { .. } => None,
                 ExprKind::Assign { target, value }
                 | ExprKind::Binary {

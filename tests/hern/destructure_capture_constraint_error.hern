@@ -1,0 +1,6 @@
+fn bad(outer) {
+  let #{ f } = #{ f: fn(x) { outer + x } };
+  (f(1), f(1.0))
+}
+
+bad(1);

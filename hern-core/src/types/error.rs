@@ -36,6 +36,10 @@ pub enum TypeError {
         trait_name: String,
         message: String,
     },
+    InvalidTraitConstraint {
+        trait_name: String,
+        message: String,
+    },
     InvalidAssignmentTarget,
     NonExhaustiveMatch {
         missing: String,
@@ -332,6 +336,14 @@ impl fmt::Display for TypeError {
                 "invalid impl head for trait `{}`: {}",
                 trait_name, message
             ),
+            TypeError::InvalidTraitConstraint {
+                trait_name,
+                message,
+            } => write!(
+                f,
+                "invalid constraint for trait `{}`: {}",
+                trait_name, message
+            ),
             TypeError::InvalidAssignmentTarget => write!(f, "invalid assignment target"),
             TypeError::NonExhaustiveMatch { missing } => {
                 write!(f, "non-exhaustive match: {}", missing)
@@ -462,7 +474,7 @@ impl fmt::Display for TypeError {
             }
             TypeError::InvalidTraitImplTarget(target) => write!(
                 f,
-                "invalid trait impl target `{}`: expected a named type or type application",
+                "invalid trait impl target `{}`: expected a named type, type application, or tuple",
                 target
             ),
             TypeError::UnknownAssociatedFunction { target, function } => {

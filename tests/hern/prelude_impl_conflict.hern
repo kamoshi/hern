@@ -1,6 +1,5 @@
-impl Add for float {
+impl Add for float, float -> float {
     fn +(lhs, rhs) { lhs }
 }
 
 print(1 + 2)
-

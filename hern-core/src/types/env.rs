@@ -33,6 +33,10 @@ impl TypeEnv {
         self.0.get(name)
     }
 
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&String, &EnvInfo)> {
+        self.0.iter()
+    }
+
     pub(super) fn free_vars(&self, s: &Subst) -> HashSet<TyVar> {
         perf::type_env_free_vars(self.0.len());
         let mut vars = HashSet::new();

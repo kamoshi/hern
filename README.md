@@ -1,83 +1,188 @@
 # Hern
 
-Hern is **Highly Expressive Rusty Notation**: a small statically typed language
-with Hindley-Milner-style inference, structural data, higher-kinded traits,
-modules, and Lua code generation.
+Hern is an experimental statically typed language that compiles to Lua.
 
-Source files use the `.hern` extension. Extensionless imports resolve to `.hern` files.
+It is a small language for exploring expressive type inference, structural
+data, traits that can talk about more than one type at once, and practical
+scripting ergonomics without carrying a large runtime. Source files use the
+`.hern` extension, and extensionless imports resolve to `.hern` files.
 
-## Language
+The name started as **Highly Expressive Rusty Notation**. The current shape is
+closer to: ML-style inference, Rust-flavored traits and impls, structural
+records that can remain open over the fields a function does not touch,
+algebraic data types, explicit mutation, and Lua as the portable execution
+target.
 
-Hern is expression-oriented and infers types for ordinary code without requiring
-annotations at every binding. Function signatures may be explicit when useful,
-but local values, lambdas, array literals, records, and many function
-declarations can be inferred.
+Hern is not a production language. It is a working compiler, standard library,
+CLI, REPL, and language server for testing language-design ideas in real code.
+The compiler parses and typechecks Hern, resolves traits by passing explicit
+dictionaries, then emits Lua that can be printed, bundled, or executed.
+
+## Current Status
+
+Hern is best understood as a language workbench:
+
+- The core compiler, CLI, REPL, LSP, and integration test suite are active and
+  usable.
+- The standard library is deliberately compact, with enough primitives to write
+  examples, algorithms, parser combinators, and small numeric programs.
+- The language favors clear static semantics over production hardening. Expect
+  sharp edges, evolving syntax, and occasional migration work as the type system
+  improves.
+
+## A Taste
 
 ```hern
-fn map_pair(f, pair) {
-  let (x, y) = pair;
+fn map_pair(f, (x, y)) {
   (f(x), f(y))
 }
 
 let inc = fn(x) { x + 1 };
-map_pair(inc, (1, 2))
+let answer = Some(map_pair(inc, (1, 2)));
+
+match answer {
+  Some((left, right)) -> print(left + right),
+  None -> print(0),
+}
 ```
 
-The type system has:
-
-- Parametric polymorphism: functions can quantify over unconstrained type
-  variables like `'a` and `'b`.
-- Trait constraints: generic functions can require capabilities without fixing a
-  concrete type. The trait parameter can itself be a type constructor, enabling
-  higher-kinded abstractions like `Functor`.
-- Row-polymorphic records: functions can ask for fields they use while
-  preserving the rest of the record.
-- Algebraic data types: sum types with constructors and payloads.
-- Pattern matching: tuples, records, arrays/lists, constructors, literals,
-  wildcards, and destructuring in `let`, function parameters, `match`, and
-  `for`.
-- Typed mutation: `let mut` is explicit, and assignment checks the existing
-  binding type.
-- Mutable place tracking: `mut self` methods may only be called on *fresh
-  mutable places* - bindings whose value is a newly allocated array or record,
-  or the return of a `mut T`-annotated function. This prevents aliased mutation
-  without a borrow checker.
-- Inherent impl blocks: types can have methods and associated functions.
-  `Self` refers to the implementing type; associated functions are called as
-  `Type::function()`.
-- Modules: files can import other `.hern` modules and export values through
-  record-shaped module results.
+Hern infers ordinary local types, lambda parameters, many function signatures,
+records, tuples, arrays, and generic functions. Record types are structural, so
+a function can ask for the fields it uses while preserving the rest of the
+caller-provided value. Add annotations where they make an API clearer:
 
 ```hern
-fn get_x(r) {
-  r.x
+fn length_squared(x: float, y: float) -> float {
+  x * x + y * y
 }
-
-let point = #{ x: 1, y: 2, label: "origin" };
-get_x(point)
 ```
 
-That style gives `get_x` a record-polymorphic shape: it only cares that `x`
-exists, not what other fields are present.
+Mutation is explicit, but it is not just a boolean on a variable. Hern tracks
+fresh mutable places so mutating methods can be called on newly allocated values
+without opening the door to casual aliasing:
 
-Traits are resolved through dictionaries during lowering, then emitted as Lua.
-The generated Lua is intended to be readable enough for debugging while keeping
-Hern's type information in the compiler.
+```hern
+let mut values = [];
+values.push(1);
+values.push(2);
+```
 
-The language server currently supports diagnostics, hover type hints,
-go-to-definition, references, rename, and completion from scope.
+## What It Supports
 
-## Build
+- Hindley-Milner-style type inference with parametric polymorphism.
+- Algebraic data types such as `Option('a)` and `Result('a, 'e)`.
+- Pattern matching for constructors, tuples, records, arrays, literals, and
+  wildcards.
+- Row-polymorphic records, so functions can require only the fields they use.
+- Traits, impl blocks, associated functions, and operator methods.
+- Multi-parameter traits with functional dependencies, used by operators like
+  `Add`, `Mul`, and `Index`.
+- Higher-kinded trait parameters for abstractions like `Functor`.
+- Explicit `let mut` mutation with place tracking for mutable method calls.
+- Modules through file imports and record-shaped exports.
+- Lua code generation, including single-file bundles.
+- LSP support for diagnostics, hover, definitions, references, document
+  highlights, document/workspace symbols, rename, completions, signature help,
+  code actions, semantic tokens, and inlay hints.
+
+## Traits And Operators
+
+Simple trait constraints look like this:
+
+```hern
+fn show_twice(value: 'a) -> string
+where 'a: ToString
+{
+  value.to_string() <> value.to_string()
+}
+```
+
+Traits are compiled away through dictionaries, but at the source level they can
+still describe fairly rich relationships. Multi-parameter traits put all
+parameters before the trait name. Functional dependencies use `->` before the
+determined output type:
+
+```hern
+trait Mul 'lhs 'rhs -> 'output {
+  fn infixl 7 *(lhs: 'lhs, rhs: 'rhs) -> 'output
+}
+
+fn scale(value: 'value, factor: float) -> 'out
+where 'value float -> 'out: Mul
+{
+  value * factor
+}
+```
+
+That shape lets `*` mean `int * int -> int`, `float * float -> float`, and also
+library-defined operations such as `Matrix * Vector -> Vector`.
+
+Trait parameters can also be type constructors, which is how the prelude defines
+abstractions such as `Functor`, `Applicative`, and `Monad` for `Option`,
+`Result`, arrays, and parser combinators.
+
+## Standard Library
+
+The standard library is intentionally small, but it is real enough to write
+programs. The prelude is also where many language ideas are exercised: operators
+are ordinary traits, indexing is a functional-dependency trait, and common data
+types such as `Option`, `Result`, `Map`, `Heap`, `Queue`, and `Set` are available
+without extra imports.
+
+- `std/prelude.hern`: core types, traits, operators, collections, ranges, JSON
+  helpers, and Lua-backed primitives.
+- `std/grid.hern`: a compact generic grid helper.
+- `std/parser.hern`: parser-combinator utilities.
+- `std/linalg.hern`: small linear algebra types for vectors and matrices.
+- `std/astar.hern`: generic A* path search over caller-defined node types.
+
+Example import:
+
+```hern
+let linalg = import "hern:linalg";
+
+let v = linalg.vector([3.0, 4.0]);
+print(v.length());
+```
+
+Modules export values with record syntax, and imports bind that record:
+
+```hern
+let astar = import "hern:astar";
+
+fn key(n: int) -> string { n.to_string() }
+fn neighbors(n: int) -> [int] { if n == 0 { [1] } else { [] } }
+
+let path = astar.search(
+  0,
+  fn(n) { n == 1 },
+  key,
+  neighbors,
+  fn(a, b) { 1.0 },
+  fn(n) { 0.0 }
+);
+```
+
+## CLI
+
+Build the CLI:
 
 ```sh
 cargo build -p hern
 ```
 
-## CLI
+Run a file:
+
+```sh
+cargo run -p hern -- path/to/file.hern
+```
+
+Available commands:
 
 ```sh
 cargo run -p hern -- parse path/to/file.hern
 cargo run -p hern -- typecheck path/to/file.hern
+cargo run -p hern -- typecheck --dump path/to/file.hern
 cargo run -p hern -- lua path/to/file.hern
 cargo run -p hern -- run path/to/file.hern
 cargo run -p hern -- bundle path/to/file.hern
@@ -86,26 +191,39 @@ cargo run -p hern -- repl path/to/file.hern
 cargo run -p hern -- lsp
 ```
 
-The `lua` command prints generated Lua. The `run` command executes generated Lua
-through a local Lua runtime.
+`lua` prints generated Lua. `bundle` emits a self-contained Lua bundle. `run`
+typechecks, compiles, and executes through the local Lua runtime used by the
+REPL.
 
 ## Workspace
 
-- `hern-core`: lexer, parser, type inference, module loading, source indexing,
-  and Lua code generation.
+- `hern-core`: lexer, parser, type inference, modules, source indexing, and Lua
+  code generation.
 - `hern`: CLI.
-- `hern-repl`: ratatui-based interactive REPL.
-- `hern-lsp`: language server support for diagnostics, hover, definitions,
-  references, rename, and completions.
-- `std/prelude.hern`: built-in prelude loaded by the compiler.
-- `tests/hern`: integration fixtures.
+- `hern-repl`: interactive REPL.
+- `hern-lsp`: language server.
+- `std`: standard library modules loaded through `hern:` imports.
+- `tests/hern`: integration fixtures used by `tests/run.py`.
+- `examples`: sample Hern programs and experiments.
 
-## Test
+## Development
+
+Useful checks:
 
 ```sh
-cargo test -q -p hern-core
-cargo check -q -p hern-repl
-cargo test -q -p hern-lsp
-cargo test -q -p hern
+cargo fmt
+cargo check --workspace
+cargo test -p hern-core
+cargo test -p hern-lsp
+cargo test -p hern
 python3 tests/run.py
 ```
+
+The integration runner compiles and executes the fixture programs under
+`tests/hern`, including expected-error cases.
+
+## Examples
+
+The `examples` directory contains larger experiments and demos. The `tests/hern`
+fixtures are also useful as executable language documentation because each one
+is typechecked, run, or expected to fail with a specific diagnostic.

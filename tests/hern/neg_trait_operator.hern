@@ -1,0 +1,7 @@
+fn negate(x: 'a) -> 'a where 'a: Neg {
+    -x
+}
+
+print(-5);
+print(negate(12));
+print(negate(2.5));

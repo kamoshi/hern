@@ -110,7 +110,7 @@ impl Infer {
                 let _ = this.ast_to_ty_with_vars(arg, &mut impl_param_vars)?;
             }
             let initial_constraints =
-                this.collect_type_bound_constraints(&mut impl_param_vars, &id.type_bounds);
+                this.collect_type_bound_constraints(&mut impl_param_vars, &id.type_bounds)?;
 
             this.with_pending_constraints_scope(initial_constraints, |this| {
                 let mut dict_fields: Vec<(String, Ty)> = Vec::new();
@@ -266,13 +266,11 @@ impl Infer {
                 let mut param_vars = HashMap::new();
                 let target_ty = this.ast_to_ty_with_vars(&id.target, &mut param_vars)?;
                 let mut initial_constraints =
-                    this.collect_type_bound_constraints(&mut param_vars, &id.type_bounds);
-                initial_constraints.extend(
-                    this.collect_type_bound_constraints(
-                        &mut param_vars,
-                        &inferred_method.type_bounds,
-                    ),
-                );
+                    this.collect_type_bound_constraints(&mut param_vars, &id.type_bounds)?;
+                initial_constraints.extend(this.collect_type_bound_constraints(
+                    &mut param_vars,
+                    &inferred_method.type_bounds,
+                )?);
                 let mut param_tys = Vec::new();
                 let mut body_env = env.clone();
 

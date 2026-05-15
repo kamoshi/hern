@@ -69,6 +69,7 @@ fn reassoc_expr(expr: &mut Expr, table: &FixityTable) {
     // Otherwise recurse into sub-expressions.
     match &mut expr.kind {
         ExprKind::Grouped(e) | ExprKind::Not(e) => reassoc_expr(e, table),
+        ExprKind::Neg { operand, .. } => reassoc_expr(operand, table),
         ExprKind::Assign { target, value } => {
             reassoc_expr(target, table);
             reassoc_expr(value, table);

@@ -150,6 +150,9 @@ fn collect_stmt_referenced_names(
             let mut impl_type_scope = type_scope.clone();
             impl_type_scope.insert("Self".to_string());
             for bound in &id.type_bounds {
+                for arg in &bound.args {
+                    collect_type_referenced_names(arg, refs, &impl_type_scope);
+                }
                 for trait_name in &bound.traits {
                     if !impl_type_scope.contains(trait_name) {
                         refs.types.insert(trait_name.clone());
@@ -160,6 +163,9 @@ fn collect_stmt_referenced_names(
                 let mut method_scope = value_scope.clone();
                 let method_type_scope = impl_type_scope.clone();
                 for bound in &method.type_bounds {
+                    for arg in &bound.args {
+                        collect_type_referenced_names(arg, refs, &method_type_scope);
+                    }
                     for trait_name in &bound.traits {
                         if !method_type_scope.contains(trait_name) {
                             refs.types.insert(trait_name.clone());
@@ -228,6 +234,9 @@ fn collect_expr_referenced_names(
         | ExprKind::Break(Some(expr))
         | ExprKind::Return(Some(expr)) => {
             collect_expr_referenced_names(expr, refs, value_scope, type_scope);
+        }
+        ExprKind::Neg { operand, .. } => {
+            collect_expr_referenced_names(operand, refs, value_scope, type_scope);
         }
         ExprKind::FieldAccess { expr, .. } => {
             if let ExprKind::Ident(name) = &expr.kind {

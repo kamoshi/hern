@@ -1,0 +1,6 @@
+fn bad(x: Option(Option(int))) -> int {
+    match x {
+        Some(None) -> 0,
+        None -> 1,
+    }
+}

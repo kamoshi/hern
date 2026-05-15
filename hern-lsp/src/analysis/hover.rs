@@ -11,9 +11,9 @@ use hern_core::module::{GraphInference, ModuleEnv, ModuleGraph};
 use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
 use hern_core::types::infer::{TypeEnv, VariantEnv};
 use hern_core::types::{
-    BindingCapabilities, Scheme, TraitConstraint, Ty, TyVar, display_ty_with_var_names,
-    free_type_vars_in_display_order, trait_impl_arg_keys_from_ast, trait_impl_dict_name_from_keys,
-    type_var_name,
+    BindingCapabilities, Scheme, TraitConstraint, Ty, TyVar, determinant_indexes_are_prefix,
+    display_ty_with_var_names, free_type_vars_in_display_order, trait_impl_arg_keys_from_ast,
+    trait_impl_dict_name_from_keys, type_var_name,
 };
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 use std::collections::HashMap;
@@ -59,9 +59,8 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
         .and_then(|caps| caps.get(&info.node_id))
         .is_some()
     {
-        let scheme = Scheme::mono(info.ty.clone());
         return Some(type_hover_with_span(
-            hover_scheme_to_string(&scheme),
+            ty_to_display_string(&info.ty),
             markdown,
             info.span,
         ));
@@ -113,6 +112,7 @@ fn prelude_hover_from_analysis(
             Some(&prelude.inference.env),
             Some(&prelude.inference.definition_schemes),
             &operator.name,
+            operator.arity,
         )
     {
         return Some(type_hover(contents, markdown));
@@ -133,9 +133,8 @@ fn prelude_hover_from_analysis(
         .callable_capabilities
         .contains_key(&info.node_id)
     {
-        let scheme = Scheme::mono(info.ty.clone());
         return Some(type_hover_with_span(
-            hover_scheme_to_string(&scheme),
+            ty_to_display_string(&info.ty),
             markdown,
             info.span,
         ));
@@ -260,6 +259,7 @@ fn trait_access_hover(
 
 struct OperatorUse {
     name: String,
+    arity: usize,
 }
 
 fn operator_hover(
@@ -275,8 +275,11 @@ fn operator_hover(
         inference.env_for_module(module_name),
         inference.definition_schemes_for_module(module_name),
         &operator.name,
+        operator.arity,
     )
-    .or_else(|| operator_definition_hover_text(&graph.prelude, None, None, &operator.name))
+    .or_else(|| {
+        operator_definition_hover_text(&graph.prelude, None, None, &operator.name, operator.arity)
+    })
 }
 
 fn operator_use_at(program: &Program, position: SourcePosition) -> Option<OperatorUse> {
@@ -289,7 +292,18 @@ fn operator_use_at(program: &Program, position: SourcePosition) -> Option<Operat
             && contains(*op_span, position)
             && let BinOp::Custom(name) = op
         {
-            operator = Some(OperatorUse { name: name.clone() });
+            operator = Some(OperatorUse {
+                name: name.clone(),
+                arity: 2,
+            });
+        }
+        if let ExprKind::Neg { op_span, .. } = &expr.kind
+            && contains(*op_span, position)
+        {
+            operator = Some(OperatorUse {
+                name: "-".to_string(),
+                arity: 1,
+            });
         }
     });
     operator
@@ -300,6 +314,7 @@ fn operator_definition_hover_text(
     env: Option<&TypeEnv>,
     definition_schemes: Option<&HashMap<SourceSpan, Scheme>>,
     operator: &str,
+    arity: usize,
 ) -> Option<String> {
     program.stmts.iter().find_map(|stmt| match stmt {
         Stmt::Op {
@@ -307,8 +322,9 @@ fn operator_definition_hover_text(
             name_span,
             fixity,
             prec,
+            params,
             ..
-        } if name == operator => {
+        } if name == operator && params.len() == arity => {
             let ty = definition_schemes
                 .and_then(|schemes| schemes.get(name_span))
                 .map(hover_scheme_to_string)
@@ -321,7 +337,7 @@ fn operator_definition_hover_text(
         Stmt::Trait(trait_def) => trait_def
             .methods
             .iter()
-            .find(|method| method.name == operator)
+            .find(|method| method.name == operator && method.params.len() == arity)
             .and_then(|method| trait_operator_hover_text(trait_def, method)),
         _ => None,
     })
@@ -340,7 +356,6 @@ fn operator_definition_fixity(program: &Program, span: SourceSpan) -> Option<(Fi
 }
 
 fn trait_operator_hover_text(trait_def: &TraitDef, method: &TraitMethod) -> Option<String> {
-    let (fixity, prec) = method.fixity?;
     let params = method
         .params
         .iter()
@@ -348,13 +363,35 @@ fn trait_operator_hover_text(trait_def: &TraitDef, method: &TraitMethod) -> Opti
         .collect::<Vec<_>>()
         .join(", ");
     let ty = format!("fn({}) -> {}", params, ast_type_to_string(&method.ret_type));
-    let mut result = with_fixity_line(ty, fixity, prec);
+    let mut result = if let Some((fixity, prec)) = method.fixity {
+        with_fixity_line(ty, fixity, prec)
+    } else {
+        ty
+    };
     result.push_str(&format!(
         "\n\n{}: {}",
-        trait_def.params.join(" "),
+        trait_def_predicate_for_display(trait_def),
         trait_def.name
     ));
     Some(result)
+}
+
+fn trait_def_predicate_for_display(trait_def: &TraitDef) -> String {
+    let Some(fundep) = trait_def.fundeps.first() else {
+        return trait_def.params.join(" ");
+    };
+    debug_assert!(
+        determinant_indexes_are_prefix(&fundep.determinants),
+        "hover display assumes source fundep arrows split a prefix determinant list"
+    );
+    let mut parts = Vec::new();
+    for (index, param) in trait_def.params.iter().enumerate() {
+        if index > 0 && index == fundep.determinants.len() {
+            parts.push("->".to_string());
+        }
+        parts.push(param.clone());
+    }
+    parts.join(" ")
 }
 
 fn with_fixity_line(ty: String, fixity: Fixity, prec: u8) -> String {
@@ -433,11 +470,11 @@ fn scheme_to_display_string(scheme: &Scheme, include_constraints: bool) -> Strin
     let names = type_var_names(scheme);
     let mut out = display_ty_body_for_lsp(&scheme.ty, &names);
     if include_constraints {
-        let constraints = constraints_by_var(scheme, &names);
+        let constraints = constraints_for_display(scheme, &names);
         if !constraints.is_empty() {
             out.push('\n');
-            for (name, traits) in constraints {
-                out.push_str(&format!("\n'{}: {}", name, traits.join(" + ")));
+            for (predicate, traits) in constraints {
+                out.push_str(&format!("\n{}: {}", predicate, traits.join(" + ")));
             }
         }
     }
@@ -472,6 +509,13 @@ fn type_var_names(scheme: &Scheme) -> HashMap<TyVar, String> {
         if !vars.contains(&constraint.var) {
             vars.push(constraint.var);
         }
+        for arg in &constraint.args {
+            for var in free_type_vars_in_display_order(arg) {
+                if !vars.contains(&var) {
+                    vars.push(var);
+                }
+            }
+        }
     }
 
     vars.into_iter()
@@ -480,41 +524,63 @@ fn type_var_names(scheme: &Scheme) -> HashMap<TyVar, String> {
         .collect()
 }
 
-fn constraints_by_var(
+fn constraints_for_display(
     scheme: &Scheme,
     names: &HashMap<TyVar, String>,
 ) -> Vec<(String, Vec<String>)> {
-    let mut grouped: Vec<(TyVar, Vec<String>)> = Vec::new();
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
     for constraint in &scheme.constraints {
-        let resolved_var = constraint_var_for_hover(constraint, &scheme.ty);
-        if let Some((_, traits)) = grouped.iter_mut().find(|(var, _)| *var == resolved_var) {
+        let predicate = constraint_predicate_for_display(constraint, names);
+        if let Some((_, traits)) = grouped
+            .iter_mut()
+            .find(|(existing, _)| existing == &predicate)
+        {
             if !traits.contains(&constraint.trait_name) {
                 traits.push(constraint.trait_name.clone());
             }
         } else {
-            grouped.push((resolved_var, vec![constraint.trait_name.clone()]));
+            grouped.push((predicate, vec![constraint.trait_name.clone()]));
         }
     }
-    grouped.sort_by_key(|(var, _)| names.get(var).cloned().unwrap_or_else(|| var.to_string()));
+    grouped.sort_by(|(left, _), (right, _)| left.cmp(right));
     grouped
-        .into_iter()
-        .map(|(var, traits)| {
-            (
-                names.get(&var).cloned().unwrap_or_else(|| var.to_string()),
-                traits,
-            )
-        })
-        .collect()
 }
 
-fn constraint_var_for_hover(constraint: &TraitConstraint, ty: &Ty) -> TyVar {
-    match ty {
-        Ty::Qualified(_, inner) => match inner.as_ref() {
-            Ty::Var(var) => *var,
-            _ => constraint.var,
-        },
-        _ => constraint.var,
+fn constraint_predicate_for_display(
+    constraint: &TraitConstraint,
+    names: &HashMap<TyVar, String>,
+) -> String {
+    if constraint.args.is_empty() {
+        return type_var_for_display(constraint.var, names);
     }
+    let dependent_index = first_dependent_index(constraint);
+    let mut parts = Vec::new();
+    for (index, arg) in constraint.args.iter().enumerate() {
+        if index > 0 && dependent_index == Some(index) {
+            parts.push("->".to_string());
+        }
+        parts.push(display_ty_with_var_names(arg, names));
+    }
+    parts.join(" ")
+}
+
+fn first_dependent_index(constraint: &TraitConstraint) -> Option<usize> {
+    debug_assert!(
+        determinant_indexes_are_prefix(&constraint.determinant_indexes),
+        "hover display assumes source fundep arrows split a prefix determinant list"
+    );
+    if constraint.determinant_indexes.len() < constraint.args.len() {
+        Some(constraint.determinant_indexes.len())
+    } else {
+        None
+    }
+}
+
+fn type_var_for_display(var: TyVar, names: &HashMap<TyVar, String>) -> String {
+    format!(
+        "'{}",
+        names.get(&var).cloned().unwrap_or_else(|| var.to_string())
+    )
 }
 
 fn type_declaration_hover_text(program: &Program, definition: &Definition) -> Option<String> {
@@ -1317,6 +1383,9 @@ fn param_type_in_expr_stmts(
         | ExprKind::FieldAccess { expr: e, .. } => {
             param_type_in_expr_stmts(e, name, param_span, env, expr_types, variant_env)
         }
+        ExprKind::Neg { operand, .. } => {
+            param_type_in_expr_stmts(operand, name, param_span, env, expr_types, variant_env)
+        }
         ExprKind::Assign { target, value }
         | ExprKind::Binary {
             lhs: target,
@@ -1596,6 +1665,9 @@ fn local_pattern_binding_type_in_expr(
         | ExprKind::Lambda { body: e, .. } => {
             local_pattern_binding_type_in_expr(e, name, binding_span, expr_types, variant_env)
         }
+        ExprKind::Neg { operand, .. } => {
+            local_pattern_binding_type_in_expr(operand, name, binding_span, expr_types, variant_env)
+        }
         ExprKind::Assign { target, value }
         | ExprKind::Binary {
             lhs: target,
@@ -1826,6 +1898,7 @@ fn declaration_value_type_in_expr<'a>(
         | ExprKind::Lambda { body: expr, .. } => {
             declaration_value_type_in_expr(expr, span, expr_types)
         }
+        ExprKind::Neg { operand, .. } => declaration_value_type_in_expr(operand, span, expr_types),
         ExprKind::Assign { target, value }
         | ExprKind::Binary {
             lhs: target,

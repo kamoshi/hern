@@ -1,0 +1,44 @@
+impl Ord for (int, int) {
+  fn <(lhs, rhs) {
+    let (_, a) = lhs;
+    let (_, b) = rhs;
+    a < b
+  }
+
+  fn >(lhs, rhs) {
+    let (_, a) = lhs;
+    let (_, b) = rhs;
+    a > b
+  }
+
+  fn <=(lhs, rhs) {
+    let (_, a) = lhs;
+    let (_, b) = rhs;
+    a <= b
+  }
+
+  fn >=(lhs, rhs) {
+    let (_, a) = lhs;
+    let (_, b) = rhs;
+    a >= b
+  }
+
+  fn compare(lhs, rhs) {
+    let (_, a) = lhs;
+    let (_, b) = rhs;
+    compare(a, b)
+  }
+}
+
+let mut pairs = [(30, 3), (10, 1), (20, 2)];
+pairs.sort();
+for item in pairs {
+  let (label, _) = item;
+  print(label);
+};
+
+print(to_string([3, 1, 2].min()));
+print(to_string([3, 1, 2].max()));
+print(to_string([1].drop(1).min()));
+print(to_string([3, 1, 2].min_by(fn(x) { if x == 2 { "a" } else { "z" } })));
+print(to_string([3, 1, 2].max_by(fn(x) { if x == 2 { "z" } else { "a" } })));

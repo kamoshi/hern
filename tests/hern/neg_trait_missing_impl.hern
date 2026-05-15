@@ -1,0 +1,3 @@
+fn bad(x: bool) -> bool {
+    -x
+}

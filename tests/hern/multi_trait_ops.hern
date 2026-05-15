@@ -1,4 +1,4 @@
-fn scale_then_shift(x: 'a, y: 'a, z: 'a) -> 'a where 'a: Add + Mul {
+fn scale_then_shift(x: 'a, y: 'a, z: 'a) -> 'a where 'a 'a -> 'a: Add + Mul {
     x * y + z
 }
 

@@ -52,6 +52,10 @@ impl TraitConstraint {
         primary_var: TyVar,
         determinant_indexes: Vec<usize>,
     ) -> Self {
+        debug_assert!(
+            determinant_indexes_are_prefix(&determinant_indexes),
+            "source fundep arrows currently split a prefix determinant list"
+        );
         Self {
             var: primary_var,
             trait_name: trait_name.into(),
@@ -59,6 +63,10 @@ impl TraitConstraint {
             determinant_indexes,
         }
     }
+}
+
+pub fn determinant_indexes_are_prefix(indexes: &[usize]) -> bool {
+    indexes.iter().copied().eq(0..indexes.len())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

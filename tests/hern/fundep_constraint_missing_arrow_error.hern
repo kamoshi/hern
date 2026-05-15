@@ -1,0 +1,3 @@
+fn double(x: 'a) -> 'a where 'a: Add {
+  x + x
+}

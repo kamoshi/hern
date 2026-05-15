@@ -1,0 +1,71 @@
+fn reconstruct_path(current: 'node, key: fn('node) -> 'key, came_from: Map('key, 'node)) -> ['node] {
+  let mut path = [current];
+  let mut node = current;
+  let mut node_key = key(node);
+
+  loop {
+    match came_from.get(node_key) {
+      Some(previous) -> {
+        path.push(previous);
+        node = previous;
+        node_key = key(node);
+      },
+      None -> break,
+    }
+  };
+
+  path.reverse()
+}
+
+fn search(
+  start: 'node,
+  is_goal: fn('node) -> bool,
+  key: fn('node) -> 'key,
+  neighbors: fn('node) -> ['node],
+  distance: fn('node, 'node) -> float,
+  heuristic: fn('node) -> float
+) -> Option(['node]) {
+  let mut frontier: Heap('node) = Heap::new();
+  let mut came_from: Map('key, 'node) = Map::new();
+  let mut cost_so_far: Map('key, float) = Map::new();
+
+  let start_key = key(start);
+  frontier.push(heuristic(start), start);
+  cost_so_far.set(start_key, 0.0);
+
+  loop {
+    if frontier.is_empty() {
+      return None;
+    };
+
+    let (popped_priority, current) = frontier.pop();
+    let current_key = key(current);
+    let current_cost = cost_so_far[current_key];
+    if popped_priority != current_cost + heuristic(current) {
+      continue;
+    };
+
+    if is_goal(current) {
+      return Some(reconstruct_path(current, key, came_from));
+    };
+
+    for next in neighbors(current) {
+      let next_key = key(next);
+      let next_cost = current_cost + distance(current, next);
+      let better = match cost_so_far.get(next_key) {
+        Some(old_cost) -> next_cost < old_cost,
+        None -> true,
+      };
+
+      if better {
+        cost_so_far.set(next_key, next_cost);
+        came_from.set(next_key, current);
+        frontier.push(next_cost + heuristic(next), next);
+      }
+    }
+  }
+}
+
+#{
+  search
+}

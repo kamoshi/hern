@@ -31,7 +31,7 @@ pub fn gen_lua_bundle(
             "local __prelude = require({})\n",
             lua_quote(PRELUDE_MODULE)
         ));
-        out.push_str(&LuaCodegen::gen_prelude_aliases(prelude_stmts));
+        out.push_str(&LuaCodegen::gen_prelude_env_setup());
         out.push_str(&import_dict_bindings(
             graph,
             module_envs,
@@ -51,7 +51,7 @@ pub fn gen_lua_bundle(
         "local __prelude = require({})\n",
         lua_quote(PRELUDE_MODULE)
     ));
-    out.push_str(&LuaCodegen::gen_prelude_aliases(prelude_stmts));
+    out.push_str(&LuaCodegen::gen_prelude_env_setup());
     out.push_str(&import_dict_bindings(
         graph,
         module_envs,

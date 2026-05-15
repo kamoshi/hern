@@ -15,6 +15,65 @@ output = """
 6
 """
 
+[tests.neg_trait_operator]
+path = "tests/hern/neg_trait_operator.hern"
+expect = "typecheck"
+output = """
+-5
+-12
+-2.5
+"""
+
+[tests.neg_trait_missing_impl]
+path = "tests/hern/neg_trait_missing_impl.hern"
+expect = "error"
+error_contains = "trait `Neg` is not implemented for `bool`"
+
+[tests.pow_trait_operator]
+path = "tests/hern/pow_trait_operator.hern"
+expect = "typecheck"
+output = """
+32
+27
+512
+18
+-4
+4
+6.25
+"""
+
+[tests.pow_trait_missing_impl]
+path = "tests/hern/pow_trait_missing_impl.hern"
+expect = "error"
+error_contains = "trait `Pow` is not implemented for `bool, bool`"
+
+[tests.ordering_ord_compare]
+path = "tests/hern/ordering_ord_compare.hern"
+expect = "typecheck"
+output = """
+LT
+EQ
+GT
+LT
+3
+7
+10
+"""
+
+[tests.generic_array_ord_helpers]
+path = "tests/hern/generic_array_ord_helpers.hern"
+expect = "typecheck"
+output = """
+10
+20
+30
+Some(1)
+Some(3)
+None
+Some(2)
+Some(2)
+"""
+
 [tests.hashbang]
 path = "tests/hern/hashbang.hern"
 expect = "typecheck"
@@ -384,6 +443,34 @@ error_contains = "non-exhaustive match"
 path = "tests/hern/exhaustive_list.hern"
 expect = "error"
 error_contains = "non-exhaustive match"
+
+[tests.nested_constructor_exhaustiveness_error]
+path = "tests/hern/nested_constructor_exhaustiveness_error.hern"
+expect = "error"
+error_contains = "missing pattern: Some(Some(_))"
+
+[tests.nested_list_exhaustiveness_error]
+path = "tests/hern/nested_list_exhaustiveness_error.hern"
+expect = "error"
+error_contains = "missing pattern: [None, ..]"
+
+[tests.nested_list_mixed_prefix_exhaustiveness_error]
+path = "tests/hern/nested_list_mixed_prefix_exhaustiveness_error.hern"
+expect = "error"
+error_contains = "missing pattern: [None, Some(_), ..]"
+
+[tests.tuple_nested_exhaustive]
+path = "tests/hern/tuple_nested_exhaustive.hern"
+expect = "typecheck"
+output = """
+1
+0
+"""
+
+[tests.tuple_nested_exhaustiveness_error]
+path = "tests/hern/tuple_nested_exhaustiveness_error.hern"
+expect = "error"
+error_contains = "missing pattern: (Some(_), None)"
 
 [tests.strings_and_bools]
 path = "tests/hern/strings_and_bools.hern"
@@ -764,6 +851,11 @@ output = """
 42
 """
 
+[tests.fundep_constraint_missing_arrow_error]
+path = "tests/hern/fundep_constraint_missing_arrow_error.hern"
+expect = "error"
+error_contains = "fundep trait constraints must include `->`"
+
 [tests.qualified_constraint_erasure_error]
 path = "tests/hern/qualified_constraint_erasure_error.hern"
 expect = "error"
@@ -774,6 +866,14 @@ path = "tests/hern/multi_trait_ops.hern"
 expect = "typecheck"
 output = """
 10
+"""
+
+[tests.heterogeneous_mul_operator]
+path = "tests/hern/heterogeneous_mul_operator.hern"
+expect = "typecheck"
+output = """
+1
+12
 """
 
 [tests.inline_fallback]
@@ -797,7 +897,7 @@ error_contains = "wrong number of arguments"
 [tests.prelude_impl_conflict]
 path = "tests/hern/prelude_impl_conflict.hern"
 expect = "error"
-error_contains = "impl Add for float is defined in multiple modules"
+error_contains = "impl Add for float, float is defined in multiple modules"
 
 [tests.prelude_ergonomics]
 path = "tests/hern/prelude_ergonomics.hern"
@@ -1161,6 +1261,18 @@ output = """
 34
 """
 
+[tests.destructure_capture_constraint]
+path = "tests/hern/destructure_capture_constraint.hern"
+expect = "typecheck"
+output = """
+3
+"""
+
+[tests.destructure_capture_constraint_error]
+path = "tests/hern/destructure_capture_constraint_error.hern"
+expect = "error"
+error_contains = "type mismatch in function parameter 1"
+
 [tests.tuple_patterns]
 path = "tests/hern/tuple_patterns.hern"
 expect = "typecheck"
@@ -1176,6 +1288,13 @@ output = """
 1
 1
 1
+"""
+
+[tests.tuple_trait_impl_target]
+path = "tests/hern/tuple_trait_impl_target.hern"
+expect = "typecheck"
+output = """
+7:seven
 """
 
 [tests.inherent_impl_where]
@@ -1244,6 +1363,39 @@ None
 [[1, 2], [2, 1], [2, 2]]
 Some([2, 2])
 None
+"""
+
+[tests.std_astar]
+path = "tests/hern/std_astar.hern"
+expect = "typecheck"
+output = """
+Some([0, 1, 4, 5])
+None
+"""
+
+[tests.std_linalg]
+path = "tests/hern/std_linalg.hern"
+expect = "typecheck"
+output = """
+3
+13
+47
+15
+4
+14
+32
+139
+6
+1
+0
+Vector([0.6, 0.8])
+"""
+
+[tests.std_linalg_dimension_error]
+path = "tests/hern/std_linalg_dimension_error.hern"
+expect = "typecheck"
+output = """
+dimension error
 """
 
 [tests.lua_std_tests]

@@ -5,6 +5,9 @@ use crate::types::{
 };
 use std::collections::HashMap;
 
+// Hern targets LuaJIT/Lua 5.1 semantics. The generated runtime uses `setfenv`
+// for bundled module environments and the prelude uses LuaJIT's `bit` library.
+
 // Must stay in sync with the prelude's `impl Iterable for Array` dictionary name.
 const ARRAY_ITER_METHOD: &str = "__Iterable__Array.iter";
 
@@ -163,6 +166,21 @@ impl LuaCodegen {
             ));
         }
         out
+    }
+
+    pub fn gen_prelude_env_setup() -> String {
+        [
+            "local __hern_env = setmetatable({}, { __index = function(_, key)",
+            "  local value = __prelude.__hern_value[key]",
+            "  if value ~= nil then return value end",
+            "  value = __prelude.__hern_dicts[key]",
+            "  if value ~= nil then return value end",
+            "  return _G[key]",
+            "end })",
+            "setfenv(1, __hern_env)",
+            "",
+        ]
+        .join("\n")
     }
 
     fn gen_program_stmts(&mut self, stmts: &[Stmt]) -> String {
@@ -511,6 +529,14 @@ impl LuaCodegen {
                 let v = self.gen_expr_with_subst(e, subst, pre)?;
                 Some(format!("({} == 0 and 1 or 0)", v))
             }
+            ExprKind::Neg {
+                operand,
+                resolved_op,
+                ..
+            } => {
+                let value = self.gen_expr_with_subst(operand, subst, pre)?;
+                Some(self.gen_unary_operator_expr("-", &value, resolved_op, pre))
+            }
             ExprKind::Binary {
                 lhs,
                 op,
@@ -704,6 +730,14 @@ impl LuaCodegen {
                 let v = self.gen_expr(e, pre);
                 format!("({} == 0 and 1 or 0)", v)
             }
+            ExprKind::Neg {
+                operand,
+                resolved_op,
+                ..
+            } => {
+                let value = self.gen_expr(operand, pre);
+                self.gen_unary_operator_expr("-", &value, resolved_op, pre)
+            }
             ExprKind::Binary {
                 lhs,
                 op,
@@ -838,6 +872,25 @@ impl LuaCodegen {
                 }
                 None => format!("{}({}, {})", mangle_op(op), l, r),
             },
+        }
+    }
+
+    fn gen_unary_operator_expr(
+        &mut self,
+        op: &str,
+        value: &str,
+        resolved_op: &Option<ResolvedCallee>,
+        pre: &mut String,
+    ) -> String {
+        match resolved_op {
+            Some(resolved) => {
+                let resolved = gen_resolved_callee(resolved);
+                if let Some(inlined) = self.gen_inline_call(&resolved, &[value.to_string()], pre) {
+                    return inlined;
+                }
+                format!("{}({})", resolved, value)
+            }
+            None => format!("{}({})", mangle_op(op), value),
         }
     }
 
@@ -1884,6 +1937,7 @@ fn expr_flow(expr: &Expr, include_bc: bool) -> Flow {
         ExprKind::Grouped(e) | ExprKind::Not(e) | ExprKind::FieldAccess { expr: e, .. } => {
             expr_flow(e, include_bc)
         }
+        ExprKind::Neg { operand, .. } => expr_flow(operand, include_bc),
         ExprKind::Index { receiver, key, .. } => {
             expr_flow(receiver, include_bc).seq(expr_flow(key, include_bc))
         }
@@ -2301,9 +2355,36 @@ let hof_result = apply_twice(local_double, 1.0);
 
         assert!(
             lua.contains(
-                "local hof_result = apply_twice((function(...) return local_double(__Add__float, ...) end), 1)"
+                "local hof_result = apply_twice((function(...) return local_double(__Add__float__float, ...) end), 1)"
             ),
             "higher-order constrained lambda arguments should eta-expand with the concrete dict:\n{lua}"
+        );
+    }
+
+    #[test]
+    fn constrained_lambda_capturing_outer_param_keeps_outer_dict() {
+        let source = r#"
+fn make_adder(n) {
+    let inner = fn(x) { x + n };
+    inner
+}
+
+let add_two = make_adder(2.0);
+let result = add_two(3.0);
+"#;
+        let lua = lua_for_source("hern_codegen_capture_dict_test.hern", source);
+
+        assert!(
+            lua.contains("local function make_adder(__dict_Add_"),
+            "captured constraints should stay on the outer function dictionary:\n{lua}"
+        );
+        assert!(
+            lua.contains("return __dict_Add_") && lua.contains(".__op_pl(x, n)"),
+            "inner lambda should use the captured outer dictionary:\n{lua}"
+        );
+        assert!(
+            lua.contains("local add_two = make_adder(__Add__float__float, 2)"),
+            "concrete call should pass the float Add dictionary into the closure factory:\n{lua}"
         );
     }
 

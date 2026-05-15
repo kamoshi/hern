@@ -307,6 +307,9 @@ fn collect_expr_hints(
         | ExprKind::FieldAccess { expr: inner, .. } => {
             collect_expr_hints(inner, range, binding_types, definition_schemes, hints);
         }
+        ExprKind::Neg { operand, .. } => {
+            collect_expr_hints(operand, range, binding_types, definition_schemes, hints);
+        }
         ExprKind::Lambda { params, body, .. } => {
             for param in params {
                 if param.ty.is_none() {

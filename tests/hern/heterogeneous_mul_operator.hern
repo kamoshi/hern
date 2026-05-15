@@ -1,0 +1,20 @@
+type Matrix = Matrix
+type Vector = Vector
+
+impl Mul for Matrix, Vector -> Vector {
+    fn *(lhs, rhs) { Vector }
+}
+
+fn transform(matrix: Matrix, vector: Vector) -> Vector {
+    matrix * vector
+}
+
+fn generic_transform(matrix: 'm, vector: 'v) -> 'out where 'm 'v -> 'out: Mul {
+    matrix * vector
+}
+
+match generic_transform(Matrix, Vector) {
+  Vector -> print(1),
+}
+
+print(3 * 4)

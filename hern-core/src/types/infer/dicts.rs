@@ -2,7 +2,7 @@ use crate::ast::*;
 use crate::types::{
     Scheme, Subst, TraitConstraint, Ty, TypeEnv,
     error::TypeError,
-    perf,
+    free_type_vars, perf,
     type_syntax::{
         trait_impl_arg_key_candidates_from_ty, trait_impl_dict_name_from_keys,
         trait_impl_target_keys_from_ty,
@@ -12,7 +12,25 @@ use crate::types::{
 use std::collections::{HashMap, HashSet};
 
 pub(super) fn dict_param_name(constraint: &TraitConstraint) -> String {
-    format!("__dict_{}_{}", constraint.trait_name, constraint.var)
+    // Preserve the historical unary-style dictionary parameter name when the
+    // full predicate carries no extra information beyond the primary variable.
+    if constraint
+        .args
+        .iter()
+        .all(|arg| matches!(arg, Ty::Var(var) if *var == constraint.var))
+    {
+        return format!("__dict_{}_{}", constraint.trait_name, constraint.var);
+    }
+    let args = constraint
+        .args
+        .iter()
+        .map(dict_param_ty_fragment)
+        .collect::<Vec<_>>()
+        .join("_");
+    format!(
+        "__dict_{}_{}_{}",
+        constraint.trait_name, constraint.var, args
+    )
 }
 
 pub(super) fn dict_ref_concrete_name(dict: &DictRef) -> Option<&str> {
@@ -89,14 +107,103 @@ fn resolve_local_dict_name(
     subst: &Subst,
 ) -> Option<DictRef> {
     let resolved = subst.apply(&Ty::Var(pending.var));
-    if let Ty::Var(var) = resolved {
+    if matches!(resolved, Ty::Var(_)) {
         constraints
             .iter()
-            .find(|c| c.var == var && c.trait_name == pending.trait_name)
+            .find(|constraint| local_constraint_matches_pending(constraint, pending, subst))
             .map(|constraint| DictRef::Param(dict_param_name(constraint)))
     } else {
         None
     }
+}
+
+fn local_constraint_matches_pending(
+    constraint: &TraitConstraint,
+    pending: &PendingDictArg,
+    subst: &Subst,
+) -> bool {
+    // Local dictionary reuse must match the already-normalized predicate exactly.
+    // Unifying here would mutate selection instead of merely finding the dict
+    // parameter owned by the current callable.
+    constraint.trait_name == pending.trait_name
+        && constraint.determinant_indexes == pending.determinant_indexes
+        && constraint.args.len() == pending.args.len()
+        && constraint
+            .args
+            .iter()
+            .zip(&pending.args)
+            .all(|(constraint_arg, pending_arg)| {
+                subst.apply(constraint_arg) == subst.apply(pending_arg)
+            })
+}
+
+fn dict_param_ty_fragment(ty: &Ty) -> String {
+    match ty {
+        Ty::Int => "int".to_string(),
+        Ty::Float => "float".to_string(),
+        Ty::Unit => "unit".to_string(),
+        Ty::Never => "never".to_string(),
+        Ty::Var(var) => format!("v{var}"),
+        Ty::Con(name) => format!("c{}", stable_name_fragment(name)),
+        Ty::App(con, args) => format!(
+            "app{}_{}",
+            dict_param_ty_fragment(con),
+            list_fragment(args.iter().map(dict_param_ty_fragment))
+        ),
+        Ty::Tuple(items) => format!(
+            "tuple{}",
+            list_fragment(items.iter().map(dict_param_ty_fragment))
+        ),
+        Ty::Func(params, ret) => {
+            let params =
+                list_fragment(params.iter().map(|param| dict_param_ty_fragment(&param.ty)));
+            format!("fn{params}_ret{}", dict_param_ty_fragment(&ret.ty))
+        }
+        Ty::Record(row) => format!(
+            "record{}_tail{}",
+            list_fragment(row.fields.iter().map(|(name, ty)| format!(
+                "{}_{}",
+                stable_name_fragment(name),
+                dict_param_ty_fragment(ty)
+            ))),
+            dict_param_ty_fragment(&row.tail)
+        ),
+        Ty::Qualified(constraints, inner) => format!(
+            "qualified{}_inner{}",
+            list_fragment(constraints.iter().map(|constraint| format!(
+                "{}{}",
+                stable_name_fragment(&constraint.trait_name),
+                list_fragment(constraint.args.iter().map(dict_param_ty_fragment))
+            ))),
+            dict_param_ty_fragment(inner)
+        ),
+    }
+}
+
+fn stable_name_fragment(input: &str) -> String {
+    let mut out = String::new();
+    for byte in input.as_bytes() {
+        if byte.is_ascii_alphanumeric() || *byte == b'_' {
+            out.push(char::from(*byte));
+        } else {
+            out.push('x');
+            out.push_str(&format!("{byte:02x}"));
+        }
+    }
+    format!("{}_{out}", input.len())
+}
+
+fn list_fragment(items: impl Iterator<Item = String>) -> String {
+    let items = items.collect::<Vec<_>>();
+    format!(
+        "{}_{}",
+        items.len(),
+        items
+            .into_iter()
+            .map(|item| format!("{}_{item}", item.len()))
+            .collect::<Vec<_>>()
+            .join("_")
+    )
 }
 
 pub(super) fn resolve_local_or_concrete(
@@ -186,7 +293,14 @@ pub(super) fn resolve_concrete_from_args_unifying(
     for index in determinant_indexes {
         let candidates = trait_impl_arg_key_candidates_from_ty(args.get(*index)?);
         if candidates.is_empty() {
-            return None;
+            return resolve_concrete_from_impl_schemes_unifying(
+                trait_name,
+                args,
+                env,
+                known_impl_dicts,
+                known_impl_schemes,
+                subst,
+            );
         }
         candidate_sets.push(candidates);
     }
@@ -224,6 +338,106 @@ pub(super) fn resolve_concrete_from_args_unifying(
             })
         }
     })
+    .or_else(|| {
+        resolve_concrete_from_impl_schemes_unifying(
+            trait_name,
+            args,
+            env,
+            known_impl_dicts,
+            known_impl_schemes,
+            subst,
+        )
+    })
+}
+
+fn resolve_concrete_from_impl_schemes_unifying(
+    trait_name: &str,
+    args: &[Ty],
+    env: &TypeEnv,
+    known_impl_dicts: &HashSet<String>,
+    known_impl_schemes: &HashMap<String, Scheme>,
+    subst: &mut Subst,
+) -> Option<DictRef> {
+    if !args
+        .iter()
+        .any(|arg| ty_has_concrete_shape(&subst.apply(arg)))
+    {
+        return None;
+    }
+
+    let mut candidates = impl_scheme_candidates(trait_name, env, known_impl_schemes);
+    // Deterministic fallback for shape-based scheme lookup. Hern does not yet
+    // report overlapping parameterized impls as ambiguity here, so sorted names
+    // keep selection stable until a real ambiguity diagnostic exists.
+    candidates.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    for (dict_name, scheme) in candidates {
+        let mut trial = subst.clone();
+        if !unify_scheme_method_actuals(&scheme.ty, args, &mut trial) {
+            continue;
+        }
+        let resolved_args = args.iter().map(|arg| trial.apply(arg)).collect::<Vec<_>>();
+        let Some(dict_args) = dict_ref_args_for_scheme_args(
+            &scheme,
+            &resolved_args,
+            env,
+            known_impl_dicts,
+            known_impl_schemes,
+        ) else {
+            continue;
+        };
+        *subst = trial;
+        return if dict_args.is_empty() {
+            Some(DictRef::Concrete(dict_name.to_string()))
+        } else {
+            Some(DictRef::Applied {
+                dict: dict_name.to_string(),
+                args: dict_args,
+            })
+        };
+    }
+
+    None
+}
+
+fn impl_scheme_candidates<'a>(
+    trait_name: &str,
+    env: &'a TypeEnv,
+    known_impl_schemes: &'a HashMap<String, Scheme>,
+) -> Vec<(&'a str, &'a Scheme)> {
+    let prefix = format!("__{trait_name}__");
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for (name, info) in env.iter() {
+        if name.starts_with(&prefix) {
+            seen.insert(name.as_str());
+            candidates.push((name.as_str(), &info.scheme));
+        }
+    }
+    for (name, scheme) in known_impl_schemes {
+        if name.starts_with(&prefix) && seen.insert(name.as_str()) {
+            candidates.push((name.as_str(), scheme));
+        }
+    }
+    candidates
+}
+
+fn ty_has_concrete_shape(ty: &Ty) -> bool {
+    match ty {
+        Ty::Var(_) => false,
+        Ty::Qualified(_, inner) => ty_has_concrete_shape(inner),
+        Ty::Func(params, ret) => {
+            params.iter().any(|param| ty_has_concrete_shape(&param.ty))
+                || ty_has_concrete_shape(&ret.ty)
+        }
+        Ty::Tuple(items) => items.iter().any(ty_has_concrete_shape),
+        Ty::App(con, args) => ty_has_concrete_shape(con) || args.iter().any(ty_has_concrete_shape),
+        Ty::Record(row) => {
+            row.fields.iter().any(|(_, ty)| ty_has_concrete_shape(ty))
+                || ty_has_concrete_shape(&row.tail)
+        }
+        Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => true,
+    }
 }
 
 pub(super) fn resolve_concrete_dict_ref(
@@ -565,10 +779,7 @@ fn resolve_dict_uses_expr_with_mode(
                     });
                     *pending_op = None;
                 } else if hard_unresolved {
-                    return Err(TypeError::UnresolvedTrait {
-                        context: "operator".to_string(),
-                        trait_name: pending.trait_name.clone(),
-                    });
+                    return Err(unresolved_pending_error("operator", pending));
                 }
             }
             if hard_unresolved {
@@ -578,6 +789,26 @@ fn resolve_dict_uses_expr_with_mode(
             }
             resolve_dict_uses_expr_with_mode(lhs, resolve, process_fn, hard_unresolved)?;
             resolve_dict_uses_expr_with_mode(rhs, resolve, process_fn, hard_unresolved)?;
+            Ok(())
+        }
+        ExprKind::Neg {
+            operand,
+            resolved_op,
+            pending_op,
+            ..
+        } => {
+            if let Some(pending) = pending_op.as_ref() {
+                if let Some(dict) = resolve(pending) {
+                    *resolved_op = Some(ResolvedCallee::DictMethod {
+                        dict,
+                        method: "-".to_string(),
+                    });
+                    *pending_op = None;
+                } else if hard_unresolved {
+                    return Err(unresolved_pending_error("operator", pending));
+                }
+            }
+            resolve_dict_uses_expr_with_mode(operand, resolve, process_fn, hard_unresolved)?;
             Ok(())
         }
         ExprKind::Call {
@@ -841,16 +1072,38 @@ fn drain_pending(
 ) -> Result<(), TypeError> {
     let names: Result<Vec<_>, _> = pending
         .iter()
-        .map(|p| {
-            resolve(p).ok_or_else(|| TypeError::UnresolvedTrait {
-                context: context.to_string(),
-                trait_name: p.trait_name.clone(),
-            })
-        })
+        .map(|p| resolve(p).ok_or_else(|| unresolved_pending_error(context, p)))
         .collect();
     resolved.extend(names?);
     pending.clear();
     Ok(())
+}
+
+fn unresolved_pending_error(context: &str, pending: &PendingDictArg) -> TypeError {
+    let determinant_args = pending
+        .determinant_indexes
+        .iter()
+        .filter_map(|index| pending.args.get(*index))
+        .collect::<Vec<_>>();
+    if !determinant_args.is_empty()
+        && determinant_args
+            .iter()
+            .all(|arg| free_type_vars(arg).is_empty())
+    {
+        return TypeError::MissingTraitImpl {
+            trait_name: pending.trait_name.clone(),
+            impl_target: determinant_args
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+    }
+
+    TypeError::UnresolvedTrait {
+        context: context.to_string(),
+        trait_name: pending.trait_name.clone(),
+    }
 }
 
 fn drain_pending_lenient(

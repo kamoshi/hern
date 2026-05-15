@@ -599,6 +599,7 @@ impl IndexBuilder {
             | ExprKind::Loop(expr)
             | ExprKind::Break(Some(expr))
             | ExprKind::Return(Some(expr)) => self.index_expr(expr),
+            ExprKind::Neg { operand, .. } => self.index_expr(operand),
             ExprKind::Assign { target, value }
             | ExprKind::Binary {
                 lhs: target,

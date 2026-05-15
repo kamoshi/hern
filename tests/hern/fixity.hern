@@ -1,8 +1,8 @@
-fn infixr 5 <+>(a, b) {
+fn infixr 5 <+>(a: 'a, b: 'a) -> 'a where 'a 'a -> 'a: Add {
   a + b
 }
 
-fn infixl 7 ><(a, b) {
+fn infixl 7 ><(a: 'a, b: 'a) -> 'a where 'a 'a -> 'a: Add {
   a + a + b
 }
 

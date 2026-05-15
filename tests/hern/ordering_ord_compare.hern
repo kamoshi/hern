@@ -1,0 +1,7 @@
+print(to_string(compare(1, 2)));
+print(to_string(compare(2, 2)));
+print(to_string(compare(3, 2)));
+print(to_string(compare("a", "b")));
+print(to_string(min(7, 3)));
+print(to_string(max(7, 3)));
+print(to_string(clamp(12, 0, 10)));

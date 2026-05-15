@@ -127,6 +127,18 @@ where 'a: ToString, 'e: ToString
   }
 }
 
+type Ordering = LT | EQ | GT
+
+impl ToString for Ordering {
+  fn to_string(self) {
+    match self {
+      LT -> "LT",
+      EQ -> "EQ",
+      GT -> "GT",
+    }
+  }
+}
+
 type Map('k, 'v) = *
 
 type Heap('a) = *
@@ -135,13 +147,17 @@ type Heap('a) = *
 
 extern __float_add: fn(float, float) -> float = #[template] "(($1) + ($2))";
 extern __float_sub: fn(float, float) -> float = #[template] "(($1) - ($2))";
+extern __float_neg: fn(float) -> float = #[template] "(-($1))";
 extern __float_mul: fn(float, float) -> float = #[template] "(($1) * ($2))";
+extern __float_pow: fn(float, float) -> float = #[template] "(($1) ^ ($2))";
 extern __float_div: fn(float, float) -> float = #[template] "(($1) / ($2))";
 extern __float_mod: fn(float, float) -> float = #[template] "(($1) % ($2))";
 
 extern __int_add: fn(int, int) -> int = #[template] "bit.tobit(($1) + ($2))";
 extern __int_sub: fn(int, int) -> int = #[template] "bit.tobit(($1) - ($2))";
+extern __int_neg: fn(int) -> int = #[template] "bit.tobit(-($1))";
 extern __int_mul: fn(int, int) -> int = #[template] "bit.tobit(($1) * ($2))";
+extern __int_pow: fn(int, int) -> int = #[template] "bit.tobit(($1) ^ ($2))";
 extern __int_div: fn(int, int) -> int = #[template] "bit.tobit(($1) / ($2))";
 extern __int_mod: fn(int, int) -> int = #[template] "bit.tobit(($1) % ($2))";
 
@@ -153,6 +169,10 @@ extern __int_lt:  fn(int, int) -> bool = #[template] "((($1) < ($2)) and 1 or 0)
 extern __int_gt:  fn(int, int) -> bool = #[template] "((($1) > ($2)) and 1 or 0)";
 extern __int_lte: fn(int, int) -> bool = #[template] "((($1) <= ($2)) and 1 or 0)";
 extern __int_gte: fn(int, int) -> bool = #[template] "((($1) >= ($2)) and 1 or 0)";
+extern __string_lt:  fn(string, string) -> bool = #[template] "((($1) < ($2)) and 1 or 0)";
+extern __string_gt:  fn(string, string) -> bool = #[template] "((($1) > ($2)) and 1 or 0)";
+extern __string_lte: fn(string, string) -> bool = #[template] "((($1) <= ($2)) and 1 or 0)";
+extern __string_gte: fn(string, string) -> bool = #[template] "((($1) >= ($2)) and 1 or 0)";
 
 extern __eq_float:  fn(float, float) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
 extern __eq_int:  fn(int, int) -> bool = #[template] "((($1) == ($2)) and 1 or 0)";
@@ -173,24 +193,32 @@ extern __float_trunc_to_int: fn(float) -> int = #[template] "bit.tobit(math.modf
 extern __float_floor_to_int: fn(float) -> int = #[template] "bit.tobit(math.floor($1))";
 extern __float_ceil_to_int: fn(float) -> int = #[template] "bit.tobit(math.ceil($1))";
 
-trait Add 'a {
-  fn infixl 6 +(lhs: 'a, rhs: 'a) -> 'a
+trait Add 'lhs 'rhs -> 'output {
+  fn infixl 6 +(lhs: 'lhs, rhs: 'rhs) -> 'output
 }
 
-trait Sub 'a {
-  fn infixl 6 -(lhs: 'a, rhs: 'a) -> 'a
+trait Sub 'lhs 'rhs -> 'output {
+  fn infixl 6 -(lhs: 'lhs, rhs: 'rhs) -> 'output
 }
 
-trait Mul 'a {
-  fn infixl 7 *(lhs: 'a, rhs: 'a) -> 'a
+trait Neg 'a {
+  fn -(value: 'a) -> 'a
 }
 
-trait Div 'a {
-  fn infixl 7 /(lhs: 'a, rhs: 'a) -> 'a
+trait Mul 'lhs 'rhs -> 'output {
+  fn infixl 7 *(lhs: 'lhs, rhs: 'rhs) -> 'output
 }
 
-trait Mod 'a {
-  fn infixl 7 %(lhs: 'a, rhs: 'a) -> 'a
+trait Pow 'base 'exponent -> 'output {
+  fn infixr 8 **(base: 'base, exponent: 'exponent) -> 'output
+}
+
+trait Div 'lhs 'rhs -> 'output {
+  fn infixl 7 /(lhs: 'lhs, rhs: 'rhs) -> 'output
+}
+
+trait Mod 'lhs 'rhs -> 'output {
+  fn infixl 7 %(lhs: 'lhs, rhs: 'rhs) -> 'output
 }
 
 trait Ord 'a {
@@ -198,6 +226,23 @@ trait Ord 'a {
   fn infix 4 >(lhs: 'a, rhs: 'a) -> bool
   fn infix 4 <=(lhs: 'a, rhs: 'a) -> bool
   fn infix 4 >=(lhs: 'a, rhs: 'a) -> bool
+  fn compare(lhs: 'a, rhs: 'a) -> Ordering
+}
+
+fn compare(lhs: 'a, rhs: 'a) -> Ordering where 'a: Ord {
+  Ord::compare(lhs, rhs)
+}
+
+fn min(lhs: 'a, rhs: 'a) -> 'a where 'a: Ord {
+  if lhs <= rhs { lhs } else { rhs }
+}
+
+fn max(lhs: 'a, rhs: 'a) -> 'a where 'a: Ord {
+  if lhs >= rhs { lhs } else { rhs }
+}
+
+fn clamp(value: 'a, low: 'a, high: 'a) -> 'a where 'a: Ord {
+  if value < low { low } else if value > high { high } else { value }
 }
 
 trait Eq 'a {
@@ -217,27 +262,37 @@ trait Or 'a {
   fn infixl 2 ||(lhs: 'a, rhs: 'a) -> bool
 }
 
-impl Add for float {
+impl Add for float, float -> float {
   #[inline]
   fn +(lhs, rhs) { __float_add(lhs, rhs) }
 }
 
-impl Sub for float {
+impl Sub for float, float -> float {
   #[inline]
   fn -(lhs, rhs) { __float_sub(lhs, rhs) }
 }
 
-impl Mul for float {
+impl Neg for float {
+  #[inline]
+  fn -(value) { __float_neg(value) }
+}
+
+impl Mul for float, float -> float {
   #[inline]
   fn *(lhs, rhs) { __float_mul(lhs, rhs) }
 }
 
-impl Div for float {
+impl Pow for float, float -> float {
+  #[inline]
+  fn **(base, exponent) { __float_pow(base, exponent) }
+}
+
+impl Div for float, float -> float {
   #[inline]
   fn /(lhs, rhs) { __float_div(lhs, rhs) }
 }
 
-impl Mod for float {
+impl Mod for float, float -> float {
   #[inline]
   fn %(lhs, rhs) { __float_mod(lhs, rhs) }
 }
@@ -251,6 +306,9 @@ impl Ord for float {
   fn <=(lhs, rhs) { __float_lte(lhs, rhs) }
   #[inline]
   fn >=(lhs, rhs) { __float_gte(lhs, rhs) }
+  fn compare(lhs, rhs) {
+    if __float_lt(lhs, rhs) { LT } else if __float_gt(lhs, rhs) { GT } else { EQ }
+  }
 }
 
 impl Eq for float {
@@ -270,27 +328,37 @@ impl ToString for float {
   fn to_string(self) { tostring(self) }
 }
 
-impl Add for int {
+impl Add for int, int -> int {
   #[inline]
   fn +(lhs, rhs) { __int_add(lhs, rhs) }
 }
 
-impl Sub for int {
+impl Sub for int, int -> int {
   #[inline]
   fn -(lhs, rhs) { __int_sub(lhs, rhs) }
 }
 
-impl Mul for int {
+impl Neg for int {
+  #[inline]
+  fn -(value) { __int_neg(value) }
+}
+
+impl Mul for int, int -> int {
   #[inline]
   fn *(lhs, rhs) { __int_mul(lhs, rhs) }
 }
 
-impl Div for int {
+impl Pow for int, int -> int {
+  #[inline]
+  fn **(base, exponent) { __int_pow(base, exponent) }
+}
+
+impl Div for int, int -> int {
   #[inline]
   fn /(lhs, rhs) { __int_div(lhs, rhs) }
 }
 
-impl Mod for int {
+impl Mod for int, int -> int {
   #[inline]
   fn %(lhs, rhs) { __int_mod(lhs, rhs) }
 }
@@ -304,6 +372,9 @@ impl Ord for int {
   fn <=(lhs, rhs) { __int_lte(lhs, rhs) }
   #[inline]
   fn >=(lhs, rhs) { __int_gte(lhs, rhs) }
+  fn compare(lhs, rhs) {
+    if __int_lt(lhs, rhs) { LT } else if __int_gt(lhs, rhs) { GT } else { EQ }
+  }
 }
 
 impl Eq for int {
@@ -328,11 +399,40 @@ impl Eq for string {
   fn !=(lhs, rhs) { __neq_string(lhs, rhs) }
 }
 
+impl Ord for string {
+  #[inline]
+  fn <(lhs, rhs) { __string_lt(lhs, rhs) }
+  #[inline]
+  fn >(lhs, rhs) { __string_gt(lhs, rhs) }
+  #[inline]
+  fn <=(lhs, rhs) { __string_lte(lhs, rhs) }
+  #[inline]
+  fn >=(lhs, rhs) { __string_gte(lhs, rhs) }
+  fn compare(lhs, rhs) {
+    if __string_lt(lhs, rhs) { LT } else if __string_gt(lhs, rhs) { GT } else { EQ }
+  }
+}
+
 impl Eq for bool {
   #[inline]
   fn ==(lhs, rhs) { __eq_bool(lhs, rhs) }
   #[inline]
   fn !=(lhs, rhs) { __neq_bool(lhs, rhs) }
+}
+
+impl Eq for Ordering {
+  fn ==(lhs, rhs) {
+    match (lhs, rhs) {
+      (LT, LT) -> true,
+      (EQ, EQ) -> true,
+      (GT, GT) -> true,
+      _ -> false,
+    }
+  }
+
+  fn !=(lhs, rhs) {
+    !(lhs == rhs)
+  }
 }
 
 impl ToString for bool {
@@ -441,16 +541,6 @@ extern __array_sum_int: fn([int]) -> int = "(function(a)
   local s = 0
   for _, v in ipairs(a) do s = bit.tobit(s + v) end
   return s
-end)";
-extern __array_max: fn([float]) -> float = "(function(a)
-  local m = -math.huge
-  for _, v in ipairs(a) do if v > m then m = v end end
-  return m
-end)";
-extern __array_min: fn([float]) -> float = "(function(a)
-  local m = math.huge
-  for _, v in ipairs(a) do if v < m then m = v end end
-  return m
 end)";
 extern __array_sort_by: fn(['a], fn('a, 'a) -> bool) -> () = "(function(a, less)
   table.sort(a, function(x, y) return less(x, y) ~= 0 end)
@@ -648,6 +738,80 @@ where 'a: Eq
   }
 }
 
+impl ['a]
+where 'a: Ord
+{
+  fn sort(mut self) -> () {
+    self.sort_by(fn(lhs, rhs) { lhs < rhs })
+  }
+
+  fn min(self) -> Option('a) {
+    let mut best = None;
+    for item in self {
+      match best {
+        None -> best = Some(item),
+        Some(current) -> if item < current {
+          best = Some(item);
+        },
+      }
+    };
+    best
+  }
+
+  fn max(self) -> Option('a) {
+    let mut best = None;
+    for item in self {
+      match best {
+        None -> best = Some(item),
+        Some(current) -> if item > current {
+          best = Some(item);
+        },
+      }
+    };
+    best
+  }
+}
+
+impl ['a] {
+  fn min_by(self, score: fn('a) -> 'b) -> Option('a) where 'b: Ord {
+    let mut best = None;
+    let mut best_score = None;
+    for item in self {
+      let item_score = score(item);
+      match best_score {
+        None -> {
+          best = Some(item);
+          best_score = Some(item_score);
+        },
+        Some(current_score) -> if item_score < current_score {
+          best = Some(item);
+          best_score = Some(item_score);
+        },
+      }
+    };
+    best
+  }
+
+  fn max_by(self, score: fn('a) -> 'b) -> Option('a) where 'b: Ord {
+    let mut best = None;
+    let mut best_score = None;
+    for item in self {
+      let item_score = score(item);
+      match best_score {
+        None -> {
+          best = Some(item);
+          best_score = Some(item_score);
+        },
+        Some(current_score) -> if item_score > current_score {
+          best = Some(item);
+          best_score = Some(item_score);
+        },
+      }
+    };
+    best
+  }
+}
+
 impl ToString for ['a]
 where 'a: ToString
 {
@@ -675,54 +839,8 @@ impl [float] {
     self.fold(1.0, fn(acc, item) { acc * item })
   }
 
-  fn max(self) -> float {
-    __array_max(self)
-  }
-
-  fn min(self) -> float {
-    __array_min(self)
-  }
-
   fn sort(mut self) -> () {
     __array_sort_float(self)
-  }
-
-  fn min_by(self, score: fn(float) -> float) -> Option(float) {
-    let mut best = None;
-    let mut best_score = 0.0;
-    for item in self {
-      let item_score = score(item);
-      match best {
-        None -> {
-          best = Some(item);
-          best_score = item_score;
-        },
-        Some(_) -> if item_score < best_score {
-          best = Some(item);
-          best_score = item_score;
-        },
-      }
-    };
-    best
-  }
-
-  fn max_by(self, score: fn(float) -> float) -> Option(float) {
-    let mut best = None;
-    let mut best_score = 0.0;
-    for item in self {
-      let item_score = score(item);
-      match best {
-        None -> {
-          best = Some(item);
-          best_score = item_score;
-        },
-        Some(_) -> if item_score > best_score {
-          best = Some(item);
-          best_score = item_score;
-        },
-      }
-    };
-    best
   }
 }
 
@@ -737,44 +855,6 @@ impl [int] {
 
   fn sort(mut self) -> () {
     __array_sort_int(self)
-  }
-
-  fn min_by(self, score: fn(int) -> int) -> Option(int) {
-    let mut best = None;
-    let mut best_score = 0;
-    for item in self {
-      let item_score = score(item);
-      match best {
-        None -> {
-          best = Some(item);
-          best_score = item_score;
-        },
-        Some(_) -> if item_score < best_score {
-          best = Some(item);
-          best_score = item_score;
-        },
-      }
-    };
-    best
-  }
-
-  fn max_by(self, score: fn(int) -> int) -> Option(int) {
-    let mut best = None;
-    let mut best_score = 0;
-    for item in self {
-      let item_score = score(item);
-      match best {
-        None -> {
-          best = Some(item);
-          best_score = item_score;
-        },
-        Some(_) -> if item_score > best_score {
-          best = Some(item);
-          best_score = item_score;
-        },
-      }
-    };
-    best
   }
 }
 

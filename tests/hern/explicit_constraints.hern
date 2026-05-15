@@ -1,8 +1,8 @@
-fn double(x: 'a) -> 'a where 'a: Add {
+fn double(x: 'a) -> 'a where 'a 'a -> 'a: Add {
     x + x
 }
 
-fn quadruple(x: 'a) -> 'a where 'a: Add {
+fn quadruple(x: 'a) -> 'a where 'a 'a -> 'a: Add {
     double(x) + double(x)
 }
 

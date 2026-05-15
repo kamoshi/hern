@@ -8,9 +8,8 @@ mod snapshot;
 
 use self::dicts::{
     attach_dict_args, dict_param_name, dict_ref_concrete_name, final_pass_stmt, resolve_concrete,
-    resolve_concrete_dict_ref, resolve_concrete_from_args_unifying,
-    resolve_concrete_multi_dict_ref, resolve_dict_uses_expr, resolve_dict_uses_expr_lenient,
-    resolve_local_or_concrete,
+    resolve_concrete_dict_ref, resolve_concrete_from_args_unifying, resolve_dict_uses_expr,
+    resolve_dict_uses_expr_lenient, resolve_local_or_concrete,
 };
 use super::{
     patterns::{
@@ -56,6 +55,19 @@ struct InherentMethodInfo {
     scheme: Scheme,
     resolved_callee: ResolvedCallee,
     has_receiver: bool,
+}
+
+struct OperatorTraitMethodTypes {
+    trait_args: Vec<Ty>,
+    lhs_param_ty: Ty,
+    rhs_param_ty: Ty,
+    ret_ty: Ty,
+}
+
+struct UnaryOperatorTraitMethodTypes {
+    trait_args: Vec<Ty>,
+    operand_param_ty: Ty,
+    ret_ty: Ty,
 }
 
 // ── Infer ─────────────────────────────────────────────────────────────────────
@@ -601,21 +613,90 @@ impl Infer {
         &mut self,
         param_vars: &mut HashMap<String, TyVar>,
         type_bounds: &[TypeBound],
-    ) -> Vec<TraitConstraint> {
+    ) -> Result<Vec<TraitConstraint>, SpannedTypeError> {
         let mut constraints = Vec::new();
         for bound in type_bounds {
-            let var = if let Some(existing) = param_vars.get(&bound.var) {
-                *existing
-            } else {
-                let fresh = self.fresh_var();
-                param_vars.insert(bound.var.clone(), fresh);
-                fresh
-            };
+            let args = bound
+                .args
+                .iter()
+                .map(|arg| self.ast_to_ty_with_vars(arg, param_vars))
+                .collect::<Result<Vec<_>, _>>()?;
             for trait_name in &bound.traits {
-                constraints.push(TraitConstraint::unary(var, trait_name.clone()));
+                if let Some(trait_def) = self.trait_env.get(trait_name) {
+                    let determinant_indexes = trait_dict_indexes(trait_def);
+                    match (bound.fundep_arrow_index, trait_def.fundeps.is_empty()) {
+                        (Some(_), true) => {
+                            return Err(TypeError::InvalidTraitConstraint {
+                                trait_name: trait_name.clone(),
+                                message:
+                                    "`->` is only valid when the trait declares a functional dependency"
+                                        .to_string(),
+                            }
+                            .into());
+                        }
+                        (None, false) => {
+                            return Err(TypeError::InvalidTraitConstraint {
+                                trait_name: trait_name.clone(),
+                                message: format!(
+                                    "fundep trait constraints must include `->` between determinant and dependent type arguments; write `{}`",
+                                    fundep_constraint_example(trait_def),
+                                ),
+                            }
+                            .into());
+                        }
+                        _ => {}
+                    }
+                    if args.len() != trait_def.params.len() {
+                        return Err(TypeError::TraitArityMismatch {
+                            trait_name: trait_name.clone(),
+                            expected: trait_def.params.len(),
+                            got: args.len(),
+                        }
+                        .into());
+                    }
+                    if let Some(arrow_index) = bound.fundep_arrow_index {
+                        if arrow_index != determinant_indexes.len() {
+                            return Err(TypeError::InvalidTraitConstraint {
+                                trait_name: trait_name.clone(),
+                                message: format!(
+                                    "fundep constraints must place `->` after {} determinant type argument{}",
+                                    determinant_indexes.len(),
+                                    if determinant_indexes.len() == 1 { "" } else { "s" }
+                                ),
+                            }
+                            .into());
+                        }
+                    }
+                    let var = primary_trait_var(&args, &determinant_indexes)
+                        .unwrap_or_else(|| self.fresh_var());
+                    constraints.push(TraitConstraint::predicate(
+                        trait_name.clone(),
+                        args.clone(),
+                        var,
+                        determinant_indexes,
+                    ));
+                } else {
+                    if bound.fundep_arrow_index.is_some() || args.len() != 1 {
+                        return Err(TypeError::TraitArityMismatch {
+                            trait_name: trait_name.clone(),
+                            expected: 1,
+                            got: args.len(),
+                        }
+                        .into());
+                    }
+                    let Ty::Var(var) = args[0].clone() else {
+                        return Err(TypeError::InvalidTraitConstraint {
+                            trait_name: trait_name.clone(),
+                            message: "unary trait constraints must target a type variable"
+                                .to_string(),
+                        }
+                        .into());
+                    };
+                    constraints.push(TraitConstraint::unary(var, trait_name.clone()));
+                }
             }
         }
-        constraints
+        Ok(constraints)
     }
 
     fn with_pending_constraints_scope<T>(
@@ -745,7 +826,7 @@ impl Infer {
             let mut param_tys = Vec::new();
             let mut body_env = env.clone();
             let initial_constraints =
-                this.collect_type_bound_constraints(&mut param_vars, type_bounds);
+                this.collect_type_bound_constraints(&mut param_vars, type_bounds)?;
 
             for param in params {
                 if !is_irrefutable_param(&param.pat, &this.variant_env) {
@@ -1136,10 +1217,32 @@ impl Infer {
             } => {
                 let generalizable_value = !*is_mutable && is_value(&*value);
                 let ambient = self.current_level;
+                let env_vars_before_let = if generalizable_value {
+                    env.free_vars(&self.subst)
+                } else {
+                    HashSet::new()
+                };
+                let pending_start = self.pending_constraints.len();
                 let inferred_ty = if generalizable_value {
                     self.with_child_level(|this| this.infer_let_value_ty(env, ty, value))?
                 } else {
                     self.infer_let_value_ty(env, ty, value)?
+                };
+                // A value that creates a pending trait constraint over an existing
+                // environment variable cannot soundly own that dictionary in a
+                // polymorphic scheme. Keep the binding monomorphic so the outer
+                // scope resolves the exact captured dictionary use.
+                let captures_constraint_from_env = generalizable_value && {
+                    let env_vars_after_let = env.free_vars(&self.subst);
+                    self.pending_constraints[pending_start..]
+                        .iter()
+                        .any(|constraint| {
+                            constraint_mentions_any_var(
+                                constraint,
+                                &env_vars_after_let,
+                                &self.subst,
+                            )
+                        })
                 };
 
                 // Reject refutable patterns in let position.
@@ -1156,7 +1259,7 @@ impl Infer {
                         && let Some(imported_scheme) = self.imported_member_scheme_for_expr(value)
                     {
                         imported_scheme
-                    } else if !generalizable_value {
+                    } else if !generalizable_value || captures_constraint_from_env {
                         Scheme::mono(inferred_ty)
                     } else {
                         self.generalize_at(env, inferred_ty, ambient)
@@ -1182,18 +1285,11 @@ impl Infer {
                         },
                     );
                 } else {
-                    // Destructuring: bind each pattern variable, then generalize if
-                    // the RHS is a syntactic value (preserving let-polymorphism).
-                    //
-                    // Snapshot env free vars BEFORE inserting new bindings so that
-                    // sibling bindings don't prevent each other from being generalized.
-                    let pre_let_env_vars: HashSet<TyVar> = if generalizable_value {
-                        env.free_vars(&self.subst)
-                    } else {
-                        HashSet::new()
-                    };
+                    // Destructuring: bind each pattern variable, then generalize
+                    // against the pre-let environment so sibling bindings don't
+                    // prevent each other from being generalized.
                     self.check_pattern(pat, inferred_ty, env, *is_mutable)?;
-                    if generalizable_value {
+                    if generalizable_value && !captures_constraint_from_env {
                         let mut bound = std::collections::HashSet::new();
                         insert_pattern_bindings(&mut bound, pat);
                         let updates: Vec<(String, Ty, bool)> = bound
@@ -1209,7 +1305,7 @@ impl Infer {
                             let mut ty_vars = HashSet::new();
                             free_type_vars_into(&applied, &mut ty_vars);
                             let mut vars: Vec<TyVar> =
-                                ty_vars.difference(&pre_let_env_vars).copied().collect();
+                                ty_vars.difference(&env_vars_before_let).copied().collect();
                             vars.sort();
                             let scheme = Scheme {
                                 vars,
@@ -1435,6 +1531,12 @@ impl Infer {
                 unify(&mut self.subst, op_ty, Ty::Con("bool".to_string()))?;
                 Ok(Ty::Con("bool".to_string()))
             }
+            ExprKind::Neg {
+                operand,
+                resolved_op,
+                pending_op,
+                ..
+            } => self.infer_neg_expr(env, operand, resolved_op, pending_op),
             ExprKind::Unit => Ok(Ty::Unit),
             ExprKind::Import(path) => self
                 .import_types
@@ -1847,7 +1949,7 @@ impl Infer {
             "Index",
             "index",
             resolved_args,
-            determinant_indexes,
+            determinant_indexes.clone(),
             vec![receiver_ty, key_ty],
             output_ty.clone(),
             resolved_callee,
@@ -2001,6 +2103,71 @@ impl Infer {
         Ok(self.subst.apply(&Ty::Var(ret_var)))
     }
 
+    fn infer_neg_expr(
+        &mut self,
+        env: &TypeEnv,
+        operand: &mut Expr,
+        resolved_op: &mut Option<ResolvedCallee>,
+        pending_op: &mut Option<PendingDictArg>,
+    ) -> Result<Ty, SpannedTypeError> {
+        const TRAIT_NAME: &str = "Neg";
+        const METHOD_NAME: &str = "-";
+
+        let trait_def = self
+            .trait_env
+            .get(TRAIT_NAME)
+            .ok_or_else(|| TypeError::UnknownTrait(TRAIT_NAME.to_string()))?
+            .clone();
+        let method = trait_def
+            .methods
+            .iter()
+            .find(|method| method.name == METHOD_NAME)
+            .ok_or_else(|| TypeError::UnknownTraitMethod {
+                trait_name: TRAIT_NAME.to_string(),
+                method: METHOD_NAME.to_string(),
+            })?
+            .clone();
+        if method.params.len() != 1 {
+            return Err(TypeError::TraitMethodArityMismatch {
+                trait_name: TRAIT_NAME.to_string(),
+                method: METHOD_NAME.to_string(),
+                expected: 1,
+                got: method.params.len(),
+            }
+            .into());
+        }
+
+        let UnaryOperatorTraitMethodTypes {
+            trait_args,
+            operand_param_ty,
+            ret_ty,
+        } = self.instantiate_unary_operator_trait_method(&trait_def, &method)?;
+        if !trait_def.is_unary() {
+            return Err(TypeError::TraitArityMismatch {
+                trait_name: TRAIT_NAME.to_string(),
+                expected: 1,
+                got: trait_def.params.len(),
+            }
+            .into());
+        }
+        let target_var = operator_trait_target_var(&trait_def, &trait_args)?;
+
+        let operand_ty = self.infer_expr_expected(env, operand, operand_param_ty.clone())?;
+        unify(&mut self.subst, operand_ty, operand_param_ty)?;
+        let resolved_target = self.subst.apply(&Ty::Var(target_var));
+        self.resolve_operator_dispatch(
+            env,
+            TRAIT_NAME,
+            METHOD_NAME,
+            &resolved_target,
+            resolved_op,
+            pending_op,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )?;
+        Ok(self.subst.apply(&ret_ty))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn infer_custom_binary_expr(
         &mut self,
@@ -2065,33 +2232,234 @@ impl Infer {
                 method: op.to_string(),
             })?
             .clone();
+        if method.params.len() != 2 {
+            return Err(TypeError::TraitMethodArityMismatch {
+                trait_name: trait_name.to_string(),
+                method: op.to_string(),
+                expected: 2,
+                got: method.params.len(),
+            }
+            .into());
+        }
 
-        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-        let target_var = self.fresh_var();
-        let trait_param = primary_param_or_panic(&trait_def);
-        param_vars.insert(trait_param.to_string(), target_var);
+        let OperatorTraitMethodTypes {
+            trait_args,
+            lhs_param_ty,
+            rhs_param_ty,
+            ret_ty,
+        } = self.instantiate_operator_trait_method(&trait_def, &method)?;
 
-        let lhs_param_ty = self.ast_to_ty_with_vars(&method.params[0].1, &mut param_vars)?;
-        let rhs_param_ty = self.ast_to_ty_with_vars(&method.params[1].1, &mut param_vars)?;
-        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
+        if trait_def.is_unary() {
+            let target_var = operator_trait_target_var(&trait_def, &trait_args)?;
+            unify(&mut self.subst, l_ty, lhs_param_ty)?;
+            let rhs_param_ty = self.subst.apply(&rhs_param_ty);
+            let r_ty = self.infer_expr_expected(env, rhs, rhs_param_ty.clone())?;
+            unify(&mut self.subst, r_ty, rhs_param_ty)?;
 
-        unify(&mut self.subst, l_ty, lhs_param_ty)?;
+            let resolved_target = self.subst.apply(&Ty::Var(target_var));
+            self.resolve_operator_dispatch(
+                env,
+                trait_name,
+                op,
+                &resolved_target,
+                resolved_op,
+                pending_op,
+                dict_args,
+                pending_dict_args,
+            )?;
+            return Ok(self.subst.apply(&ret_ty));
+        }
+
+        unify(&mut self.subst, l_ty.clone(), lhs_param_ty)?;
         let rhs_param_ty = self.subst.apply(&rhs_param_ty);
         let r_ty = self.infer_expr_expected(env, rhs, rhs_param_ty.clone())?;
-        unify(&mut self.subst, r_ty, rhs_param_ty)?;
+        unify(&mut self.subst, r_ty.clone(), rhs_param_ty.clone())?;
 
-        let resolved_target = self.subst.apply(&Ty::Var(target_var));
-        self.resolve_operator_dispatch(
+        let trait_args = trait_args
+            .iter()
+            .map(|arg| self.subst.apply(arg))
+            .collect::<Vec<_>>();
+        let determinant_indexes = trait_dict_indexes(&trait_def);
+        self.apply_matching_pending_trait_constraint(trait_name, &trait_args, &determinant_indexes);
+        let trait_args_post = trait_args
+            .iter()
+            .map(|arg| self.subst.apply(arg))
+            .collect::<Vec<_>>();
+        let mut pending_trait_method = None;
+        if let Some(ret_ty) = self.resolve_multi_param_trait_dispatch(
             env,
             trait_name,
             op,
-            &resolved_target,
+            trait_args_post.clone(),
+            determinant_indexes.clone(),
+            vec![self.subst.apply(&l_ty), self.subst.apply(&rhs_param_ty)],
+            ret_ty,
             resolved_op,
-            pending_op,
-            dict_args,
-            pending_dict_args,
-        )?;
-        Ok(self.subst.apply(&ret_ty))
+            &mut pending_trait_method,
+            "operator trait dictionaries should be concrete",
+        )? {
+            if let Some((pending, _)) = pending_trait_method {
+                *pending_op = Some(pending);
+            }
+            return Ok(ret_ty);
+        }
+
+        let determinant_args = determinant_indexes
+            .iter()
+            .filter_map(|index| trait_args_post.get(*index))
+            .collect::<Vec<_>>();
+        if determinant_args
+            .iter()
+            .all(|arg| free_type_vars(arg).is_empty())
+        {
+            return Err(TypeError::MissingTraitImpl {
+                trait_name: trait_name.to_string(),
+                impl_target: determinant_args
+                    .iter()
+                    .map(|arg| arg.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }
+            .into());
+        }
+
+        Err(TypeError::UnresolvedTrait {
+            context: "operator".to_string(),
+            trait_name: trait_name.to_string(),
+        }
+        .into())
+    }
+
+    fn apply_matching_pending_trait_constraint(
+        &mut self,
+        trait_name: &str,
+        trait_args: &[Ty],
+        determinant_indexes: &[usize],
+    ) {
+        for index in 0..self.pending_constraints.len() {
+            let constraint = &self.pending_constraints[index];
+            if constraint.trait_name != trait_name
+                || constraint.args.len() != trait_args.len()
+                || constraint.determinant_indexes != determinant_indexes
+                || !determinants_share_var(
+                    &constraint.args,
+                    trait_args,
+                    determinant_indexes,
+                    &self.subst,
+                )
+            {
+                continue;
+            }
+
+            let mut trial = self.subst.clone();
+            if constraint
+                .args
+                .iter()
+                .cloned()
+                .zip(trait_args.iter().cloned())
+                .all(|(constraint_arg, trait_arg)| {
+                    unify(&mut trial, constraint_arg, trait_arg).is_ok()
+                })
+            {
+                self.subst = trial;
+                debug_assert!(
+                    self.remaining_pending_trait_matches_are_compatible(
+                        index + 1,
+                        trait_name,
+                        trait_args,
+                        determinant_indexes,
+                    ),
+                    "multiple pending fundep predicates matched but were not equivalent"
+                );
+                return;
+            }
+        }
+    }
+
+    fn remaining_pending_trait_matches_are_compatible(
+        &self,
+        start_index: usize,
+        trait_name: &str,
+        trait_args: &[Ty],
+        determinant_indexes: &[usize],
+    ) -> bool {
+        for constraint in self.pending_constraints.iter().skip(start_index) {
+            if constraint.trait_name != trait_name
+                || constraint.args.len() != trait_args.len()
+                || constraint.determinant_indexes != determinant_indexes
+                || !determinants_share_var(
+                    &constraint.args,
+                    trait_args,
+                    determinant_indexes,
+                    &self.subst,
+                )
+            {
+                continue;
+            }
+
+            let mut trial = self.subst.clone();
+            if !constraint
+                .args
+                .iter()
+                .cloned()
+                .zip(trait_args.iter().cloned())
+                .all(|(constraint_arg, trait_arg)| {
+                    unify(&mut trial, constraint_arg, trait_arg).is_ok()
+                })
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn instantiate_operator_trait_method(
+        &mut self,
+        trait_def: &TraitDef,
+        method: &TraitMethod,
+    ) -> Result<OperatorTraitMethodTypes, SpannedTypeError> {
+        ensure_operator_trait_has_params(trait_def)?;
+        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
+        let trait_args = trait_def
+            .params
+            .iter()
+            .map(|param| {
+                let var = self.fresh_var();
+                param_vars.insert(param.clone(), var);
+                Ty::Var(var)
+            })
+            .collect::<Vec<_>>();
+
+        Ok(OperatorTraitMethodTypes {
+            trait_args,
+            lhs_param_ty: self.ast_to_ty_with_vars(&method.params[0].1, &mut param_vars)?,
+            rhs_param_ty: self.ast_to_ty_with_vars(&method.params[1].1, &mut param_vars)?,
+            ret_ty: self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?,
+        })
+    }
+
+    fn instantiate_unary_operator_trait_method(
+        &mut self,
+        trait_def: &TraitDef,
+        method: &TraitMethod,
+    ) -> Result<UnaryOperatorTraitMethodTypes, SpannedTypeError> {
+        ensure_operator_trait_has_params(trait_def)?;
+        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
+        let trait_args = trait_def
+            .params
+            .iter()
+            .map(|param| {
+                let var = self.fresh_var();
+                param_vars.insert(param.clone(), var);
+                Ty::Var(var)
+            })
+            .collect::<Vec<_>>();
+
+        Ok(UnaryOperatorTraitMethodTypes {
+            trait_args,
+            operand_param_ty: self.ast_to_ty_with_vars(&method.params[0].1, &mut param_vars)?,
+            ret_ty: self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3163,6 +3531,93 @@ fn primary_trait_var(args: &[Ty], determinant_indexes: &[usize]) -> Option<TyVar
         .filter_map(|index| args.get(*index))
         .find_map(first_ty_var)
         .or_else(|| args.iter().find_map(first_ty_var))
+}
+
+fn fundep_constraint_example(trait_def: &TraitDef) -> String {
+    let determinant_indexes = trait_dict_indexes(trait_def);
+    debug_assert!(
+        crate::types::determinant_indexes_are_prefix(&determinant_indexes),
+        "fundep constraint examples assume source arrows split a prefix determinant list"
+    );
+    let mut parts = Vec::new();
+    for (index, param) in trait_def.params.iter().enumerate() {
+        if index > 0 && index == determinant_indexes.len() {
+            parts.push("->".to_string());
+        }
+        parts.push(param.clone());
+    }
+    format!("{}: {}", parts.join(" "), trait_def.name)
+}
+
+fn determinants_share_var(
+    left: &[Ty],
+    right: &[Ty],
+    determinant_indexes: &[usize],
+    subst: &Subst,
+) -> bool {
+    let mut left_vars = HashSet::new();
+    for index in determinant_indexes {
+        if let Some(arg) = left.get(*index) {
+            free_type_vars_into(&subst.apply(arg), &mut left_vars);
+        }
+    }
+    determinant_indexes.iter().any(|index| {
+        right.get(*index).is_some_and(|arg| {
+            free_type_vars(&subst.apply(arg))
+                .iter()
+                .any(|var| left_vars.contains(var))
+        })
+    })
+}
+
+fn constraint_mentions_any_var(
+    constraint: &TraitConstraint,
+    vars: &HashSet<TyVar>,
+    subst: &Subst,
+) -> bool {
+    if vars.is_empty() {
+        return false;
+    }
+    let mut constraint_vars = HashSet::new();
+    free_type_vars_into(&subst.apply(&Ty::Var(constraint.var)), &mut constraint_vars);
+    for arg in &constraint.args {
+        free_type_vars_into(&subst.apply(arg), &mut constraint_vars);
+    }
+    constraint_vars.iter().any(|var| vars.contains(var))
+}
+
+fn ensure_operator_trait_has_params(trait_def: &TraitDef) -> Result<(), SpannedTypeError> {
+    if trait_def.params.is_empty() {
+        return Err(TypeError::TraitArityMismatch {
+            trait_name: trait_def.name.clone(),
+            expected: 1,
+            got: 0,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn operator_trait_target_var(
+    trait_def: &TraitDef,
+    trait_args: &[Ty],
+) -> Result<TyVar, SpannedTypeError> {
+    let Some(first_arg) = trait_args.first() else {
+        return Err(TypeError::TraitArityMismatch {
+            trait_name: trait_def.name.clone(),
+            expected: 1,
+            got: 0,
+        }
+        .into());
+    };
+    let Ty::Var(target_var) = first_arg else {
+        return Err(TypeError::InvalidTraitConstraint {
+            trait_name: trait_def.name.clone(),
+            message: "operator trait target must be an inferred type variable".to_string(),
+        }
+        .into());
+    };
+    Ok(*target_var)
 }
 
 fn first_ty_var(ty: &Ty) -> Option<TyVar> {

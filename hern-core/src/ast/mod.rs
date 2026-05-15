@@ -165,6 +165,7 @@ pub fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         | ExprKind::Return(Some(inner))
         | ExprKind::FieldAccess { expr: inner, .. }
         | ExprKind::Lambda { body: inner, .. } => walk_expr(inner, visit),
+        ExprKind::Neg { operand, .. } => walk_expr(operand, visit),
         ExprKind::Index { receiver, key, .. } => {
             walk_expr(receiver, visit);
             walk_expr(key, visit);
@@ -248,7 +249,8 @@ pub fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
 
 #[derive(Debug, Clone)]
 pub struct TypeBound {
-    pub var: String,
+    pub args: Vec<Type>,
+    pub fundep_arrow_index: Option<usize>,
     pub traits: Vec<String>,
 }
 
@@ -609,6 +611,13 @@ pub enum ExprKind {
     /// custom operator reassociation.
     Grouped(Box<Expr>),
     Not(Box<Expr>),
+    Neg {
+        operand: Box<Expr>,
+        /// Source span of the unary `-` token itself, used for hover.
+        op_span: SourceSpan,
+        resolved_op: Option<ResolvedCallee>,
+        pending_op: Option<PendingDictArg>,
+    },
     Assign {
         target: Box<Expr>,
         value: Box<Expr>,

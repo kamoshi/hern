@@ -1104,6 +1104,7 @@ fn resolve_imports_in_expr(
         | ExprKind::Break(Some(e))
         | ExprKind::Return(Some(e))
         | ExprKind::FieldAccess { expr: e, .. } => resolve_imports_in_expr(e, base_dir, graph),
+        ExprKind::Neg { operand, .. } => resolve_imports_in_expr(operand, base_dir, graph),
         ExprKind::Index { receiver, key, .. } => {
             resolve_imports_in_expr(receiver, base_dir, graph)?;
             resolve_imports_in_expr(key, base_dir, graph)
@@ -1220,6 +1221,9 @@ fn resolve_imports_in_expr_recovering(
         | ExprKind::Return(Some(e))
         | ExprKind::FieldAccess { expr: e, .. } => {
             resolve_imports_in_expr_recovering(e, base_dir, graph, source, diagnostics);
+        }
+        ExprKind::Neg { operand, .. } => {
+            resolve_imports_in_expr_recovering(operand, base_dir, graph, source, diagnostics);
         }
         ExprKind::Index { receiver, key, .. } => {
             resolve_imports_in_expr_recovering(

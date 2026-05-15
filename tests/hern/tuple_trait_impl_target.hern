@@ -1,0 +1,16 @@
+trait PairLabel 'a {
+  fn label(value: 'a) -> string
+}
+
+impl PairLabel for (int, string) {
+  fn label(value) {
+    let (n, s) = value;
+    n.to_string() <> ":" <> s
+  }
+}
+
+fn label_pair(value: (int, string)) -> string {
+  PairLabel::label(value)
+}
+
+print(label_pair((7, "seven")));

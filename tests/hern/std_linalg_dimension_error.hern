@@ -1,0 +1,12 @@
+let la = import "hern:linalg";
+
+let m = la.matrix([
+  [1.0, 2.0],
+  [3.0, 4.0],
+]);
+let v = la.vector([1.0, 2.0, 3.0]);
+
+match pcall(fn() { m * v }) {
+  Ok(_) -> print("unexpected success"),
+  Err(_) -> print("dimension error"),
+}

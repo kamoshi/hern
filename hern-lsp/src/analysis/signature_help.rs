@@ -148,6 +148,7 @@ fn find_call_in_expr<'a>(
         | ExprKind::Break(Some(inner))
         | ExprKind::Return(Some(inner))
         | ExprKind::FieldAccess { expr: inner, .. } => find_call_in_expr(inner, position, best),
+        ExprKind::Neg { operand, .. } => find_call_in_expr(operand, position, best),
         ExprKind::Assign { target, value } => {
             find_call_in_expr(target, position, best);
             find_call_in_expr(value, position, best);

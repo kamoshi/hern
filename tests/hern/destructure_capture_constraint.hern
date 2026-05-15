@@ -1,0 +1,6 @@
+fn ok(outer) {
+  let #{ f } = #{ f: fn(x) { outer + x } };
+  f(1)
+}
+
+print(ok(2));

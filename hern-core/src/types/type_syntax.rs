@@ -1,5 +1,5 @@
 use crate::ast::{Expr, ExprKind, InherentMethod, Param, Pattern, Stmt, TraitDef, Type};
-use crate::types::{Ty, error::TypeError};
+use crate::types::{Ty, determinant_indexes_are_prefix, error::TypeError};
 use std::collections::HashSet;
 
 pub(super) fn subst_hkt_param(ty: &Type, param: &str, target: &Type) -> Type {
@@ -111,7 +111,13 @@ pub fn trait_dict_indexes(trait_def: &TraitDef) -> Vec<usize> {
     trait_def
         .fundeps
         .first()
-        .map(|fundep| fundep.determinants.clone())
+        .map(|fundep| {
+            debug_assert!(
+                determinant_indexes_are_prefix(&fundep.determinants),
+                "source fundep arrows currently split a prefix determinant list"
+            );
+            fundep.determinants.clone()
+        })
         .unwrap_or_else(|| (0..trait_def.params.len()).collect())
 }
 
@@ -140,6 +146,7 @@ pub fn trait_impl_target_key_from_ast(target: &Type) -> Result<String, TypeError
                 )))
             }
         }
+        Type::Tuple(_) => exact_impl_target_key_from_ast(target),
         _ => Err(TypeError::InvalidTraitImplTarget(type_name_for_error(
             target,
         ))),
@@ -182,6 +189,14 @@ pub(crate) fn exact_impl_target_key_from_ast(target: &Type) -> Result<String, Ty
             for arg in args {
                 key.push_str("__");
                 key.push_str(&exact_impl_target_key_from_ast(arg)?);
+            }
+            Ok(key)
+        }
+        Type::Tuple(items) => {
+            let mut key = format!("tuple{}", items.len());
+            for item in items {
+                key.push_str("__");
+                key.push_str(&exact_impl_target_key_from_ast(item)?);
             }
             Ok(key)
         }
@@ -316,6 +331,7 @@ fn substitute_self_in_expr_types(expr: &mut Expr, target: &Type) {
         | ExprKind::Break(Some(expr))
         | ExprKind::Return(Some(expr))
         | ExprKind::FieldAccess { expr, .. } => substitute_self_in_expr_types(expr, target),
+        ExprKind::Neg { operand, .. } => substitute_self_in_expr_types(operand, target),
         ExprKind::Index { receiver, key, .. } => {
             substitute_self_in_expr_types(receiver, target);
             substitute_self_in_expr_types(key, target);
@@ -477,8 +493,16 @@ pub(crate) fn exact_impl_target_key_from_ty(ty: &Ty) -> Option<String> {
             }
             Some(key)
         }
+        Ty::Tuple(items) => {
+            let mut key = format!("tuple{}", items.len());
+            for item in items {
+                key.push_str("__");
+                key.push_str(&exact_impl_target_key_from_ty(item)?);
+            }
+            Some(key)
+        }
         Ty::Qualified(_, inner) => exact_impl_target_key_from_ty(inner),
-        Ty::Var(_) | Ty::Tuple(_) | Ty::Func(_, _) | Ty::Record(_) => None,
+        Ty::Var(_) | Ty::Func(_, _) | Ty::Record(_) => None,
     }
 }
 
