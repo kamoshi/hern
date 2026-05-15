@@ -683,6 +683,7 @@ pub enum ExprKind {
     Import(String),
     Lambda {
         params: Vec<Param>,
+        return_type: Option<Type>,
         body: Box<Expr>,
         dict_params: Vec<String>,
     },

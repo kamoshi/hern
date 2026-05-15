@@ -1,0 +1,3 @@
+let aaa = fn(x) -> int { x };
+print(aaa(42));
+

@@ -654,7 +654,7 @@ output = """
 [tests.lambda_arrow_error]
 path = "tests/hern/lambda_arrow_error.hern"
 expect = "error"
-error_contains = "anonymous functions must use `fn(...) { ... }`"
+error_contains = "anonymous functions with return annotations must use `fn(...) -> Type { ... }`"
 
 [tests.constrained_lambdas]
 path = "tests/hern/constrained_lambdas.hern"
@@ -1418,6 +1418,18 @@ error_contains = "`->` is only valid when the trait declares a functional depend
 path = "tests/hern/impl_arity_panic.hern"
 expect = "error"
 error_contains = "trait `Index` expects 3 type arguments, got 1"
+
+[tests.lambda_return_annotation]
+path = "tests/hern/lambda_return_annotation.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
+[tests.lambda_return_annotation_mismatch_error]
+path = "tests/hern/lambda_return_annotation_mismatch_error.hern"
+expect = "error"
+error_contains = "expected `int`, got `string`"
 
 [tests.trait_fundep_unreachable_dependent_error]
 path = "tests/hern/trait_fundep_unreachable_dependent_error.hern"

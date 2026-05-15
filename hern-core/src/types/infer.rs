@@ -1364,6 +1364,7 @@ impl Infer {
             }
             ExprKind::Lambda {
                 params,
+                return_type,
                 body,
                 dict_params,
             } => {
@@ -1372,6 +1373,7 @@ impl Infer {
                         env,
                         expr_id,
                         params,
+                        return_type.as_ref(),
                         body,
                         dict_params,
                         Some((expected_params, expected_ret)),
@@ -1781,9 +1783,18 @@ impl Infer {
             ),
             ExprKind::Lambda {
                 params,
+                return_type,
                 body,
                 dict_params,
-            } => self.infer_lambda_expr(env, expr_id, params, body, dict_params, None),
+            } => self.infer_lambda_expr(
+                env,
+                expr_id,
+                params,
+                return_type.as_ref(),
+                body,
+                dict_params,
+                None,
+            ),
             ExprKind::For {
                 pat,
                 iterable,
@@ -2523,6 +2534,7 @@ impl Infer {
         env: &TypeEnv,
         expr_id: NodeId,
         params: &[Param],
+        annotated_return: Option<&Type>,
         body: &mut Expr,
         dict_params: &mut Vec<String>,
         expected_func: Option<(Vec<FuncParam>, FuncReturn)>,
@@ -2574,9 +2586,25 @@ impl Infer {
                 this.check_param_pattern(&param.pat, p_ty, &mut body_env, param.mut_place)?;
             }
 
-            let (ret_ty, ret_capability) = match &expected_func {
-                Some((_, expected_ret)) => ((*expected_ret.ty).clone(), expected_ret.capability),
-                None => (this.fresh_ty(), ReturnCapability::Value),
+            let (ret_ty, ret_capability) = match (&expected_func, annotated_return) {
+                (Some((_, expected_ret)), Some(annotated)) => {
+                    let annotated_ty = this.ast_to_ty_with_vars(annotated, &mut param_vars)?;
+                    unify(
+                        &mut this.subst,
+                        annotated_ty.clone(),
+                        (*expected_ret.ty).clone(),
+                    )
+                    .map_err(|err| err.at(body.span))?;
+                    (annotated_ty, expected_ret.capability)
+                }
+                (Some((_, expected_ret)), None) => {
+                    ((*expected_ret.ty).clone(), expected_ret.capability)
+                }
+                (None, Some(annotated)) => (
+                    this.ast_to_ty_with_vars(annotated, &mut param_vars)?,
+                    ReturnCapability::Value,
+                ),
+                (None, None) => (this.fresh_ty(), ReturnCapability::Value),
             };
             let fn_ret = FuncReturn {
                 ty: Box::new(ret_ty.clone()),

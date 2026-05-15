@@ -1,0 +1,2 @@
+let aaa = fn(x) -> int { "nope" };
+

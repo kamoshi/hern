@@ -2135,6 +2135,7 @@ impl<'tokens> Parser<'tokens> {
                                 ty,
                                 mut_place: is_mutable,
                             }],
+                            return_type: None,
                             body: Box::new(rest),
                             dict_params: vec![],
                         },
@@ -2181,6 +2182,7 @@ impl<'tokens> Parser<'tokens> {
                                 ty: None,
                                 mut_place: false,
                             }],
+                            return_type: None,
                             body: Box::new(rest),
                             dict_params: vec![],
                         },
@@ -2438,14 +2440,23 @@ impl<'tokens> Parser<'tokens> {
             }
         }
         ptr += self.expect(&tokens[ptr..], Token::RParen)?;
-        if let Some(tok) = tokens.get(ptr)
+        let return_type = if let Some(tok) = tokens.get(ptr)
             && tok.token == Token::Arrow
         {
-            return Err(ParseError::new(
-                "anonymous functions must use `fn(...) { ... }`",
-                tok.span,
-            ));
-        }
+            let arrow_span = tok.span;
+            ptr += 1;
+            let (consumed, ret_ty) = self.parse_type(&tokens[ptr..])?;
+            ptr += consumed;
+            if tokens.get(ptr).map(|tok| &tok.token) != Some(&Token::LBrace) {
+                return Err(ParseError::new(
+                    "anonymous functions with return annotations must use `fn(...) -> Type { ... }`",
+                    arrow_span,
+                ));
+            }
+            Some(ret_ty)
+        } else {
+            None
+        };
         let (c_body, body) = self.parse_block(&tokens[ptr..])?;
         ptr += c_body;
         Ok((
@@ -2455,6 +2466,7 @@ impl<'tokens> Parser<'tokens> {
                 ptr,
                 ExprKind::Lambda {
                     params,
+                    return_type,
                     body: Box::new(body),
                     dict_params: Vec::new(),
                 },

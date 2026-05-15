@@ -720,6 +720,7 @@ impl LuaCodegen {
             ExprKind::Assign { target, value } => self.gen_assign_expr(target, value, pre),
             ExprKind::Lambda {
                 params,
+                return_type: _,
                 body,
                 dict_params,
             } => self.gen_lambda_expr(params, body, dict_params),
