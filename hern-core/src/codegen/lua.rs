@@ -865,7 +865,7 @@ impl LuaCodegen {
             }
             ExprKind::FieldAccess { expr, field, .. } => {
                 let e = self.gen_expr_with_subst(expr, subst, pre)?;
-                Some(format!("{}[{}]", e, lua_string(field)))
+                Some(format!("{}[{}]", lua_field_receiver(e), lua_string(field)))
             }
             ExprKind::Index {
                 receiver,
@@ -984,7 +984,7 @@ impl LuaCodegen {
             ExprKind::Record(entries) => self.gen_record_expr(entries, pre),
             ExprKind::FieldAccess { expr, field, .. } => {
                 let e = self.gen_expr(expr, pre);
-                format!("{}[{}]", e, lua_string(field))
+                format!("{}[{}]", lua_field_receiver(e), lua_string(field))
             }
             ExprKind::Index {
                 receiver,
@@ -2541,6 +2541,16 @@ fn lua_field_key(s: &str) -> String {
     format!("[{}]", lua_string(s))
 }
 
+fn lua_field_receiver(expr: String) -> String {
+    // Lua requires parentheses before indexing a table constructor: `{ x = 1 }["x"]`
+    // is invalid, but `({ x = 1 })["x"]` is fine.
+    if expr.trim_start().starts_with('{') {
+        format!("({})", expr)
+    } else {
+        expr
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2604,6 +2614,51 @@ let hof_result = apply_twice(local_double, 1.0);
         assert_eq!(
             lua_string("quote\" slash\\\n\r\t\u{7f}"),
             "\"quote\\\" slash\\\\\\n\\r\\t\\127\""
+        );
+    }
+
+    #[test]
+    fn interpolation_codegen_uses_string_concat_and_tostring() {
+        let lua = lua_for_source(
+            "hern_codegen_interpolation_concat_test.hern",
+            "let msg = $\"a${1}b\";\n",
+        );
+
+        assert!(
+            lua.contains("__ToString__int.to_string(1)"),
+            "interpolation holes should lower through ToString:\n{lua}"
+        );
+        assert!(
+            lua.contains("local msg = ")
+                && lua.contains("(\"a\") ..")
+                && lua.contains(".. (\"b\")"),
+            "interpolation pieces should lower to Lua string concat:\n{lua}"
+        );
+    }
+
+    #[test]
+    fn single_hole_interpolation_codegen_avoids_concat_chain() {
+        let lua = lua_for_source(
+            "hern_codegen_single_hole_interpolation_test.hern",
+            "let msg = $\"${1}\";\n",
+        );
+
+        assert!(
+            lua.contains("\nlocal msg = __ToString__int.to_string(1)\n"),
+            "single-hole interpolation should lower to the wrapped hole directly:\n{lua}"
+        );
+    }
+
+    #[test]
+    fn record_literal_field_access_codegen_parenthesizes_receiver() {
+        let lua = lua_for_source(
+            "hern_codegen_record_literal_field_access_test.hern",
+            "let value = #{ y: 7 }.y;\n",
+        );
+
+        assert!(
+            lua.contains("local value = ({ [\"y\"] = 7 })[\"y\"]"),
+            "record literal field access should parenthesize the Lua table constructor:\n{lua}"
         );
     }
 

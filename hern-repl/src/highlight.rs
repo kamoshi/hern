@@ -79,7 +79,7 @@ fn token_style(token: &Token) -> Style {
             .fg(Color::Blue)
             .add_modifier(Modifier::BOLD),
         Token::True | Token::False | Token::Number(_) => Style::default().fg(Color::Cyan),
-        Token::StringLit(_) => Style::default().fg(Color::Green),
+        Token::StringLit(_) | Token::InterpolatedString(_) => Style::default().fg(Color::Green),
         Token::Ident(name) if name.chars().next().is_some_and(char::is_uppercase) => {
             Style::default().fg(Color::Yellow)
         }

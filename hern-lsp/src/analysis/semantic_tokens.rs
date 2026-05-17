@@ -205,7 +205,7 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
         Token::Ident(name) if name.starts_with('\'') => TY_TYPE_PARAMETER,
         Token::Ident(_) => TY_VARIABLE,
         Token::Number(_) => TY_NUMBER,
-        Token::StringLit(_) => TY_STRING,
+        Token::StringLit(_) | Token::InterpolatedString(_) => TY_STRING,
         Token::Equal
         | Token::EqEq
         | Token::Plus

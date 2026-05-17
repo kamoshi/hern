@@ -1,9 +1,12 @@
 use crate::ast::*;
-use crate::lex::error::{ParseError, Span};
-use crate::lex::{NumberLiteral, Spanned, Token};
+use crate::lex::error::{LexErrorKind, ParseError, Span};
+use crate::lex::{InterpolatedStringPart, Lexer, NumberLiteral, Spanned, Token};
 use std::cell::{Cell, RefCell};
 
 type FnParamsBody = (usize, Vec<Param>, Option<TypeReturn>, Vec<TypeBound>, Expr);
+// Interpolation is deliberately lowered through the language's canonical string
+// Semigroup operator, matching derive-generated ToString implementations.
+const CONCAT_OP: &str = "<>";
 
 fn is_alias_token(token: &Token) -> bool {
     matches!(token, Token::Ident(name) if name == "alias")
@@ -127,6 +130,53 @@ fn infix_binary_op(token: &Token) -> Option<(BinOp, u8, u8)> {
         _ => return None,
     };
     Some((op, l_bp, r_bp))
+}
+
+fn rebase_interpolated_tokens(tokens: &mut [Spanned], base: Span) {
+    for token in tokens {
+        token.span = rebase_interpolated_span(token.span, base);
+        if let Token::InterpolatedString(parts) = &mut token.token {
+            rebase_interpolated_parts(parts, base);
+        }
+    }
+}
+
+fn rebase_interpolated_parts(parts: &mut [InterpolatedStringPart], base: Span) {
+    for part in parts {
+        if let InterpolatedStringPart::Expr { span, .. } = part {
+            *span = rebase_interpolated_span(*span, base);
+        }
+    }
+}
+
+fn rebase_interpolated_span(mut span: Span, base: Span) -> Span {
+    debug_assert!(span.line > 0);
+    debug_assert!(span.col > 0);
+    debug_assert!(base.line > 0);
+    debug_assert!(base.col > 0);
+
+    let original_line = span.line;
+    span.line += base.line.saturating_sub(1);
+    // Columns are relative to the interpolation hole only on the first line.
+    // Later lines already start at column 1 in the outer source.
+    if original_line == 1 {
+        span.col += base.col.saturating_sub(1);
+    }
+    span
+}
+
+fn interpolated_lex_error_message(kind: LexErrorKind) -> String {
+    match kind {
+        LexErrorKind::UnexpectedChar(c) => {
+            format!("Invalid interpolation expression: unexpected character `{c}`")
+        }
+        LexErrorKind::UnterminatedString => {
+            "Invalid interpolation expression: unterminated string literal".to_string()
+        }
+        LexErrorKind::ReservedIdentifier => {
+            "Invalid interpolation expression: reserved identifier".to_string()
+        }
+    }
 }
 
 fn can_end_range(tokens: &[Spanned], ptr: usize) -> bool {
@@ -408,6 +458,114 @@ impl<'tokens> Parser<'tokens> {
             .map(|t| t.span)
             .unwrap_or(start);
         self.expr_from_bounds(start, end, kind)
+    }
+
+    fn expr_at_span(&self, span: Span, kind: ExprKind) -> Expr {
+        Expr::new(self.next_node_id(), SourceSpan::from_lex_span(span), kind)
+    }
+
+    fn parse_interpolated_string(
+        &self,
+        parts: &[InterpolatedStringPart],
+        span: Span,
+    ) -> Result<Expr, ParseError> {
+        let mut pieces = Vec::new();
+        for part in parts {
+            match part {
+                InterpolatedStringPart::Text(text) if text.is_empty() => {}
+                InterpolatedStringPart::Text(text) => {
+                    pieces.push(self.expr_at_span(span, ExprKind::StringLit(text.clone())));
+                }
+                InterpolatedStringPart::Expr { source, span } => {
+                    let expr = self.parse_interpolated_hole(source, *span)?;
+                    pieces.push(self.wrap_interpolated_expr(expr, *span));
+                }
+            }
+        }
+
+        let mut pieces = pieces.into_iter();
+        let Some(mut expr) = pieces.next() else {
+            return Ok(self.expr_at_span(span, ExprKind::StringLit(String::new())));
+        };
+
+        for rhs in pieces {
+            expr = self.expr_at_span(
+                span,
+                ExprKind::Binary {
+                    lhs: Box::new(expr),
+                    op: BinOp::Custom(CONCAT_OP.to_string()),
+                    op_span: SourceSpan::from_lex_span(span),
+                    rhs: Box::new(rhs),
+                    resolved_op: None,
+                    pending_op: None,
+                    dict_args: vec![],
+                    pending_dict_args: vec![],
+                },
+            );
+        }
+
+        Ok(expr)
+    }
+
+    fn parse_interpolated_hole(&self, source: &str, span: Span) -> Result<Expr, ParseError> {
+        if source.trim().is_empty() {
+            let span = Span {
+                len: span.len.max(1),
+                ..span
+            };
+            return Err(ParseError::new(
+                "Expected expression inside string interpolation",
+                span,
+            ));
+        }
+
+        let mut tokens = Lexer::new(source).tokenize().map_err(|err| {
+            ParseError::new(
+                interpolated_lex_error_message(err.kind),
+                rebase_interpolated_span(err.span, span),
+            )
+        })?;
+        rebase_interpolated_tokens(&mut tokens, span);
+        let (consumed, expr) = self.parse_expr(&tokens, 0)?;
+        if tokens.get(consumed).map(|tok| &tok.token) != Some(&Token::Eof) {
+            let unexpected = tokens.get(consumed).map(|tok| tok.span).unwrap_or(span);
+            return Err(ParseError::new(
+                "Unexpected token after interpolation expression",
+                unexpected,
+            ));
+        }
+        Ok(expr)
+    }
+
+    fn wrap_interpolated_expr(&self, expr: Expr, span: Span) -> Expr {
+        // Keep interpolation desugaring type-agnostic: even string-typed holes go through
+        // ToString, whose string impl is identity. A type-aware peephole can erase it later.
+        let source_span = SourceSpan::from_lex_span(span);
+        let callee = Expr::new(
+            self.next_node_id(),
+            source_span,
+            ExprKind::AssociatedAccess {
+                target: Type::Ident("ToString".to_string()),
+                target_span: source_span,
+                member: "to_string".to_string(),
+                member_span: source_span,
+                resolution: None,
+            },
+        );
+        Expr::new(
+            self.next_node_id(),
+            source_span,
+            ExprKind::Call {
+                callee: Box::new(callee),
+                args: vec![expr],
+                is_method_call: false,
+                arg_wrappers: vec![],
+                resolved_callee: None,
+                pending_trait_method: None,
+                dict_args: vec![],
+                pending_dict_args: vec![],
+            },
+        )
     }
 
     fn parse_inline_attrs(
@@ -2241,6 +2399,10 @@ impl<'tokens> Parser<'tokens> {
                 let s = s.clone();
                 ptr += 1;
                 self.expr_from_tokens(tokens, ptr, ExprKind::StringLit(s))
+            }
+            Token::InterpolatedString(parts) => {
+                ptr += 1;
+                self.parse_interpolated_string(parts, tok.span)?
             }
             Token::True => {
                 ptr += 1;

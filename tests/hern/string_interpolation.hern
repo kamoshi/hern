@@ -1,0 +1,16 @@
+let name = "Ada";
+print($"hello ${name}");
+print($"");
+print($"${name}");
+print($"sum ${1 + 2}");
+print($"field ${#{ x: 7 }.x}");
+print($"array ${[1, 2]}");
+print($"literal \${name}");
+print($"nested ${"not ${a hole}"}");
+print($"nested interp ${$"inner ${1 + 2}"}");
+print($"nested quote ${$"quote ${"\""}"}");
+print($"field call ${#{ f: fn(x) { x + 1 } }.f(1)}");
+print($"array index ${[10, 20][0]}");
+print($"multi ${
+  1 + 2
+}");

@@ -57,6 +57,30 @@ output = """
 6
 """
 
+[tests.string_interpolation]
+path = "tests/hern/string_interpolation.hern"
+expect = "typecheck"
+output = """
+hello Ada
+
+Ada
+sum 3
+field 7
+array [1, 2]
+literal ${name}
+nested not ${a hole}
+nested interp inner 3
+nested quote quote "
+field call 2
+array index 10
+multi 3
+"""
+
+[tests.string_interpolation_missing_tostring_error]
+path = "tests/hern/string_interpolation_missing_tostring_error.hern"
+expect = "error"
+error_contains = "trait `ToString` is not implemented"
+
 [tests.neg_trait_operator]
 path = "tests/hern/neg_trait_operator.hern"
 expect = "typecheck"

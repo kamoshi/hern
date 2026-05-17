@@ -319,6 +319,86 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn diagnostics_for_interpolation_lex_error_point_inside_hole() {
+        let project = TestProject::new("interpolation-lex-diagnostic");
+        let source = "print($\"value ${`}\")\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics
+            .get(&uri)
+            .and_then(|items| items.first())
+            .expect("interpolation diagnostic should be reported");
+
+        assert_eq!(
+            diagnostic.message,
+            "Invalid interpolation expression: unexpected character ```"
+        );
+        assert_eq!(diagnostic.range.start, Position::new(0, 16));
+        assert_eq!(diagnostic.range.end, Position::new(0, 17));
+    }
+
+    #[test]
+    fn diagnostics_for_nested_interpolation_rebase_transitively() {
+        let project = TestProject::new("interpolation-nested-diagnostic");
+        let source = "print($\"outer ${$\"inner ${`}\"}\")\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics
+            .get(&uri)
+            .and_then(|items| items.first())
+            .expect("nested interpolation diagnostic should be reported");
+
+        assert_eq!(
+            diagnostic.message,
+            "Invalid interpolation expression: unexpected character ```"
+        );
+        assert_eq!(diagnostic.range.start, Position::new(0, 26));
+        assert_eq!(diagnostic.range.end, Position::new(0, 27));
+    }
+
+    #[test]
+    fn diagnostics_for_empty_interpolation_have_visible_hole_range() {
+        let project = TestProject::new("interpolation-empty-diagnostic");
+        let source = "print($\"value ${}\")\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics
+            .get(&uri)
+            .and_then(|items| items.first())
+            .expect("empty interpolation diagnostic should be reported");
+
+        assert_eq!(
+            diagnostic.message,
+            "Expected expression inside string interpolation"
+        );
+        assert_eq!(diagnostic.range.start, Position::new(0, 16));
+        assert_eq!(diagnostic.range.end, Position::new(0, 17));
+    }
+
+    #[test]
+    fn diagnostics_for_trailing_interpolation_tokens_point_at_extra_token() {
+        let project = TestProject::new("interpolation-trailing-token-diagnostic");
+        let source = "print($\"value ${1 2}\")\n";
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics
+            .get(&uri)
+            .and_then(|items| items.first())
+            .expect("trailing interpolation diagnostic should be reported");
+
+        assert_eq!(
+            diagnostic.message,
+            "Unexpected token after interpolation expression"
+        );
+        assert_eq!(diagnostic.range.start, Position::new(0, 18));
+        assert_eq!(diagnostic.range.end, Position::new(0, 19));
+    }
+
+    #[test]
     fn diagnostics_for_document_reports_imported_parse_errors() {
         let ImportFixture {
             mut state,

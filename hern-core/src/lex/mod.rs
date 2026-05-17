@@ -35,6 +35,7 @@ pub enum Token {
     Ident(String),
     Number(NumberLiteral),
     StringLit(String),
+    InterpolatedString(Vec<InterpolatedStringPart>),
 
     // Operators
     Equal,      // =
@@ -74,6 +75,12 @@ pub enum Token {
     Eof,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum InterpolatedStringPart {
+    Text(String),
+    Expr { source: String, span: Span },
+}
+
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -101,6 +108,7 @@ impl fmt::Display for Token {
             Token::Ident(name) => write!(f, "identifier `{}`", name),
             Token::Number(value) => write!(f, "number `{}`", value.as_lua_source()),
             Token::StringLit(value) => write!(f, "string literal {:?}", value),
+            Token::InterpolatedString(_) => write!(f, "interpolated string literal"),
             Token::Equal => write!(f, "`=`"),
             Token::EqEq => write!(f, "`==`"),
             Token::Plus => write!(f, "`+`"),
@@ -356,6 +364,7 @@ impl<'src> Lexer<'src> {
                 Token::Comma
             }
             b'"' => self.lex_string(line, col)?,
+            b'$' if self.peek2() == Some(b'"') => self.lex_interpolated_string(line, col)?,
             b'0'..=b'9' => self.lex_number(),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'\'' => self.lex_ident_or_keyword(),
             b'+' | b'-' | b'*' | b'!' | b'&' | b'|' | b'.' | b'<' | b'>' | b'~' | b'@' | b'?'
@@ -454,38 +463,7 @@ impl<'src> Lexer<'src> {
                     self.advance();
                     break;
                 }
-                Some(b'\\') => {
-                    self.advance();
-                    match self.peek() {
-                        Some(b'n') => {
-                            self.advance();
-                            s.push('\n');
-                        }
-                        Some(b't') => {
-                            self.advance();
-                            s.push('\t');
-                        }
-                        Some(b'r') => {
-                            self.advance();
-                            s.push('\r');
-                        }
-                        Some(b'"') => {
-                            self.advance();
-                            s.push('"');
-                        }
-                        Some(b'\\') => {
-                            self.advance();
-                            s.push('\\');
-                        }
-                        Some(_) => {
-                            let c = self.current_char().unwrap_or('?');
-                            s.push('\\');
-                            s.push(c);
-                            self.advance_char();
-                        }
-                        None => break,
-                    }
-                }
+                Some(b'\\') => self.lex_string_escape_into(&mut s, false),
                 Some(_) => {
                     let c = self.current_char().unwrap_or('?');
                     s.push(c);
@@ -494,6 +472,222 @@ impl<'src> Lexer<'src> {
             }
         }
         Ok(Token::StringLit(s))
+    }
+
+    fn lex_interpolated_string(&mut self, line: usize, col: usize) -> Result<Token, LexError> {
+        self.advance(); // consume $
+        self.advance(); // consume opening "
+        let mut parts = Vec::new();
+        let mut text = String::new();
+
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(LexError {
+                        kind: LexErrorKind::UnterminatedString,
+                        span: self.span_at(line, col, 1),
+                    });
+                }
+                Some(b'"') => {
+                    self.advance();
+                    break;
+                }
+                Some(b'\\') => self.lex_string_escape_into(&mut text, true),
+                Some(b'$') if self.peek2() == Some(b'{') => {
+                    self.advance(); // $
+                    self.advance(); // {
+                    if !text.is_empty() {
+                        parts.push(InterpolatedStringPart::Text(std::mem::take(&mut text)));
+                    }
+                    let expr_line = self.line;
+                    let expr_col = self.col;
+                    let source = self.lex_interpolated_expr(line, col)?;
+                    // `Span` cannot represent a multi-line extent, so this length is exact for
+                    // single-line holes and best-effort for whole-hole synthetic spans. Tokens
+                    // parsed from the hole are rebased individually and keep precise locations.
+                    parts.push(InterpolatedStringPart::Expr {
+                        span: self.span_at(expr_line, expr_col, source.chars().count()),
+                        source,
+                    });
+                }
+                Some(_) => {
+                    let c = self.current_char().unwrap_or('?');
+                    text.push(c);
+                    self.advance_char();
+                }
+            }
+        }
+
+        if !text.is_empty() {
+            parts.push(InterpolatedStringPart::Text(text));
+        }
+        Ok(Token::InterpolatedString(parts))
+    }
+
+    fn lex_string_escape_into(&mut self, out: &mut String, allow_dollar_escape: bool) {
+        self.advance(); // consume backslash
+        match self.peek() {
+            Some(b'n') => {
+                self.advance();
+                out.push('\n');
+            }
+            Some(b't') => {
+                self.advance();
+                out.push('\t');
+            }
+            Some(b'r') => {
+                self.advance();
+                out.push('\r');
+            }
+            Some(b'"') => {
+                self.advance();
+                out.push('"');
+            }
+            Some(b'\\') => {
+                self.advance();
+                out.push('\\');
+            }
+            Some(b'$') if allow_dollar_escape => {
+                self.advance();
+                out.push('$');
+            }
+            Some(_) => {
+                let c = self.current_char().unwrap_or('?');
+                out.push('\\');
+                out.push(c);
+                self.advance_char();
+            }
+            None => {}
+        }
+    }
+
+    fn lex_interpolated_expr(
+        &mut self,
+        string_line: usize,
+        string_col: usize,
+    ) -> Result<String, LexError> {
+        let mut depth = 1usize;
+        let mut source = String::new();
+
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(LexError {
+                        kind: LexErrorKind::UnterminatedString,
+                        span: self.span_at(string_line, string_col, 1),
+                    });
+                }
+                Some(b'$') if self.peek2() == Some(b'"') => {
+                    self.lex_nested_interpolated_string_into(&mut source, string_line, string_col)?;
+                }
+                Some(b'"') => self.lex_raw_string_into(&mut source, string_line, string_col)?,
+                Some(b'/') if self.peek2() == Some(b'/') => {
+                    // TODO: this preserves comment semantics inside the hole, but malformed
+                    // one-line holes like `${// comment}` naturally consume the `}` as part of
+                    // the comment and currently surface as an outer unterminated-string error.
+                    // A nicer diagnostic needs interpolation-specific recovery/error kinds.
+                    self.push_advanced_char(&mut source);
+                    self.push_advanced_char(&mut source);
+                    while let Some(ch) = self.peek() {
+                        if ch == b'\n' {
+                            break;
+                        }
+                        self.push_advanced_char(&mut source);
+                    }
+                }
+                Some(b'{') => {
+                    depth += 1;
+                    self.push_advanced_char(&mut source);
+                }
+                Some(b'}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.advance();
+                        break;
+                    }
+                    self.push_advanced_char(&mut source);
+                }
+                Some(_) => self.push_advanced_char(&mut source),
+            }
+        }
+
+        Ok(source)
+    }
+
+    fn lex_raw_string_into(
+        &mut self,
+        out: &mut String,
+        string_line: usize,
+        string_col: usize,
+    ) -> Result<(), LexError> {
+        self.push_advanced_char(out); // opening "
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(LexError {
+                        kind: LexErrorKind::UnterminatedString,
+                        span: self.span_at(string_line, string_col, 1),
+                    });
+                }
+                Some(b'"') => {
+                    self.push_advanced_char(out);
+                    return Ok(());
+                }
+                Some(b'\\') => {
+                    self.push_advanced_char(out);
+                    if self.peek().is_some() {
+                        self.push_advanced_char(out);
+                    }
+                }
+                Some(_) => self.push_advanced_char(out),
+            }
+        }
+    }
+
+    fn lex_nested_interpolated_string_into(
+        &mut self,
+        out: &mut String,
+        string_line: usize,
+        string_col: usize,
+    ) -> Result<(), LexError> {
+        self.push_advanced_char(out); // $
+        self.push_advanced_char(out); // opening "
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(LexError {
+                        kind: LexErrorKind::UnterminatedString,
+                        span: self.span_at(string_line, string_col, 1),
+                    });
+                }
+                Some(b'"') => {
+                    self.push_advanced_char(out);
+                    return Ok(());
+                }
+                Some(b'\\') => {
+                    self.push_advanced_char(out);
+                    if self.peek().is_some() {
+                        self.push_advanced_char(out);
+                    }
+                }
+                Some(b'$') if self.peek2() == Some(b'{') => {
+                    self.push_advanced_char(out);
+                    self.push_advanced_char(out);
+                    let source = self.lex_interpolated_expr(string_line, string_col)?;
+                    out.push_str(&source);
+                    out.push('}');
+                }
+                Some(_) => self.push_advanced_char(out),
+            }
+        }
+    }
+
+    fn push_advanced_char(&mut self, out: &mut String) {
+        let c = self
+            .current_char()
+            .expect("push_advanced_char requires a current character");
+        out.push(c);
+        self.advance_char();
     }
 
     fn lex_op(&mut self) -> String {
