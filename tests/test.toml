@@ -46,6 +46,17 @@ output = """
 15
 """
 
+[tests.lua_codegen_keywords]
+path = "tests/hern/lua_codegen_keywords.hern"
+expect = "typecheck"
+output = """
+2
+15
+12
+6
+6
+"""
+
 [tests.neg_trait_operator]
 path = "tests/hern/neg_trait_operator.hern"
 expect = "typecheck"

@@ -81,7 +81,7 @@ pub fn gen_lua_iife_bundle(
             "local {} = (function(__prelude)\n",
             bundle_module_var(name)
         ));
-        out.push_str(&LuaCodegen::gen_prelude_aliases(prelude_stmts));
+        out.push_str(&LuaCodegen::gen_prelude_env_setup());
         out.push_str(&import_dict_bindings(
             graph,
             module_envs,
@@ -97,7 +97,7 @@ pub fn gen_lua_iife_bundle(
     }
     let mut codegen = LuaCodegen::new().with_import_mode(ImportMode::Bundle);
     let entry_program = graph.module(entry).expect("entry module missing");
-    out.push_str(&LuaCodegen::gen_prelude_aliases(prelude_stmts));
+    out.push_str(&LuaCodegen::gen_prelude_env_setup());
     out.push_str(&import_dict_bindings(
         graph,
         module_envs,
@@ -129,7 +129,7 @@ pub fn gen_lua_iife_test_bundle(
             "local {} = (function(__prelude)\n",
             bundle_module_var(name)
         ));
-        out.push_str(&LuaCodegen::gen_prelude_aliases(prelude_stmts));
+        out.push_str(&LuaCodegen::gen_prelude_env_setup());
         out.push_str(&import_dict_bindings(
             graph,
             module_envs,
@@ -148,7 +148,7 @@ pub fn gen_lua_iife_test_bundle(
         .with_import_mode(ImportMode::Bundle)
         .with_test_emit_mode(TestEmitMode::Include);
     let entry_program = graph.module(entry).expect("entry module missing");
-    out.push_str(&LuaCodegen::gen_prelude_aliases(prelude_stmts));
+    out.push_str(&LuaCodegen::gen_prelude_env_setup());
     out.push_str(&import_dict_bindings(
         graph,
         module_envs,
@@ -222,13 +222,23 @@ fn test_module_label(graph: &ModuleGraph, name: &str) -> String {
 }
 
 fn lua_quote(s: &str) -> String {
-    let escaped = s
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t");
-    format!("\"{}\"", escaped)
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            ch if ch <= '\u{1F}' || ch == '\u{7F}' => out.push_str(&format!("\\{:03}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn prelude_stmts(graph: &ModuleGraph) -> &[Stmt] {
@@ -264,9 +274,9 @@ fn import_dict_bindings(
             ImportMode::Bundle => bundle_module_var(&import),
         };
         for dict_name in env.exported_dict_names() {
-            bindings
-                .entry(dict_name.clone())
-                .or_insert_with(|| format!("{}.__hern_dicts.{}", module_ref, dict_name));
+            bindings.entry(dict_name.clone()).or_insert_with(|| {
+                format!("{}.__hern_dicts[{}]", module_ref, lua_quote(&dict_name))
+            });
         }
     }
     let mut names: Vec<_> = bindings.into_iter().collect();

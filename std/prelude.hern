@@ -1313,7 +1313,7 @@ type alias BitModule = #{
   bswap: fn(int) -> int
 }
 
-extern bit: BitModule = "bit or {}";
+extern bit: BitModule = "(bit or require(\"bit\"))";
 
 type alias JitModule = #{
   on: fn() -> (),

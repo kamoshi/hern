@@ -1,0 +1,21 @@
+let f = fn(and) { and + 1 };
+print(f(1));
+
+let r = #{ and: 7, or: 8 };
+print(r.and + r.or);
+
+let #{ and: value, ..or } = #{ and: 3, or: 4, test: 5 };
+print(value + or.or + or.test);
+
+let mut array_sum = 0;
+for and in [1, 2, 3] {
+  array_sum = array_sum + and;
+}
+print(array_sum);
+
+let mut range_sum = 0;
+for or in range(1, 3) {
+  range_sum = range_sum + or;
+}
+print(range_sum);
+

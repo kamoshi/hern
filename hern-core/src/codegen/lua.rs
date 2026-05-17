@@ -161,11 +161,7 @@ impl LuaCodegen {
     }
 
     pub fn gen_prelude_module(&mut self, prelude_stmts: &[Stmt]) -> String {
-        let program = Program {
-            stmts: prelude_stmts.to_vec(),
-            inner_attrs: vec![],
-        };
-        self.collect_codegen_metadata(&[&program]);
+        self.collect_codegen_metadata_from_stmts([prelude_stmts]);
         let mut out = String::from("-- Hern generated Lua prelude\n");
         for stmt in prelude_stmts {
             out.push_str(&self.gen_stmt(stmt));
@@ -176,14 +172,24 @@ impl LuaCodegen {
         out.push_str(&format!("{}__hern_value = {{\n", self.ind()));
         self.indent += 2;
         for name in prelude_value_names(prelude_stmts) {
-            out.push_str(&format!("{}{} = {},\n", self.ind(), name, name));
+            out.push_str(&format!(
+                "{}{} = {},\n",
+                self.ind(),
+                lua_field_key(&name),
+                name
+            ));
         }
         self.indent -= 2;
         out.push_str(&format!("{}}},\n", self.ind()));
         out.push_str(&format!("{}__hern_dicts = {{\n", self.ind()));
         self.indent += 2;
         for dict_name in impl_dict_names_from_stmts(prelude_stmts) {
-            out.push_str(&format!("{}{} = {},\n", self.ind(), dict_name, dict_name));
+            out.push_str(&format!(
+                "{}{} = {},\n",
+                self.ind(),
+                lua_field_key(&dict_name),
+                dict_name
+            ));
         }
         self.indent -= 2;
         out.push_str(&format!("{}}},\n", self.ind()));
@@ -196,14 +202,16 @@ impl LuaCodegen {
         let mut out = String::new();
         for name in prelude_value_names(prelude_stmts) {
             out.push_str(&format!(
-                "local {} = __prelude.__hern_value.{}\n",
-                name, name
+                "local {} = __prelude.__hern_value[{}]\n",
+                name,
+                lua_string(&name)
             ));
         }
         for dict_name in impl_dict_names_from_stmts(prelude_stmts) {
             out.push_str(&format!(
-                "local {} = __prelude.__hern_dicts.{}\n",
-                dict_name, dict_name
+                "local {} = __prelude.__hern_dicts[{}]\n",
+                dict_name,
+                lua_string(&dict_name)
             ));
         }
         out
@@ -211,11 +219,11 @@ impl LuaCodegen {
 
     pub fn gen_prelude_env_setup() -> String {
         [
-            "local __hern_env = setmetatable({}, { __index = function(_, key)",
+            "local __hern_env = setmetatable({}, { __index = function(env, key)",
             "  local value = __prelude.__hern_value[key]",
-            "  if value ~= nil then return value end",
+            "  if value ~= nil then _G.rawset(env, key, value); return value end",
             "  value = __prelude.__hern_dicts[key]",
-            "  if value ~= nil then return value end",
+            "  if value ~= nil then _G.rawset(env, key, value); return value end",
             "  return _G[key]",
             "end })",
             "setfenv(1, __hern_env)",
@@ -263,7 +271,12 @@ impl LuaCodegen {
         out.push_str(&format!("{}__hern_dicts = {{\n", self.ind()));
         self.indent += 2;
         for dict_name in dict_names {
-            out.push_str(&format!("{}{} = {},\n", self.ind(), dict_name, dict_name));
+            out.push_str(&format!(
+                "{}{} = {},\n",
+                self.ind(),
+                lua_field_key(&dict_name),
+                dict_name
+            ));
         }
         self.indent -= 2;
         out.push_str(&format!("{}}},\n", self.ind()));
@@ -276,11 +289,18 @@ impl LuaCodegen {
     }
 
     fn collect_codegen_metadata(&mut self, programs: &[&Program]) {
+        self.collect_codegen_metadata_from_stmts(programs.iter().map(|program| &program.stmts[..]));
+    }
+
+    fn collect_codegen_metadata_from_stmts<'a>(
+        &mut self,
+        stmt_groups: impl IntoIterator<Item = &'a [Stmt]>,
+    ) {
         self.extern_templates.clear();
         self.inline_methods.clear();
-        for program in programs {
-            self.collect_extern_templates_from_stmts(&program.stmts);
-            self.collect_inline_methods_from_stmts(&program.stmts);
+        for stmts in stmt_groups {
+            self.collect_extern_templates_from_stmts(stmts);
+            self.collect_inline_methods_from_stmts(stmts);
         }
     }
 
@@ -835,7 +855,7 @@ impl LuaCodegen {
                     .map(|e| {
                         if let RecordEntry::Field(n, expr) = e {
                             self.gen_expr_with_subst(expr, subst, pre)
-                                .map(|v| format!("{} = {}", n, v))
+                                .map(|v| format!("{} = {}", lua_field_key(n), v))
                         } else {
                             unreachable!()
                         }
@@ -845,7 +865,7 @@ impl LuaCodegen {
             }
             ExprKind::FieldAccess { expr, field, .. } => {
                 let e = self.gen_expr_with_subst(expr, subst, pre)?;
-                Some(format!("{}.{}", e, field))
+                Some(format!("{}[{}]", e, lua_string(field)))
             }
             ExprKind::Index {
                 receiver,
@@ -964,7 +984,7 @@ impl LuaCodegen {
             ExprKind::Record(entries) => self.gen_record_expr(entries, pre),
             ExprKind::FieldAccess { expr, field, .. } => {
                 let e = self.gen_expr(expr, pre);
-                format!("{}.{}", e, field)
+                format!("{}[{}]", e, lua_string(field))
             }
             ExprKind::Index {
                 receiver,
@@ -1124,7 +1144,7 @@ impl LuaCodegen {
         let mut pattern_destructures = String::new();
         for (i, param) in params.iter().enumerate() {
             match &param.pat {
-                Pattern::Variable(n, _) => param_names.push(n.clone()),
+                Pattern::Variable(n, _) => param_names.push(mangle_op(n)),
                 Pattern::Wildcard => param_names.push("_".to_string()),
                 _ => {
                     let placeholder = format!("__p{}", i);
@@ -1332,20 +1352,23 @@ impl LuaCodegen {
         }
 
         let tmp = self.fresh_tmp();
+        let len = self.fresh_tmp();
         let ind = self.ind();
         pre.push_str(&format!("{}local {} = {{}}\n", ind, tmp));
+        pre.push_str(&format!("{}local {} = 0\n", ind, len));
         for entry in entries {
             match entry {
                 ArrayEntry::Elem(expr) => {
                     let v = self.gen_expr(expr, pre);
-                    pre.push_str(&format!("{}{}[#{}+1] = {}\n", ind, tmp, tmp, v));
+                    pre.push_str(&format!("{}{} = {} + 1\n", ind, len, len));
+                    pre.push_str(&format!("{}{}[{}] = {}\n", ind, tmp, len, v));
                 }
                 ArrayEntry::Spread(expr) => {
                     let v = self.gen_expr(expr, pre);
                     let iter_var = self.fresh_tmp();
                     pre.push_str(&format!(
-                        "{}for _, {} in ipairs({}) do {}[#{}+1] = {} end\n",
-                        ind, iter_var, v, tmp, tmp, iter_var
+                        "{}for _, {} in ipairs({}) do {} = {} + 1; {}[{}] = {} end\n",
+                        ind, iter_var, v, len, len, tmp, len, iter_var
                     ));
                 }
             }
@@ -1362,7 +1385,7 @@ impl LuaCodegen {
                 .iter()
                 .map(|e| {
                     if let RecordEntry::Field(n, expr) = e {
-                        format!("{} = {}", n, self.gen_expr(expr, pre))
+                        format!("{} = {}", lua_field_key(n), self.gen_expr(expr, pre))
                     } else {
                         unreachable!()
                     }
@@ -1378,7 +1401,7 @@ impl LuaCodegen {
             match entry {
                 RecordEntry::Field(name, expr) => {
                     let v = self.gen_expr(expr, pre);
-                    pre.push_str(&format!("{}{}[\"{}\"] = {}\n", ind, tmp, name, v));
+                    pre.push_str(&format!("{}{}[{}] = {}\n", ind, tmp, lua_string(name), v));
                 }
                 RecordEntry::Spread(expr) => {
                     let v = self.gen_expr(expr, pre);
@@ -1475,7 +1498,7 @@ impl LuaCodegen {
                 pre.push_str(&format!(
                     "{}local {} = {}[{}]\n",
                     self.ind(),
-                    name,
+                    mangle_op(name),
                     arr,
                     idx
                 ));
@@ -1505,7 +1528,7 @@ impl LuaCodegen {
         ind: &str,
     ) {
         let (loop_var, needs_bindings) = match pat {
-            Pattern::Variable(name, _) => (name.clone(), false),
+            Pattern::Variable(name, _) => (mangle_op(name), false),
             Pattern::Wildcard => ("_".to_string(), false),
             _ => (self.fresh_tmp(), true),
         };
@@ -1781,11 +1804,11 @@ impl LuaCodegen {
                 let mut out = String::new();
                 for (field, binding, _) in fields {
                     out.push_str(&format!(
-                        "{}local {} = {}.{}\n",
+                        "{}local {} = {}[{}]\n",
                         self.ind(),
                         mangle_op(binding),
                         var,
-                        field
+                        lua_string(field)
                     ));
                 }
                 if let Some(Some((rest_name, _))) = rest {
@@ -1796,7 +1819,7 @@ impl LuaCodegen {
                     self.indent += 2;
                     let guards = fields
                         .iter()
-                        .map(|(f, _, _)| format!("_k ~= \"{}\"", f))
+                        .map(|(f, _, _)| format!("_k ~= {}", lua_string(f)))
                         .collect::<Vec<_>>();
                     if guards.is_empty() {
                         out.push_str(&format!("{}{}[_k] = _v\n", self.ind(), rest_lua));
@@ -1926,7 +1949,7 @@ impl LuaCodegen {
                 ))
             }
             Pattern::Constructor { name, binding } => {
-                let tag_cond = format!("{}._tag == \"{}\"", var, name);
+                let tag_cond = format!("{}._tag == {}", var, lua_string(name));
                 match binding
                     .as_deref()
                     .and_then(|binding| self.gen_pattern_cond_for(binding, &format!("{}._0", var)))
@@ -1982,17 +2005,17 @@ impl LuaCodegen {
             .map(|v| {
                 if v.payload.is_some() {
                     format!(
-                        "{}local function {}(_0) return {{ _tag = \"{}\", _0 = _0 }} end\n",
+                        "{}local function {}(_0) return {{ _tag = {}, _0 = _0 }} end\n",
                         ind,
                         mangle_op(&v.name),
-                        v.name
+                        lua_string(&v.name)
                     )
                 } else {
                     format!(
-                        "{}local {} = {{ _tag = \"{}\" }}\n",
+                        "{}local {} = {{ _tag = {} }}\n",
                         ind,
                         mangle_op(&v.name),
-                        v.name
+                        lua_string(&v.name)
                     )
                 }
             })
@@ -2017,7 +2040,7 @@ impl LuaCodegen {
             let mut pattern_destructures = String::new();
             for (i, param) in method.params.iter().enumerate() {
                 match &param.pat {
-                    Pattern::Variable(n, _) => param_names.push(n.clone()),
+                    Pattern::Variable(n, _) => param_names.push(mangle_op(n)),
                     Pattern::Wildcard => param_names.push("_".to_string()),
                     _ => {
                         let placeholder = format!("__p{}", i);
@@ -2065,7 +2088,7 @@ impl LuaCodegen {
             let mut pattern_destructures = String::new();
             for (i, param) in method.params.iter().enumerate() {
                 match &param.pat {
-                    Pattern::Variable(n, _) => param_names.push(n.clone()),
+                    Pattern::Variable(n, _) => param_names.push(mangle_op(n)),
                     Pattern::Wildcard => param_names.push("_".to_string()),
                     _ => {
                         let placeholder = format!("__p{}", i);
@@ -2391,7 +2414,7 @@ fn impl_dict_names_from_stmts(stmts: &[Stmt]) -> Vec<String> {
 
 fn collect_pattern_names(pat: &Pattern, names: &mut Vec<String>) {
     match pat {
-        Pattern::Variable(name, _) => names.push(name.clone()),
+        Pattern::Variable(name, _) => names.push(mangle_op(name)),
         Pattern::Wildcard
         | Pattern::StringLit(_)
         | Pattern::NumberLit(_)
@@ -2404,10 +2427,10 @@ fn collect_pattern_names(pat: &Pattern, names: &mut Vec<String>) {
         } => collect_pattern_names(binding, names),
         Pattern::Record { fields, rest } => {
             for (_, binding, _) in fields {
-                names.push(binding.clone());
+                names.push(mangle_op(binding));
             }
             if let Some(Some((rest_name, _))) = rest {
-                names.push(rest_name.clone());
+                names.push(mangle_op(rest_name));
             }
         }
         Pattern::List { elements, rest } => {
@@ -2415,7 +2438,7 @@ fn collect_pattern_names(pat: &Pattern, names: &mut Vec<String>) {
                 collect_pattern_names(elem, names);
             }
             if let Some(Some((rest_name, _))) = rest {
-                names.push(rest_name.clone());
+                names.push(mangle_op(rest_name));
             }
         }
         Pattern::Tuple(elems) => {
@@ -2434,10 +2457,10 @@ fn prelude_value_names(stmts: &[Stmt]) -> Vec<String> {
                 name,
                 kind: ExternKind::Value(_),
                 ..
-            } => names.push(name.clone()),
+            } => names.push(mangle_op(name)),
             Stmt::Fn { name, .. } | Stmt::Op { name, .. } => names.push(mangle_op(name)),
             Stmt::Type(td) => {
-                names.extend(td.variants.iter().map(|variant| variant.name.clone()));
+                names.extend(td.variants.iter().map(|variant| mangle_op(&variant.name)));
             }
             Stmt::Let { pat, .. } => collect_pattern_names(pat, &mut names),
             Stmt::TestBlock { .. } => {}
@@ -2495,13 +2518,27 @@ fn bundle_module_var(name: &str) -> String {
 }
 
 fn lua_string(s: &str) -> String {
-    let escaped = s
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t");
-    format!("\"{}\"", escaped)
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            ch if ch <= '\u{1F}' || ch == '\u{7F}' => out.push_str(&format!("\\{:03}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn lua_field_key(s: &str) -> String {
+    format!("[{}]", lua_string(s))
 }
 
 #[cfg(test)]
@@ -2559,6 +2596,14 @@ let hof_result = apply_twice(local_double, 1.0);
         assert!(
             lua.contains("local value = \"café ☃\""),
             "generated Lua should preserve UTF-8 string contents:\n{lua}"
+        );
+    }
+
+    #[test]
+    fn lua_string_escapes_control_bytes() {
+        assert_eq!(
+            lua_string("quote\" slash\\\n\r\t\u{7f}"),
+            "\"quote\\\" slash\\\\\\n\\r\\t\\127\""
         );
     }
 
@@ -2669,7 +2714,7 @@ get_a(#{ a: 1 })
         );
 
         assert!(
-            lua.contains("  do\n    local a = row.a\n"),
+            lua.contains("  do\n    local a = row[\"a\"]\n"),
             "irrefutable match bindings should be scoped inside a do block:\n{lua}"
         );
         assert!(
@@ -2725,7 +2770,7 @@ inspect(#{ a: 1 })
         let lua = lua_for_source("hern_codegen_statement_match_scope.hern", source);
 
         assert!(
-            lua.contains("  do\n    local a = row.a\n"),
+            lua.contains("  do\n    local a = row[\"a\"]\n"),
             "statement-position match bindings should be scoped inside a do block:\n{lua}"
         );
         assert!(
