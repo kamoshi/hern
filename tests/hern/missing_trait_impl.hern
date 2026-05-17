@@ -4,4 +4,4 @@ trait Show 'a {
 
 // no impl Show for float
 
-print(show(1));
+print(Show::show(1));

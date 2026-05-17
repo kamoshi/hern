@@ -416,8 +416,10 @@ impl IndexBuilder {
                 }
             }
             Stmt::Impl(impl_def) => {
-                for method in &impl_def.methods {
-                    self.define(&method.name, method.name_span, DefinitionKind::ImplMethod);
+                if impl_def.generated_by.is_none() {
+                    for method in &impl_def.methods {
+                        self.define(&method.name, method.name_span, DefinitionKind::ImplMethod);
+                    }
                 }
             }
             Stmt::InherentImpl(impl_def) => {
@@ -442,6 +444,11 @@ impl IndexBuilder {
                 self.define(name, *name_span, DefinitionKind::Extern);
             }
             Stmt::TestBlock { .. } => {}
+            Stmt::RecBlock { stmts, .. } => {
+                for stmt in stmts {
+                    self.define_top_level(stmt);
+                }
+            }
             Stmt::Expr(_) => {}
         }
     }
@@ -462,8 +469,10 @@ impl IndexBuilder {
                 ..
             } => self.index_callable_body(params, *name_span, body),
             Stmt::Impl(impl_def) => {
-                for method in &impl_def.methods {
-                    self.index_callable_body(&method.params, method.span, &method.body);
+                if impl_def.generated_by.is_none() {
+                    for method in &impl_def.methods {
+                        self.index_callable_body(&method.params, method.span, &method.body);
+                    }
                 }
             }
             Stmt::InherentImpl(impl_def) => {
@@ -471,18 +480,8 @@ impl IndexBuilder {
                     self.index_callable_body(&method.params, method.span, &method.body);
                 }
             }
-            Stmt::TestBlock { span, stmts } => {
-                self.push_scope_with_end(SourcePosition {
-                    line: span.end_line,
-                    col: span.end_col,
-                });
-                for stmt in stmts {
-                    self.define_top_level(stmt);
-                }
-                for stmt in stmts {
-                    self.index_top_level_stmt(stmt);
-                }
-                self.pop_scope();
+            Stmt::TestBlock { span, stmts } | Stmt::RecBlock { span, stmts } => {
+                self.index_scoped_top_level_stmts(*span, stmts);
             }
             Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
         }
@@ -519,8 +518,10 @@ impl IndexBuilder {
                 self.index_callable_body(params, *name_span, body);
             }
             Stmt::Impl(impl_def) => {
-                for method in &impl_def.methods {
-                    self.index_callable_body(&method.params, method.span, &method.body);
+                if impl_def.generated_by.is_none() {
+                    for method in &impl_def.methods {
+                        self.index_callable_body(&method.params, method.span, &method.body);
+                    }
                 }
             }
             Stmt::InherentImpl(impl_def) => {
@@ -528,21 +529,25 @@ impl IndexBuilder {
                     self.index_callable_body(&method.params, method.span, &method.body);
                 }
             }
-            Stmt::TestBlock { span, stmts } => {
-                self.push_scope_with_end(SourcePosition {
-                    line: span.end_line,
-                    col: span.end_col,
-                });
-                for stmt in stmts {
-                    self.define_top_level(stmt);
-                }
-                for stmt in stmts {
-                    self.index_top_level_stmt(stmt);
-                }
-                self.pop_scope();
+            Stmt::TestBlock { span, stmts } | Stmt::RecBlock { span, stmts } => {
+                self.index_scoped_top_level_stmts(*span, stmts);
             }
             Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
         }
+    }
+
+    fn index_scoped_top_level_stmts(&mut self, span: SourceSpan, stmts: &[Stmt]) {
+        self.push_scope_with_end(SourcePosition {
+            line: span.end_line,
+            col: span.end_col,
+        });
+        for stmt in stmts {
+            self.define_top_level(stmt);
+        }
+        for stmt in stmts {
+            self.index_top_level_stmt(stmt);
+        }
+        self.pop_scope();
     }
 
     fn index_callable_body(&mut self, params: &[Param], _span: SourceSpan, body: &Expr) {
@@ -779,7 +784,11 @@ impl IndexBuilder {
 
     fn define_pattern_bindings(&mut self, pattern: &Pattern) {
         match pattern {
-            Pattern::Wildcard | Pattern::StringLit(_) => {}
+            Pattern::Wildcard
+            | Pattern::StringLit(_)
+            | Pattern::NumberLit(_)
+            | Pattern::BoolLit(_)
+            | Pattern::IntRange { .. } => {}
             Pattern::Variable(name, span) => {
                 self.define(name, *span, DefinitionKind::Let);
             }
@@ -823,6 +832,9 @@ impl IndexBuilder {
             }
             Pattern::Wildcard
             | Pattern::StringLit(_)
+            | Pattern::NumberLit(_)
+            | Pattern::BoolLit(_)
+            | Pattern::IntRange { .. }
             | Pattern::Constructor { binding: None, .. } => {}
             Pattern::Constructor {
                 binding: Some(binding),
@@ -883,6 +895,9 @@ impl IndexBuilder {
             }
             Pattern::Wildcard
             | Pattern::StringLit(_)
+            | Pattern::NumberLit(_)
+            | Pattern::BoolLit(_)
+            | Pattern::IntRange { .. }
             | Pattern::Constructor { binding: None, .. } => {}
             Pattern::Constructor {
                 binding: Some(binding),

@@ -446,6 +446,11 @@ fn substitute_self_in_stmt_types(stmt: &mut Stmt, target: &Type) {
                 substitute_self_in_stmt_types(stmt, target);
             }
         }
+        Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                substitute_self_in_stmt_types(stmt, target);
+            }
+        }
         // Nested item declarations own their own type scope. In particular, a nested
         // impl's `Self` is not the outer inherent impl's `Self`.
         Stmt::Trait(_)

@@ -1,0 +1,10 @@
+trait Label 'a { fn label(x: 'a) -> string }
+
+impl Label for int {
+  fn label(x) { "int" }
+}
+
+fn f(x) { g(x) }
+and fn g(x) { Label::label(x) }
+
+print(f(1));

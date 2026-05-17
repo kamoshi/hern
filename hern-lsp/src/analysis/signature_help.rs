@@ -114,6 +114,11 @@ fn find_call_in_stmt<'a>(
                 find_call_in_stmt(stmt, position, best);
             }
         }
+        Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                find_call_in_stmt(stmt, position, best);
+            }
+        }
         Stmt::Expr(expr) => find_call_in_expr(expr, position, best),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
     }

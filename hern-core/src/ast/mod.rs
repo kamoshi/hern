@@ -26,6 +26,10 @@ impl SourceSpan {
         }
     }
 
+    pub fn is_synthetic(&self) -> bool {
+        *self == Self::synthetic()
+    }
+
     pub fn from_lex_span(span: Span) -> Self {
         Self {
             start_line: span.line,
@@ -54,6 +58,7 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribute {
     pub name: String,
+    pub args: Vec<String>,
     pub span: SourceSpan,
 }
 
@@ -61,6 +66,35 @@ impl Attribute {
     pub fn is(&self, name: &str) -> bool {
         self.name == name
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeriveTrait {
+    Eq,
+    ToString,
+}
+
+impl DeriveTrait {
+    pub fn name(self) -> &'static str {
+        match self {
+            DeriveTrait::Eq => "Eq",
+            DeriveTrait::ToString => "ToString",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeriveAttr {
+    pub traits: Vec<DeriveTrait>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub enum GeneratedBy {
+    Derive {
+        trait_name: String,
+        source_span: SourceSpan,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,6 +143,10 @@ pub enum Stmt {
         span: SourceSpan,
         stmts: Vec<Stmt>,
     },
+    RecBlock {
+        span: SourceSpan,
+        stmts: Vec<Stmt>,
+    },
     Type(TypeDef),
     TypeAlias {
         span: SourceSpan,
@@ -139,6 +177,7 @@ impl Stmt {
             Stmt::Impl(id) => id.span,
             Stmt::InherentImpl(id) => id.span,
             Stmt::TestBlock { span, .. } => *span,
+            Stmt::RecBlock { span, .. } => *span,
             Stmt::Type(td) => td.span,
             Stmt::Expr(expr) => expr.span,
         }
@@ -176,6 +215,11 @@ pub fn walk_stmt_exprs(stmt: &Stmt, visit: &mut impl FnMut(&Expr)) {
             }
         }
         Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                walk_stmt_exprs(stmt, visit);
+            }
+        }
+        Stmt::RecBlock { stmts, .. } => {
             for stmt in stmts {
                 walk_stmt_exprs(stmt, visit);
             }
@@ -479,6 +523,7 @@ pub struct ImplDef {
     pub type_bounds: Vec<TypeBound>,
     pub dict_params: Vec<String>,
     pub methods: Vec<ImplMethod>,
+    pub generated_by: Option<GeneratedBy>,
 }
 
 impl ImplDef {
@@ -529,6 +574,9 @@ pub struct TypeDef {
     /// Type parameters, e.g. `["'a", "'b"]` for `type Result['a, 'b]`
     pub params: Vec<String>,
     pub variants: Vec<Variant>,
+    /// Derive metadata parsed from source. The derive expansion pass drains this
+    /// field after inserting generated impls, making the pass idempotent.
+    pub derives: Vec<DeriveAttr>,
 }
 
 // ── Patterns ──────────────────────────────────────────────────────────────────
@@ -542,6 +590,16 @@ pub enum Pattern {
     Wildcard,
     /// String literal, e.g. `"("`
     StringLit(String),
+    /// Numeric literal, e.g. `0` or `0.0`.
+    NumberLit(NumberLiteral),
+    /// Boolean literal, e.g. `true`.
+    BoolLit(bool),
+    /// Integer range literal, e.g. `1..5` or `1..=5`.
+    IntRange {
+        start: i32,
+        end: i32,
+        inclusive: bool,
+    },
     /// A simple variable binding, e.g. `x` in `for x in arr`.
     /// The `SourceSpan` is the span of the binding name in source.
     Variable(String, SourceSpan),

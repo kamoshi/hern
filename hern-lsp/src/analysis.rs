@@ -782,7 +782,7 @@ pub(super) mod tests {
     fn hover_returns_type_and_trait_declarations() {
         let project = TestProject::new("type-trait-hover");
         let source = concat!(
-            "type Pair = #{ x: float, y: float }\n",
+            "type alias Pair = #{ x: float, y: float }\n",
             "type Option2('a) = Some2('a) | None2\n",
             "trait Show 'a {\n",
             "  fn show(x: 'a) -> string\n",
@@ -790,12 +790,15 @@ pub(super) mod tests {
         );
         let (state, uri) = project.open("main.hern", source);
 
-        let alias = hover(&state, uri.clone(), Position::new(0, 6)).expect("alias hover");
+        let alias = hover(&state, uri.clone(), Position::new(0, 12)).expect("alias hover");
         let sum = hover(&state, uri.clone(), Position::new(1, 6)).expect("type hover");
         let trait_info = hover(&state, uri.clone(), Position::new(2, 7)).expect("trait hover");
         let trait_method = hover(&state, uri, Position::new(3, 5)).expect("trait method hover");
 
-        assert_eq!(hover_text(alias), "type Pair = #{ x: float, y: float }");
+        assert_eq!(
+            hover_text(alias),
+            "type alias Pair = #{ x: float, y: float }"
+        );
         assert_eq!(hover_text(sum), "type Option2('a) = Some2('a) | None2");
         assert_eq!(hover_text(trait_info), "trait Show 'a");
         assert_eq!(hover_text(trait_method), "fn show(x: 'a) -> string");
@@ -1200,7 +1203,7 @@ pub(super) mod tests {
     fn hover_resolves_constructor_payload_type_aliases() {
         let project = TestProject::new("match-aliased-payload-hover");
         let source = concat!(
-            "type Amount = float\n",
+            "type alias Amount = float\n",
             "type Wrapped = Wrap(Amount) | Empty\n",
             "match Wrap(1.0) {\n",
             "  Wrap(v) -> v + 1.0,\n",

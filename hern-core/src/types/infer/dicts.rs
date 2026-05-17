@@ -667,9 +667,13 @@ fn bind_func_vars_to_actuals(
     actual_args: &[Ty],
     bindings: &mut HashMap<u32, Ty>,
 ) -> bool {
-    if actual_args.is_empty() || params.len() > actual_args.len() {
+    if actual_args.is_empty() {
         return false;
     }
+    // `actual_args` are trait arguments, not method-call arguments. A unary trait
+    // such as `Eq` has one trait argument but two method parameters, so binding
+    // from the shared prefix is the intended path for schemes like
+    // `impl Eq for Box('a) where 'a: Eq`.
     let mut local = bindings.clone();
     for (param, actual) in params.iter().zip(actual_args) {
         if !bind_ty_vars_to_actual(&param.ty, actual, &mut local) {
@@ -1050,6 +1054,12 @@ fn resolve_dict_uses_stmt_inner_with_mode(
             }
             Ok(())
         }
+        Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, hard_unresolved)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1213,6 +1223,48 @@ mod tests {
             dict_args.as_slice(),
             [DictRef::Concrete(show), DictRef::Concrete(eq)]
                 if show == "__Show__string" && eq == "__Eq__string"
+        ));
+    }
+
+    #[test]
+    fn scheme_target_binding_uses_trait_args_not_full_method_arity() {
+        let scheme = Scheme {
+            vars: vec![0],
+            constraints: vec![TraitConstraint::unary(0, "Eq".to_string())],
+            ty: Ty::Record(Row {
+                fields: vec![(
+                    "==".to_string(),
+                    Ty::Func(
+                        vec![
+                            FuncParam::value(Ty::App(
+                                Box::new(Ty::Con("Box".to_string())),
+                                vec![Ty::Var(0)],
+                            )),
+                            FuncParam::value(Ty::App(
+                                Box::new(Ty::Con("Box".to_string())),
+                                vec![Ty::Var(0)],
+                            )),
+                        ],
+                        FuncReturn::value(Ty::Con("bool".to_string())),
+                    ),
+                )],
+                tail: Box::new(Ty::Unit),
+            }),
+        };
+        let known_impl_dicts = HashSet::from(["__Eq__int".to_string()]);
+
+        let dict_args = dict_ref_args_for_scheme_args(
+            &scheme,
+            &[Ty::App(Box::new(Ty::Con("Box".to_string())), vec![Ty::Int])],
+            &TypeEnv::new(),
+            &known_impl_dicts,
+            &HashMap::new(),
+        )
+        .expect("unary trait target should bind through the first method parameter");
+
+        assert!(matches!(
+            dict_args.as_slice(),
+            [DictRef::Concrete(name)] if name == "__Eq__int"
         ));
     }
 }

@@ -137,7 +137,7 @@ fn seq(p: Parser('a), q: Parser('b)) -> Parser(('a, 'b)) {
   do {
     let a <- p;
     let b <- q;
-    pure((a, b))
+    Applicative::pure((a, b))
   }
 }
 
@@ -146,7 +146,7 @@ fn keep_left(p: Parser('a), q: Parser('b)) -> Parser('a) {
   do {
     let a <- p;
     q;
-    pure(a)
+    Applicative::pure(a)
   }
 }
 
@@ -197,7 +197,7 @@ fn many1(p: Parser('a)) -> Parser(['a]) {
   do {
     let first <- p;
     let rest <- many(p);
-    pure([first, ..rest])
+    Applicative::pure([first, ..rest])
   }
 }
 
@@ -209,13 +209,13 @@ fn between(open: Parser('a), close: Parser('b), p: Parser('c)) -> Parser('c) {
     open;
     let v <- p;
     close;
-    pure(v)
+    Applicative::pure(v)
   }
 }
 
 // p optionally present; returns Some(value) or None without consuming on absence.
 fn optional(p: Parser('a)) -> Parser(Option('a)) {
-  choice(map(p, fn(v) { Some(v) }), pure(None))
+  choice(Functor::map(p, fn(v) { Some(v) }), Applicative::pure(None))
 }
 
 // One or more occurrences of p separated by sep.
@@ -223,13 +223,13 @@ fn sep_by1(p: Parser('a), sep: Parser('b)) -> Parser(['a]) {
   do {
     let first <- p;
     let rest <- many(keep_right(sep, p));
-    pure([first, ..rest])
+    Applicative::pure([first, ..rest])
   }
 }
 
 // Zero or more occurrences of p separated by sep.
 fn sep_by(p: Parser('a), sep: Parser('b)) -> Parser(['a]) {
-  choice(sep_by1(p, sep), pure([]))
+  choice(sep_by1(p, sep), Applicative::pure([]))
 }
 
 // Wrap a self-referential parser in a thunk to allow recursive grammars.
@@ -270,14 +270,14 @@ fn whitespace() -> Parser(string) {
 
 // Zero or more whitespace characters; returns the consumed whitespace as a string.
 fn spaces() -> Parser(string) {
-  map(many(whitespace()), fn(cs: [string]) {
+  Functor::map(many(whitespace()), fn(cs: [string]) {
     cs.fold("", fn(acc, c) { acc <> c })
   })
 }
 
 // One or more whitespace characters; returns the consumed whitespace as a string.
 fn spaces1() -> Parser(string) {
-  map(many1(whitespace()), fn(cs: [string]) {
+  Functor::map(many1(whitespace()), fn(cs: [string]) {
     cs.fold("", fn(acc, c) { acc <> c })
   })
 }
@@ -286,7 +286,7 @@ fn spaces1() -> Parser(string) {
 
 // Parse a non-negative integer (digits only, no sign).
 fn natural() -> Parser(int) {
-  map(many1(digit()), fn(digits: [string]) {
+  Functor::map(many1(digit()), fn(digits: [string]) {
     digits.fold("", fn(acc, c) { acc <> c }).to_int()
   })
 }
@@ -296,7 +296,7 @@ fn integer() -> Parser(int) {
   do {
     let sign <- optional(char_p("-"));
     let n <- natural();
-    pure(match sign {
+    Applicative::pure(match sign {
       Some(_) -> 0 - n,
       None -> n,
     })

@@ -1,0 +1,2 @@
+#[derive(Clone)]
+type Box('a) = Box('a)

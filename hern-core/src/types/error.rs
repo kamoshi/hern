@@ -46,6 +46,7 @@ pub enum TypeError {
     },
     DuplicateOperator(String),
     DuplicateTestFunction(String),
+    DuplicateFunctionInGroup(String),
     MissingTraitMethod {
         trait_name: String,
         impl_target: String,
@@ -80,6 +81,10 @@ pub enum TypeError {
     },
     UnknownImport(String),
     UnknownType(String),
+    UnknownVariant {
+        type_name: String,
+        variant: String,
+    },
     TypeAliasArityMismatch {
         name: String,
         expected: usize,
@@ -220,6 +225,13 @@ impl SpannedTypeError {
         }
         self
     }
+
+    pub fn with_span_if_absent_or_synthetic(mut self, span: SourceSpan) -> Self {
+        if self.span.is_none_or(|existing| existing.is_synthetic()) {
+            self.span = Some(span);
+        }
+        self
+    }
 }
 
 impl From<TypeError> for SpannedTypeError {
@@ -355,6 +367,13 @@ impl fmt::Display for TypeError {
             TypeError::DuplicateTestFunction(name) => {
                 write!(f, "test function `{}` is defined multiple times", name)
             }
+            TypeError::DuplicateFunctionInGroup(name) => {
+                write!(
+                    f,
+                    "function `{}` is defined multiple times in recursive group",
+                    name
+                )
+            }
             TypeError::MissingTraitMethod {
                 trait_name,
                 impl_target,
@@ -408,6 +427,9 @@ impl fmt::Display for TypeError {
             }
             TypeError::UnknownImport(path) => write!(f, "unknown import: `{}`", path),
             TypeError::UnknownType(name) => write!(f, "unknown type: `{}`", name),
+            TypeError::UnknownVariant { type_name, variant } => {
+                write!(f, "type `{}` has no variant `{}`", type_name, variant)
+            }
             TypeError::TypeAliasArityMismatch {
                 name,
                 expected,

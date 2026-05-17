@@ -1,0 +1,12 @@
+#[derive(Eq, ToString)]
+type Box('a) = Box('a)
+
+#[derive(Eq, ToString)]
+type Color = Red | Green | Blue
+
+print(to_string(Box(1) == Box(1)));
+print(to_string(Box(1) != Box(2)));
+print(to_string(Box(3)));
+print(to_string(Red));
+print(to_string(Green == Green));
+print(to_string(Blue != Red));

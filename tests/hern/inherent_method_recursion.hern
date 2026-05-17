@@ -1,0 +1,26 @@
+#[derive(ToString)]
+type Counter = Counter(int)
+
+impl Counter {
+  fn down(self) -> Counter {
+    match self {
+      Counter(n) -> if n <= 0 { Counter(0) } else { Counter(n - 1).down() },
+    }
+  }
+
+  fn even(self) -> bool {
+    match self {
+      Counter(n) -> if n == 0 { true } else { Counter(n - 1).odd() },
+    }
+  }
+
+  fn odd(self) -> bool {
+    match self {
+      Counter(n) -> if n == 0 { false } else { Counter(n - 1).even() },
+    }
+  }
+}
+
+print(to_string(Counter(3).down()));
+print(to_string(Counter(4).even()));
+print(to_string(Counter(4).odd()));

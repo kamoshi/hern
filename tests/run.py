@@ -10,7 +10,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_TOML_PATH = os.path.join(REPO_ROOT, "tests", "test.toml")
 DEFAULT_LUA = os.environ.get("HERN_TEST_LUA", "luajit")
 
-ALLOWED_EXPECTS = {"typecheck", "error", "test"}
+ALLOWED_EXPECTS = {"typecheck", "error", "test", "test_error"}
 ALLOWED_KEYS = {
     "path",
     "expect",
@@ -91,8 +91,10 @@ def validate_manifest(tests):
 
         if "output" in test and expect == "error":
             errors.append(f"{name}: error tests must not specify `output`")
-        if "error_contains" in test and expect != "error":
-            errors.append(f"{name}: only error tests may specify `error_contains`")
+        if "error_contains" in test and expect not in {"error", "test_error"}:
+            errors.append(
+                f"{name}: only error and test_error tests may specify `error_contains`"
+            )
 
         tags = test.get("tags", [])
         if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
@@ -202,7 +204,7 @@ def run_test(name, test, hern_bin, lua_bin):
     path = os.path.join(REPO_ROOT, test["path"])
     expect = test["expect"]
 
-    command = "test" if expect == "test" else "lua"
+    command = "test" if expect in {"test", "test_error"} else "lua"
     result = subprocess.run([hern_bin, command, path], capture_output=True, text=True)
 
     if expect == "error":
@@ -212,6 +214,18 @@ def run_test(name, test, hern_bin, lua_bin):
         if error_contains and error_contains not in result.stderr:
             return False, f"Error mismatch. Expected: {error_contains}, Got: {result.stderr}"
         return True, "Correctly rejected"
+
+    if expect == "test_error":
+        if result.returncode == 0:
+            return False, "Expected failing test run but succeeded"
+        error_contains = test.get("error_contains")
+        combined = result.stdout + result.stderr
+        if error_contains and error_contains not in combined:
+            return False, (
+                f"Error mismatch. Expected: {error_contains}, "
+                f"Got stdout: {result.stdout}, stderr: {result.stderr}"
+            )
+        return True, "Correctly failed test run"
 
     if result.returncode != 0:
         return False, f"Compilation failed: {result.stderr}"

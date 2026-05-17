@@ -1,0 +1,4 @@
+fn infixl 5 |++(a, b) { a - b }
+fn infixr 5 ++|(a, b) { a + b }
+
+print(10 |++ 3 ++| 1)

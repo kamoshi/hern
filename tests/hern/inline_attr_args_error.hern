@@ -1,0 +1,5 @@
+impl Eq for int {
+  #[derive(Eq)]
+  fn ==(lhs, rhs) { true }
+  fn !=(lhs, rhs) { false }
+}

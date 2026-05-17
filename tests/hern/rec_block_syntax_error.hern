@@ -1,0 +1,8 @@
+rec {
+  fn even(n: int) -> bool {
+    if n == 0 { true } else { odd(n - 1) }
+  }
+  fn odd(n: int) -> bool {
+    if n == 0 { false } else { even(n - 1) }
+  }
+}

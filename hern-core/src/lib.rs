@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod ast;
 pub mod codegen;
+pub mod derive;
 pub mod lex;
 pub mod module;
 pub mod parse;

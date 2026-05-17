@@ -201,8 +201,7 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
         | Token::True
         | Token::False
         | Token::In
-        | Token::Do
-        | Token::Test => TY_KEYWORD,
+        | Token::Do => TY_KEYWORD,
         Token::Ident(name) if name.starts_with('\'') => TY_TYPE_PARAMETER,
         Token::Ident(_) => TY_VARIABLE,
         Token::Number(_) => TY_NUMBER,
@@ -325,6 +324,11 @@ fn push_associated_access_tokens(
             }
         }
         Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                push_associated_access_tokens(raw, pos_to_idx, source, stmt);
+            }
+        }
+        Stmt::RecBlock { stmts, .. } => {
             for stmt in stmts {
                 push_associated_access_tokens(raw, pos_to_idx, source, stmt);
             }

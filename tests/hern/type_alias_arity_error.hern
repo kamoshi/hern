@@ -1,5 +1,5 @@
 #![no_implicit_prelude]
 
-type Id('a) = 'a
+type alias Id('a) = 'a
 
 extern bad: fn() -> Id(int, string) = #[template] "nil";

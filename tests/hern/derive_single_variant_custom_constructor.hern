@@ -1,0 +1,5 @@
+#[derive(Eq, ToString)]
+type Pair = MkPair(int)
+
+print(to_string(MkPair(1) == MkPair(1)));
+print(to_string(MkPair(1)));

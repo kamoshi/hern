@@ -1,0 +1,9 @@
+fn caller(n: int) -> int {
+  callee(n) + 1
+}
+
+fn callee(n: int) -> int {
+  n * 2
+}
+
+caller(2)

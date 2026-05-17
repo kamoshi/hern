@@ -1,5 +1,5 @@
 use crate::ast::Stmt;
-use crate::codegen::lua::{ImportMode, LuaCodegen, TestEmitMode, test_function_names};
+use crate::codegen::lua::{ImportMode, LuaCodegen, TestEmitMode};
 use crate::module::{ModuleEnv, ModuleGraph, collect_imports_in_program};
 use std::collections::HashMap;
 
@@ -156,21 +156,17 @@ pub fn gen_lua_iife_test_bundle(
         ImportMode::Bundle,
     ));
     out.push_str(&codegen.gen_program_with_prelude(&graph.prelude, entry_program));
-    out.push_str(&gen_test_harness(graph, entry, entry_program));
+    out.push_str(&gen_test_harness(graph, entry));
     out
 }
 
-fn gen_test_harness(
-    graph: &ModuleGraph,
-    entry: &str,
-    entry_program: &crate::ast::Program,
-) -> String {
+fn gen_test_harness(graph: &ModuleGraph, entry: &str) -> String {
     let mut out = String::new();
-    out.push_str("local __hern_tests = {}\n");
+    out.push_str("local __hern_all_tests = {}\n");
     out.push_str("local function __hern_add_tests(prefix, tests)\n");
-    out.push_str("  for _, test in ipairs(tests or {}) do\n");
+    out.push_str("  for _, test in _G.ipairs(tests or {}) do\n");
     out.push_str(
-        "    table.insert(__hern_tests, { name = prefix .. \"::\" .. test.name, fn = test.fn })\n",
+        "    _G.table.insert(__hern_all_tests, { name = prefix .. \"::\" .. test.name, fn = test.fn })\n",
     );
     out.push_str("  end\n");
     out.push_str("end\n");
@@ -182,31 +178,23 @@ fn gen_test_harness(
         ));
     }
     out.push_str(&format!(
-        "__hern_add_tests({}, {{\n",
+        "__hern_add_tests({}, __hern_tests)\n",
         lua_quote(&test_module_label(graph, entry))
     ));
-    for name in test_function_names(entry_program) {
-        out.push_str(&format!(
-            "  {{ name = {}, fn = {} }},\n",
-            lua_quote(&name),
-            name
-        ));
-    }
-    out.push_str("})\n");
     out.push_str("local __hern_passed = 0\n");
     out.push_str("local __hern_failed = 0\n");
-    out.push_str("for _, test in ipairs(__hern_tests) do\n");
-    out.push_str("  local ok, err = pcall(test.fn)\n");
+    out.push_str("for _, test in _G.ipairs(__hern_all_tests) do\n");
+    out.push_str("  local ok, err = _G.pcall(test.fn)\n");
     out.push_str("  if ok then\n");
     out.push_str("    __hern_passed = __hern_passed + 1\n");
-    out.push_str("    print(\"ok \" .. test.name)\n");
+    out.push_str("    _G.print(\"ok \" .. test.name)\n");
     out.push_str("  else\n");
     out.push_str("    __hern_failed = __hern_failed + 1\n");
-    out.push_str("    print(\"FAILED \" .. test.name .. \": \" .. tostring(err))\n");
+    out.push_str("    _G.print(\"FAILED \" .. test.name .. \": \" .. _G.tostring(err))\n");
     out.push_str("  end\n");
     out.push_str("end\n");
-    out.push_str("print(tostring(__hern_passed) .. \" passed; \" .. tostring(__hern_failed) .. \" failed\")\n");
-    out.push_str("if __hern_failed ~= 0 then error(\"test failure\") end\n");
+    out.push_str("_G.print(_G.tostring(__hern_passed) .. \" passed; \" .. _G.tostring(__hern_failed) .. \" failed\")\n");
+    out.push_str("if __hern_failed ~= 0 then _G.error(\"test failure\") end\n");
     out
 }
 

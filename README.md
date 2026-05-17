@@ -147,6 +147,25 @@ print(v.length());
 
 Modules export values with record syntax, and imports bind that record:
 
+The final expression of a module is its export value. When that final
+expression is a record, fields that directly re-export a named binding keep
+that binding's generalized type scheme:
+
+```hern
+fn id(x) { x }
+
+#{ id: id }
+```
+
+Inline expressions are inferred as ordinary record field values instead:
+
+```hern
+#{ id: fn(x) { x } }
+```
+
+So prefer naming reusable generic exports before placing them in the final
+record.
+
 ```hern
 let astar = import "hern:astar";
 
@@ -211,6 +230,19 @@ test {
     assert_eq(Some(1).map(fn(x) { x + 1 }), expected())
   }
 }
+```
+
+The prelude provides `assert_eq` and `assert_ne` for tests and other checks.
+Both require `Eq + ToString` so failures can include the compared values.
+
+Hern can derive structural `Eq` and `ToString` implementations for sum types:
+
+```hern
+#[derive(Eq, ToString)]
+type Box('a) = Box('a)
+
+print(Box(1) == Box(1))   // true
+print(to_string(Box(2)))  // Box(2)
 ```
 
 ## Workspace

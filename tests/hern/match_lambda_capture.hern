@@ -1,0 +1,8 @@
+fn make(n: int) -> fn(int) -> int {
+  match n {
+    x -> fn(y: int) { x + y },
+  }
+}
+
+let add3 = make(3);
+print(to_string(add3(4)));

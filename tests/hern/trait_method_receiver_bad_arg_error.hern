@@ -1,0 +1,15 @@
+type Person = Person(string)
+
+trait Take 'a {
+  fn take(self: 'a, x: float) -> float
+}
+
+impl Take for Person {
+  fn take(self, x) {
+    x + 0.5
+  }
+}
+
+let p = Person("Ada");
+
+p.take("wrong")

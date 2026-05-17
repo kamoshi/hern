@@ -2,6 +2,7 @@ use crate::analysis::{CompilerDiagnostic, DiagnosticSource, analyze_prelude};
 use crate::ast::{
     Expr, ExprKind, NodeId, Param, Pattern, Program, SourceSpan, Stmt, TraitDef, walk_program_exprs,
 };
+use crate::derive::expand_derives;
 use crate::pipeline::{
     AnalysisOutput, parse_source, parse_source_recovering, reassociate_with_program,
 };
@@ -280,6 +281,7 @@ impl ModuleGraph {
                 .to_path_buf();
             resolve_imports_in_program(&mut program, &base_dir, self)
                 .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
+            expand_derives(&mut program);
             if program
                 .inner_attrs
                 .iter()
@@ -291,9 +293,12 @@ impl ModuleGraph {
                         stmts: vec![],
                         inner_attrs: vec![],
                     },
-                );
+                )
+                .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
             } else {
-                reassociate_with_program(&mut program, &self.prelude);
+                reassociate_with_program(&mut program, &self.prelude).map_err(|err| {
+                    err.with_source_if_absent(DiagnosticSource::Path(path.clone()))
+                })?;
             }
             Ok(program)
         })();
@@ -357,21 +362,28 @@ impl ModuleGraph {
                 self,
                 DiagnosticSource::Path(path.clone()),
             ));
+            expand_derives(&mut parsed.program);
             if parsed
                 .program
                 .inner_attrs
                 .iter()
                 .any(|a| a == "no_implicit_prelude")
             {
-                reassociate_with_program(
+                if let Err(err) = reassociate_with_program(
                     &mut parsed.program,
                     &Program {
                         stmts: vec![],
                         inner_attrs: vec![],
                     },
-                );
+                ) {
+                    diagnostics
+                        .push(err.with_source_if_absent(DiagnosticSource::Path(path.clone())));
+                }
             } else {
-                reassociate_with_program(&mut parsed.program, &self.prelude);
+                if let Err(err) = reassociate_with_program(&mut parsed.program, &self.prelude) {
+                    diagnostics
+                        .push(err.with_source_if_absent(DiagnosticSource::Path(path.clone())));
+                }
             }
             Ok((parsed.program, diagnostics))
         })();
@@ -578,7 +590,8 @@ pub fn parse_file(path: &Path, prelude: &Program) -> Result<Program, CompilerDia
     })?;
     let mut program =
         parse_source(&content).map_err(|err| err.with_source_if_absent(source.clone()))?;
-    reassociate_with_program(&mut program, prelude);
+    expand_derives(&mut program);
+    reassociate_with_program(&mut program, prelude)?;
     Ok(program)
 }
 
@@ -605,7 +618,12 @@ pub fn parse_file_recovering(
         return Ok(AnalysisOutput::diagnostics(parsed.diagnostics));
     }
 
-    reassociate_with_program(&mut parsed.program, prelude);
+    expand_derives(&mut parsed.program);
+    if let Err(err) = reassociate_with_program(&mut parsed.program, prelude) {
+        return Ok(AnalysisOutput::diagnostics(vec![
+            err.with_source_if_absent(source),
+        ]));
+    }
     Ok(AnalysisOutput::success(parsed.program))
 }
 
@@ -1049,6 +1067,12 @@ fn resolve_imports_in_stmt(
             }
             Ok(())
         }
+        Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                resolve_imports_in_stmt(stmt, base_dir, graph)?;
+            }
+            Ok(())
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => Ok(()),
     }
 }
@@ -1090,6 +1114,17 @@ fn resolve_imports_in_stmt_recovering(
             }
         }
         Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                resolve_imports_in_stmt_recovering(
+                    stmt,
+                    base_dir,
+                    graph,
+                    source.clone(),
+                    diagnostics,
+                );
+            }
+        }
+        Stmt::RecBlock { stmts, .. } => {
             for stmt in stmts {
                 resolve_imports_in_stmt_recovering(
                     stmt,
@@ -1885,6 +1920,38 @@ mod tests {
             );
             assert!(diagnostic.span.is_some());
         }
+    }
+
+    #[test]
+    fn parse_file_recovering_expands_derives() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "hern-file-recovery-derives-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&test_dir).expect("temp test directory should be created");
+
+        let path = test_dir.join("main.hern");
+        fs::write(&path, "#[derive(Eq)]\ntype Box('a) = Box('a)\n")
+            .expect("module should be written");
+
+        let graph = ModuleGraph::new().expect("module graph should initialize");
+        let output = parse_file_recovering(&path, &graph.prelude)
+            .expect("recovering parser should read and lex the file");
+        let program = output
+            .into_result()
+            .expect("valid file should return a parsed program");
+
+        assert!(program.stmts.iter().any(|stmt| {
+            matches!(
+                stmt,
+                Stmt::Impl(impl_def)
+                    if impl_def.generated_by.is_some() && impl_def.trait_name == "Eq"
+            )
+        }));
     }
 
     #[test]

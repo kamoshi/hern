@@ -1,0 +1,14 @@
+test {
+  #[test]
+  fn dup() {
+    ()
+  }
+
+  #[test]
+  fn dup() {
+    ()
+  }
+  and fn helper() {
+    ()
+  }
+}

@@ -11,6 +11,7 @@ pub(super) struct CollectedNames {
     values: HashSet<String>,
     types: HashSet<String>,
     traits: HashSet<String>,
+    evidence: HashSet<String>,
 }
 
 impl CollectedNames {
@@ -18,18 +19,24 @@ impl CollectedNames {
         self.values.extend(other.values);
         self.types.extend(other.types);
         self.traits.extend(other.traits);
+        self.evidence.extend(other.evidence);
     }
 
     pub(super) fn overlaps(&self, other: &Self) -> bool {
         self.values.iter().any(|name| other.values.contains(name))
             || self.types.iter().any(|name| other.types.contains(name))
             || self.traits.iter().any(|name| other.traits.contains(name))
+            || self
+                .evidence
+                .iter()
+                .any(|name| other.evidence.contains(name))
     }
 
     pub(super) fn remove_all(&mut self, other: &Self) {
         self.values.retain(|name| !other.values.contains(name));
         self.types.retain(|name| !other.types.contains(name));
         self.traits.retain(|name| !other.traits.contains(name));
+        self.evidence.retain(|name| !other.evidence.contains(name));
     }
 }
 
@@ -55,7 +62,12 @@ pub(super) fn stmt_bound_names(stmt: &Stmt) -> CollectedNames {
             names.traits.insert(td.name.clone());
         }
         Stmt::Impl(id) => {
-            names.traits.insert(id.trait_name.clone());
+            names.evidence.insert(id.trait_name.clone());
+        }
+        Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                names.extend(stmt_bound_names(stmt));
+            }
         }
         Stmt::TestBlock { .. } | Stmt::InherentImpl(_) | Stmt::Expr(_) => {}
     }
@@ -215,6 +227,18 @@ fn collect_stmt_referenced_names(
                 block_type_scope.extend(bindings.types);
             }
         }
+        Stmt::RecBlock { stmts, .. } => {
+            let mut block_value_scope = value_scope.clone();
+            let mut block_type_scope = type_scope.clone();
+            for stmt in stmts {
+                let bindings = stmt_bound_names(stmt);
+                block_value_scope.extend(bindings.values);
+                block_type_scope.extend(bindings.types);
+            }
+            for stmt in stmts {
+                collect_stmt_referenced_names(stmt, refs, &block_value_scope, &block_type_scope);
+            }
+        }
     }
 }
 
@@ -249,9 +273,6 @@ fn collect_expr_referenced_names(
             collect_expr_referenced_names(operand, refs, value_scope, type_scope);
         }
         ExprKind::FieldAccess { expr, .. } => {
-            if let ExprKind::Ident(name) = &expr.kind {
-                refs.traits.insert(name.clone());
-            }
             collect_expr_referenced_names(expr, refs, value_scope, type_scope);
         }
         ExprKind::AssociatedAccess { target, .. } => {
@@ -404,6 +425,9 @@ fn collect_pattern_referenced_names(pat: &Pattern, refs: &mut CollectedNames) {
         }
         Pattern::Wildcard
         | Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. }
         | Pattern::Variable(_, _)
         | Pattern::Record { .. } => {}
     }

@@ -10,5 +10,5 @@ impl Label for [float] {
     fn label(xs) { "numbers" }
 }
 
-print(label([1.0]));
-print(label(["a"]));
+print(Label::label([1.0]));
+print(Label::label(["a"]));

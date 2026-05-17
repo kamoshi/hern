@@ -1,4 +1,5 @@
 use crate::ast::{Expr, ExprKind, NodeId, Program, SourcePosition, SourceSpan, Stmt};
+use crate::derive::expand_derives;
 use crate::pipeline::{
     infer_program, infer_program_with_seed, parse_source, reassociate_standalone,
     reassociate_with_program,
@@ -117,7 +118,8 @@ pub fn analyze_prelude() -> Result<PreludeAnalysis, CompilerDiagnostic> {
 
 pub fn analyze_prelude_source(source: &str) -> Result<PreludeAnalysis, CompilerDiagnostic> {
     let mut program = parse_source(source)?;
-    reassociate_standalone(&mut program);
+    expand_derives(&mut program);
+    reassociate_standalone(&mut program)?;
 
     let inference = infer_program(&mut program)?;
     let env = inference.env.clone();
@@ -137,7 +139,8 @@ pub fn analyze_source(
     prelude: &PreludeAnalysis,
 ) -> Result<Analysis, CompilerDiagnostic> {
     let mut program = parse_source(source)?;
-    reassociate_with_program(&mut program, &prelude.program);
+    expand_derives(&mut program);
+    reassociate_with_program(&mut program, &prelude.program)?;
 
     let inference =
         infer_program_with_seed(&mut program, &prelude.program.stmts, Some(&prelude.env))?;
@@ -183,6 +186,11 @@ fn find_hover_in_stmt(
             }
         }
         Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                find_hover_in_stmt(stmt, expr_types, symbol_types, pos, best);
+            }
+        }
+        Stmt::RecBlock { stmts, .. } => {
             for stmt in stmts {
                 find_hover_in_stmt(stmt, expr_types, symbol_types, pos, best);
             }
@@ -534,6 +542,9 @@ mod tests {
                     .iter()
                     .find_map(|method| find_in_expr(&method.body, method_name)),
                 Stmt::TestBlock { stmts, .. } => stmts
+                    .iter()
+                    .find_map(|stmt| find_in_stmt(stmt, method_name)),
+                Stmt::RecBlock { stmts, .. } => stmts
                     .iter()
                     .find_map(|stmt| find_in_stmt(stmt, method_name)),
                 Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {

@@ -15,6 +15,37 @@ output = """
 6
 """
 
+[tests.int_div_zero_error]
+path = "tests/hern/int_div_zero_error.hern"
+expect = "test_error"
+error_contains = "attempt to divide by zero"
+
+[tests.literal_and_range_patterns]
+path = "tests/hern/literal_and_range_patterns.hern"
+expect = "typecheck"
+output = """
+negative
+zero
+small
+middle
+other
+yes
+no
+negative
+zero
+other
+"""
+
+[tests.pattern_keyword_bindings]
+path = "tests/hern/pattern_keyword_bindings.hern"
+expect = "typecheck"
+output = """
+1
+2
+5
+15
+"""
+
 [tests.neg_trait_operator]
 path = "tests/hern/neg_trait_operator.hern"
 expect = "typecheck"
@@ -120,6 +151,11 @@ error_contains = "type alias `Id` expects 1 type argument, got 2"
 path = "tests/hern/type_alias_missing_args_error.hern"
 expect = "error"
 error_contains = "type alias `Id` expects 1 type argument, got 0"
+
+[tests.type_alias_requires_keyword_error]
+path = "tests/hern/type_alias_requires_keyword_error.hern"
+expect = "error"
+error_contains = "type aliases must use `type alias Name = ...`"
 
 [tests.imported_hkt_impl]
 path = "tests/hern/imported_hkt_impl.hern"
@@ -398,6 +434,15 @@ output = """
 {x=1, }
 """
 
+[tests.generic_recursive_trait_dict]
+path = "tests/hern/generic_recursive_trait_dict.hern"
+expect = "typecheck"
+output = """
+2
+5
+2
+"""
+
 [tests.annotated_let]
 path = "tests/hern/annotated_let.hern"
 expect = "typecheck"
@@ -511,6 +556,13 @@ output = """
 2
 """
 
+[tests.match_lambda_capture]
+path = "tests/hern/match_lambda_capture.hern"
+expect = "typecheck"
+output = """
+7
+"""
+
 [tests.inherent_impls]
 path = "tests/hern/inherent_impls.hern"
 expect = "typecheck"
@@ -524,6 +576,15 @@ output = """
 10
 hello
 10
+"""
+
+[tests.inherent_method_recursion]
+path = "tests/hern/inherent_method_recursion.hern"
+expect = "typecheck"
+output = """
+Counter(0)
+true
+false
 """
 
 [tests.inherent_method_associated_call]
@@ -711,6 +772,15 @@ output = """
 2
 """
 
+[tests.contextual_keywords]
+path = "tests/hern/contextual_keywords.hern"
+expect = "typecheck"
+output = """
+5
+6
+8
+"""
+
 [tests.custom_op]
 path = "tests/hern/custom_op.hern"
 expect = "typecheck"
@@ -718,6 +788,11 @@ output = """
 3
 17
 """
+
+[tests.operator_assoc_conflict_error]
+path = "tests/hern/operator_assoc_conflict_error.hern"
+expect = "error"
+error_contains = "conflicting associativity for operators `|++` and `++|` at precedence 5"
 
 [tests.fixity]
 path = "tests/hern/fixity.hern"
@@ -1170,6 +1245,24 @@ path = "tests/hern/trait_method_associated_missing_impl.hern"
 expect = "error"
 error_contains = "trait `Functor` is not implemented for `Set`"
 
+[tests.trait_method_receiver_call]
+path = "tests/hern/trait_method_receiver_call.hern"
+expect = "typecheck"
+output = """
+hello
+hello
+"""
+
+[tests.trait_method_receiver_bad_arity_error]
+path = "tests/hern/trait_method_receiver_bad_arity_error.hern"
+expect = "error"
+error_contains = "wrong number of arguments: expected 0, got 1"
+
+[tests.trait_method_receiver_bad_arg_error]
+path = "tests/hern/trait_method_receiver_bad_arg_error.hern"
+expect = "error"
+error_contains = "type mismatch: expected `float`, got `string`"
+
 [tests.associated_top_level_hole_error]
 path = "tests/hern/associated_top_level_hole_error.hern"
 expect = "error"
@@ -1177,19 +1270,14 @@ error_contains = "`_` is only allowed inside an explicit associated type target"
 
 [tests.bare_trait_method]
 path = "tests/hern/bare_trait_method.hern"
-expect = "typecheck"
-output = """
-42
-0
-"""
+expect = "error"
+error_contains = "unbound variable: `double`"
 
 [tests.bare_imported_trait_method]
 path = "tests/hern/bare_imported_trait_method.hern"
 fixtures = ["tests/hern/bare_imported_trait_method_dep.hern"]
-expect = "typecheck"
-output = """
-42
-"""
+expect = "error"
+error_contains = "unbound variable: `double`"
 
 [tests.bare_trait_method_shadowed]
 path = "tests/hern/bare_trait_method_shadowed.hern"
@@ -1578,6 +1666,13 @@ output = """
 42
 """
 
+[tests.lambda_block_tail]
+path = "tests/hern/lambda_block_tail.hern"
+expect = "typecheck"
+output = """
+7
+"""
+
 [tests.lambda_return_annotation_mismatch_error]
 path = "tests/hern/lambda_return_annotation_mismatch_error.hern"
 expect = "error"
@@ -1596,6 +1691,138 @@ ok first_class_test::option_map_some
 1 passed; 0 failed
 """
 
+[tests.test_block_scope]
+path = "tests/hern/test_block_scope.hern"
+expect = "test"
+output = """
+ok test_block_scope::sees_test_helper
+1 passed; 0 failed
+"""
+
+[tests.failing_test_assert_error]
+path = "tests/hern/failing_test_assert_error.hern"
+expect = "test_error"
+error_contains = "FAILED failing_test_assert_error::this_should_fail"
+
+[tests.failing_test_panic_error]
+path = "tests/hern/failing_test_panic_error.hern"
+expect = "test_error"
+error_contains = "FAILED failing_test_panic_error::this_should_panic"
+
+[tests.generic_eq_payload_impl]
+path = "tests/hern/generic_eq_payload_impl.hern"
+expect = "typecheck"
+output = """
+true
+true
+"""
+
+[tests.recursive_trait_impls]
+path = "tests/hern/recursive_trait_impls.hern"
+expect = "typecheck"
+output = """
+true
+false
+true
+false
+true
+Link(Link(End))
+"""
+
+[tests.and_fn_mutual_recursion]
+path = "tests/hern/and_fn_mutual_recursion.hern"
+expect = "typecheck"
+output = """
+true
+false
+false
+true
+"""
+
+[tests.and_fn_trait_constraint]
+path = "tests/hern/and_fn_trait_constraint.hern"
+expect = "typecheck"
+output = """
+int
+"""
+
+[tests.and_fn_contextual_keyword]
+path = "tests/hern/and_fn_contextual_keyword.hern"
+expect = "typecheck"
+output = """
+5
+"""
+
+[tests.and_fn_duplicate_name_error]
+path = "tests/hern/and_fn_duplicate_name_error.hern"
+expect = "error"
+error_contains = "function `repeat` is defined multiple times in recursive group"
+
+[tests.rec_block_syntax_error]
+path = "tests/hern/rec_block_syntax_error.hern"
+expect = "error"
+error_contains = "unbound variable: `rec`"
+
+[tests.forward_fn_outside_rec_error]
+path = "tests/hern/forward_fn_outside_rec_error.hern"
+expect = "error"
+error_contains = "unbound variable: `callee`"
+
+[tests.derive_eq_tostring]
+path = "tests/hern/derive_eq_tostring.hern"
+expect = "typecheck"
+output = """
+true
+true
+Box(3)
+Red
+true
+true
+"""
+
+[tests.derive_unknown_error]
+path = "tests/hern/derive_unknown_error.hern"
+expect = "error"
+error_contains = "Cannot derive `Clone`: supported derives are Eq, ToString"
+
+[tests.derive_on_function_error]
+path = "tests/hern/derive_on_function_error.hern"
+expect = "error"
+error_contains = "Attribute `derive` is only allowed on type declarations"
+
+[tests.test_attr_on_type_error]
+path = "tests/hern/test_attr_on_type_error.hern"
+expect = "error"
+error_contains = "Attribute `test` is not allowed on type declarations"
+
+[tests.inline_attr_args_error]
+path = "tests/hern/inline_attr_args_error.hern"
+expect = "error"
+error_contains = "Attribute `derive` cannot be used here"
+
+[tests.derive_alias_error]
+path = "tests/hern/derive_alias_error.hern"
+expect = "error"
+error_contains = "derive is not supported for type aliases"
+
+[tests.derive_single_variant_custom_constructor]
+path = "tests/hern/derive_single_variant_custom_constructor.hern"
+expect = "typecheck"
+output = """
+true
+MkPair(1)
+"""
+
+[tests.derive_duplicate_error]
+path = "tests/hern/derive_duplicate_error.hern"
+expect = "error"
+error_contains = "Duplicate derive `Eq`"
+
+[tests.derive_missing_payload_impl_error]
+path = "tests/hern/derive_missing_payload_impl_error.hern"
+expect = "error"
+error_contains = "trait `Eq` is not implemented for `Wrap(fn() -> int)`"
+
 [tests.test_block_type_decl_error]
 path = "tests/hern/test_block_type_decl_error.hern"
 expect = "error"
@@ -1610,3 +1837,8 @@ error_contains = "Expected function, helper declaration, or `}` inside test bloc
 path = "tests/hern/duplicate_test_name_error.hern"
 expect = "error"
 error_contains = "test function `repeats` is defined multiple times"
+
+[tests.duplicate_test_name_and_fn_error]
+path = "tests/hern/duplicate_test_name_and_fn_error.hern"
+expect = "error"
+error_contains = "test function `dup` is defined multiple times"

@@ -32,6 +32,17 @@ pub(super) struct AssociatedTraitMethodLookup {
     pub(super) explicit_args: Option<Vec<Type>>,
 }
 
+#[derive(Clone)]
+struct ReceiverTraitMethodMatch {
+    trait_def: TraitDef,
+    method: TraitMethod,
+}
+
+struct ReceiverTraitMethodResolution {
+    ret_ty: Ty,
+    resolved_callee: ResolvedCallee,
+}
+
 impl Infer {
     pub(super) fn associated_inherent_method(
         &self,
@@ -1078,6 +1089,19 @@ impl Infer {
             return Ok(applied.ret_ty);
         }
 
+        if let Some(ret_ty) = self.resolve_receiver_trait_call(
+            env,
+            callee_id,
+            &receiver_ty,
+            method_name,
+            args,
+            arg_wrappers,
+            is_method_call,
+            resolved_callee,
+        )? {
+            return Ok(ret_ty);
+        }
+
         if let Some(info) = env.get(method_name) {
             let scheme = info.scheme.clone();
             let method_ty = self.instantiate_value(&scheme);
@@ -1207,6 +1231,278 @@ impl Infer {
         candidates
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_receiver_trait_call(
+        &mut self,
+        env: &TypeEnv,
+        callee_id: NodeId,
+        receiver_ty: &Ty,
+        method_name: &str,
+        args: &mut [Expr],
+        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
+        is_method_call: &mut bool,
+        resolved_callee: &mut Option<ResolvedCallee>,
+    ) -> Result<Option<Ty>, SpannedTypeError> {
+        let candidates = self.receiver_trait_method_candidates(method_name);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let mut matches = Vec::new();
+        let mut receiver_matches = Vec::new();
+        for candidate in &candidates {
+            let snapshot = self.subst.checkpoint();
+            let mut probe_args = args.to_vec();
+            let mut probe_arg_wrappers = Vec::new();
+            let matched = self
+                .infer_args(env, &mut probe_args, &mut probe_arg_wrappers)
+                .and_then(|arg_tys| {
+                    self.try_receiver_trait_method(env, receiver_ty, &arg_tys, candidate)
+                })
+                .is_ok();
+            self.subst.restore_checkpoint(snapshot);
+            if matched {
+                matches.push(candidate.clone());
+                receiver_matches.push(candidate.clone());
+                continue;
+            }
+
+            let snapshot = self.subst.checkpoint();
+            let receiver_matched =
+                self.receiver_trait_method_matches_receiver(env, receiver_ty, candidate);
+            self.subst.restore_checkpoint(snapshot);
+            if receiver_matched {
+                receiver_matches.push(candidate.clone());
+            }
+        }
+
+        if matches.len() > 1 {
+            return Err(TypeError::AmbiguousTraitMethod {
+                method: method_name.to_string(),
+                candidates: matches
+                    .iter()
+                    .map(|candidate| candidate.trait_def.name.clone())
+                    .collect(),
+            }
+            .into());
+        }
+
+        let Some(candidate) = matches.into_iter().next() else {
+            if receiver_matches.len() == 1 {
+                let candidate = receiver_matches
+                    .into_iter()
+                    .next()
+                    .expect("single receiver match exists");
+                if candidate.method.params.len() != args.len() + 1 {
+                    return Err(TypeError::ArityMismatch {
+                        expected: candidate.method.params.len().saturating_sub(1),
+                        got: args.len(),
+                    }
+                    .into());
+                }
+                let arg_tys = self.infer_args(env, args, arg_wrappers)?;
+                let resolved =
+                    self.try_receiver_trait_method(env, receiver_ty, &arg_tys, &candidate)?;
+                self.record_symbol_type(
+                    callee_id,
+                    Ty::Func(
+                        value_func_params(arg_tys),
+                        value_func_return(resolved.ret_ty.clone()),
+                    ),
+                );
+                *is_method_call = true;
+                *resolved_callee = Some(resolved.resolved_callee);
+                return Ok(Some(resolved.ret_ty));
+            }
+            return Ok(None);
+        };
+
+        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
+        let resolved = self.try_receiver_trait_method(env, receiver_ty, &arg_tys, &candidate)?;
+        self.record_symbol_type(
+            callee_id,
+            Ty::Func(
+                value_func_params(arg_tys),
+                value_func_return(resolved.ret_ty.clone()),
+            ),
+        );
+        *is_method_call = true;
+        *resolved_callee = Some(resolved.resolved_callee);
+        Ok(Some(resolved.ret_ty))
+    }
+
+    fn receiver_trait_method_candidates(&self, method_name: &str) -> Vec<ReceiverTraitMethodMatch> {
+        let mut candidates = self
+            .trait_env
+            .values()
+            .filter_map(|trait_def| {
+                trait_def
+                    .methods
+                    .iter()
+                    .find(|method| method.name == method_name)
+                    .map(|method| ReceiverTraitMethodMatch {
+                        trait_def: trait_def.clone(),
+                        method: method.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.trait_def.name.cmp(&right.trait_def.name));
+        candidates
+    }
+
+    fn try_receiver_trait_method(
+        &mut self,
+        env: &TypeEnv,
+        receiver_ty: &Ty,
+        arg_tys: &[Ty],
+        candidate: &ReceiverTraitMethodMatch,
+    ) -> Result<ReceiverTraitMethodResolution, SpannedTypeError> {
+        let trait_def = &candidate.trait_def;
+        let method = &candidate.method;
+        if method.params.len() != arg_tys.len() + 1 {
+            return Err(TypeError::ArityMismatch {
+                expected: method.params.len().saturating_sub(1),
+                got: arg_tys.len(),
+            }
+            .into());
+        }
+
+        let mut param_vars = HashMap::new();
+        let trait_vars = trait_def
+            .params
+            .iter()
+            .map(|param| {
+                let var = self.fresh_var();
+                param_vars.insert(param.clone(), var);
+                var
+            })
+            .collect::<Vec<_>>();
+        let method_param_tys = method
+            .params
+            .iter()
+            .map(|(_, ty)| self.ast_to_ty_with_vars(ty, &mut param_vars))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
+
+        unify(
+            &mut self.subst,
+            method_param_tys[0].clone(),
+            receiver_ty.clone(),
+        )?;
+        for (actual, expected) in arg_tys
+            .iter()
+            .cloned()
+            .zip(method_param_tys.into_iter().skip(1))
+        {
+            unify(&mut self.subst, actual, expected)?;
+        }
+
+        let trait_args = trait_vars
+            .into_iter()
+            .map(|var| self.subst.apply(&Ty::Var(var)))
+            .collect::<Vec<_>>();
+        let determinant_indexes = trait_dict_indexes(trait_def);
+        let dict = resolve_concrete_from_args_unifying(
+            &trait_def.name,
+            &trait_args,
+            &determinant_indexes,
+            env,
+            &self.known_impl_dicts,
+            &self.known_impl_schemes,
+            &mut self.subst,
+        )
+        .ok_or_else(|| TypeError::MissingTraitImpl {
+            trait_name: trait_def.name.clone(),
+            impl_target: format_trait_target_for_receiver_error(&trait_args, &determinant_indexes),
+        })?;
+
+        let dict_name = dict_ref_concrete_name(&dict)
+            .expect("receiver trait method dictionaries should be concrete")
+            .to_string();
+        if let Some(dict_scheme) = env
+            .get(&dict_name)
+            .map(|info| info.scheme.clone())
+            .or_else(|| self.known_impl_schemes.get(&dict_name).cloned())
+        {
+            let dict_ty = self.instantiate(&dict_scheme);
+            let method_ty =
+                record_field_ty(&self.subst.apply(&dict_ty), &method.name).ok_or_else(|| {
+                    TypeError::UnknownTraitMethod {
+                        trait_name: trait_def.name.clone(),
+                        method: method.name.clone(),
+                    }
+                })?;
+            let checked_ret = Ty::Var(self.fresh_var());
+            let mut all_args = Vec::with_capacity(arg_tys.len() + 1);
+            all_args.push(receiver_ty.clone());
+            all_args.extend(arg_tys.iter().cloned());
+            unify(
+                &mut self.subst,
+                method_ty,
+                Ty::Func(
+                    value_func_params(all_args),
+                    value_func_return(checked_ret.clone()),
+                ),
+            )?;
+            unify(&mut self.subst, ret_ty.clone(), checked_ret)?;
+        }
+
+        Ok(ReceiverTraitMethodResolution {
+            ret_ty: self.subst.apply(&ret_ty),
+            resolved_callee: ResolvedCallee::DictMethod {
+                dict,
+                method: method.name.clone(),
+            },
+        })
+    }
+
+    fn receiver_trait_method_matches_receiver(
+        &mut self,
+        env: &TypeEnv,
+        receiver_ty: &Ty,
+        candidate: &ReceiverTraitMethodMatch,
+    ) -> bool {
+        let trait_def = &candidate.trait_def;
+        let method = &candidate.method;
+        let Some((_, receiver_ast_ty)) = method.params.first() else {
+            return false;
+        };
+
+        let mut param_vars = HashMap::new();
+        let trait_vars = trait_def
+            .params
+            .iter()
+            .map(|param| {
+                let var = self.fresh_var();
+                param_vars.insert(param.clone(), var);
+                var
+            })
+            .collect::<Vec<_>>();
+        let Ok(expected_receiver_ty) = self.ast_to_ty_with_vars(receiver_ast_ty, &mut param_vars)
+        else {
+            return false;
+        };
+        if unify(&mut self.subst, expected_receiver_ty, receiver_ty.clone()).is_err() {
+            return false;
+        }
+
+        let trait_args = trait_vars
+            .into_iter()
+            .map(|var| self.subst.apply(&Ty::Var(var)))
+            .collect::<Vec<_>>();
+        let determinant_indexes = trait_dict_indexes(trait_def);
+        resolve_concrete_from_args_unifying(
+            &trait_def.name,
+            &trait_args,
+            &determinant_indexes,
+            env,
+            &self.known_impl_dicts,
+            &self.known_impl_schemes,
+            &mut self.subst,
+        )
+        .is_some()
+    }
+
     fn array_method_matching_expected_return(
         &mut self,
         method_name: &str,
@@ -1245,39 +1541,6 @@ impl Infer {
             }
         }
         (matches.len() == 1).then(|| matches.remove(0))
-    }
-
-    pub(super) fn bare_trait_method(
-        &self,
-        method_name: &str,
-    ) -> Result<Option<ResolvedTraitMethod>, TypeError> {
-        let mut matching: Vec<_> = self
-            .trait_env
-            .values()
-            .filter_map(|trait_def| {
-                trait_def
-                    .methods
-                    .iter()
-                    .find(|method| method.name == method_name)
-                    .map(|method| ResolvedTraitMethod {
-                        trait_def: trait_def.clone(),
-                        method: method.clone(),
-                    })
-            })
-            .collect();
-        matching.sort_by(|a, b| a.trait_def.name.cmp(&b.trait_def.name));
-
-        if matching.len() > 1 {
-            return Err(TypeError::AmbiguousTraitMethod {
-                method: method_name.to_string(),
-                candidates: matching
-                    .iter()
-                    .map(|candidate| candidate.trait_def.name.clone())
-                    .collect(),
-            });
-        }
-
-        Ok(matching.into_iter().next())
     }
 
     pub(super) fn infer_args(
@@ -1606,6 +1869,16 @@ fn pretty_method_receiver_for_error(receiver: &Ty) -> String {
         .map(|(index, var)| (var, type_var_name(index)))
         .collect();
     display_ty_with_var_names(receiver, &names)
+}
+
+fn format_trait_target_for_receiver_error(args: &[Ty], determinant_indexes: &[usize]) -> String {
+    let target = determinant_indexes
+        .first()
+        .and_then(|index| args.get(*index))
+        .or_else(|| args.first());
+    target
+        .map(|ty| pretty_method_receiver_for_error(ty))
+        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 fn is_array_with_unresolved_element(receiver: &Ty) -> bool {

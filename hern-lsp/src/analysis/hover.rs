@@ -611,7 +611,7 @@ fn type_declaration_hover_text(program: &Program, definition: &Definition) -> Op
                 ty,
                 ..
             } if *name_span == definition.location.span => Some(format!(
-                "type {}{} = {}",
+                "type alias {}{} = {}",
                 name,
                 type_params_suffix(params),
                 ast_type_to_string(ty)
@@ -793,6 +793,16 @@ fn pattern_to_string(pat: &Pattern) -> String {
     match pat {
         Pattern::Wildcard => "_".to_string(),
         Pattern::StringLit(value) => format!("{value:?}"),
+        Pattern::NumberLit(value) => value.as_lua_source(),
+        Pattern::BoolLit(value) => value.to_string(),
+        Pattern::IntRange {
+            start,
+            end,
+            inclusive,
+        } => {
+            let op = if *inclusive { "..=" } else { ".." };
+            format!("{start}{op}{end}")
+        }
         Pattern::Variable(name, _) => name.clone(),
         Pattern::Constructor { name, binding } => match binding {
             Some(binding) => format!("{name}({})", pattern_to_string(binding)),
@@ -1600,6 +1610,9 @@ fn local_pattern_binding_type_in_stmt(
         Stmt::TestBlock { stmts, .. } => stmts.iter().find_map(|stmt| {
             local_pattern_binding_type_in_stmt(stmt, name, binding_span, expr_types, variant_env)
         }),
+        Stmt::RecBlock { stmts, .. } => stmts.iter().find_map(|stmt| {
+            local_pattern_binding_type_in_stmt(stmt, name, binding_span, expr_types, variant_env)
+        }),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
     }
 }
@@ -1869,6 +1882,9 @@ fn declaration_value_type_in_stmt<'a>(
                 .flatten()
         }),
         Stmt::TestBlock { stmts, .. } => stmts
+            .iter()
+            .find_map(|stmt| declaration_value_type_in_stmt(stmt, span, expr_types)),
+        Stmt::RecBlock { stmts, .. } => stmts
             .iter()
             .find_map(|stmt| declaration_value_type_in_stmt(stmt, span, expr_types)),
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,

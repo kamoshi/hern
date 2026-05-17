@@ -1,9 +1,88 @@
 use crate::ast::*;
 use crate::lex::error::{ParseError, Span};
-use crate::lex::{Spanned, Token};
+use crate::lex::{NumberLiteral, Spanned, Token};
 use std::cell::{Cell, RefCell};
 
 type FnParamsBody = (usize, Vec<Param>, Option<TypeReturn>, Vec<TypeBound>, Expr);
+
+fn is_alias_token(token: &Token) -> bool {
+    matches!(token, Token::Ident(name) if name == "alias")
+}
+
+fn is_test_token(token: &Token) -> bool {
+    matches!(token, Token::Ident(name) if name == "test")
+}
+
+fn is_and_token(token: &Token) -> bool {
+    matches!(token, Token::Ident(name) if name == "and")
+}
+
+fn attr_error_span(attr: &Attribute) -> Span {
+    Span {
+        line: attr.span.start_line,
+        col: attr.span.start_col,
+        len: attr.span.end_col.saturating_sub(attr.span.start_col),
+    }
+}
+
+fn starts_statement_or_item(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Let
+            | Token::Fn
+            | Token::Trait
+            | Token::Impl
+            | Token::Type
+            | Token::Extern
+            | Token::Import
+            | Token::Do
+            | Token::Return
+            | Token::Break
+            | Token::Continue
+            | Token::If
+            | Token::Match
+            | Token::Loop
+    ) || is_test_token(token)
+}
+
+fn negate_number_literal(number: &NumberLiteral) -> NumberLiteral {
+    match number {
+        NumberLiteral::Int(value) => NumberLiteral::Int(value.saturating_neg()),
+        NumberLiteral::Float(value) => NumberLiteral::Float(-value),
+    }
+}
+
+fn parse_signed_int_pattern_bound(
+    tokens: &[Spanned],
+    fallback_span: Span,
+) -> Result<(usize, i32), ParseError> {
+    let Some(first) = tokens.first() else {
+        return Err(ParseError::new(
+            "range pattern requires an end bound",
+            fallback_span,
+        ));
+    };
+    let (sign, number_index, span) = if first.token == Token::Minus {
+        let Some(next) = tokens.get(1) else {
+            return Err(ParseError::new(
+                "Expected integer after `-` in range pattern",
+                first.span,
+            ));
+        };
+        (-1, 1, next.span)
+    } else {
+        (1, 0, first.span)
+    };
+
+    let Token::Number(NumberLiteral::Int(value)) = &tokens[number_index].token else {
+        return Err(ParseError::new(
+            "range patterns require integer bounds",
+            span,
+        ));
+    };
+
+    Ok((number_index + 1, value.saturating_mul(sign)))
+}
 
 fn consumed_span(tokens: &[Spanned], consumed: usize) -> SourceSpan {
     let start = tokens.first().map(|token| token.span).unwrap_or(Span {
@@ -114,6 +193,9 @@ fn recover_stmt_tokens(tokens: &[Spanned]) -> usize {
             Token::Let | Token::Fn | Token::Trait | Token::Impl | Token::Type | Token::Extern
                 if parens == 0 && braces == 0 && brackets == 0 =>
             {
+                return idx;
+            }
+            _ if is_test_token(&token.token) && parens == 0 && braces == 0 && brackets == 0 => {
                 return idx;
             }
             Token::Eof => return idx,
@@ -348,6 +430,12 @@ impl<'tokens> Parser<'tokens> {
             });
             let (c_attr, attr) = self.expect_ident(&tokens[ptr..])?;
             ptr += c_attr;
+            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::LParen) {
+                return Err(ParseError::new(
+                    format!("Attribute `{}` cannot be used here", attr),
+                    attr_span,
+                ));
+            }
             ptr += self.expect(&tokens[ptr..], Token::RBracket)?;
 
             if attr == "inline" {
@@ -387,9 +475,6 @@ impl<'tokens> Parser<'tokens> {
                     token: Token::Ident(name),
                     ..
                 }) => name.clone(),
-                Some(Spanned {
-                    token: Token::Test, ..
-                }) => "test".to_string(),
                 Some(tok) => {
                     return Err(ParseError::new(
                         format!("Expected attribute name, found {}", tok.token),
@@ -399,9 +484,44 @@ impl<'tokens> Parser<'tokens> {
                 None => return Err(ParseError::new("Unexpected EOF", attr_span)),
             };
             ptr += 1;
+            let mut args = Vec::new();
+            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::LParen) {
+                ptr += 1;
+                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::RParen) {
+                    return Err(ParseError::new(
+                        format!("Attribute `{}` requires at least one argument", name),
+                        tokens[ptr].span,
+                    ));
+                }
+                loop {
+                    let arg_span = tokens.get(ptr).map(|t| t.span).unwrap_or(attr_span);
+                    let arg = match tokens.get(ptr) {
+                        Some(Spanned {
+                            token: Token::Ident(arg),
+                            ..
+                        }) => arg.clone(),
+                        Some(tok) => {
+                            return Err(ParseError::new(
+                                format!("Expected attribute argument, found {}", tok.token),
+                                tok.span,
+                            ));
+                        }
+                        None => return Err(ParseError::new("Unexpected EOF", arg_span)),
+                    };
+                    ptr += 1;
+                    args.push(arg);
+                    if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
+                        ptr += 1;
+                    } else {
+                        break;
+                    }
+                }
+                ptr += self.expect(&tokens[ptr..], Token::RParen)?;
+            }
             ptr += self.expect(&tokens[ptr..], Token::RBracket)?;
             attrs.push(Attribute {
                 name,
+                args,
                 span: consumed_span(&tokens[attr_start..], ptr - attr_start),
             });
         }
@@ -507,29 +627,6 @@ impl<'tokens> Parser<'tokens> {
     ) -> Result<(usize, Stmt), ParseError> {
         let (attrs_consumed, attrs) = self.parse_outer_attrs(tokens, 0)?;
         if attrs_consumed > 0 {
-            if let Some(attr) = attrs.iter().find(|attr| !attr.is("test")) {
-                return Err(ParseError::new(
-                    format!("Unknown attribute `{}`", attr.name),
-                    Span {
-                        line: attr.span.start_line,
-                        col: attr.span.start_col,
-                        len: attr.span.end_col.saturating_sub(attr.span.start_col),
-                    },
-                ));
-            }
-            if !in_test_block {
-                return Err(ParseError::new(
-                    "Attribute `test` can only be used inside a `test` block",
-                    Span {
-                        line: attrs[0].span.start_line,
-                        col: attrs[0].span.start_col,
-                        len: attrs[0]
-                            .span
-                            .end_col
-                            .saturating_sub(attrs[0].span.start_col),
-                    },
-                ));
-            }
             let Some(tok) = tokens.get(attrs_consumed) else {
                 let attr_span = attrs
                     .last()
@@ -544,24 +641,57 @@ impl<'tokens> Parser<'tokens> {
                     },
                 ));
             };
+            if tok.token == Token::Type {
+                if in_test_block {
+                    return Err(ParseError::new(
+                        "Type declarations are not allowed inside `test` blocks",
+                        tok.span,
+                    ));
+                }
+                if let Some(attr) = attrs.iter().find(|attr| !attr.is("derive")) {
+                    return Err(ParseError::new(
+                        format!(
+                            "Attribute `{}` is not allowed on type declarations",
+                            attr.name
+                        ),
+                        attr_error_span(attr),
+                    ));
+                }
+                let (consumed, stmt) =
+                    self.parse_type_def_stmt_with_attrs(&tokens[attrs_consumed..], attrs)?;
+                return Ok((attrs_consumed + consumed, stmt));
+            }
+            if let Some(attr) = attrs.iter().find(|attr| !attr.is("test")) {
+                let message = if attr.is("derive") {
+                    "Attribute `derive` is only allowed on type declarations".to_string()
+                } else {
+                    format!("Unknown attribute `{}`", attr.name)
+                };
+                return Err(ParseError::new(message, attr_error_span(attr)));
+            }
+            if let Some(attr) = attrs.iter().find(|attr| !attr.args.is_empty()) {
+                return Err(ParseError::new(
+                    format!("Attribute `{}` does not accept arguments", attr.name),
+                    attr_error_span(attr),
+                ));
+            }
+            if !in_test_block {
+                return Err(ParseError::new(
+                    "Attribute `test` can only be used inside a `test` block",
+                    attr_error_span(&attrs[0]),
+                ));
+            }
             if tok.token != Token::Fn {
                 return Err(ParseError::new(
                     format!(
                         "Attribute `{}` can only be used on functions",
                         attrs[0].name
                     ),
-                    Span {
-                        line: attrs[0].span.start_line,
-                        col: attrs[0].span.start_col,
-                        len: attrs[0]
-                            .span
-                            .end_col
-                            .saturating_sub(attrs[0].span.start_col),
-                    },
+                    attr_error_span(&attrs[0]),
                 ));
             }
             let (consumed, stmt) =
-                self.parse_fn_stmt_with_attrs(&tokens[attrs_consumed..], attrs)?;
+                self.parse_fn_group_stmt_with_attrs(&tokens[attrs_consumed..], attrs)?;
             return Ok((attrs_consumed + consumed, stmt));
         }
 
@@ -577,8 +707,12 @@ impl<'tokens> Parser<'tokens> {
         })?;
         match &tok.token {
             Token::Let => self.parse_let_stmt(tokens),
-            Token::Fn => self.parse_fn_stmt(tokens),
-            Token::Test => self.parse_test_stmt(tokens),
+            Token::Fn => self.parse_fn_group_stmt(tokens),
+            _ if is_test_token(&tok.token)
+                && tokens.get(1).map(|tok| &tok.token) == Some(&Token::LBrace) =>
+            {
+                self.parse_test_stmt(tokens)
+            }
             Token::Trait => self.parse_trait_stmt(tokens),
             Token::Impl => self.parse_impl_stmt(tokens),
             Token::Type => self.parse_type_def_stmt(tokens),
@@ -598,7 +732,17 @@ impl<'tokens> Parser<'tokens> {
 
     fn parse_test_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
         let mut ptr = 0;
-        ptr += self.expect(&tokens[ptr..], Token::Test)?;
+        if !tokens.get(ptr).is_some_and(|tok| is_test_token(&tok.token)) {
+            return Err(ParseError::new(
+                "Expected `test`",
+                tokens.get(ptr).map(|t| t.span).unwrap_or(Span {
+                    line: 0,
+                    col: 0,
+                    len: 0,
+                }),
+            ));
+        }
+        ptr += 1;
         ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
         let mut stmts = Vec::new();
         while tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
@@ -614,7 +758,7 @@ impl<'tokens> Parser<'tokens> {
                     ptr += consumed;
                     stmts.push(stmt);
                 }
-                Some(Token::Test) => {
+                Some(token) if is_test_token(token) => {
                     return Err(ParseError::new(
                         "`test` blocks cannot be nested",
                         tokens[ptr].span,
@@ -663,7 +807,14 @@ impl<'tokens> Parser<'tokens> {
             ty = Some(parsed_ty);
         }
 
+        let equal_span = tokens.get(ptr).map(|tok| tok.span);
         ptr += self.expect(&tokens[ptr..], Token::Equal)?;
+        self.reject_missing_rhs_before_next_statement(
+            tokens,
+            ptr,
+            equal_span,
+            "expected expression after `=` in let binding",
+        )?;
         let (consumed_expr, value) = self.parse_expr(&tokens[ptr..], 0)?;
         ptr += consumed_expr;
         ptr += self.expect(&tokens[ptr..], Token::Semicolon)?;
@@ -683,6 +834,55 @@ impl<'tokens> Parser<'tokens> {
         self.parse_fn_stmt_with_attrs(tokens, vec![])
     }
 
+    fn parse_fn_group_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
+        self.parse_fn_group_stmt_with_attrs(tokens, vec![])
+    }
+
+    fn parse_fn_group_stmt_with_attrs(
+        &self,
+        tokens: &[Spanned],
+        attrs: Vec<Attribute>,
+    ) -> Result<(usize, Stmt), ParseError> {
+        let (mut ptr, first) = self.parse_fn_stmt_with_attrs(tokens, attrs)?;
+        let mut fns = vec![first];
+
+        while tokens.get(ptr).is_some_and(|tok| is_and_token(&tok.token))
+            && tokens.get(ptr + 1).map(|tok| &tok.token) == Some(&Token::Fn)
+        {
+            ptr += 1;
+            let (consumed, next) = self.parse_fn_stmt(&tokens[ptr..])?;
+            match next {
+                Stmt::Fn { .. } => {
+                    ptr += consumed;
+                    fns.push(next);
+                }
+                Stmt::Op { span, .. } => {
+                    return Err(ParseError::new(
+                        "`and fn` can only continue ordinary function declarations",
+                        Span {
+                            line: span.start_line,
+                            col: span.start_col,
+                            len: span.end_col.saturating_sub(span.start_col),
+                        },
+                    ));
+                }
+                _ => unreachable!("parse_fn_stmt only returns function-like statements"),
+            }
+        }
+
+        if fns.len() == 1 {
+            return Ok((ptr, fns.remove(0)));
+        }
+
+        Ok((
+            ptr,
+            Stmt::RecBlock {
+                span: consumed_span(tokens, ptr),
+                stmts: fns,
+            },
+        ))
+    }
+
     fn parse_fn_stmt_with_attrs(
         &self,
         tokens: &[Spanned],
@@ -698,11 +898,7 @@ impl<'tokens> Parser<'tokens> {
             if let Some(attr) = attrs.iter().find(|attr| attr.is("test")) {
                 return Err(ParseError::new(
                     "Attribute `test` is not supported on operator functions",
-                    Span {
-                        line: attr.span.start_line,
-                        col: attr.span.start_col,
-                        len: attr.span.end_col.saturating_sub(attr.span.start_col),
-                    },
+                    attr_error_span(attr),
                 ));
             }
             let fixity = match s.as_str() {
@@ -942,32 +1138,56 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_type_def_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
+        self.parse_type_def_stmt_with_attrs(tokens, vec![])
+    }
+
+    fn parse_type_def_stmt_with_attrs(
+        &self,
+        tokens: &[Spanned],
+        attrs: Vec<Attribute>,
+    ) -> Result<(usize, Stmt), ParseError> {
+        let derives = self.parse_derive_attrs(&attrs)?;
         let mut ptr = 0;
         ptr += self.expect(&tokens[ptr..], Token::Type)?;
+
+        if tokens
+            .get(ptr)
+            .is_some_and(|tok| is_alias_token(&tok.token))
+        {
+            if let Some(attr) = attrs.first() {
+                return Err(ParseError::new(
+                    "derive is not supported for type aliases",
+                    attr_error_span(attr),
+                ));
+            }
+            ptr += 1;
+            let (consumed, stmt) = self.parse_type_alias_after_keyword(&tokens[ptr..])?;
+            return Ok((ptr + consumed, stmt));
+        }
+
         let (c_name, name, name_span) = self.expect_ident_with_span(&tokens[ptr..])?;
         ptr += c_name;
 
-        // Optional type params: ('a, 'b, ...)
-        let mut params = Vec::new();
-        if tokens.get(ptr).map(|t| &t.token) == Some(&Token::LParen) {
-            ptr += 1;
-            loop {
-                let (c_p, p) = self.expect_ident(&tokens[ptr..])?;
-                ptr += c_p;
-                params.push(p);
-                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
-                    ptr += 1;
-                } else {
-                    break;
-                }
-            }
-            ptr += self.expect(&tokens[ptr..], Token::RParen)?;
-        }
+        let (consumed_params, params) = self.parse_type_params(&tokens[ptr..])?;
+        ptr += consumed_params;
 
+        let equal_span = tokens.get(ptr).map(|tok| tok.span);
         ptr += self.expect(&tokens[ptr..], Token::Equal)?;
+        self.reject_missing_rhs_before_next_statement(
+            tokens,
+            ptr,
+            equal_span,
+            "expected type or variant after `=` in type declaration",
+        )?;
 
         // Opaque type: `type Foo('a) = *`
         if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Star) {
+            if let Some(attr) = attrs.first() {
+                return Err(ParseError::new(
+                    "derive is only supported for sum type declarations",
+                    attr_error_span(attr),
+                ));
+            }
             ptr += 1;
             return Ok((
                 ptr,
@@ -977,98 +1197,187 @@ impl<'tokens> Parser<'tokens> {
                     name_span,
                     params,
                     variants: vec![],
+                    derives,
                 }),
             ));
         }
 
-        // Peek to see if it's a type alias or a sum type.
-        //
-        // `type Wrap = Wrap(float)` is the nominal-newtype spelling: the right-hand
-        // identifier is treated as a constructor when it matches the declared type.
-        // Other single `Ident(args...)` forms remain aliases, so `type Names = Array(string)`
-        // keeps its existing type-alias meaning.
-        let is_sum_type = if let Some(tok) = tokens.get(ptr) {
-            match tok.token {
-                Token::Hash | Token::LParen | Token::Fn | Token::LBracket | Token::Star => false,
-                Token::Ident(ref id) if id.starts_with('\'') => false,
-                Token::Ident(ref id) => {
-                    // It could be a variant or a type ident alias.
-                    let mut lookahead = ptr;
-                    let mut pipe_found = false;
-                    while lookahead < tokens.len() {
-                        match tokens[lookahead].token {
-                            Token::Pipe => {
-                                pipe_found = true;
-                                break;
-                            }
-                            Token::Semicolon
-                            | Token::RBrace
-                            | Token::Type
-                            | Token::Let
-                            | Token::Fn
-                            | Token::Extern => break,
-                            _ => lookahead += 1,
-                        }
-                    }
-                    pipe_found || id == &name
-                }
-                _ => false,
-            }
-        } else {
-            false
+        let alias_shaped_rhs = match tokens.get(ptr).map(|tok| &tok.token) {
+            Some(Token::Hash | Token::LParen | Token::Fn | Token::LBracket) => true,
+            Some(Token::Ident(id)) if id.starts_with('\'') => true,
+            _ => false,
         };
-
-        if is_sum_type {
-            let mut variants = Vec::new();
-            loop {
-                let variant_start = ptr;
-                let (c_vname, vname, vname_span) = self.expect_ident_with_span(&tokens[ptr..])?;
-                ptr += c_vname;
-                let payload = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::LParen) {
-                    ptr += 1;
-                    let (c_ty, ty) = self.parse_type(&tokens[ptr..])?;
-                    ptr += c_ty;
-                    ptr += self.expect(&tokens[ptr..], Token::RParen)?;
-                    Some(ty)
-                } else {
-                    None
-                };
-                variants.push(Variant {
-                    span: consumed_span(&tokens[variant_start..], ptr - variant_start),
-                    name: vname,
-                    name_span: vname_span,
-                    payload,
-                });
-                if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Pipe) {
-                    ptr += 1;
-                } else {
-                    break;
-                }
-            }
-            Ok((
-                ptr,
-                Stmt::Type(TypeDef {
-                    span: consumed_span(tokens, ptr),
-                    name,
-                    name_span,
-                    params,
-                    variants,
+        if alias_shaped_rhs {
+            return Err(ParseError::new(
+                "type aliases must use `type alias Name = ...`",
+                tokens.get(ptr).map(|t| t.span).unwrap_or(Span {
+                    line: 0,
+                    col: 0,
+                    len: 0,
                 }),
-            ))
-        } else {
-            let (c_ty, ty) = self.parse_type(&tokens[ptr..])?;
-            ptr += c_ty;
-            Ok((
-                ptr,
-                Stmt::TypeAlias {
-                    span: consumed_span(tokens, ptr),
-                    name,
-                    name_span,
-                    params,
-                    ty,
-                },
-            ))
+            ));
         }
+
+        let mut variants = Vec::new();
+        loop {
+            let variant_start = ptr;
+            let (c_vname, vname, vname_span) = self.expect_ident_with_span(&tokens[ptr..])?;
+            ptr += c_vname;
+            let payload = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::LParen) {
+                ptr += 1;
+                let (c_ty, ty) = self.parse_type(&tokens[ptr..])?;
+                ptr += c_ty;
+                ptr += self.expect(&tokens[ptr..], Token::RParen)?;
+                Some(ty)
+            } else {
+                None
+            };
+            variants.push(Variant {
+                span: consumed_span(&tokens[variant_start..], ptr - variant_start),
+                name: vname,
+                name_span: vname_span,
+                payload,
+            });
+            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Pipe) {
+                ptr += 1;
+            } else {
+                break;
+            }
+        }
+        Ok((
+            ptr,
+            Stmt::Type(TypeDef {
+                span: consumed_span(tokens, ptr),
+                name,
+                name_span,
+                params,
+                variants,
+                derives,
+            }),
+        ))
+    }
+
+    fn parse_type_alias_after_keyword(
+        &self,
+        tokens: &[Spanned],
+    ) -> Result<(usize, Stmt), ParseError> {
+        let mut ptr = 0;
+        let (c_name, name, name_span) = self.expect_ident_with_span(&tokens[ptr..])?;
+        ptr += c_name;
+
+        let (consumed_params, params) = self.parse_type_params(&tokens[ptr..])?;
+        ptr += consumed_params;
+
+        let equal_span = tokens.get(ptr).map(|tok| tok.span);
+        ptr += self.expect(&tokens[ptr..], Token::Equal)?;
+        self.reject_missing_rhs_before_next_statement(
+            tokens,
+            ptr,
+            equal_span,
+            "expected type after `=` in type alias",
+        )?;
+        let (c_ty, ty) = self.parse_type(&tokens[ptr..])?;
+        ptr += c_ty;
+        Ok((
+            ptr,
+            Stmt::TypeAlias {
+                span: consumed_span(tokens, ptr),
+                name,
+                name_span,
+                params,
+                ty,
+            },
+        ))
+    }
+
+    fn parse_type_params(&self, tokens: &[Spanned]) -> Result<(usize, Vec<String>), ParseError> {
+        let mut ptr = 0;
+        let mut params = Vec::new();
+        if tokens.get(ptr).map(|t| &t.token) != Some(&Token::LParen) {
+            return Ok((0, params));
+        }
+
+        ptr += 1;
+        loop {
+            let (consumed_param, param) = self.expect_ident(&tokens[ptr..])?;
+            ptr += consumed_param;
+            params.push(param);
+            if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Comma) {
+                ptr += 1;
+            } else {
+                break;
+            }
+        }
+        ptr += self.expect(&tokens[ptr..], Token::RParen)?;
+        Ok((ptr, params))
+    }
+
+    fn reject_missing_rhs_before_next_statement(
+        &self,
+        tokens: &[Spanned],
+        ptr: usize,
+        equal_span: Option<Span>,
+        message: &str,
+    ) -> Result<(), ParseError> {
+        let Some(next) = tokens.get(ptr) else {
+            return Ok(());
+        };
+        if matches!(next.token, Token::Eof)
+            || equal_span.is_some_and(|span| {
+                next.span.line > span.line && starts_statement_or_item(&next.token)
+            })
+        {
+            return Err(ParseError::new(message, next.span));
+        }
+        Ok(())
+    }
+
+    fn parse_derive_attrs(&self, attrs: &[Attribute]) -> Result<Vec<DeriveAttr>, ParseError> {
+        let mut derives = Vec::new();
+        let mut seen = Vec::new();
+        for attr in attrs {
+            if !attr.is("derive") {
+                return Err(ParseError::new(
+                    format!("Unknown attribute `{}`", attr.name),
+                    attr_error_span(attr),
+                ));
+            }
+            if attr.args.is_empty() {
+                return Err(ParseError::new(
+                    "Attribute `derive` requires at least one argument",
+                    attr_error_span(attr),
+                ));
+            }
+            let mut traits = Vec::new();
+            for arg in &attr.args {
+                let derive_trait = match arg.as_str() {
+                    "Eq" => DeriveTrait::Eq,
+                    "ToString" => DeriveTrait::ToString,
+                    _ => {
+                        return Err(ParseError::new(
+                            format!(
+                                "Cannot derive `{}`: supported derives are Eq, ToString",
+                                arg
+                            ),
+                            attr_error_span(attr),
+                        ));
+                    }
+                };
+                if seen.contains(&derive_trait) {
+                    return Err(ParseError::new(
+                        format!("Duplicate derive `{}`", derive_trait.name()),
+                        attr_error_span(attr),
+                    ));
+                }
+                seen.push(derive_trait);
+                traits.push(derive_trait);
+            }
+            derives.push(DeriveAttr {
+                traits,
+                span: attr.span,
+            });
+        }
+        Ok(derives)
     }
 
     fn parse_trait_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
@@ -1291,6 +1600,7 @@ impl<'tokens> Parser<'tokens> {
                 type_bounds,
                 dict_params: vec![],
                 methods,
+                generated_by: None,
             }),
         ))
     }
@@ -1531,7 +1841,7 @@ impl<'tokens> Parser<'tokens> {
         ptr += self.expect(&tokens[ptr..], Token::LBrace)?;
         let mut arms = Vec::new();
         while tokens.get(ptr).map(|t| &t.token) != Some(&Token::RBrace) {
-            let (c_pat, pattern) = self.parse_pattern(&tokens[ptr..])?;
+            let (c_pat, pattern) = self.parse_for_pattern(&tokens[ptr..])?;
             ptr += c_pat;
             ptr += self.expect(&tokens[ptr..], Token::Arrow)?;
             let (c_expr, arm_expr) = self.parse_expr(&tokens[ptr..], 0)?;
@@ -1572,6 +1882,24 @@ impl<'tokens> Parser<'tokens> {
         match &tok.token {
             Token::Ident(name) if name == "_" => Ok((1, Pattern::Wildcard)),
             Token::StringLit(s) => Ok((1, Pattern::StringLit(s.clone()))),
+            Token::Number(n) => self.parse_number_pattern(tokens, 1, n.clone(), tok.span),
+            Token::Minus => {
+                let Some(next) = tokens.get(1) else {
+                    return Err(ParseError::new(
+                        "Expected number after `-` in pattern",
+                        tok.span,
+                    ));
+                };
+                let Token::Number(n) = &next.token else {
+                    return Err(ParseError::new(
+                        "Expected number after `-` in pattern",
+                        tok.span,
+                    ));
+                };
+                self.parse_number_pattern(tokens, 2, negate_number_literal(n), tok.span)
+            }
+            Token::True => Ok((1, Pattern::BoolLit(true))),
+            Token::False => Ok((1, Pattern::BoolLit(false))),
             Token::Ident(name) => {
                 let name = name.clone();
                 ptr += 1;
@@ -1682,6 +2010,41 @@ impl<'tokens> Parser<'tokens> {
                 tok.span,
             )),
         }
+    }
+
+    fn parse_number_pattern(
+        &self,
+        tokens: &[Spanned],
+        mut ptr: usize,
+        number: NumberLiteral,
+        number_span: Span,
+    ) -> Result<(usize, Pattern), ParseError> {
+        if !matches!(
+            tokens.get(ptr).map(|t| &t.token),
+            Some(Token::DotDot | Token::DotDotEq)
+        ) {
+            return Ok((ptr, Pattern::NumberLit(number)));
+        }
+
+        let NumberLiteral::Int(start) = number else {
+            return Err(ParseError::new(
+                "range patterns require integer bounds",
+                number_span,
+            ));
+        };
+        let op_tok = &tokens[ptr];
+        let inclusive = op_tok.token == Token::DotDotEq;
+        ptr += 1;
+        let (consumed_end, end) = parse_signed_int_pattern_bound(&tokens[ptr..], op_tok.span)?;
+        ptr += consumed_end;
+        Ok((
+            ptr,
+            Pattern::IntRange {
+                start,
+                end,
+                inclusive,
+            },
+        ))
     }
 
     fn parse_type(&self, tokens: &[Spanned]) -> Result<(usize, Type), ParseError> {
@@ -2489,7 +2852,12 @@ impl<'tokens> Parser<'tokens> {
         while ptr < tokens.len() && tokens[ptr].token != Token::RBrace {
             let current_tokens = &tokens[ptr..];
             let first_tok = &current_tokens[0].token;
-            if matches!(first_tok, Token::Let | Token::Fn) {
+            let starts_named_fn_stmt = matches!(first_tok, Token::Fn)
+                && matches!(
+                    current_tokens.get(1).map(|tok| &tok.token),
+                    Some(Token::Ident(_))
+                );
+            if matches!(first_tok, Token::Let) || starts_named_fn_stmt {
                 let (consumed, stmt) = self.parse_stmt(current_tokens)?;
                 ptr += consumed;
                 stmts.push(stmt);

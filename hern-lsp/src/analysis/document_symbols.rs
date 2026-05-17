@@ -47,7 +47,8 @@ fn symbols_for_stmt(stmt: &Stmt) -> Vec<DocumentSymbol> {
             None,
         )],
         Stmt::Trait(trait_def) => vec![trait_symbol(trait_def)],
-        Stmt::Impl(impl_def) => vec![impl_symbol(impl_def)],
+        Stmt::Impl(impl_def) if impl_def.generated_by.is_none() => vec![impl_symbol(impl_def)],
+        Stmt::Impl(_) => Vec::new(),
         Stmt::InherentImpl(impl_def) => vec![inherent_impl_symbol(impl_def)],
         Stmt::Type(type_def) => vec![type_symbol(type_def)],
         Stmt::TypeAlias {
@@ -80,6 +81,13 @@ fn symbols_for_stmt(stmt: &Stmt) -> Vec<DocumentSymbol> {
         )],
         Stmt::TestBlock { span, stmts } => vec![symbol(
             "test".to_string(),
+            SymbolKind::NAMESPACE,
+            *span,
+            *span,
+            Some(stmts.iter().flat_map(symbols_for_stmt).collect()),
+        )],
+        Stmt::RecBlock { span, stmts } => vec![symbol(
+            "function group".to_string(),
             SymbolKind::NAMESPACE,
             *span,
             *span,
@@ -243,7 +251,12 @@ fn collect_pattern_bindings(
                 collect_pattern_bindings(element, declaration_span, bindings);
             }
         }
-        Pattern::Wildcard | Pattern::StringLit(_) | Pattern::Constructor { binding: None, .. } => {}
+        Pattern::Wildcard
+        | Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. }
+        | Pattern::Constructor { binding: None, .. } => {}
     }
 }
 
@@ -332,6 +345,24 @@ fn main() { 1 }
             .expect("function symbol should exist");
         assert_eq!(answer.selection_range.start, Position::new(0, 3));
         assert_eq!(answer.selection_range.end, Position::new(0, 9));
+    }
+
+    #[test]
+    fn document_symbols_hide_derived_impls() {
+        let project = TestProject::new("document-symbol-derived-impls");
+        let source = "#[derive(Eq, ToString)]\ntype Box('a) = Box('a)\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let Some(DocumentSymbolResponse::Nested(symbols)) = document_symbols(&state, uri) else {
+            panic!("document symbols should be available");
+        };
+
+        assert!(symbols.iter().any(|symbol| symbol.name == "Box"));
+        assert!(
+            !symbols
+                .iter()
+                .any(|symbol| symbol.name.starts_with("impl "))
+        );
     }
 
     #[test]

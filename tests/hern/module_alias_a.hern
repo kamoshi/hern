@@ -1,4 +1,3 @@
-type LocalAlias = float
+type alias LocalAlias = float
 
 #{ value: 1 }
-

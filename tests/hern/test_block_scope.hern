@@ -1,0 +1,16 @@
+fn value() -> int {
+  1
+}
+
+test {
+  fn value() -> int {
+    2
+  }
+
+  #[test]
+  fn sees_test_helper() {
+    assert_eq(value(), 2)
+  }
+}
+
+print(value());

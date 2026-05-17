@@ -1,0 +1,24 @@
+type Box('a) = Box('a)
+
+impl Eq for Box('a)
+where 'a: Eq
+{
+  fn ==(lhs, rhs) {
+    match lhs {
+      Box(l) -> match rhs {
+        Box(r) -> l == r,
+      },
+    }
+  }
+
+  fn !=(lhs, rhs) {
+    match lhs {
+      Box(l) -> match rhs {
+        Box(r) -> l != r,
+      },
+    }
+  }
+}
+
+print(to_string(Box(1) == Box(1)));
+print(to_string(Box(1) != Box(2)));

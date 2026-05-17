@@ -1,0 +1,11 @@
+test {
+  #[test]
+  fn int_division_by_zero_panics() {
+    let _ = 10 / 0;
+  }
+
+  #[test]
+  fn int_remainder_by_zero_panics() {
+    let _ = 10 % 0;
+  }
+}

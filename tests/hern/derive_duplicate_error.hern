@@ -1,0 +1,2 @@
+#[derive(Eq, Eq)]
+type Box('a) = Box('a)

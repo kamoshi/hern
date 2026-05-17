@@ -1,4 +1,4 @@
-type MathModule = #{
+type alias MathModule = #{
   floor: fn(float) -> float,
   abs: fn(float) -> float,
   max: fn(float, float) -> float

@@ -11,8 +11,9 @@ impl Runner for float {
 }
 
 impl Executor for float {
-    fn run(x) { x + 1 }
+    fn run(x) { x + 1.0 }
 }
 
-// ambiguous: both Runner and Executor have `run`
-print(run(1));
+// ambiguous: both Runner and Executor provide `.run()`
+let x = 1.0;
+print(x.run());

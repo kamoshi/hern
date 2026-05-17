@@ -20,6 +20,7 @@ fn panic(message: string) -> 'a {
   __panic(message)
 }
 
+#[derive(Eq, ToString)]
 type Option('a) = Some('a) | None
 
 impl Option('a) {
@@ -59,6 +60,7 @@ impl Option('a) {
   }
 }
 
+#[derive(Eq, ToString)]
 type Result('a, 'e) = Ok('a) | Err('e)
 
 impl Result('a, 'e) {
@@ -105,39 +107,8 @@ impl Result('a, 'e) {
   }
 }
 
-impl ToString for Option('a)
-where 'a: ToString
-{
-  fn to_string(self) {
-    match self {
-      Some(value) -> "Some(" <> ToString::to_string(value) <> ")",
-      None -> "None",
-    }
-  }
-}
-
-impl ToString for Result('a, 'e)
-where 'a: ToString, 'e: ToString
-{
-  fn to_string(self) {
-    match self {
-      Ok(value) -> "Ok(" <> ToString::to_string(value) <> ")",
-      Err(error) -> "Err(" <> ToString::to_string(error) <> ")",
-    }
-  }
-}
-
+#[derive(Eq, ToString)]
 type Ordering = LT | EQ | GT
-
-impl ToString for Ordering {
-  fn to_string(self) {
-    match self {
-      LT -> "LT",
-      EQ -> "EQ",
-      GT -> "GT",
-    }
-  }
-}
 
 type Map('k, 'v) = *
 
@@ -158,8 +129,8 @@ extern __int_sub: fn(int, int) -> int = #[template] "bit.tobit(($1) - ($2))";
 extern __int_neg: fn(int) -> int = #[template] "bit.tobit(-($1))";
 extern __int_mul: fn(int, int) -> int = #[template] "bit.tobit(($1) * ($2))";
 extern __int_pow: fn(int, int) -> int = #[template] "bit.tobit(($1) ^ ($2))";
-extern __int_div: fn(int, int) -> int = #[template] "bit.tobit(($1) / ($2))";
-extern __int_mod: fn(int, int) -> int = #[template] "bit.tobit(($1) % ($2))";
+extern __int_div: fn(int, int) -> int = #[template] "(function() if ($2) == 0 then _G.error(\"attempt to divide by zero\") end return bit.tobit(($1) / ($2)) end)()";
+extern __int_mod: fn(int, int) -> int = #[template] "(function() if ($2) == 0 then _G.error(\"attempt to calculate the remainder with a divisor of zero\") end return bit.tobit(($1) % ($2)) end)()";
 
 extern __float_lt:  fn(float, float) -> bool = #[template] "((($1) < ($2)) and 1 or 0)";
 extern __float_gt:  fn(float, float) -> bool = #[template] "((($1) > ($2)) and 1 or 0)";
@@ -420,56 +391,24 @@ impl Eq for bool {
   fn !=(lhs, rhs) { __neq_bool(lhs, rhs) }
 }
 
-impl Eq for Ordering {
-  fn ==(lhs, rhs) {
-    match (lhs, rhs) {
-      (LT, LT) -> true,
-      (EQ, EQ) -> true,
-      (GT, GT) -> true,
-      _ -> false,
-    }
-  }
-
-  fn !=(lhs, rhs) {
-    !(lhs == rhs)
-  }
-}
-
-// TODO: replace this concrete bridge with Eq for Option('a) where 'a: Eq
-// once generic impl resolution reliably picks that dictionary.
-impl Eq for Option(int)
-{
-  fn ==(lhs, rhs) {
-    match lhs {
-      Some(l) -> match rhs {
-        Some(r) -> l == r,
-        None -> false,
-      },
-      None -> match rhs {
-        Some(_) -> false,
-        None -> true,
-      },
-    }
-  }
-
-  fn !=(lhs, rhs) {
-    match lhs {
-      Some(l) -> match rhs {
-        Some(r) -> l != r,
-        None -> true,
-      },
-      None -> match rhs {
-        Some(_) -> true,
-        None -> false,
-      },
-    }
-  }
-}
+extern assert: fn(bool, string) -> () = "(function(c, m) if c == 0 then _G.error(m or \"assertion failed!\") end end)";
 
 fn assert_eq(lhs: 'a, rhs: 'a) -> ()
-where 'a: Eq
+where 'a: Eq + ToString
 {
-  assert(lhs == rhs, "assert_eq failed")
+  assert(
+    lhs == rhs,
+    "assert_eq failed: " <> ToString::to_string(lhs) <> " != " <> ToString::to_string(rhs)
+  )
+}
+
+fn assert_ne(lhs: 'a, rhs: 'a) -> ()
+where 'a: Eq + ToString
+{
+  assert(
+    lhs != rhs,
+    "assert_ne failed: both values were " <> ToString::to_string(lhs)
+  )
 }
 
 impl ToString for bool {
@@ -512,7 +451,6 @@ extern print: fn('a) -> () = "(function(x)
   return {}
 end)";
 
-extern assert: fn(bool, string) -> () = "(function(c, m) if c == 0 then _G.error(m or \"assertion failed!\") end end)";
 extern error: fn(string) -> ! = "error";
 extern todo: fn(string) -> ! = "(function(message) _G.error(\"todo: \" .. (message or \"not implemented\")) end)";
 extern tostring: fn('a) -> string = "tostring";
@@ -1293,7 +1231,7 @@ impl Index for string, RangeFull -> string {
 
 // --- Lua interop ---
 
-type Math = #{
+type alias Math = #{
   abs: fn(float) -> float,
   acos: fn(float) -> float,
   asin: fn(float) -> float,
@@ -1326,7 +1264,7 @@ type Math = #{
 
 extern math: Math = "math";
 
-type StringModule = #{
+type alias StringModule = #{
   byte: fn(string, int) -> int,
   char: fn(int) -> string,
   len: fn(string) -> int,
@@ -1339,7 +1277,7 @@ type StringModule = #{
 
 extern string: StringModule = "string";
 
-type TableModule = #{
+type alias TableModule = #{
   concat: fn(['a], string) -> string,
   insert: fn(['a], 'a) -> (),
   maxn: fn(['a]) -> int,
@@ -1349,7 +1287,7 @@ type TableModule = #{
 
 extern table: TableModule = "table";
 
-type OSModule = #{
+type alias OSModule = #{
   clock: fn() -> float,
   date: fn(string) -> string,
   difftime: fn(float, float) -> float,
@@ -1360,7 +1298,7 @@ type OSModule = #{
 
 extern os: OSModule = "os";
 
-type BitModule = #{
+type alias BitModule = #{
   tobit: fn(int) -> int,
   tohex: fn(int) -> string,
   bnot: fn(int) -> int,
@@ -1377,7 +1315,7 @@ type BitModule = #{
 
 extern bit: BitModule = "bit or {}";
 
-type JitModule = #{
+type alias JitModule = #{
   on: fn() -> (),
   off: fn() -> (),
   flush: fn() -> (),

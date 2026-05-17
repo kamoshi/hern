@@ -1,4 +1,5 @@
 use crate::ast::Pattern;
+use crate::lex::NumberLiteral;
 use crate::types::{Ty, TyVar, VariantEnv, error::TypeError};
 use std::collections::HashSet;
 
@@ -19,7 +20,10 @@ pub(super) fn is_irrefutable_param(pat: &Pattern, variant_env: &VariantEnv) -> b
         // A constructor pattern is irrefutable when it is the sole variant of its
         // type — there is no other shape the value could have.
         Pattern::Constructor { name, .. } => is_sole_variant(name, variant_env),
-        Pattern::StringLit(_) => false,
+        Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. } => false,
     }
 }
 
@@ -32,7 +36,10 @@ pub(super) fn is_irrefutable_let(pat: &Pattern, variant_env: &VariantEnv) -> boo
         Pattern::Tuple(elems) => elems.iter().all(|e| is_irrefutable_let(e, variant_env)),
         Pattern::List { elements, rest } => elements.is_empty() && rest.is_some(),
         Pattern::Constructor { name, .. } => is_sole_variant(name, variant_env),
-        Pattern::StringLit(_) => false,
+        Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. } => false,
     }
 }
 
@@ -98,7 +105,11 @@ pub(super) fn insert_pattern_bindings(scope: &mut HashSet<String>, pat: &Pattern
                 insert_pattern_bindings(scope, elem);
             }
         }
-        Pattern::Wildcard | Pattern::StringLit(_) => {}
+        Pattern::Wildcard
+        | Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. } => {}
     }
 }
 
@@ -272,6 +283,9 @@ fn witness_patterns(ty: &Ty, variant_env: &VariantEnv, depth: usize) -> Option<V
             }
             Some(witnesses)
         }
+        Ty::Con(name) if name == "bool" => {
+            Some(vec![Pattern::BoolLit(true), Pattern::BoolLit(false)])
+        }
         Ty::Con(_) | Ty::App(_, _) => {
             let type_name = nominal_type_name(ty)?;
             if type_name == "Array" {
@@ -335,6 +349,24 @@ fn pattern_covers(pattern: &Pattern, witness: &Pattern) -> bool {
     match pattern {
         Pattern::Wildcard | Pattern::Variable(_, _) | Pattern::Record { .. } => true,
         Pattern::StringLit(value) => matches!(witness, Pattern::StringLit(other) if value == other),
+        Pattern::NumberLit(value) => {
+            matches!(witness, Pattern::NumberLit(other) if number_literals_equal(value, other))
+        }
+        Pattern::BoolLit(value) => matches!(witness, Pattern::BoolLit(other) if value == other),
+        Pattern::IntRange {
+            start,
+            end,
+            inclusive,
+        } => {
+            let Pattern::NumberLit(NumberLiteral::Int(value)) = witness else {
+                return false;
+            };
+            if *inclusive {
+                value >= start && value <= end
+            } else {
+                value >= start && value < end
+            }
+        }
         Pattern::Constructor { name, binding } => {
             let Pattern::Constructor {
                 name: witness_name,
@@ -386,6 +418,14 @@ fn pattern_covers(pattern: &Pattern, witness: &Pattern) -> bool {
                 .zip(witness_elements)
                 .all(|(pattern, witness)| pattern_covers(pattern, witness))
         }
+    }
+}
+
+fn number_literals_equal(left: &NumberLiteral, right: &NumberLiteral) -> bool {
+    match (left, right) {
+        (NumberLiteral::Int(left), NumberLiteral::Int(right)) => left == right,
+        (NumberLiteral::Float(left), NumberLiteral::Float(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -475,6 +515,16 @@ fn pattern_for_message(pattern: &Pattern) -> String {
         Pattern::Wildcard => "_".to_string(),
         Pattern::Variable(name, _) => name.clone(),
         Pattern::StringLit(value) => format!("{value:?}"),
+        Pattern::NumberLit(value) => value.as_lua_source(),
+        Pattern::BoolLit(value) => value.to_string(),
+        Pattern::IntRange {
+            start,
+            end,
+            inclusive,
+        } => {
+            let op = if *inclusive { "..=" } else { ".." };
+            format!("{start}{op}{end}")
+        }
         Pattern::Constructor { name, binding } => match binding {
             Some(binding) => format!("{name}({})", pattern_for_message(binding)),
             None => name.clone(),

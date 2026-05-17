@@ -1,0 +1,17 @@
+let from_match = match 1 {
+  and -> and,
+};
+
+let #{ x, ..and } = #{ x: 1, y: 2, z: 3 };
+let from_list = match [4, 5, 6] {
+  [head, ..or] -> or[0],
+  _ -> 0,
+};
+let from_tuple = match (7, 8) {
+  (and, or) -> and + or,
+};
+
+print(from_match);
+print(and.y);
+print(from_list);
+print(from_tuple);

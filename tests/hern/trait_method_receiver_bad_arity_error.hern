@@ -1,0 +1,15 @@
+type Person = Person(string)
+
+trait Greet 'a {
+  fn greet(self: 'a) -> string
+}
+
+impl Greet for Person {
+  fn greet(self) {
+    "hello"
+  }
+}
+
+let p = Person("Ada");
+
+p.greet(1)

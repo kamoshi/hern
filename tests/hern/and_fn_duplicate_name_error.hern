@@ -1,0 +1,8 @@
+fn repeat() {
+  1
+}
+and fn repeat() {
+  2
+}
+
+print(repeat());

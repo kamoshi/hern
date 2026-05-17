@@ -1,0 +1,7 @@
+test {
+  #[test]
+  fn this_should_panic() {
+    let _ = panic("boom");
+    ()
+  }
+}

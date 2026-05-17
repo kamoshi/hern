@@ -2,6 +2,7 @@ mod calls;
 mod decls;
 mod dicts;
 mod impls;
+mod lexical;
 mod metadata;
 mod recovery;
 mod snapshot;
@@ -24,6 +25,7 @@ use super::{
     },
 };
 use crate::ast::*;
+use crate::lex::NumberLiteral;
 use crate::types::{
     BindingCapabilities, CallableCapabilities, EnvInfo, FuncParam, FuncReturn,
     InherentMethodScheme, ParamCapability, ROOT_LEVEL, ReturnCapability, Row, Scheme, Subst,
@@ -44,11 +46,6 @@ use snapshot::InferSnapshot;
 use std::collections::{HashMap, HashSet};
 
 const NO_NODE_ID: NodeId = 0;
-
-struct ResolvedTraitMethod {
-    trait_def: TraitDef,
-    method: TraitMethod,
-}
 
 #[derive(Debug, Clone)]
 struct InherentMethodInfo {
@@ -105,6 +102,19 @@ struct FinalizedConstraints {
     scheme: Scheme,
     owned: Vec<TraitConstraint>,
     bubbled: Vec<TraitConstraint>,
+}
+
+struct RecFnInfo {
+    name: String,
+    fn_ty: Ty,
+    param_tys: Vec<Ty>,
+    ret_ty: Ty,
+    fn_ret: FuncReturn,
+    has_explicit_return: bool,
+    initial_constraints: Vec<TraitConstraint>,
+    constraints: Vec<TraitConstraint>,
+    owned_constraints: Vec<TraitConstraint>,
+    scheme: Option<Scheme>,
 }
 
 #[cfg(debug_assertions)]
@@ -878,6 +888,10 @@ impl Infer {
 
         *dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
+        if add_self_binding && !finalized.owned.is_empty() {
+            attach_owned_dicts_to_recursive_self_calls(body, name, &finalized.owned);
+        }
+
         let resolver = |p: &PendingDictArg| {
             resolve_local_or_concrete(
                 p,
@@ -1119,6 +1133,15 @@ impl Infer {
                 continue;
             }
 
+            if let Stmt::TestBlock { stmts, .. } = stmt {
+                let block_diagnostics = self.infer_test_block_collecting(&env, stmts);
+                let block_ok = block_diagnostics.is_empty();
+                diagnostics.extend(block_diagnostics);
+                succeeded[idx] = block_ok;
+                value_ty = Ty::Unit;
+                continue;
+            }
+
             let snapshot = InferSnapshot::capture(self, &env);
 
             match self.infer_stmt(&mut env, stmt) {
@@ -1188,6 +1211,50 @@ impl Infer {
             },
             diagnostics,
         )
+    }
+
+    fn infer_test_block_collecting(
+        &mut self,
+        env: &TypeEnv,
+        stmts: &mut [Stmt],
+    ) -> Vec<SpannedTypeError> {
+        let mut test_env = env.clone();
+        let mut diagnostics = Vec::new();
+        let mut unavailable = CollectedNames::default();
+
+        for stmt in stmts {
+            let bound = stmt_bound_names(stmt);
+            let refs = stmt_referenced_names(stmt);
+            if unavailable.overlaps(&refs) {
+                unavailable.extend(bound);
+                continue;
+            }
+
+            let snapshot = InferSnapshot::capture(self, &test_env);
+            match self.infer_stmt(&mut test_env, stmt) {
+                Ok(_) => {
+                    if let Err(err) = self.validate_test_stmt_shape(&test_env, stmt) {
+                        let failed_metadata = snapshot.metadata_added_before_failure(self);
+                        snapshot.restore(self, &mut test_env);
+                        self.metadata.extend_failed_statement(failed_metadata);
+                        unavailable.extend(bound);
+                        diagnostics.push(err);
+                    } else {
+                        snapshot.discard(self);
+                        unavailable.remove_all(&bound);
+                    }
+                }
+                Err(err) => {
+                    let failed_metadata = snapshot.metadata_added_before_failure(self);
+                    snapshot.restore(self, &mut test_env);
+                    self.metadata.extend_failed_statement(failed_metadata);
+                    unavailable.extend(bound);
+                    diagnostics.push(err);
+                }
+            }
+        }
+
+        diagnostics
     }
 
     fn reset_program_state(&mut self) {
@@ -1392,12 +1459,220 @@ impl Infer {
                 }
                 Ok(Ty::Unit)
             }
+            Stmt::RecBlock { stmts, .. } => {
+                self.infer_rec_block(env, stmts)?;
+                Ok(Ty::Unit)
+            }
             Stmt::Expr(expr) => self.infer_expr(env, expr),
         })();
-        result.map_err(|err| err.with_span_if_absent(span))
+        result.map_err(|err| match stmt {
+            Stmt::Impl(ImplDef {
+                generated_by: Some(GeneratedBy::Derive { source_span, .. }),
+                ..
+            }) => err.with_span_if_absent_or_synthetic(*source_span),
+            _ => err.with_span_if_absent(span),
+        })
+    }
+
+    fn infer_rec_block(
+        &mut self,
+        env: &mut TypeEnv,
+        stmts: &mut [Stmt],
+    ) -> Result<(), SpannedTypeError> {
+        self.validate_rec_group_function_names(stmts)?;
+        let ambient = self.current_level;
+        let mut rec_infos = self.with_child_level(|this| {
+            let mut rec_env = env.clone();
+            let mut infos = Vec::new();
+
+            for stmt in stmts.iter() {
+                let Stmt::Fn {
+                    name,
+                    params,
+                    ret_type,
+                    type_bounds,
+                    ..
+                } = stmt
+                else {
+                    unreachable!("parser restricts rec blocks to functions")
+                };
+                let info = this.prepare_rec_fn_info(name.clone(), params, ret_type, type_bounds)?;
+                rec_env.insert(
+                    name.clone(),
+                    EnvInfo::immutable(Scheme::mono(info.fn_ty.clone())),
+                );
+                infos.push(info);
+            }
+
+            for (stmt, info) in stmts.iter_mut().zip(infos.iter_mut()) {
+                let Stmt::Fn { params, body, .. } = stmt else {
+                    unreachable!("rec block was validated to contain only functions")
+                };
+                let mut body_env = rec_env.clone();
+                for (param, p_ty) in params.iter().zip(info.param_tys.iter()) {
+                    if !is_irrefutable_param(&param.pat, &this.variant_env) {
+                        return Err(TypeError::RefutableParamPattern.at(body.span));
+                    }
+                    this.check_param_pattern(
+                        &param.pat,
+                        p_ty.clone(),
+                        &mut body_env,
+                        param.mut_place,
+                    )?;
+                }
+                let (_, constraints) = this.with_pending_constraints_scope(
+                    info.initial_constraints.clone(),
+                    |this| {
+                        let body_ty = this.with_fn_return_scope(info.fn_ret.clone(), |this| {
+                            if info.has_explicit_return {
+                                this.infer_expr_expected(&body_env, body, info.ret_ty.clone())
+                            } else {
+                                this.infer_expr(&body_env, body)
+                            }
+                        })?;
+                        unify_expr_result(&mut this.subst, body_ty.clone(), info.ret_ty.clone())
+                            .map_err(|err| err.at(body.span))?;
+                        if !matches!(this.subst.apply(&body_ty), Ty::Never) {
+                            this.check_fresh_return_expr(body, &info.fn_ret)?;
+                        }
+                        Ok(())
+                    },
+                )?;
+                info.constraints = constraints;
+            }
+
+            propagate_rec_block_constraints(stmts, &mut infos);
+
+            Ok(infos)
+        })?;
+
+        for info in &mut rec_infos {
+            let finalized = self.finalize_constraints_at(
+                env,
+                info.fn_ty.clone(),
+                std::mem::take(&mut info.constraints),
+                ambient,
+            );
+            self.pending_constraints.extend(finalized.bubbled.clone());
+            info.owned_constraints = finalized.owned.clone();
+            info.scheme = Some(finalized.scheme);
+        }
+
+        for info in &rec_infos {
+            if info.owned_constraints.is_empty() {
+                continue;
+            }
+            for stmt in stmts.iter_mut() {
+                let Stmt::Fn { body, .. } = stmt else {
+                    unreachable!("rec block was validated to contain only functions")
+                };
+                attach_owned_dicts_to_recursive_self_calls(
+                    body,
+                    &info.name,
+                    &info.owned_constraints,
+                );
+            }
+        }
+
+        for (stmt, info) in stmts.iter_mut().zip(rec_infos.iter()) {
+            let Stmt::Fn {
+                name,
+                name_span,
+                body,
+                dict_params,
+                ..
+            } = stmt
+            else {
+                unreachable!("rec block was validated to contain only functions")
+            };
+            *dict_params = info.owned_constraints.iter().map(dict_param_name).collect();
+            let resolver = |p: &PendingDictArg| {
+                resolve_local_or_concrete(
+                    p,
+                    &info.owned_constraints,
+                    env,
+                    &self.known_impl_dicts,
+                    &self.known_impl_schemes,
+                    &self.subst,
+                )
+            };
+            resolve_dict_uses_expr(body, &resolver, false)?;
+            let scheme = info
+                .scheme
+                .clone()
+                .expect("rec function should have a finalized scheme");
+            env.insert(name.clone(), EnvInfo::immutable(scheme.clone()));
+            self.metadata.record_definition_scheme(*name_span, scheme);
+        }
+
+        Ok(())
+    }
+
+    fn validate_rec_group_function_names(&self, stmts: &[Stmt]) -> Result<(), SpannedTypeError> {
+        let mut seen: HashMap<&str, SourceSpan> = HashMap::new();
+        for stmt in stmts {
+            let Stmt::Fn {
+                name, name_span, ..
+            } = stmt
+            else {
+                unreachable!("parser restricts recursive groups to functions")
+            };
+            if seen.insert(name.as_str(), *name_span).is_some() {
+                return Err(TypeError::DuplicateFunctionInGroup(name.clone()).at(*name_span));
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_rec_fn_info(
+        &mut self,
+        name: String,
+        params: &[Param],
+        ret_type: &Option<TypeReturn>,
+        type_bounds: &[TypeBound],
+    ) -> Result<RecFnInfo, SpannedTypeError> {
+        let mut param_vars = HashMap::new();
+        let initial_constraints =
+            self.collect_type_bound_constraints(&mut param_vars, type_bounds)?;
+        let mut param_tys = Vec::new();
+        for param in params {
+            let p_ty = match &param.ty {
+                Some(t) => self.ast_to_ty_with_vars(t, &mut param_vars)?,
+                None => self.fresh_ty(),
+            };
+            param_tys.push(p_ty);
+        }
+        let ret_ty = match ret_type {
+            Some(t) => self.ast_to_ty_with_vars(&t.ty, &mut param_vars)?,
+            None => self.fresh_ty(),
+        };
+        let fn_ret = func_return_from_annotation(ret_type, ret_ty.clone());
+        let fn_ty = Ty::Func(
+            func_params_from_params(params, param_tys.clone()),
+            fn_ret.clone(),
+        );
+        Ok(RecFnInfo {
+            name,
+            fn_ty,
+            param_tys,
+            ret_ty,
+            fn_ret,
+            has_explicit_return: ret_type.is_some(),
+            initial_constraints,
+            constraints: Vec::new(),
+            owned_constraints: Vec::new(),
+            scheme: None,
+        })
     }
 
     fn validate_test_stmt_shape(&self, env: &TypeEnv, stmt: &Stmt) -> Result<(), SpannedTypeError> {
+        if let Stmt::RecBlock { stmts, .. } = stmt {
+            for stmt in stmts {
+                self.validate_test_stmt_shape(env, stmt)?;
+            }
+            return Ok(());
+        }
+
         let Stmt::Fn {
             name,
             name_span,
@@ -1436,19 +1711,29 @@ impl Infer {
             let Stmt::TestBlock { stmts, .. } = stmt else {
                 continue;
             };
-            for stmt in stmts {
-                let Stmt::Fn {
+            self.validate_duplicate_test_function_names_in_stmts(stmts, &mut seen)?;
+        }
+        Ok(())
+    }
+
+    fn validate_duplicate_test_function_names_in_stmts<'a>(
+        &self,
+        stmts: &'a [Stmt],
+        seen: &mut HashMap<&'a str, SourceSpan>,
+    ) -> Result<(), SpannedTypeError> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Fn {
                     name, name_span, ..
-                } = stmt
-                else {
-                    continue;
-                };
-                if !stmt.is_test_fn() {
-                    continue;
+                } if stmt.is_test_fn() => {
+                    if seen.insert(name.as_str(), *name_span).is_some() {
+                        return Err(TypeError::DuplicateTestFunction(name.clone()).at(*name_span));
+                    }
                 }
-                if seen.insert(name.as_str(), *name_span).is_some() {
-                    return Err(TypeError::DuplicateTestFunction(name.clone()).at(*name_span));
+                Stmt::RecBlock { stmts, .. } => {
+                    self.validate_duplicate_test_function_names_in_stmts(stmts, seen)?;
                 }
+                _ => {}
             }
         }
         Ok(())
@@ -2707,22 +2992,6 @@ impl Infer {
             );
         }
 
-        if let ExprKind::Ident(method_name) = &callee.kind
-            && env.get(method_name.as_str()).is_none()
-            && let Some(resolved) = self.bare_trait_method(method_name)?
-        {
-            return self.resolve_trait_method_call(
-                env,
-                args,
-                arg_wrappers,
-                resolved_callee,
-                pending_trait_method,
-                resolved.trait_def,
-                resolved.method,
-                "bare trait method call",
-            );
-        }
-
         if let ExprKind::Ident(callee_name) = &callee.kind
             && let Some(info) = env.get(callee_name.as_str())
         {
@@ -3123,6 +3392,15 @@ impl Infer {
             Pattern::StringLit(_) => {
                 unify(&mut self.subst, scrutinee_ty, Ty::Con("string".to_string()))
             }
+            Pattern::NumberLit(NumberLiteral::Int(_)) | Pattern::IntRange { .. } => {
+                unify(&mut self.subst, scrutinee_ty, Ty::Int)
+            }
+            Pattern::NumberLit(NumberLiteral::Float(_)) => {
+                unify(&mut self.subst, scrutinee_ty, Ty::Float)
+            }
+            Pattern::BoolLit(_) => {
+                unify(&mut self.subst, scrutinee_ty, Ty::Con("bool".to_string()))
+            }
             Pattern::Variable(name, span) => {
                 self.metadata
                     .record_binding_type(*span, scrutinee_ty.clone());
@@ -3134,7 +3412,9 @@ impl Infer {
                     .variant_env
                     .0
                     .get(name)
-                    .ok_or_else(|| TypeError::UnboundVariable(name.clone()))?
+                    .ok_or_else(|| {
+                        pattern_unknown_constructor_error(name, &self.subst.apply(&scrutinee_ty))
+                    })?
                     .clone();
 
                 let mut param_map: HashMap<String, TyVar> = HashMap::new();
@@ -3593,6 +3873,26 @@ fn is_unknown_trait_method_error(err: &SpannedTypeError) -> bool {
     matches!(err.error.as_ref(), TypeError::UnknownTraitMethod { .. })
 }
 
+fn pattern_unknown_constructor_error(name: &str, scrutinee_ty: &Ty) -> TypeError {
+    if let Some(type_name) = nominal_type_name(scrutinee_ty) {
+        TypeError::UnknownVariant {
+            type_name,
+            variant: name.to_string(),
+        }
+    } else {
+        TypeError::UnboundVariable(name.to_string())
+    }
+}
+
+fn nominal_type_name(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Con(name) => Some(name.clone()),
+        Ty::App(con, _) => nominal_type_name(con),
+        Ty::Qualified(_, inner) => nominal_type_name(inner),
+        _ => None,
+    }
+}
+
 pub(super) fn primary_param_or_panic(trait_def: &TraitDef) -> &str {
     trait_def
         .primary_param()
@@ -3816,6 +4116,326 @@ fn stmt_always_exits(stmt: &Stmt, include_bc: bool) -> bool {
     }
 }
 
+fn attach_owned_dicts_to_recursive_self_calls(
+    expr: &mut Expr,
+    self_name: &str,
+    owned_constraints: &[TraitConstraint],
+) {
+    let self_dict_args = owned_constraints
+        .iter()
+        .map(|constraint| DictRef::Param(dict_param_name(constraint)))
+        .collect::<Vec<_>>();
+    attach_owned_dicts_to_recursive_self_calls_inner(expr, self_name, &self_dict_args);
+}
+
+fn attach_owned_dicts_to_recursive_self_calls_inner(
+    expr: &mut Expr,
+    self_name: &str,
+    self_dict_args: &[DictRef],
+) {
+    match &mut expr.kind {
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
+        | ExprKind::Neg { operand: inner, .. }
+        | ExprKind::Loop(inner)
+        | ExprKind::Break(Some(inner))
+        | ExprKind::Return(Some(inner))
+        | ExprKind::FieldAccess { expr: inner, .. } => {
+            attach_owned_dicts_to_recursive_self_calls_inner(inner, self_name, self_dict_args);
+        }
+        ExprKind::Assign { target, value } => {
+            attach_owned_dicts_to_recursive_self_calls_inner(target, self_name, self_dict_args);
+            attach_owned_dicts_to_recursive_self_calls_inner(value, self_name, self_dict_args);
+        }
+        ExprKind::Binary {
+            lhs,
+            op,
+            rhs,
+            dict_args,
+            pending_dict_args,
+            ..
+        } => {
+            if matches!(op, BinOp::Pipe)
+                && expr_is_ident(rhs, self_name)
+                && dict_args.is_empty()
+                && pending_dict_args.is_empty()
+            {
+                dict_args.extend_from_slice(self_dict_args);
+            }
+            attach_owned_dicts_to_recursive_self_calls_inner(lhs, self_name, self_dict_args);
+            attach_owned_dicts_to_recursive_self_calls_inner(rhs, self_name, self_dict_args);
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                attach_owned_dicts_to_recursive_self_calls_inner(start, self_name, self_dict_args);
+            }
+            if let Some(end) = end {
+                attach_owned_dicts_to_recursive_self_calls_inner(end, self_name, self_dict_args);
+            }
+        }
+        ExprKind::Call {
+            callee,
+            args,
+            is_method_call,
+            dict_args,
+            pending_dict_args,
+            ..
+        } => {
+            if !*is_method_call
+                && expr_is_ident(callee, self_name)
+                && dict_args.is_empty()
+                && pending_dict_args.is_empty()
+            {
+                dict_args.extend_from_slice(self_dict_args);
+            }
+            attach_owned_dicts_to_recursive_self_calls_inner(callee, self_name, self_dict_args);
+            for arg in args {
+                attach_owned_dicts_to_recursive_self_calls_inner(arg, self_name, self_dict_args);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            attach_owned_dicts_to_recursive_self_calls_inner(cond, self_name, self_dict_args);
+            attach_owned_dicts_to_recursive_self_calls_inner(
+                then_branch,
+                self_name,
+                self_dict_args,
+            );
+            attach_owned_dicts_to_recursive_self_calls_inner(
+                else_branch,
+                self_name,
+                self_dict_args,
+            );
+        }
+        ExprKind::Lambda { params, body, .. } => {
+            if !params
+                .iter()
+                .any(|param| pattern_binds_name(&param.pat, self_name))
+            {
+                attach_owned_dicts_to_recursive_self_calls_inner(body, self_name, self_dict_args);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            attach_owned_dicts_to_recursive_self_calls_inner(scrutinee, self_name, self_dict_args);
+            for (pat, body) in arms {
+                if !pattern_binds_name(pat, self_name) {
+                    attach_owned_dicts_to_recursive_self_calls_inner(
+                        body,
+                        self_name,
+                        self_dict_args,
+                    );
+                }
+            }
+        }
+        ExprKind::Tuple(items) => {
+            for item in items {
+                attach_owned_dicts_to_recursive_self_calls_inner(item, self_name, self_dict_args);
+            }
+        }
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                attach_owned_dicts_to_recursive_self_calls_inner(
+                    entry.expr_mut(),
+                    self_name,
+                    self_dict_args,
+                );
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                attach_owned_dicts_to_recursive_self_calls_inner(
+                    entry.expr_mut(),
+                    self_name,
+                    self_dict_args,
+                );
+            }
+        }
+        ExprKind::Index { receiver, key, .. } => {
+            attach_owned_dicts_to_recursive_self_calls_inner(receiver, self_name, self_dict_args);
+            attach_owned_dicts_to_recursive_self_calls_inner(key, self_name, self_dict_args);
+        }
+        ExprKind::For {
+            pat,
+            iterable,
+            body,
+            ..
+        } => {
+            attach_owned_dicts_to_recursive_self_calls_inner(iterable, self_name, self_dict_args);
+            if !pattern_binds_name(pat, self_name) {
+                attach_owned_dicts_to_recursive_self_calls_inner(body, self_name, self_dict_args);
+            }
+        }
+        ExprKind::Block { stmts, final_expr } => {
+            let mut shadowed = false;
+            for stmt in stmts {
+                if !shadowed {
+                    attach_owned_dicts_to_recursive_self_calls_in_stmt(
+                        stmt,
+                        self_name,
+                        self_dict_args,
+                    );
+                }
+                shadowed |= stmt_binds_name(stmt, self_name);
+            }
+            if !shadowed && let Some(final_expr) = final_expr {
+                attach_owned_dicts_to_recursive_self_calls_inner(
+                    final_expr,
+                    self_name,
+                    self_dict_args,
+                );
+            }
+        }
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Unit
+        | ExprKind::Import(_)
+        | ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None)
+        | ExprKind::AssociatedAccess { .. } => {}
+    }
+}
+
+fn attach_owned_dicts_to_recursive_self_calls_in_stmt(
+    stmt: &mut Stmt,
+    self_name: &str,
+    self_dict_args: &[DictRef],
+) {
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Expr(value) => {
+            attach_owned_dicts_to_recursive_self_calls_inner(value, self_name, self_dict_args);
+        }
+        Stmt::TestBlock { stmts, .. } => {
+            for stmt in stmts {
+                attach_owned_dicts_to_recursive_self_calls_in_stmt(stmt, self_name, self_dict_args);
+            }
+        }
+        Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                attach_owned_dicts_to_recursive_self_calls_in_stmt(stmt, self_name, self_dict_args);
+            }
+        }
+        Stmt::Fn { .. }
+        | Stmt::Op { .. }
+        | Stmt::Trait(_)
+        | Stmt::Impl(_)
+        | Stmt::InherentImpl(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. } => {}
+    }
+}
+
+fn propagate_rec_block_constraints(stmts: &[Stmt], infos: &mut [RecFnInfo]) {
+    let call_targets = collect_rec_block_call_targets(stmts, infos);
+    let mut constraints = infos
+        .iter()
+        .map(|info| info.constraints.clone())
+        .collect::<Vec<_>>();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for caller_idx in 0..constraints.len() {
+            for &callee_idx in &call_targets[caller_idx] {
+                let callee_constraints = constraints[callee_idx].clone();
+                for constraint in callee_constraints {
+                    if !constraints[caller_idx].contains(&constraint) {
+                        constraints[caller_idx].push(constraint);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    for (info, constraints) in infos.iter_mut().zip(constraints) {
+        info.constraints = constraints;
+    }
+}
+
+fn collect_rec_block_call_targets(stmts: &[Stmt], infos: &[RecFnInfo]) -> Vec<Vec<usize>> {
+    let indexes = infos
+        .iter()
+        .enumerate()
+        .map(|(idx, info)| (info.name.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+
+    let mut targets_by_fn = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        let Stmt::Fn { body, .. } = stmt else {
+            unreachable!("rec block was validated to contain only functions")
+        };
+        let targets = lexical::collect_unshadowed_direct_call_targets(body, &indexes);
+        let mut targets = targets.into_iter().collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets_by_fn.push(targets);
+    }
+    targets_by_fn
+}
+
+fn stmt_binds_name(stmt: &Stmt, name: &str) -> bool {
+    match stmt {
+        Stmt::Let { pat, .. } => pattern_binds_name(pat, name),
+        Stmt::Fn { name: bound, .. } | Stmt::Op { name: bound, .. } => bound == name,
+        Stmt::Extern { name: bound, .. } => bound == name,
+        Stmt::TestBlock { .. }
+        | Stmt::RecBlock { .. }
+        | Stmt::Trait(_)
+        | Stmt::Impl(_)
+        | Stmt::InherentImpl(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Expr(_) => false,
+    }
+}
+
+fn pattern_binds_name(pat: &Pattern, name: &str) -> bool {
+    match pat {
+        Pattern::Variable(bound, _) => bound == name,
+        Pattern::Tuple(items) => items.iter().any(|item| pattern_binds_name(item, name)),
+        Pattern::List { elements, rest } => {
+            elements
+                .iter()
+                .any(|element| pattern_binds_name(element, name))
+                || rest
+                    .as_ref()
+                    .and_then(|rest| rest.as_ref())
+                    .is_some_and(|(bound, _)| bound == name)
+        }
+        Pattern::Constructor {
+            binding: Some(binding),
+            ..
+        } => pattern_binds_name(binding, name),
+        Pattern::Record { fields, rest } => {
+            fields.iter().any(|(_, bound, _)| bound == name)
+                || rest
+                    .as_ref()
+                    .and_then(|rest| rest.as_ref())
+                    .is_some_and(|(bound, _)| bound == name)
+        }
+        Pattern::Wildcard
+        | Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. }
+        | Pattern::Constructor { binding: None, .. } => false,
+    }
+}
+
+fn expr_is_ident(expr: &Expr, name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(ident) => ident == name,
+        ExprKind::Grouped(inner) => expr_is_ident(inner, name),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3825,7 +4445,7 @@ mod tests {
     fn failed_type_declaration_prunes_variant_state() {
         let mut program = parse_source("type Broken('a) = Good('a) | Bad(Missing)\n")
             .expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         let mut infer = Infer::new();
         let (inference, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
@@ -3847,7 +4467,7 @@ mod tests {
              let other: bool = 1;\n",
         )
         .expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         let mut infer = Infer::new();
         let (inference, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
@@ -3869,13 +4489,44 @@ mod tests {
     }
 
     #[test]
+    fn collecting_inference_reports_independent_test_block_errors() {
+        let mut program = parse_source(
+            "test {
+               #[test]
+               fn has_arg(x: int) { () }
+
+               #[test]
+               fn returns_int() { 1 }
+             }\n",
+        )
+        .expect("source should parse");
+        reassociate_standalone(&mut program).expect("source should reassociate");
+
+        let mut infer = Infer::new();
+        let (_, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(matches!(
+            diagnostics[0].error.as_ref(),
+            TypeError::ArityMismatch {
+                expected: 0,
+                got: 1
+            }
+        ));
+        assert!(matches!(
+            diagnostics[1].error.as_ref(),
+            TypeError::Mismatch(Ty::Unit, Ty::Int)
+        ));
+    }
+
+    #[test]
     fn collecting_inference_normalizes_failed_symbol_types_before_rollback() {
         let mut program = parse_source(
             "fn takes(x) { x }\n\
              if takes(1) { 0 } else { 1 }\n",
         )
         .expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         let callee_id = match &program.stmts[1] {
             Stmt::Expr(expr) => match &expr.kind {
@@ -3921,7 +4572,7 @@ mod tests {
              let value = wrapped.unwrap();\n",
         )
         .expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         assert!(matches!(
             &program.stmts[0],
@@ -3937,12 +4588,12 @@ mod tests {
     #[test]
     fn recursive_type_alias_reports_error_instead_of_recursing() {
         let mut program = parse_source(
-            "type A = B\n\
-             type B = A\n\
+            "type alias A = B\n\
+             type alias B = A\n\
              extern value: A = \"value\";\n",
         )
         .expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         let mut infer = Infer::new();
         let err = infer
@@ -4192,7 +4843,7 @@ mod tests {
              }\n",
         )
         .expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         let mut infer = Infer::new();
         let (_inference, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
@@ -4217,7 +4868,7 @@ mod tests {
              }\n",
         )
         .expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         let mut infer = Infer::new();
         let (_inference, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
@@ -4241,7 +4892,7 @@ mod tests {
                fn show(x: 'a) -> string
              }
 
-             show(1)\n",
+             Show::show(1)\n",
         );
 
         assert!(matches!(
@@ -4262,7 +4913,7 @@ mod tests {
                fn show(x: 'a) -> string
              }
 
-             show(Boxed(1.0))\n",
+             Show::show(Boxed(1.0))\n",
         );
 
         assert!(matches!(
@@ -4287,7 +4938,7 @@ mod tests {
                fn show(x) { 1 }
              }
 
-             show(Boxed(1.0))\n",
+             Show::show(Boxed(1.0))\n",
         )
         .expect("source should parse");
 
@@ -4345,18 +4996,19 @@ mod tests {
                fn show(x) { \"ok\" }
              }
 
-             show(1.0)\n",
+             let x = 1.0;
+             x.show()\n",
         )
         .expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         let mut infer = Infer::new();
         infer
             .infer_program(&mut program)
             .expect("available concrete impl should infer");
 
-        let Stmt::Expr(expr) = &program.stmts[2] else {
-            panic!("third statement should be the call expression");
+        let Stmt::Expr(expr) = &program.stmts[3] else {
+            panic!("fourth statement should be the call expression");
         };
         let ExprKind::Call {
             dict_args,
@@ -4413,19 +5065,65 @@ mod tests {
              Show::show(1.0)\n",
         )
         .expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         Infer::new()
             .infer_program(&mut program)
             .expect("qualified trait method should infer");
     }
 
+    #[test]
+    fn failed_impl_does_not_make_trait_unavailable_for_recovery() {
+        let mut program = parse_source(
+            "trait Show 'a {
+               fn show(x: 'a) -> string
+             }
+
+             impl Show for int {
+               fn show(x) { 1 }
+             }
+
+             Show::show(1)\n",
+        )
+        .expect("source should parse");
+        reassociate_standalone(&mut program).expect("source should reassociate");
+
+        let (_, diagnostics) = Infer::new().infer_program_collecting(&mut program, &[], None);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(matches!(
+            diagnostics[0].error.as_ref(),
+            TypeError::Mismatch(Ty::Con(expected), Ty::Int) if expected == "string"
+        ));
+        assert!(matches!(
+            diagnostics[1].error.as_ref(),
+            TypeError::MissingTraitImpl {
+                trait_name,
+                impl_target,
+            } if trait_name == "Show" && impl_target == "int"
+        ));
+    }
+
     fn infer_source_error(source: &str) -> SpannedTypeError {
         let mut program = parse_source(source).expect("source should parse");
-        reassociate_standalone(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
 
         Infer::new()
             .infer_program(&mut program)
             .expect_err("source should fail inference")
+    }
+
+    #[test]
+    fn unknown_constructor_pattern_reports_variant_context() {
+        let err = infer_source_error(
+            "type Color = Red | Blue\nfn name(c: Color) -> string { match c { Purple -> \"purple\", _ -> \"other\" } }\n",
+        );
+
+        assert!(matches!(
+            err.error.as_ref(),
+            TypeError::UnknownVariant { type_name, variant }
+                if type_name == "Color" && variant == "Purple"
+        ));
+        assert_eq!(err.to_string(), "type `Color` has no variant `Purple`");
     }
 }

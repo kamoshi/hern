@@ -118,6 +118,11 @@ fn collect_stmt_hints(
                 collect_stmt_hints(stmt, range, binding_types, definition_schemes, hints);
             }
         }
+        Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                collect_stmt_hints(stmt, range, binding_types, definition_schemes, hints);
+            }
+        }
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
     }
 }
@@ -251,7 +256,12 @@ fn collect_pattern_type_hints_with_type(
             }
             collect_rest_pattern_type_hint(rest, range, binding_types, hints);
         }
-        Pattern::Variable(_, _) | Pattern::Wildcard | Pattern::StringLit(_) => {}
+        Pattern::Variable(_, _)
+        | Pattern::Wildcard
+        | Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. } => {}
     }
 }
 

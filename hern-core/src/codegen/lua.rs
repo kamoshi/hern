@@ -24,6 +24,12 @@ enum Tail<'a> {
     Assign(&'a str),
 }
 
+#[derive(Copy, Clone)]
+enum FunctionDeclStyle {
+    LocalFunction,
+    Assignment,
+}
+
 // ── Codegen state ─────────────────────────────────────────────────────────────
 
 pub struct LuaCodegen {
@@ -33,16 +39,34 @@ pub struct LuaCodegen {
     current_loop_tmp: String,
     current_break_label: String,
     tmp_counter: usize,
+    test_block_counter: usize,
+    test_block_tables: Vec<String>,
     inline_methods: HashMap<String, InlineMethod>,
     extern_templates: HashMap<String, String>,
     import_mode: ImportMode,
     test_emit_mode: TestEmitMode,
+    current_function: Option<FunctionContext>,
+    current_impl_dict: Option<ImplDictContext>,
 }
 
 #[derive(Clone)]
 struct InlineMethod {
     params: Vec<String>,
     body: Expr,
+}
+
+#[derive(Clone)]
+struct FunctionContext {
+    source_name: String,
+    lua_name: String,
+    dict_params: Vec<String>,
+    source_param_count: usize,
+}
+
+#[derive(Clone)]
+struct ImplDictContext {
+    name: String,
+    dict_params: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -72,10 +96,14 @@ impl LuaCodegen {
             current_loop_tmp: String::new(),
             current_break_label: String::new(),
             tmp_counter: 0,
+            test_block_counter: 0,
+            test_block_tables: Vec::new(),
             inline_methods: HashMap::new(),
             extern_templates: HashMap::new(),
             import_mode: ImportMode::Require,
             test_emit_mode: TestEmitMode::Omit,
+            current_function: None,
+            current_impl_dict: None,
         }
     }
 
@@ -197,15 +225,23 @@ impl LuaCodegen {
     }
 
     fn gen_program_stmts(&mut self, stmts: &[Stmt]) -> String {
+        self.begin_test_collection();
         let mut out = String::from("-- Hern generated Lua\n");
         for stmt in stmts {
+            if self.test_emit_mode == TestEmitMode::Include && matches!(stmt, Stmt::Expr(_)) {
+                continue;
+            }
             out.push_str(&self.gen_stmt(stmt));
             out.push('\n');
+        }
+        if self.test_emit_mode == TestEmitMode::Include {
+            out.push_str(&self.gen_collected_test_table("__hern_tests"));
         }
         out
     }
 
     fn gen_module_stmts(&mut self, stmts: &[Stmt], dict_names: Vec<String>) -> String {
+        self.begin_test_collection();
         let mut out = String::from("-- Hern generated Lua module\n");
         let (body_stmts, final_expr) = split_module_body(stmts);
         for stmt in body_stmts {
@@ -218,6 +254,9 @@ impl LuaCodegen {
             .map(|expr| self.gen_expr(expr, &mut pre))
             .unwrap_or_else(|| "{}".to_string());
         out.push_str(&pre);
+        if self.test_emit_mode == TestEmitMode::Include {
+            out.push_str(&self.gen_collected_test_table("__hern_tests"));
+        }
         out.push_str("return {\n");
         self.indent += 2;
         out.push_str(&format!("{}__hern_value = {},\n", self.ind(), value));
@@ -229,18 +268,7 @@ impl LuaCodegen {
         self.indent -= 2;
         out.push_str(&format!("{}}},\n", self.ind()));
         if self.test_emit_mode == TestEmitMode::Include {
-            out.push_str(&format!("{}__hern_tests = {{\n", self.ind()));
-            self.indent += 2;
-            for name in test_function_names_from_stmts(stmts) {
-                out.push_str(&format!(
-                    "{}{{ name = {}, fn = {} }},\n",
-                    self.ind(),
-                    lua_string(&name),
-                    name
-                ));
-            }
-            self.indent -= 2;
-            out.push_str(&format!("{}}},\n", self.ind()));
+            out.push_str(&format!("{}__hern_tests = __hern_tests,\n", self.ind()));
         }
         self.indent -= 2;
         out.push_str("}\n");
@@ -317,19 +345,20 @@ impl LuaCodegen {
                 let val = self.gen_expr(value, &mut pre);
                 match pat {
                     Pattern::Variable(name, _) => {
+                        let lua_name = mangle_op(name);
                         // Simple binding — same as before.
                         if pre.is_empty() {
-                            format!("{}local {} = {}", self.ind(), name, val)
+                            format!("{}local {} = {}", self.ind(), lua_name, val)
                         } else if expr_always_exits(value, true) {
-                            format!("{}local {}\n{}", self.ind(), name, pre)
+                            format!("{}local {}\n{}", self.ind(), lua_name, pre)
                         } else {
                             format!(
                                 "{}local {}\n{}{}{} = {}",
                                 self.ind(),
-                                name,
+                                lua_name,
                                 pre,
                                 self.ind(),
-                                name,
+                                lua_name,
                                 val
                             )
                         }
@@ -393,7 +422,7 @@ impl LuaCodegen {
             Stmt::Extern { name, kind, .. } => match kind {
                 ExternKind::Value(lib_path) if name == lib_path => String::new(),
                 ExternKind::Value(lib_path) => {
-                    format!("{}local {} = {}", self.ind(), name, lib_path)
+                    format!("{}local {} = {}", self.ind(), mangle_op(name), lib_path)
                 }
                 ExternKind::Template(_) => String::new(),
             },
@@ -408,16 +437,59 @@ impl LuaCodegen {
                 if self.test_emit_mode == TestEmitMode::Omit {
                     String::new()
                 } else {
-                    let mut out = String::new();
-                    for stmt in stmts {
-                        out.push_str(&self.gen_stmt(stmt));
-                        out.push('\n');
-                    }
-                    out
+                    self.gen_test_block(stmts)
                 }
             }
+            Stmt::RecBlock { stmts, .. } => self.gen_rec_block(stmts),
             Stmt::Trait(_) | Stmt::TypeAlias { .. } => String::new(),
         }
+    }
+
+    fn begin_test_collection(&mut self) {
+        self.test_block_counter = 0;
+        self.test_block_tables.clear();
+    }
+
+    fn gen_test_block(&mut self, stmts: &[Stmt]) -> String {
+        self.test_block_counter += 1;
+        let table_name = format!("__hern_test_block_{}", self.test_block_counter);
+        self.test_block_tables.push(table_name.clone());
+
+        let ind = self.ind();
+        let mut out = format!("{}local {} = (function()\n", ind, table_name);
+        self.indent += 2;
+        for stmt in stmts {
+            out.push_str(&self.gen_stmt(stmt));
+            out.push('\n');
+        }
+        out.push_str(&format!("{}return {{\n", self.ind()));
+        self.indent += 2;
+        for name in direct_test_function_names(stmts) {
+            out.push_str(&format!(
+                "{}{{ name = {}, fn = {} }},\n",
+                self.ind(),
+                lua_string(&name),
+                mangle_op(&name)
+            ));
+        }
+        self.indent -= 2;
+        out.push_str(&format!("{}}}\n", self.ind()));
+        self.indent -= 2;
+        out.push_str(&format!("{}end)()", ind));
+        out
+    }
+
+    fn gen_collected_test_table(&self, name: &str) -> String {
+        let mut out = format!("{}local {} = {{}}\n", self.ind(), name);
+        for table_name in &self.test_block_tables {
+            out.push_str(&format!(
+                "{}for _, __hern_test in ipairs({}) do table.insert({}, __hern_test) end\n",
+                self.ind(),
+                table_name,
+                name
+            ));
+        }
+        out
     }
 
     fn gen_function(
@@ -427,13 +499,60 @@ impl LuaCodegen {
         dict_params: &[String],
         body: &Expr,
     ) -> String {
+        self.gen_function_decl(
+            name,
+            params,
+            dict_params,
+            body,
+            FunctionDeclStyle::LocalFunction,
+        )
+    }
+
+    fn gen_rec_block(&mut self, stmts: &[Stmt]) -> String {
+        let mut out = String::new();
+        for stmt in stmts {
+            let Stmt::Fn { name, .. } = stmt else {
+                unreachable!("parser restricts rec blocks to functions")
+            };
+            out.push_str(&format!("{}local {}\n", self.ind(), mangle_op(name)));
+        }
+        for stmt in stmts {
+            let Stmt::Fn {
+                name,
+                params,
+                dict_params,
+                body,
+                ..
+            } = stmt
+            else {
+                unreachable!("parser restricts rec blocks to functions")
+            };
+            out.push_str(&self.gen_function_decl(
+                name,
+                params,
+                dict_params,
+                body,
+                FunctionDeclStyle::Assignment,
+            ));
+        }
+        out
+    }
+
+    fn gen_function_decl(
+        &mut self,
+        name: &str,
+        params: &[Param],
+        dict_params: &[String],
+        body: &Expr,
+        style: FunctionDeclStyle,
+    ) -> String {
         let lua_name = mangle_op(name);
         let ind = self.ind();
         let mut all_params: Vec<String> = dict_params.to_vec();
         let mut pattern_destructures = String::new();
         for (i, param) in params.iter().enumerate() {
             match &param.pat {
-                Pattern::Variable(n, _) => all_params.push(n.clone()),
+                Pattern::Variable(n, _) => all_params.push(mangle_op(n)),
                 Pattern::Wildcard => all_params.push("_".to_string()),
                 _ => {
                     let placeholder = format!("__p{}", i);
@@ -446,10 +565,24 @@ impl LuaCodegen {
             }
         }
         let params_s = all_params.join(", ");
-        let mut out = format!("{}local function {}({})\n", ind, lua_name, params_s);
+        let mut out = match style {
+            FunctionDeclStyle::LocalFunction => {
+                format!("{}local function {}({})\n", ind, lua_name, params_s)
+            }
+            FunctionDeclStyle::Assignment => {
+                format!("{}{} = function({})\n", ind, lua_name, params_s)
+            }
+        };
         self.indent += 2;
+        let previous_function = self.current_function.replace(FunctionContext {
+            source_name: name.to_string(),
+            lua_name: lua_name.clone(),
+            dict_params: dict_params.to_vec(),
+            source_param_count: params.len(),
+        });
         out.push_str(&pattern_destructures);
         out.push_str(&self.gen_expr_as_body(body));
+        self.current_function = previous_function;
         self.indent -= 2;
         out.push_str(&format!("{}end\n", ind));
         out
@@ -559,7 +692,9 @@ impl LuaCodegen {
     ) -> Option<String> {
         match &expr.kind {
             ExprKind::Grouped(expr) => self.gen_expr_with_subst(expr, subst, pre),
-            ExprKind::Ident(name) => Some(subst.get(name).cloned().unwrap_or_else(|| name.clone())),
+            ExprKind::Ident(name) => {
+                Some(subst.get(name).cloned().unwrap_or_else(|| mangle_op(name)))
+            }
             ExprKind::Number(n) => Some(n.as_lua_source()),
             ExprKind::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
             ExprKind::Unit => Some("{}".to_string()),
@@ -588,13 +723,13 @@ impl LuaCodegen {
                 let r = self.gen_expr_with_subst(rhs, subst, pre)?;
                 match op {
                     BinOp::Pipe => {
-                        let mut all_args = gen_dict_refs(dict_args);
+                        let mut all_args = self.gen_dict_refs(dict_args);
                         all_args.push(l);
                         Some(format!("{}({})", r, all_args.join(", ")))
                     }
                     BinOp::Custom(op) => match resolved_op {
                         Some(resolved) => {
-                            let resolved = gen_resolved_callee(resolved);
+                            let resolved = self.gen_resolved_callee(resolved);
                             if dict_args.is_empty()
                                 && let Some(inlined) =
                                     self.gen_inline_call(&resolved, &[l.clone(), r.clone()], pre)
@@ -604,7 +739,7 @@ impl LuaCodegen {
                             if dict_args.is_empty() {
                                 Some(format!("{}({}, {})", resolved, l, r))
                             } else {
-                                let dict_args = gen_dict_refs(dict_args);
+                                let dict_args = self.gen_dict_refs(dict_args);
                                 Some(format!(
                                     "{}({}, {}, {})",
                                     resolved,
@@ -644,9 +779,9 @@ impl LuaCodegen {
             } => {
                 let callee_s = resolved_callee
                     .as_ref()
-                    .map(gen_resolved_callee)
+                    .map(|callee| self.gen_resolved_callee(callee))
                     .or_else(|| self.gen_expr_with_subst(callee, subst, pre))?;
-                let mut all_args: Vec<String> = gen_dict_refs(dict_args);
+                let mut all_args: Vec<String> = self.gen_dict_refs(dict_args);
                 if let Some(receiver) = method_receiver(callee, *is_method_call) {
                     all_args.push(self.gen_expr_with_subst(receiver, subst, pre)?);
                 }
@@ -655,7 +790,7 @@ impl LuaCodegen {
                     .enumerate()
                     .map(|(idx, arg)| {
                         let arg_s = self.gen_expr_with_subst(arg, subst, pre)?;
-                        Some(wrap_call_argument(
+                        Some(self.wrap_call_argument(
                             arg_s,
                             arg_wrappers.get(idx).and_then(Option::as_ref),
                         ))
@@ -719,8 +854,10 @@ impl LuaCodegen {
                 dict_args,
                 ..
             } => {
-                let callee = resolved_callee.as_ref().map(gen_resolved_callee)?;
-                let mut all_args = gen_dict_refs(dict_args);
+                let callee = resolved_callee
+                    .as_ref()
+                    .map(|callee| self.gen_resolved_callee(callee))?;
+                let mut all_args = self.gen_dict_refs(dict_args);
                 all_args.push(self.gen_expr_with_subst(receiver, subst, pre)?);
                 all_args.push(self.gen_expr_with_subst(key, subst, pre)?);
                 Some(format!("{}({})", callee, all_args.join(", ")))
@@ -730,7 +867,7 @@ impl LuaCodegen {
                 member,
                 resolution,
                 ..
-            } => Some(gen_associated_access(target, member, resolution.as_ref())),
+            } => Some(self.gen_associated_access(target, member, resolution.as_ref())),
             ExprKind::Block { stmts, final_expr } if stmts.is_empty() => final_expr
                 .as_ref()
                 .map(|expr| self.gen_expr_with_subst(expr, subst, pre))
@@ -758,7 +895,9 @@ impl LuaCodegen {
             ExprKind::Number(n) => n.as_lua_source(),
             ExprKind::Bool(b) => if *b { "1" } else { "0" }.to_string(),
             ExprKind::Unit => "{}".to_string(),
-            ExprKind::Ident(name) => name.clone(),
+            ExprKind::Ident(name) => self
+                .gen_current_function_value(name)
+                .unwrap_or_else(|| mangle_op(name)),
             ExprKind::Import(path) => match self.import_mode {
                 ImportMode::Require => format!("require({}).__hern_value", lua_string(path)),
                 ImportMode::Bundle => format!("{}.__hern_value", bundle_module_var(path)),
@@ -839,7 +978,7 @@ impl LuaCodegen {
                 member,
                 resolution,
                 ..
-            } => gen_associated_access(target, member, resolution.as_ref()),
+            } => self.gen_associated_access(target, member, resolution.as_ref()),
 
             // Loops use a temp variable (not an IIFE) so `return` inside the body
             // reaches the enclosing Lua function. `break`/`continue` use `goto` so
@@ -886,16 +1025,21 @@ impl LuaCodegen {
         pre: &mut String,
     ) -> String {
         let l = self.gen_expr(lhs, pre);
-        let r = self.gen_expr(rhs, pre);
+        let r = if matches!(op, BinOp::Pipe) {
+            self.gen_current_function_callee(rhs, dict_args)
+                .unwrap_or_else(|| self.gen_expr(rhs, pre))
+        } else {
+            self.gen_expr(rhs, pre)
+        };
         match op {
             BinOp::Pipe => {
-                let mut all_args = gen_dict_refs(dict_args);
+                let mut all_args = self.gen_dict_refs(dict_args);
                 all_args.push(l);
                 format!("{}({})", r, all_args.join(", "))
             }
             BinOp::Custom(op) => match resolved_op {
                 Some(resolved) => {
-                    let resolved = gen_resolved_callee(resolved);
+                    let resolved = self.gen_resolved_callee(resolved);
                     if dict_args.is_empty()
                         && let Some(inlined) =
                             self.gen_inline_call(&resolved, &[l.clone(), r.clone()], pre)
@@ -905,7 +1049,7 @@ impl LuaCodegen {
                     if dict_args.is_empty() {
                         format!("{}({}, {})", resolved, l, r)
                     } else {
-                        let dict_args = gen_dict_refs(dict_args);
+                        let dict_args = self.gen_dict_refs(dict_args);
                         format!("{}({}, {}, {})", resolved, dict_args.join(", "), l, r)
                     }
                 }
@@ -923,7 +1067,7 @@ impl LuaCodegen {
     ) -> String {
         match resolved_op {
             Some(resolved) => {
-                let resolved = gen_resolved_callee(resolved);
+                let resolved = self.gen_resolved_callee(resolved);
                 if let Some(inlined) = self.gen_inline_call(&resolved, &[value.to_string()], pre) {
                     return inlined;
                 }
@@ -946,9 +1090,9 @@ impl LuaCodegen {
         // semantically ambiguous.
         let callee = resolved_callee
             .as_ref()
-            .map(gen_resolved_callee)
+            .map(|callee| self.gen_resolved_callee(callee))
             .expect("index expression reached codegen without resolved Index dictionary");
-        let mut all_args = gen_dict_refs(dict_args);
+        let mut all_args = self.gen_dict_refs(dict_args);
         all_args.push(self.gen_expr(receiver, pre));
         all_args.push(self.gen_expr(key, pre));
         format!("{}({})", callee, all_args.join(", "))
@@ -1015,15 +1159,16 @@ impl LuaCodegen {
     ) -> String {
         let callee_s = resolved_callee
             .as_ref()
-            .map(gen_resolved_callee)
+            .map(|callee| self.gen_resolved_callee(callee))
+            .or_else(|| self.gen_current_function_callee(callee, dict_args))
             .unwrap_or_else(|| self.gen_expr(callee, pre));
-        let mut all_args: Vec<String> = gen_dict_refs(dict_args);
+        let mut all_args: Vec<String> = self.gen_dict_refs(dict_args);
         if let Some(receiver) = method_receiver(callee, is_method_call) {
             all_args.push(self.gen_expr(receiver, pre));
         }
         all_args.extend(args.iter().enumerate().map(|(idx, arg)| {
             let arg_s = self.gen_expr(arg, pre);
-            wrap_call_argument(arg_s, arg_wrappers.get(idx).and_then(Option::as_ref))
+            self.wrap_call_argument(arg_s, arg_wrappers.get(idx).and_then(Option::as_ref))
         }));
         if dict_args.is_empty()
             && let Some(inlined) = self.gen_inline_call(&callee_s, &all_args, pre)
@@ -1036,6 +1181,145 @@ impl LuaCodegen {
             return expanded;
         }
         format!("{}({})", callee_s, all_args.join(", "))
+    }
+
+    fn wrap_call_argument(&self, arg: String, wrapper: Option<&ArgWrapper>) -> String {
+        let Some(wrapper) = wrapper else {
+            return arg;
+        };
+        if wrapper.dict_args.is_empty() {
+            return arg;
+        }
+        let dict_args = self.gen_dict_refs(&wrapper.dict_args);
+        format!(
+            "(function(...) return {}({}, ...) end)",
+            arg,
+            dict_args.join(", ")
+        )
+    }
+
+    fn gen_current_function_callee(&self, callee: &Expr, dict_args: &[DictRef]) -> Option<String> {
+        if dict_args.is_empty() {
+            return None;
+        }
+        let context = self.current_function.as_ref()?;
+        if expr_is_ident(callee, &context.source_name) {
+            Some(context.lua_name.clone())
+        } else {
+            None
+        }
+    }
+
+    fn gen_current_function_value(&self, name: &str) -> Option<String> {
+        let context = self.current_function.as_ref()?;
+        if context.dict_params.is_empty() || name != context.source_name {
+            return None;
+        }
+
+        let source_args = (0..context.source_param_count)
+            .map(|idx| format!("__hern_self_arg_{}", idx + 1))
+            .collect::<Vec<_>>();
+        let mut call_args = context.dict_params.clone();
+        call_args.extend(source_args.iter().cloned());
+        Some(format!(
+            "(function({}) return {}({}) end)",
+            source_args.join(", "),
+            context.lua_name,
+            call_args.join(", ")
+        ))
+    }
+
+    fn gen_resolved_callee(&self, callee: &ResolvedCallee) -> String {
+        match callee {
+            ResolvedCallee::Function(name) => mangle_op(name),
+            ResolvedCallee::InherentMethod { dict, method } => {
+                format!("{}.{}", dict, mangle_op(method))
+            }
+            ResolvedCallee::DictMethod { dict, method } => {
+                format!("{}.{}", self.gen_dict_ref(dict), mangle_op(method))
+            }
+        }
+    }
+
+    fn gen_associated_access(
+        &self,
+        target: &Type,
+        member: &str,
+        resolution: Option<&AssociatedAccessResolution>,
+    ) -> String {
+        match resolution {
+            Some(AssociatedAccessResolution::Inherent(callee)) => self.gen_resolved_callee(callee),
+            Some(AssociatedAccessResolution::TraitMethod {
+                method,
+                dict: Some(dict),
+            }) => format!("{}.{}", self.gen_dict_ref(dict), mangle_op(method)),
+            Some(AssociatedAccessResolution::TraitMethod { method, dict: None }) => {
+                let method = mangle_op(method);
+                format!("(function(__dict, ...) return __dict.{}(...) end)", method)
+            }
+            None => associated_access_lua(target, member),
+        }
+    }
+
+    fn gen_dict_refs(&self, dicts: &[DictRef]) -> Vec<String> {
+        dicts.iter().map(|dict| self.gen_dict_ref(dict)).collect()
+    }
+
+    fn gen_dict_ref(&self, dict: &DictRef) -> String {
+        match dict {
+            DictRef::Param(name) => name.clone(),
+            DictRef::Concrete(name) => {
+                if let Some(context) = &self.current_impl_dict
+                    && context.name == *name
+                    && !context.dict_params.is_empty()
+                {
+                    return format!("{}({})", name, context.dict_params.join(", "));
+                }
+                name.clone()
+            }
+            DictRef::Applied { dict, args } => {
+                format!("{}({})", dict, self.gen_dict_refs(args).join(", "))
+            }
+            DictRef::Structural(structural) => self.gen_structural_dict_ref(structural),
+        }
+    }
+
+    fn gen_structural_dict_ref(&self, dict: &StructuralDictRef) -> String {
+        match (&dict.trait_name[..], &dict.target) {
+            ("Eq", DictTarget::Tuple(len)) => {
+                format!("({})", self.gen_tuple_eq_dict(*len, &dict.args))
+            }
+            _ => "nil".to_string(),
+        }
+    }
+
+    fn gen_tuple_eq_dict(&self, len: usize, args: &[DictRef]) -> String {
+        let eq = self.gen_tuple_eq_expr(len, args, "a", "b");
+        format!(
+            "{{ __op_eqeq = function(a, b) return {} end, __op_bneq = function(a, b) return (({}) == 0 and 1 or 0) end }}",
+            eq, eq
+        )
+    }
+
+    fn gen_tuple_eq_expr(&self, len: usize, args: &[DictRef], lhs: &str, rhs: &str) -> String {
+        if len == 0 {
+            return "1".to_string();
+        }
+        let parts = args
+            .iter()
+            .enumerate()
+            .map(|(idx, dict)| {
+                format!(
+                    "({}.__op_eqeq({}[{}], {}[{}]) ~= 0)",
+                    self.gen_dict_ref(dict),
+                    lhs,
+                    idx + 1,
+                    rhs,
+                    idx + 1
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("(({}) and 1 or 0)", parts.join(" and "))
     }
 
     fn gen_array_expr(&mut self, entries: &[ArrayEntry], pre: &mut String) -> String {
@@ -1155,7 +1439,7 @@ impl LuaCodegen {
 
         let iter_fn = resolved_iter
             .as_ref()
-            .map(gen_resolved_callee)
+            .map(|callee| self.gen_resolved_callee(callee))
             .unwrap_or_else(|| "nil".to_string());
         let mut iter_pre = String::new();
         let iter_s = self.gen_expr(iterable, &mut iter_pre);
@@ -1481,8 +1765,14 @@ impl LuaCodegen {
 
     fn gen_for_pattern_bindings(&mut self, pat: &Pattern, var: &str) -> String {
         match pat {
-            Pattern::Wildcard | Pattern::StringLit(_) => String::new(),
-            Pattern::Variable(name, _) => format!("{}local {} = {}\n", self.ind(), name, var),
+            Pattern::Wildcard
+            | Pattern::StringLit(_)
+            | Pattern::NumberLit(_)
+            | Pattern::BoolLit(_)
+            | Pattern::IntRange { .. } => String::new(),
+            Pattern::Variable(name, _) => {
+                format!("{}local {} = {}\n", self.ind(), mangle_op(name), var)
+            }
             Pattern::Constructor { binding, .. } => match binding {
                 Some(binding) => self.gen_for_pattern_bindings(binding, &format!("{}._0", var)),
                 None => String::new(),
@@ -1493,14 +1783,15 @@ impl LuaCodegen {
                     out.push_str(&format!(
                         "{}local {} = {}.{}\n",
                         self.ind(),
-                        binding,
+                        mangle_op(binding),
                         var,
                         field
                     ));
                 }
                 if let Some(Some((rest_name, _))) = rest {
+                    let rest_lua = mangle_op(rest_name);
                     let ind = self.ind();
-                    out.push_str(&format!("{}local {} = {{}}\n", ind, rest_name));
+                    out.push_str(&format!("{}local {} = {{}}\n", ind, rest_lua));
                     out.push_str(&format!("{}for _k, _v in pairs({}) do\n", ind, var));
                     self.indent += 2;
                     let guards = fields
@@ -1508,11 +1799,11 @@ impl LuaCodegen {
                         .map(|(f, _, _)| format!("_k ~= \"{}\"", f))
                         .collect::<Vec<_>>();
                     if guards.is_empty() {
-                        out.push_str(&format!("{}{}[_k] = _v\n", self.ind(), rest_name));
+                        out.push_str(&format!("{}{}[_k] = _v\n", self.ind(), rest_lua));
                     } else {
                         out.push_str(&format!("{}if {} then\n", self.ind(), guards.join(" and ")));
                         self.indent += 2;
-                        out.push_str(&format!("{}{}[_k] = _v\n", self.ind(), rest_name));
+                        out.push_str(&format!("{}{}[_k] = _v\n", self.ind(), rest_lua));
                         self.indent -= 2;
                         out.push_str(&format!("{}end\n", self.ind()));
                     }
@@ -1522,75 +1813,51 @@ impl LuaCodegen {
                 out
             }
             Pattern::List { elements, rest } => {
-                let mut out = String::new();
-                for (i, elem) in elements.iter().enumerate() {
-                    match elem {
-                        Pattern::Variable(name, _) if name != "_" => {
-                            out.push_str(&format!(
-                                "{}local {} = {}[{}]\n",
-                                self.ind(),
-                                name,
-                                var,
-                                i + 1
-                            ));
-                        }
-                        Pattern::Wildcard => {}
-                        _ => {
-                            let tmp = self.fresh_tmp();
-                            out.push_str(&format!(
-                                "{}local {} = {}[{}]\n",
-                                self.ind(),
-                                tmp,
-                                var,
-                                i + 1
-                            ));
-                            out.push_str(&self.gen_for_pattern_bindings(elem, &tmp));
-                        }
-                    }
-                }
+                let mut out = self.gen_indexed_pattern_bindings(elements, var);
                 if let Some(Some((rest_name, _))) = rest {
                     let start = elements.len() + 1;
                     out.push_str(&format!(
                         "{}local {} = {{_unpack({}, {})}}\n",
                         self.ind(),
-                        rest_name,
+                        mangle_op(rest_name),
                         var,
                         start
                     ));
                 }
                 out
             }
-            Pattern::Tuple(elems) => {
-                let mut out = String::new();
-                for (i, elem) in elems.iter().enumerate() {
-                    match elem {
-                        Pattern::Variable(name, _) if name != "_" => {
-                            out.push_str(&format!(
-                                "{}local {} = {}[{}]\n",
-                                self.ind(),
-                                name,
-                                var,
-                                i + 1
-                            ));
-                        }
-                        Pattern::Wildcard => {}
-                        _ => {
-                            // Nested destructuring: emit a fresh temp and recurse.
-                            let tmp = self.fresh_tmp();
-                            out.push_str(&format!(
-                                "{}local {} = {}[{}]\n",
-                                self.ind(),
-                                tmp,
-                                var,
-                                i + 1
-                            ));
-                            out.push_str(&self.gen_for_pattern_bindings(elem, &tmp));
-                        }
-                    }
+            Pattern::Tuple(elems) => self.gen_indexed_pattern_bindings(elems, var),
+        }
+    }
+
+    fn gen_indexed_pattern_bindings(&mut self, elements: &[Pattern], var: &str) -> String {
+        let mut out = String::new();
+        for (i, elem) in elements.iter().enumerate() {
+            match elem {
+                Pattern::Variable(name, _) if name != "_" => {
+                    out.push_str(&format!(
+                        "{}local {} = {}[{}]\n",
+                        self.ind(),
+                        mangle_op(name),
+                        var,
+                        i + 1
+                    ));
                 }
-                out
+                Pattern::Wildcard => {}
+                _ => {
+                    let tmp = self.fresh_tmp();
+                    out.push_str(&format!(
+                        "{}local {} = {}[{}]\n",
+                        self.ind(),
+                        tmp,
+                        var,
+                        i + 1
+                    ));
+                    out.push_str(&self.gen_for_pattern_bindings(elem, &tmp));
+                }
             }
         }
+        out
     }
 
     // ── Pattern matching ──────────────────────────────────────────────────────
@@ -1612,7 +1879,7 @@ impl LuaCodegen {
                     first = false;
                     out.push_str(&format!("{}{} {} then\n", self.ind(), kw, cond));
                     self.indent += 2;
-                    out.push_str(&self.gen_pattern_bindings(pat, scrutinee_var));
+                    out.push_str(&self.gen_for_pattern_bindings(pat, scrutinee_var));
                     out.push_str(&self.gen_tail(body, tail));
                     self.indent -= 2;
                 }
@@ -1621,7 +1888,7 @@ impl LuaCodegen {
                         out.push_str(&format!("{}else\n", self.ind()));
                         self.indent += 2;
                     }
-                    out.push_str(&self.gen_pattern_bindings(pat, scrutinee_var));
+                    out.push_str(&self.gen_for_pattern_bindings(pat, scrutinee_var));
                     out.push_str(&self.gen_tail(body, tail));
                     if !first {
                         self.indent -= 2;
@@ -1645,6 +1912,19 @@ impl LuaCodegen {
         match pat {
             Pattern::Wildcard | Pattern::Variable(_, _) | Pattern::Record { .. } => None,
             Pattern::StringLit(s) => Some(format!("{} == {}", var, lua_string(s))),
+            Pattern::NumberLit(n) => Some(format!("{} == {}", var, n.as_lua_source())),
+            Pattern::BoolLit(value) => Some(format!("{} == {}", var, if *value { 1 } else { 0 })),
+            Pattern::IntRange {
+                start,
+                end,
+                inclusive,
+            } => {
+                let upper_op = if *inclusive { "<=" } else { "<" };
+                Some(format!(
+                    "({} >= {} and {} {} {})",
+                    var, start, var, upper_op, end
+                ))
+            }
             Pattern::Constructor { name, binding } => {
                 let tag_cond = format!("{}._tag == \"{}\"", var, name);
                 match binding
@@ -1693,94 +1973,6 @@ impl LuaCodegen {
         }
     }
 
-    fn gen_pattern_bindings(&mut self, pat: &Pattern, var: &str) -> String {
-        match pat {
-            Pattern::Wildcard | Pattern::StringLit(_) => String::new(),
-            Pattern::Variable(name, _) => format!("{}local {} = {}\n", self.ind(), name, var),
-            Pattern::Constructor { binding, .. } => match binding {
-                Some(binding) => self.gen_for_pattern_bindings(binding, &format!("{}._0", var)),
-                None => String::new(),
-            },
-            Pattern::Record { fields, rest } => {
-                let mut out = String::new();
-                for (field, binding, _) in fields {
-                    out.push_str(&format!(
-                        "{}local {} = {}.{}\n",
-                        self.ind(),
-                        binding,
-                        var,
-                        field
-                    ));
-                }
-                if let Some(Some((rest_name, _))) = rest {
-                    let ind = self.ind();
-                    out.push_str(&format!("{}local {} = {{}}\n", ind, rest_name));
-                    out.push_str(&format!("{}for _k, _v in pairs({}) do\n", ind, var));
-                    self.indent += 2;
-                    let guards = fields
-                        .iter()
-                        .map(|(f, _, _)| format!("_k ~= \"{}\"", f))
-                        .collect::<Vec<_>>();
-                    if guards.is_empty() {
-                        out.push_str(&format!("{}{}[_k] = _v\n", self.ind(), rest_name));
-                    } else {
-                        out.push_str(&format!("{}if {} then\n", self.ind(), guards.join(" and ")));
-                        self.indent += 2;
-                        out.push_str(&format!("{}{}[_k] = _v\n", self.ind(), rest_name));
-                        self.indent -= 2;
-                        out.push_str(&format!("{}end\n", self.ind()));
-                    }
-                    self.indent -= 2;
-                    out.push_str(&format!("{}end\n", self.ind()));
-                }
-                out
-            }
-            Pattern::List { elements, rest } => {
-                let mut out = String::new();
-                for (i, elem) in elements.iter().enumerate() {
-                    match elem {
-                        Pattern::Variable(name, _) if name != "_" => {
-                            out.push_str(&format!(
-                                "{}local {} = {}[{}]\n",
-                                self.ind(),
-                                name,
-                                var,
-                                i + 1
-                            ));
-                        }
-                        Pattern::Wildcard => {}
-                        _ => {
-                            let tmp = self.fresh_tmp();
-                            out.push_str(&format!(
-                                "{}local {} = {}[{}]\n",
-                                self.ind(),
-                                tmp,
-                                var,
-                                i + 1
-                            ));
-                            out.push_str(&self.gen_for_pattern_bindings(elem, &tmp));
-                        }
-                    }
-                }
-                if let Some(Some((rest_name, _))) = rest {
-                    let start = elements.len() + 1;
-                    out.push_str(&format!(
-                        "{}local {} = {{_unpack({}, {})}}\n",
-                        self.ind(),
-                        rest_name,
-                        var,
-                        start
-                    ));
-                }
-                out
-            }
-            Pattern::Tuple(_) => {
-                // Tuples are Lua integer-indexed arrays; bind by position.
-                self.gen_for_pattern_bindings(pat, var)
-            }
-        }
-    }
-
     // ── Type definitions / trait impls ────────────────────────────────────────
 
     fn gen_type_def(&self, td: &TypeDef) -> String {
@@ -1791,10 +1983,17 @@ impl LuaCodegen {
                 if v.payload.is_some() {
                     format!(
                         "{}local function {}(_0) return {{ _tag = \"{}\", _0 = _0 }} end\n",
-                        ind, v.name, v.name
+                        ind,
+                        mangle_op(&v.name),
+                        v.name
                     )
                 } else {
-                    format!("{}local {} = {{ _tag = \"{}\" }}\n", ind, v.name, v.name)
+                    format!(
+                        "{}local {} = {{ _tag = \"{}\" }}\n",
+                        ind,
+                        mangle_op(&v.name),
+                        v.name
+                    )
                 }
             })
             .collect()
@@ -1805,7 +2004,7 @@ impl LuaCodegen {
         let ind = self.ind();
         let dict_params = id.dict_params.join(", ");
         let mut out = if id.dict_params.is_empty() {
-            format!("{}local {} = {{\n", ind, dict_name)
+            format!("{}local {}\n{}{} = {{\n", ind, dict_name, ind, dict_name)
         } else {
             format!(
                 "{}local function {}({})\n{}return {{\n",
@@ -1839,7 +2038,12 @@ impl LuaCodegen {
             ));
             self.indent += 2;
             out.push_str(&pattern_destructures);
+            let previous_impl_dict = self.current_impl_dict.replace(ImplDictContext {
+                name: dict_name.clone(),
+                dict_params: id.dict_params.clone(),
+            });
             out.push_str(&self.gen_expr_as_body(&method.body));
+            self.current_impl_dict = previous_impl_dict;
             self.indent -= 2;
             out.push_str(&format!("{}end,\n", self.ind()));
         }
@@ -2047,6 +2251,14 @@ fn method_receiver(callee: &Expr, is_method_call: bool) -> Option<&Expr> {
     Some(expr)
 }
 
+fn expr_is_ident(expr: &Expr, name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(ident) => ident == name,
+        ExprKind::Grouped(inner) => expr_is_ident(inner, name),
+        _ => false,
+    }
+}
+
 fn gen_range_literal(start: Option<String>, end: Option<String>, inclusive: bool) -> String {
     match (start, end, inclusive) {
         (Some(start), Some(end), false) => {
@@ -2089,6 +2301,15 @@ fn inherent_impl_dict_name_lua(target: &Type) -> String {
 }
 
 pub(crate) fn mangle_op(name: &str) -> String {
+    const LUA_KEYWORDS: &[&str] = &[
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if",
+        "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+    ];
+
+    if LUA_KEYWORDS.contains(&name) {
+        return format!("__hern_kw_{}", name);
+    }
+
     if name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return name.to_string();
     }
@@ -2171,7 +2392,12 @@ fn impl_dict_names_from_stmts(stmts: &[Stmt]) -> Vec<String> {
 fn collect_pattern_names(pat: &Pattern, names: &mut Vec<String>) {
     match pat {
         Pattern::Variable(name, _) => names.push(name.clone()),
-        Pattern::Wildcard | Pattern::StringLit(_) | Pattern::Constructor { binding: None, .. } => {}
+        Pattern::Wildcard
+        | Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. }
+        | Pattern::Constructor { binding: None, .. } => {}
         Pattern::Constructor {
             binding: Some(binding),
             ..
@@ -2215,6 +2441,13 @@ fn prelude_value_names(stmts: &[Stmt]) -> Vec<String> {
             }
             Stmt::Let { pat, .. } => collect_pattern_names(pat, &mut names),
             Stmt::TestBlock { .. } => {}
+            Stmt::RecBlock { stmts, .. } => {
+                for stmt in stmts {
+                    if let Stmt::Fn { name, .. } = stmt {
+                        names.push(mangle_op(name));
+                    }
+                }
+            }
             Stmt::Extern {
                 kind: ExternKind::Template(_),
                 ..
@@ -2239,127 +2472,22 @@ fn test_function_names_from_stmts(stmts: &[Stmt]) -> Vec<String> {
     let mut names = Vec::new();
     for stmt in stmts {
         if let Stmt::TestBlock { stmts, .. } = stmt {
-            for stmt in stmts {
-                if let Stmt::Fn { name, .. } = stmt
-                    && stmt.is_test_fn()
-                {
-                    names.push(name.clone());
-                }
-            }
+            names.extend(direct_test_function_names(stmts));
         }
     }
     names
 }
 
-fn wrap_call_argument(arg: String, wrapper: Option<&ArgWrapper>) -> String {
-    let Some(wrapper) = wrapper else {
-        return arg;
-    };
-    if wrapper.dict_args.is_empty() {
-        return arg;
-    }
-    let dict_args = gen_dict_refs(&wrapper.dict_args);
-    format!(
-        "(function(...) return {}({}, ...) end)",
-        arg,
-        dict_args.join(", ")
-    )
-}
-
-fn gen_resolved_callee(callee: &ResolvedCallee) -> String {
-    match callee {
-        ResolvedCallee::Function(name) => mangle_op(name),
-        ResolvedCallee::InherentMethod { dict, method } => {
-            format!("{}.{}", dict, mangle_op(method))
-        }
-        ResolvedCallee::DictMethod { dict, method } => {
-            format!("{}.{}", gen_dict_ref(dict), mangle_op(method))
+fn direct_test_function_names(stmts: &[Stmt]) -> Vec<String> {
+    let mut names = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            Stmt::Fn { name, .. } if stmt.is_test_fn() => names.push(name.clone()),
+            Stmt::RecBlock { stmts, .. } => names.extend(direct_test_function_names(stmts)),
+            _ => {}
         }
     }
-}
-
-fn gen_associated_access(
-    target: &Type,
-    member: &str,
-    resolution: Option<&AssociatedAccessResolution>,
-) -> String {
-    match resolution {
-        Some(AssociatedAccessResolution::Inherent(callee)) => gen_resolved_callee(callee),
-        Some(AssociatedAccessResolution::TraitMethod {
-            method,
-            dict: Some(dict),
-        }) => format!("{}.{}", gen_dict_ref(dict), mangle_op(method)),
-        Some(AssociatedAccessResolution::TraitMethod { method, dict: None }) => {
-            // Qualified trait-method values receive their dictionary through the
-            // same hidden first argument that call inference inserts for other
-            // constrained function values.
-            let method = mangle_op(method);
-            format!("(function(__dict, ...) return __dict.{}(...) end)", method)
-        }
-        None => associated_access_lua(target, member),
-    }
-}
-
-fn gen_dict_refs(dicts: &[DictRef]) -> Vec<String> {
-    dicts.iter().map(gen_dict_ref).collect()
-}
-
-fn gen_dict_ref(dict: &DictRef) -> String {
-    match dict {
-        DictRef::Param(name) | DictRef::Concrete(name) => name.clone(),
-        DictRef::Applied { dict, args } => {
-            format!("{}({})", dict, gen_dict_refs(args).join(", "))
-        }
-        DictRef::Structural(structural) => gen_structural_dict_ref(structural),
-    }
-}
-
-fn gen_structural_dict_ref(dict: &StructuralDictRef) -> String {
-    match (&dict.trait_name[..], &dict.target) {
-        ("Eq", DictTarget::Tuple(len)) => format!("({})", gen_tuple_eq_dict(*len, &dict.args)),
-        _ => "nil".to_string(),
-    }
-}
-
-fn gen_tuple_eq_dict(len: usize, args: &[DictRef]) -> String {
-    let eq = gen_tuple_eq_expr(len, args, "a", "b");
-    format!(
-        "{{ __op_eqeq = function(a, b) return {} end, __op_bneq = function(a, b) return (({}) == 0 and 1 or 0) end }}",
-        eq, eq
-    )
-}
-
-fn gen_tuple_eq_expr(len: usize, args: &[DictRef], lhs: &str, rhs: &str) -> String {
-    if len == 0 {
-        return "1".to_string();
-    }
-    let parts = args
-        .iter()
-        .enumerate()
-        .map(|(idx, dict)| match dict {
-            DictRef::Structural(StructuralDictRef {
-                trait_name,
-                target: DictTarget::Tuple(nested_len),
-                args,
-            }) if trait_name == "Eq" => gen_tuple_eq_expr(
-                *nested_len,
-                args,
-                &format!("({})[{}]", lhs, idx + 1),
-                &format!("({})[{}]", rhs, idx + 1),
-            ),
-            other => format!(
-                "{}.{}(({})[{}], ({})[{}])",
-                gen_dict_ref(other),
-                mangle_op("=="),
-                lhs,
-                idx + 1,
-                rhs,
-                idx + 1
-            ),
-        })
-        .map(|part| format!("({}) ~= 0", part))
-        .collect::<Vec<_>>();
-    format!("(({}) and 1 or 0)", parts.join(" and "))
+    names
 }
 
 fn bundle_module_var(name: &str) -> String {
@@ -2418,6 +2546,19 @@ let hof_result = apply_twice(local_double, 1.0);
                 "local hof_result = apply_twice((function(...) return local_double(__Add__float__float, ...) end), 1)"
             ),
             "higher-order constrained lambda arguments should eta-expand with the concrete dict:\n{lua}"
+        );
+    }
+
+    #[test]
+    fn string_literals_preserve_utf8_in_generated_lua() {
+        let lua = lua_for_source(
+            "hern_codegen_utf8_string_test.hern",
+            "let value = \"café ☃\";\n",
+        );
+
+        assert!(
+            lua.contains("local value = \"café ☃\""),
+            "generated Lua should preserve UTF-8 string contents:\n{lua}"
         );
     }
 

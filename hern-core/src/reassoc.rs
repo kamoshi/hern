@@ -3,6 +3,12 @@ use std::collections::{HashMap, VecDeque};
 
 pub type FixityTable = HashMap<String, (Fixity, u8)>;
 
+#[derive(Debug, Clone)]
+pub struct ReassocError {
+    pub span: SourceSpan,
+    pub message: String,
+}
+
 pub fn build_fixity_table(program: &Program) -> FixityTable {
     let mut table = FixityTable::new();
     for stmt in &program.stmts {
@@ -25,76 +31,84 @@ pub fn build_fixity_table(program: &Program) -> FixityTable {
     table
 }
 
-pub fn reassoc_program(program: &mut Program, table: &FixityTable) {
+pub fn reassoc_program(program: &mut Program, table: &FixityTable) -> Result<(), ReassocError> {
     for stmt in &mut program.stmts {
-        reassoc_stmt(stmt, table);
+        reassoc_stmt(stmt, table)?;
     }
+    Ok(())
 }
 
-fn reassoc_stmt(stmt: &mut Stmt, table: &FixityTable) {
+fn reassoc_stmt(stmt: &mut Stmt, table: &FixityTable) -> Result<(), ReassocError> {
     match stmt {
-        Stmt::Let { value, .. } => reassoc_expr(value, table),
-        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => reassoc_expr(body, table),
-        Stmt::Expr(e) => reassoc_expr(e, table),
+        Stmt::Let { value, .. } => reassoc_expr(value, table)?,
+        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => reassoc_expr(body, table)?,
+        Stmt::Expr(e) => reassoc_expr(e, table)?,
         Stmt::Impl(id) => {
             for m in &mut id.methods {
-                reassoc_expr(&mut m.body, table);
+                reassoc_expr(&mut m.body, table)?;
             }
         }
         Stmt::InherentImpl(id) => {
             for m in &mut id.methods {
-                reassoc_expr(&mut m.body, table);
+                reassoc_expr(&mut m.body, table)?;
             }
         }
         Stmt::TestBlock { stmts, .. } => {
             for stmt in stmts {
-                reassoc_stmt(stmt, table);
+                reassoc_stmt(stmt, table)?;
+            }
+        }
+        Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                reassoc_stmt(stmt, table)?;
             }
         }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
     }
+    Ok(())
 }
 
-fn reassoc_expr(expr: &mut Expr, table: &FixityTable) {
+fn reassoc_expr(expr: &mut Expr, table: &FixityTable) -> Result<(), ReassocError> {
     // If this is a custom-op binary chain, flatten and re-Pratt it.
     if is_custom_binary(expr) {
-        let owned = std::mem::replace(expr, Expr::synthetic(ExprKind::Unit));
+        let owned = expr.clone();
         let mut parts: VecDeque<(String, SourceSpan, Expr)> = VecDeque::new();
         let head = flatten(owned, &mut parts);
         // Reassoc atoms
-        let head = reassoc_owned(head, table);
+        let head = reassoc_owned(head, table)?;
         let parts: VecDeque<(String, SourceSpan, Expr)> = parts
             .into_iter()
-            .map(|(op, op_span, e)| (op, op_span, reassoc_owned(e, table)))
-            .collect();
+            .map(|(op, op_span, e)| reassoc_owned(e, table).map(|e| (op, op_span, e)))
+            .collect::<Result<_, _>>()?;
+        validate_operator_chain(&parts, table)?;
         *expr = pratt(head, &mut { parts }, 0, table);
-        return;
+        return Ok(());
     }
 
     // Otherwise recurse into sub-expressions.
     match &mut expr.kind {
-        ExprKind::Grouped(e) | ExprKind::Not(e) => reassoc_expr(e, table),
-        ExprKind::Neg { operand, .. } => reassoc_expr(operand, table),
+        ExprKind::Grouped(e) | ExprKind::Not(e) => reassoc_expr(e, table)?,
+        ExprKind::Neg { operand, .. } => reassoc_expr(operand, table)?,
         ExprKind::Assign { target, value } => {
-            reassoc_expr(target, table);
-            reassoc_expr(value, table);
+            reassoc_expr(target, table)?;
+            reassoc_expr(value, table)?;
         }
         ExprKind::Binary { lhs, rhs, .. } => {
-            reassoc_expr(lhs, table);
-            reassoc_expr(rhs, table);
+            reassoc_expr(lhs, table)?;
+            reassoc_expr(rhs, table)?;
         }
         ExprKind::Range { start, end, .. } => {
             if let Some(start) = start {
-                reassoc_expr(start, table);
+                reassoc_expr(start, table)?;
             }
             if let Some(end) = end {
-                reassoc_expr(end, table);
+                reassoc_expr(end, table)?;
             }
         }
         ExprKind::Call { callee, args, .. } => {
-            reassoc_expr(callee, table);
+            reassoc_expr(callee, table)?;
             for a in args {
-                reassoc_expr(a, table);
+                reassoc_expr(a, table)?;
             }
         }
         ExprKind::If {
@@ -102,60 +116,60 @@ fn reassoc_expr(expr: &mut Expr, table: &FixityTable) {
             then_branch,
             else_branch,
         } => {
-            reassoc_expr(cond, table);
-            reassoc_expr(then_branch, table);
-            reassoc_expr(else_branch, table);
+            reassoc_expr(cond, table)?;
+            reassoc_expr(then_branch, table)?;
+            reassoc_expr(else_branch, table)?;
         }
         ExprKind::Match { scrutinee, arms } => {
-            reassoc_expr(scrutinee, table);
+            reassoc_expr(scrutinee, table)?;
             for (_, body) in arms {
-                reassoc_expr(body, table);
+                reassoc_expr(body, table)?;
             }
         }
-        ExprKind::Loop(body) => reassoc_expr(body, table),
+        ExprKind::Loop(body) => reassoc_expr(body, table)?,
         ExprKind::Break(val) => {
             if let Some(e) = val {
-                reassoc_expr(e, table);
+                reassoc_expr(e, table)?;
             }
         }
         ExprKind::Return(val) => {
             if let Some(e) = val {
-                reassoc_expr(e, table);
+                reassoc_expr(e, table)?;
             }
         }
         ExprKind::Block { stmts, final_expr } => {
             for s in stmts {
-                reassoc_stmt(s, table);
+                reassoc_stmt(s, table)?;
             }
             if let Some(e) = final_expr {
-                reassoc_expr(e, table);
+                reassoc_expr(e, table)?;
             }
         }
         ExprKind::Tuple(es) => {
             for e in es {
-                reassoc_expr(e, table);
+                reassoc_expr(e, table)?;
             }
         }
         ExprKind::Array(entries) => {
             for entry in entries {
-                reassoc_expr(entry.expr_mut(), table);
+                reassoc_expr(entry.expr_mut(), table)?;
             }
         }
         ExprKind::Record(entries) => {
             for entry in entries {
-                reassoc_expr(entry.expr_mut(), table);
+                reassoc_expr(entry.expr_mut(), table)?;
             }
         }
-        ExprKind::FieldAccess { expr, .. } => reassoc_expr(expr, table),
+        ExprKind::FieldAccess { expr, .. } => reassoc_expr(expr, table)?,
         ExprKind::Index { receiver, key, .. } => {
-            reassoc_expr(receiver, table);
-            reassoc_expr(key, table);
+            reassoc_expr(receiver, table)?;
+            reassoc_expr(key, table)?;
         }
         ExprKind::AssociatedAccess { .. } => {}
-        ExprKind::Lambda { body, .. } => reassoc_expr(body, table),
+        ExprKind::Lambda { body, .. } => reassoc_expr(body, table)?,
         ExprKind::For { iterable, body, .. } => {
-            reassoc_expr(iterable, table);
-            reassoc_expr(body, table);
+            reassoc_expr(iterable, table)?;
+            reassoc_expr(body, table)?;
         }
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
@@ -165,12 +179,13 @@ fn reassoc_expr(expr: &mut Expr, table: &FixityTable) {
         | ExprKind::Unit
         | ExprKind::Continue => {}
     }
+    Ok(())
 }
 
-fn reassoc_owned(expr: Expr, table: &FixityTable) -> Expr {
+fn reassoc_owned(expr: Expr, table: &FixityTable) -> Result<Expr, ReassocError> {
     let mut e = expr;
-    reassoc_expr(&mut e, table);
-    e
+    reassoc_expr(&mut e, table)?;
+    Ok(e)
 }
 
 fn is_custom_binary(expr: &Expr) -> bool {
@@ -237,6 +252,44 @@ fn flatten_rhs(
             },
         )),
     }
+}
+
+fn validate_operator_chain(
+    tail: &VecDeque<(String, SourceSpan, Expr)>,
+    table: &FixityTable,
+) -> Result<(), ReassocError> {
+    for idx in 1..tail.len() {
+        let (left_op, _, _) = &tail[idx - 1];
+        let (right_op, right_span, _) = &tail[idx];
+        let (left_fixity, left_prec) = fixity_for(left_op, table);
+        let (right_fixity, right_prec) = fixity_for(right_op, table);
+        if left_prec != right_prec {
+            continue;
+        }
+        if left_fixity == Fixity::Non || right_fixity == Fixity::Non {
+            return Err(ReassocError {
+                span: *right_span,
+                message: format!(
+                    "cannot chain non-associative operators `{}` and `{}` at precedence {}",
+                    left_op, right_op, left_prec
+                ),
+            });
+        }
+        if left_fixity != right_fixity {
+            return Err(ReassocError {
+                span: *right_span,
+                message: format!(
+                    "conflicting associativity for operators `{}` and `{}` at precedence {}",
+                    left_op, right_op, left_prec
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn fixity_for(op: &str, table: &FixityTable) -> (Fixity, u8) {
+    table.get(op).copied().unwrap_or((Fixity::Left, 6))
 }
 
 /// Pratt parser over a flat `(op, op_span, atom)` deque.
@@ -322,7 +375,7 @@ mod tests {
             ("++".to_string(), (Fixity::Left, 1)),
         ]);
 
-        reassoc_expr(&mut expr, &table);
+        reassoc_expr(&mut expr, &table).expect("expression should reassociate");
 
         let ExprKind::Binary { lhs, op, rhs, .. } = &expr.kind else {
             panic!("expected outer binary expression");
@@ -339,5 +392,20 @@ mod tests {
                 ..
             } if name == "++"
         ));
+    }
+
+    #[test]
+    fn same_precedence_conflicting_associativity_errors() {
+        let mut expr = binary(binary(ident("a"), "|++", ident("b")), "++|", ident("c"));
+        let table = HashMap::from([
+            ("|++".to_string(), (Fixity::Left, 5)),
+            ("++|".to_string(), (Fixity::Right, 5)),
+        ]);
+
+        let err = reassoc_expr(&mut expr, &table).expect_err("conflict should fail");
+
+        assert!(err.message.contains("conflicting associativity"));
+        assert!(err.message.contains("`|++`"));
+        assert!(err.message.contains("`++|`"));
     }
 }

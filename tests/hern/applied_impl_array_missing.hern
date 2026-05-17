@@ -6,4 +6,4 @@ impl Label for [float] {
     fn label(xs) { "numbers" }
 }
 
-print(label(["a"]));
+print(Label::label(["a"]));

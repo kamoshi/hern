@@ -13,7 +13,7 @@ pub struct LexError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LexErrorKind {
-    UnexpectedChar(u8),
+    UnexpectedChar(char),
     UnterminatedString,
     ReservedIdentifier,
 }

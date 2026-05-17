@@ -1,0 +1,43 @@
+type Nat = Z | S(Nat)
+
+impl Eq for Nat {
+  fn ==(lhs, rhs) {
+    match lhs {
+      Z -> match rhs { Z -> true, _ -> false },
+      S(l) -> match rhs { S(r) -> l == r, _ -> false },
+    }
+  }
+
+  fn !=(lhs, rhs) { !(lhs == rhs) }
+}
+
+type List('a) = Nil | Cons(('a, List('a)))
+
+impl Eq for List('a)
+where 'a: Eq
+{
+  fn ==(lhs, rhs) {
+    match lhs {
+      Nil -> match rhs { Nil -> true, _ -> false },
+      Cons((lh, lt)) -> match rhs {
+        Cons((rh, rt)) -> lh == rh && lt == rt,
+        _ -> false,
+      },
+    }
+  }
+
+  fn !=(lhs, rhs) { !(lhs == rhs) }
+}
+
+#[derive(Eq, ToString)]
+type Chain = End | Link(Chain)
+
+print(to_string(S(Z) == S(Z)));
+print(to_string(S(Z) == Z));
+
+let one = Cons((1, Nil));
+print(to_string(one == Cons((1, Nil))));
+print(to_string(one == Cons((2, Nil))));
+
+print(to_string(Link(End) == Link(End)));
+print(to_string(Link(Link(End))));

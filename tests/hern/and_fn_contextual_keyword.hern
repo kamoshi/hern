@@ -1,0 +1,5 @@
+fn and(x: int) -> int { x + 1 }
+
+let and_value = and(4);
+
+print(and_value);

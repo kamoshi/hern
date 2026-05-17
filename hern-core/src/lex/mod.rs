@@ -23,7 +23,6 @@ pub enum Token {
     Extern,
     Import,
     Do,
-    Test,
 
     // Punctuation (operators continued)
     Pipe, // |
@@ -96,7 +95,6 @@ impl fmt::Display for Token {
             Token::Extern => write!(f, "`extern`"),
             Token::Import => write!(f, "`import`"),
             Token::Do => write!(f, "`do`"),
-            Token::Test => write!(f, "`test`"),
             Token::Pipe => write!(f, "`|`"),
             Token::True => write!(f, "`true`"),
             Token::False => write!(f, "`false`"),
@@ -203,10 +201,29 @@ impl<'src> Lexer<'src> {
         self.src.get(self.pos + 1).copied()
     }
 
+    fn current_char(&self) -> Option<char> {
+        std::str::from_utf8(&self.src[self.pos..])
+            .ok()?
+            .chars()
+            .next()
+    }
+
     fn advance(&mut self) -> Option<u8> {
         let ch = self.src.get(self.pos).copied()?;
         self.pos += 1;
         if ch == b'\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(ch)
+    }
+
+    fn advance_char(&mut self) -> Option<char> {
+        let ch = self.current_char()?;
+        self.pos += ch.len_utf8();
+        if ch == '\n' {
             self.line += 1;
             self.col = 1;
         } else {
@@ -309,7 +326,7 @@ impl<'src> Lexer<'src> {
                         .unwrap()
                         .to_string();
                     if self.peek() != Some(b']') {
-                        let bad = self.peek().unwrap_or(b'?');
+                        let bad = self.current_char().unwrap_or('?');
                         return Err(LexError {
                             kind: LexErrorKind::UnexpectedChar(bad),
                             span: self.span_at(self.line, self.col, 1),
@@ -344,6 +361,25 @@ impl<'src> Lexer<'src> {
             b'+' | b'-' | b'*' | b'!' | b'&' | b'|' | b'.' | b'<' | b'>' | b'~' | b'@' | b'?'
             | b'$' | b'^' | b'/' | b'%' | b'=' => {
                 let op = self.lex_op();
+                if let Some(rest) = op.strip_prefix("..=") {
+                    if !rest.is_empty() {
+                        self.pos -= rest.len();
+                        self.col -= rest.len();
+                        return Ok(Spanned {
+                            token: Token::DotDotEq,
+                            span: self.span_at(line, col, 3),
+                        });
+                    }
+                } else if let Some(rest) = op.strip_prefix("..")
+                    && !rest.is_empty()
+                {
+                    self.pos -= rest.len();
+                    self.col -= rest.len();
+                    return Ok(Spanned {
+                        token: Token::DotDot,
+                        span: self.span_at(line, col, 2),
+                    });
+                }
                 match op.as_str() {
                     "=" => Token::Equal,
                     "==" => Token::EqEq,
@@ -364,9 +400,10 @@ impl<'src> Lexer<'src> {
                 }
             }
             other => {
-                self.advance();
+                let unexpected = self.current_char().unwrap_or(other as char);
+                self.advance_char();
                 return Err(LexError {
-                    kind: LexErrorKind::UnexpectedChar(other),
+                    kind: LexErrorKind::UnexpectedChar(unexpected),
                     span: self.span_at(line, col, 1),
                 });
             }
@@ -409,7 +446,7 @@ impl<'src> Lexer<'src> {
             match self.peek() {
                 None => {
                     return Err(LexError {
-                        kind: LexErrorKind::UnexpectedChar(b'"'),
+                        kind: LexErrorKind::UnterminatedString,
                         span: self.span_at(line, col, 1),
                     });
                 }
@@ -440,17 +477,19 @@ impl<'src> Lexer<'src> {
                             self.advance();
                             s.push('\\');
                         }
-                        Some(c) => {
+                        Some(_) => {
+                            let c = self.current_char().unwrap_or('?');
                             s.push('\\');
-                            s.push(c as char);
-                            self.advance();
+                            s.push(c);
+                            self.advance_char();
                         }
                         None => break,
                     }
                 }
-                Some(c) => {
-                    s.push(c as char);
-                    self.advance();
+                Some(_) => {
+                    let c = self.current_char().unwrap_or('?');
+                    s.push(c);
+                    self.advance_char();
                 }
             }
         }
@@ -524,7 +563,6 @@ impl<'src> Lexer<'src> {
             "false" => Token::False,
             "in" => Token::In,
             "do" => Token::Do,
-            "test" => Token::Test,
             _ => Token::Ident(word.to_string()),
         }
     }
