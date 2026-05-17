@@ -28,6 +28,7 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
     let graph = snapshot.graph();
     let inference = snapshot.inference()?;
     let (module_name, program) = snapshot.module()?;
+    let source = document_source(state, &uri)?;
     let expr_types = inference.expr_types_for_module(module_name)?;
     let symbol_types = inference.symbol_types_for_module(module_name)?;
     let binding_capabilities = inference.binding_capabilities_for_module(module_name);
@@ -37,6 +38,16 @@ pub(crate) fn hover(state: &ServerState, uri: lsp_types::Uri, position: Position
         col: position.character as usize + 1,
     };
     let markdown = state.supports_markdown_hover;
+    if let Some(info) = callable_keyword_hover(
+        program,
+        &source,
+        expr_types,
+        inference.definition_schemes_for_module(module_name),
+        inference.env_for_module(module_name),
+        position,
+    ) {
+        return Some(type_hover_with_span(info.contents, markdown, info.span));
+    }
     if let Some(contents) = symbol_hover(graph, inference, module_name, program, position) {
         return Some(type_hover(contents, markdown));
     }
@@ -78,12 +89,13 @@ fn prelude_hover(state: &ServerState, uri: &lsp_types::Uri, position: Position) 
         Ok(prelude) => prelude,
         Err(_) => state.prelude.clone(),
     };
-    prelude_hover_from_analysis(state, &prelude, position)
+    prelude_hover_from_analysis(state, &prelude, &source, position)
 }
 
 fn prelude_hover_from_analysis(
     state: &ServerState,
     prelude: &PreludeAnalysis,
+    source: &str,
     position: Position,
 ) -> Option<Hover> {
     let position = SourcePosition {
@@ -92,6 +104,16 @@ fn prelude_hover_from_analysis(
     };
     let markdown = state.supports_markdown_hover;
     let index = index_program(&prelude.program);
+    if let Some(info) = callable_keyword_hover(
+        &prelude.program,
+        &source,
+        &prelude.inference.expr_types,
+        Some(&prelude.inference.definition_schemes),
+        Some(&prelude.inference.env),
+        position,
+    ) {
+        return Some(type_hover_with_span(info.contents, markdown, info.span));
+    }
     if let Some(definition) = index.definition_at(position)
         && let Some(contents) = definition_hover_text(
             definition,
@@ -183,6 +205,379 @@ fn type_hover_inner(ty: String, markdown: bool, span: Option<SourceSpan>) -> Hov
         contents,
         range: span.map(source_span_to_range),
     }
+}
+
+struct CallableKeywordHover {
+    span: SourceSpan,
+    contents: String,
+}
+
+fn callable_keyword_hover(
+    program: &Program,
+    source: &str,
+    expr_types: &HashMap<hern_core::ast::NodeId, Ty>,
+    definition_schemes: Option<&HashMap<SourceSpan, Scheme>>,
+    env: Option<&TypeEnv>,
+    position: SourcePosition,
+) -> Option<CallableKeywordHover> {
+    let mut best = None;
+    let context = CallableKeywordHoverContext {
+        source,
+        expr_types,
+        definition_schemes,
+        env,
+        position,
+    };
+    for stmt in &program.stmts {
+        callable_keyword_hover_in_stmt(stmt, &context, &mut best);
+    }
+    best
+}
+
+struct CallableKeywordHoverContext<'a> {
+    source: &'a str,
+    expr_types: &'a HashMap<hern_core::ast::NodeId, Ty>,
+    definition_schemes: Option<&'a HashMap<SourceSpan, Scheme>>,
+    env: Option<&'a TypeEnv>,
+    position: SourcePosition,
+}
+
+fn callable_keyword_hover_in_stmt(
+    stmt: &Stmt,
+    context: &CallableKeywordHoverContext<'_>,
+    best: &mut Option<CallableKeywordHover>,
+) {
+    match stmt {
+        Stmt::Fn {
+            span,
+            name,
+            name_span,
+            body,
+            ..
+        } => {
+            if let Some(contents) = callable_scheme_text(name, *name_span, context) {
+                consider_callable_keyword(context, best, *span, Some(*name_span), contents);
+            }
+            callable_keyword_hover_in_expr(body, context, best);
+        }
+        Stmt::Op {
+            span,
+            name,
+            name_span,
+            fixity,
+            prec,
+            body,
+            ..
+        } => {
+            if let Some(contents) = callable_scheme_text(name, *name_span, context)
+                .map(|ty| with_fixity_line(ty, *fixity, *prec))
+            {
+                consider_callable_keyword(context, best, *span, Some(*name_span), contents);
+            }
+            callable_keyword_hover_in_expr(body, context, best);
+        }
+        Stmt::Let { value, .. } | Stmt::Expr(value) => {
+            callable_keyword_hover_in_expr(value, context, best);
+        }
+        Stmt::Trait(trait_def) => {
+            for method in &trait_def.methods {
+                consider_callable_keyword(
+                    context,
+                    best,
+                    method.span,
+                    Some(method.name_span),
+                    trait_method_signature(method),
+                );
+            }
+        }
+        Stmt::Impl(impl_def) => {
+            for method in &impl_def.methods {
+                let contents = context
+                    .definition_schemes
+                    .and_then(|schemes| schemes.get(&method.name_span))
+                    .map(hover_scheme_to_string)
+                    .unwrap_or_else(|| impl_method_signature(method));
+                consider_callable_keyword(
+                    context,
+                    best,
+                    method.span,
+                    Some(method.name_span),
+                    contents,
+                );
+                callable_keyword_hover_in_expr(&method.body, context, best);
+            }
+        }
+        Stmt::InherentImpl(impl_def) => {
+            for method in &impl_def.methods {
+                let contents = context
+                    .definition_schemes
+                    .and_then(|schemes| schemes.get(&method.name_span))
+                    .map(hover_scheme_to_string)
+                    .unwrap_or_else(|| inherent_method_signature(method));
+                consider_callable_keyword(
+                    context,
+                    best,
+                    method.span,
+                    Some(method.name_span),
+                    contents,
+                );
+                callable_keyword_hover_in_expr(&method.body, context, best);
+            }
+        }
+        Stmt::TestBlock { stmts, .. } | Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                callable_keyword_hover_in_stmt(stmt, context, best);
+            }
+        }
+        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
+    }
+}
+
+fn callable_keyword_hover_in_expr(
+    expr: &Expr,
+    context: &CallableKeywordHoverContext<'_>,
+    best: &mut Option<CallableKeywordHover>,
+) {
+    if !contains(expr.span, context.position) {
+        return;
+    }
+    match &expr.kind {
+        ExprKind::Lambda { body, .. } => {
+            if let Some(ty) = context.expr_types.get(&expr.id) {
+                consider_callable_keyword(context, best, expr.span, None, ty_to_display_string(ty));
+            }
+            callable_keyword_hover_in_expr(body, context, best);
+        }
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
+        | ExprKind::Neg { operand: inner, .. }
+        | ExprKind::Loop(inner)
+        | ExprKind::Break(Some(inner))
+        | ExprKind::Return(Some(inner))
+        | ExprKind::FieldAccess { expr: inner, .. } => {
+            callable_keyword_hover_in_expr(inner, context, best);
+        }
+        ExprKind::Assign { target, value } => {
+            callable_keyword_hover_in_expr(target, context, best);
+            callable_keyword_hover_in_expr(value, context, best);
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            callable_keyword_hover_in_expr(lhs, context, best);
+            callable_keyword_hover_in_expr(rhs, context, best);
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                callable_keyword_hover_in_expr(start, context, best);
+            }
+            if let Some(end) = end {
+                callable_keyword_hover_in_expr(end, context, best);
+            }
+        }
+        ExprKind::Call { callee, args, .. } => {
+            callable_keyword_hover_in_expr(callee, context, best);
+            for arg in args {
+                callable_keyword_hover_in_expr(arg, context, best);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            callable_keyword_hover_in_expr(cond, context, best);
+            callable_keyword_hover_in_expr(then_branch, context, best);
+            callable_keyword_hover_in_expr(else_branch, context, best);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            callable_keyword_hover_in_expr(scrutinee, context, best);
+            for (_, body) in arms {
+                callable_keyword_hover_in_expr(body, context, best);
+            }
+        }
+        ExprKind::Block { stmts, final_expr } => {
+            for stmt in stmts {
+                callable_keyword_hover_in_stmt(stmt, context, best);
+            }
+            if let Some(expr) = final_expr {
+                callable_keyword_hover_in_expr(expr, context, best);
+            }
+        }
+        ExprKind::Tuple(items) => {
+            for item in items {
+                callable_keyword_hover_in_expr(item, context, best);
+            }
+        }
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                callable_keyword_hover_in_expr(entry.expr(), context, best);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                callable_keyword_hover_in_expr(entry.expr(), context, best);
+            }
+        }
+        ExprKind::Index { receiver, key, .. } => {
+            callable_keyword_hover_in_expr(receiver, context, best);
+            callable_keyword_hover_in_expr(key, context, best);
+        }
+        ExprKind::For { iterable, body, .. } => {
+            callable_keyword_hover_in_expr(iterable, context, best);
+            callable_keyword_hover_in_expr(body, context, best);
+        }
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Import(_)
+        | ExprKind::Unit
+        | ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None)
+        | ExprKind::AssociatedAccess { .. } => {}
+    }
+}
+
+fn callable_scheme_text(
+    name: &str,
+    name_span: SourceSpan,
+    context: &CallableKeywordHoverContext<'_>,
+) -> Option<String> {
+    context
+        .definition_schemes
+        .and_then(|schemes| schemes.get(&name_span))
+        .map(hover_scheme_to_string)
+        .or_else(|| {
+            context
+                .env
+                .and_then(|env| env.get(name))
+                .map(|info| hover_scheme_to_string(&info.scheme))
+        })
+}
+
+fn consider_callable_keyword(
+    context: &CallableKeywordHoverContext<'_>,
+    best: &mut Option<CallableKeywordHover>,
+    callable_span: SourceSpan,
+    before_span: Option<SourceSpan>,
+    contents: String,
+) {
+    if fn_keyword_span(context.source, callable_span, before_span)
+        .is_some_and(|span| contains(span, context.position))
+        && best
+            .as_ref()
+            .is_none_or(|current| span_len(callable_span) < span_len(current.span))
+    {
+        *best = Some(CallableKeywordHover {
+            span: callable_span,
+            contents,
+        });
+    }
+}
+
+fn fn_keyword_span(
+    source: &str,
+    callable_span: SourceSpan,
+    before_span: Option<SourceSpan>,
+) -> Option<SourceSpan> {
+    let start = source_position_to_byte(
+        source,
+        SourcePosition {
+            line: callable_span.start_line,
+            col: callable_span.start_col,
+        },
+    )?;
+    let end = before_span
+        .and_then(|span| {
+            source_position_to_byte(
+                source,
+                SourcePosition {
+                    line: span.start_line,
+                    col: span.start_col,
+                },
+            )
+        })
+        .or_else(|| {
+            source_position_to_byte(
+                source,
+                SourcePosition {
+                    line: callable_span.end_line,
+                    col: callable_span.end_col,
+                },
+            )
+        })?;
+    let search = source.get(start..end)?;
+    let relative = find_keyword(search, "fn")?;
+    let keyword_start = start + relative;
+    let keyword_end = keyword_start + "fn".len();
+    Some(SourceSpan {
+        start_line: byte_to_source_position(source, keyword_start)?.line,
+        start_col: byte_to_source_position(source, keyword_start)?.col,
+        end_line: byte_to_source_position(source, keyword_end)?.line,
+        end_col: byte_to_source_position(source, keyword_end)?.col,
+    })
+}
+
+fn find_keyword(source: &str, keyword: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(relative) = source[offset..].find(keyword) {
+        let start = offset + relative;
+        let end = start + keyword.len();
+        let before = source[..start].chars().next_back();
+        let after = source[end..].chars().next();
+        if !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char) {
+            return Some(start);
+        }
+        offset = end;
+    }
+    None
+}
+
+fn source_position_to_byte(source: &str, position: SourcePosition) -> Option<usize> {
+    let mut line_start = 0;
+    for (idx, line) in source.split_inclusive('\n').enumerate() {
+        if idx + 1 == position.line {
+            let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+            return Some(
+                line_start
+                    + position
+                        .col
+                        .saturating_sub(1)
+                        .min(line_without_newline.len()),
+            );
+        }
+        line_start += line.len();
+    }
+    if position.line == source.lines().count() + 1 && position.col == 1 {
+        Some(source.len())
+    } else {
+        None
+    }
+}
+
+fn byte_to_source_position(source: &str, byte: usize) -> Option<SourcePosition> {
+    if byte > source.len() {
+        return None;
+    }
+    let mut line = 1;
+    let mut line_start = 0;
+    for (idx, ch) in source.char_indices() {
+        if idx >= byte {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = idx + ch.len_utf8();
+        }
+    }
+    Some(SourcePosition {
+        line,
+        col: byte.saturating_sub(line_start) + 1,
+    })
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn symbol_hover(
@@ -411,6 +806,11 @@ fn contains(span: SourceSpan, pos: SourcePosition) -> bool {
     let end = (span.end_line, span.end_col);
     let cursor = (pos.line, pos.col);
     cursor >= start && cursor < end
+}
+
+fn span_len(span: SourceSpan) -> usize {
+    (span.end_line.saturating_sub(span.start_line)) * 100_000
+        + span.end_col.saturating_sub(span.start_col)
 }
 
 /// Display a bare `Ty` with normalized type variable names.
@@ -1988,6 +2388,7 @@ fn declaration_value_type_in_expr<'a>(
 mod tests {
     use super::*;
     use crate::analysis::tests::{TestProject, hover_text};
+    use lsp_types::Range;
 
     #[test]
     fn hover_for_associated_function_member_shows_fresh_return() {
@@ -1998,5 +2399,37 @@ mod tests {
         let text = hover_text(hover(&state, uri, Position::new(0, 18)).expect("hover"));
 
         assert!(text.starts_with("fn() -> mut Map("), "{text}");
+    }
+
+    #[test]
+    fn hover_on_fn_keyword_shows_function_type_and_selects_function() {
+        let project = TestProject::new("hover-fn-keyword");
+        let source = "fn add(x: int) -> int { x }\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let hover = hover(&state, uri, Position::new(0, 0)).expect("hover");
+        let text = hover_text(hover.clone());
+
+        assert_eq!(text, "fn(int) -> int");
+        assert_eq!(
+            hover.range,
+            Some(Range::new(Position::new(0, 0), Position::new(0, 27)))
+        );
+    }
+
+    #[test]
+    fn hover_on_lambda_fn_keyword_shows_lambda_type_and_selects_lambda() {
+        let project = TestProject::new("hover-lambda-fn-keyword");
+        let source = "let f = fn(x: int) { x };\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        let hover = hover(&state, uri, Position::new(0, 8)).expect("hover");
+        let text = hover_text(hover.clone());
+
+        assert_eq!(text, "fn(int) -> int");
+        assert_eq!(
+            hover.range,
+            Some(Range::new(Position::new(0, 8), Position::new(0, 24)))
+        );
     }
 }
