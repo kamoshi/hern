@@ -6,6 +6,10 @@ trait ToString 'a {
   fn to_string(self: 'a) -> string
 }
 
+trait Default 'a {
+  fn default() -> 'a
+}
+
 trait Index 'receiver 'key -> 'output {
   fn index(self: 'receiver, key: 'key) -> 'output
 }
@@ -14,13 +18,17 @@ fn to_string(value: 'a) -> string where 'a: ToString {
   ToString::to_string(value)
 }
 
+fn default() -> 'a where 'a: Default {
+  Default::default()
+}
+
 extern __panic: fn(string) -> 'a = "(function(message) _G.error(message) end)";
 
 fn panic(message: string) -> 'a {
   __panic(message)
 }
 
-#[derive(Eq, ToString)]
+#[derive(Default, Eq, ToString)]
 type Option('a) = Some('a) | None
 
 impl Option('a) {
@@ -107,7 +115,7 @@ impl Result('a, 'e) {
   }
 }
 
-#[derive(Eq, ToString)]
+#[derive(Eq, Ord, ToString)]
 type Ordering = LT | EQ | GT
 
 type Map('k, 'v) = *
@@ -299,6 +307,10 @@ impl ToString for float {
   fn to_string(self) { tostring(self) }
 }
 
+impl Default for float {
+  fn default() { 0.0 }
+}
+
 impl Add for int, int -> int {
   #[inline]
   fn +(lhs, rhs) { __int_add(lhs, rhs) }
@@ -363,6 +375,10 @@ impl ToString for int {
   fn to_string(self) { tostring(self) }
 }
 
+impl Default for int {
+  fn default() { 0 }
+}
+
 impl Eq for string {
   #[inline]
   fn ==(lhs, rhs) { __eq_string(lhs, rhs) }
@@ -417,6 +433,10 @@ impl ToString for bool {
   }
 }
 
+impl Default for bool {
+  fn default() { false }
+}
+
 impl And for bool {
   #[inline]
   fn &&(lhs, rhs) { __and(lhs, rhs) }
@@ -434,6 +454,10 @@ impl Semigroup for string {
 
 impl ToString for string {
   fn to_string(self) { self }
+}
+
+impl Default for string {
+  fn default() { "" }
 }
 
 // --- Globals ---
@@ -841,6 +865,10 @@ impl [string] {
 
 impl Semigroup for ['a] {
   fn <>(lhs, rhs) { __array_concat(lhs, rhs) }
+}
+
+impl Default for ['a] {
+  fn default() { [] }
 }
 
 // --- Functional traits ---

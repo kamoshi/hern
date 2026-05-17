@@ -2,7 +2,9 @@ use super::snapshot::{SnapshotMode, analysis_snapshot};
 use super::state::ServerState;
 use super::uri::{source_span_to_range, uri_to_path};
 use super::workspace::document_source;
-use hern_core::analysis::{PreludeAnalysis, analyze_prelude_source, hover_at};
+use hern_core::analysis::{
+    PreludeAnalysis, analyze_prelude_source, hover_at, is_synthetic_interpolation_concat,
+};
 use hern_core::ast::{
     BinOp, Expr, ExprKind, Fixity, ImplMethod, InherentMethod, Param, Pattern, Program,
     SourcePosition, SourceSpan, Stmt, TraitDef, TraitMethod, byte_to_source_position,
@@ -292,6 +294,9 @@ fn callable_keyword_hover_in_stmt(
             }
         }
         Stmt::Impl(impl_def) => {
+            if impl_def.generated_by.is_some() {
+                return;
+            }
             for method in &impl_def.methods {
                 let contents = context
                     .definition_schemes
@@ -590,6 +595,7 @@ fn trait_access_hover(
             member_span,
             ..
         } = &expr.kind
+            && !is_synthetic_interpolation_tostring(trait_name, *target_span, member, *member_span)
             && let Some(trait_def) = module_env.trait_def(trait_name)
         {
             if contains(*target_span, position) {
@@ -606,6 +612,17 @@ fn trait_access_hover(
         }
     });
     hover
+}
+
+fn is_synthetic_interpolation_tostring(
+    trait_name: &str,
+    target_span: SourceSpan,
+    member: &str,
+    member_span: SourceSpan,
+) -> bool {
+    // Interpolation holes lower through synthetic ToString::to_string calls.
+    // The parser gives the target/member the same non-user-visible span.
+    trait_name == "ToString" && member == "to_string" && target_span == member_span
 }
 
 // ── Operator hover ────────────────────────────────────────────────────────────
@@ -643,6 +660,7 @@ fn operator_use_at(program: &Program, position: SourcePosition) -> Option<Operat
         }
         if let ExprKind::Binary { op, op_span, .. } = &expr.kind
             && contains(*op_span, position)
+            && !is_synthetic_interpolation_concat(expr, op, *op_span)
             && let BinOp::Custom(name) = op
         {
             operator = Some(OperatorUse {

@@ -395,7 +395,7 @@ impl fmt::Display for TypeError {
             ),
             TypeError::TraitMethodMissingTarget { trait_name, method } => write!(
                 f,
-                "trait method `{}` in trait `{}` must have at least one parameter",
+                "trait method `{}` in trait `{}` must mention a trait parameter",
                 method, trait_name
             ),
             TypeError::DuplicateTypeTraitName(name) => write!(

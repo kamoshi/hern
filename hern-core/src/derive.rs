@@ -42,7 +42,9 @@ fn lower_type_derives(type_def: &mut TypeDef) -> Vec<Stmt> {
         };
         for trait_name in &derive.traits {
             out.push(match trait_name {
+                DeriveTrait::Default => Stmt::Impl(derive_default(&input)),
                 DeriveTrait::Eq => Stmt::Impl(derive_eq(&input)),
+                DeriveTrait::Ord => Stmt::Impl(derive_ord(&input)),
                 DeriveTrait::ToString => Stmt::Impl(derive_to_string(&input)),
             });
         }
@@ -167,6 +169,212 @@ fn derive_to_string(input: &DeriveInput<'_>) -> ImplDef {
     )
 }
 
+fn derive_default(input: &DeriveInput<'_>) -> ImplDef {
+    let variant = default_variant(input);
+    let type_bounds = variant
+        .payload
+        .as_ref()
+        .map(|payload| type_param_bounds_for_type(payload, input.type_params, "Default"))
+        .unwrap_or_default();
+    impl_def(
+        input,
+        "Default",
+        type_bounds,
+        vec![impl_method(
+            "default",
+            vec![],
+            default_value_for_variant(variant),
+            input.source_span,
+        )],
+    )
+}
+
+fn default_variant<'a>(input: &'a DeriveInput<'_>) -> &'a Variant {
+    if let Some(variant) = input
+        .variants
+        .iter()
+        .find(|variant| variant.attrs.iter().any(|attr| attr.is("default")))
+    {
+        return variant;
+    }
+    if let Some(variant) = input
+        .variants
+        .iter()
+        .find(|variant| variant.payload.is_none())
+    {
+        return variant;
+    }
+    input
+        .variants
+        .first()
+        .expect("derive input should contain at least one variant")
+}
+
+fn default_value_for_variant(variant: &Variant) -> Expr {
+    let Some(payload) = &variant.payload else {
+        return ident(&variant.name);
+    };
+
+    // Hern variants currently have one payload slot. If that slot is a tuple,
+    // synthesize a tuple of element defaults rather than requiring Default for
+    // the tuple as a whole.
+    let payload_default = match payload {
+        Type::Tuple(items) => tuple(items.iter().map(|_| default_call()).collect()),
+        _ => default_call(),
+    };
+    call(ident(&variant.name), vec![payload_default])
+}
+
+fn tuple(items: Vec<Expr>) -> Expr {
+    Expr::synthetic(ExprKind::Tuple(items))
+}
+
+fn derive_ord(input: &DeriveInput<'_>) -> ImplDef {
+    let lhs = "lhs";
+    let rhs = "rhs";
+    impl_def(
+        input,
+        "Ord",
+        type_param_bounds(input, "Ord"),
+        vec![
+            impl_method(
+                "<",
+                vec![param(lhs), param(rhs)],
+                compare_result_eq(compare_call(ident(lhs), ident(rhs)), "LT"),
+                input.source_span,
+            ),
+            impl_method(
+                ">",
+                vec![param(lhs), param(rhs)],
+                compare_result_eq(compare_call(ident(lhs), ident(rhs)), "GT"),
+                input.source_span,
+            ),
+            impl_method(
+                "<=",
+                vec![param(lhs), param(rhs)],
+                compare_result_ne(compare_call(ident(lhs), ident(rhs)), "GT"),
+                input.source_span,
+            ),
+            impl_method(
+                ">=",
+                vec![param(lhs), param(rhs)],
+                compare_result_ne(compare_call(ident(lhs), ident(rhs)), "LT"),
+                input.source_span,
+            ),
+            impl_method(
+                "compare",
+                vec![param(lhs), param(rhs)],
+                derive_ord_compare_body(input, lhs, rhs),
+                input.source_span,
+            ),
+        ],
+    )
+}
+
+fn derive_ord_compare_body(input: &DeriveInput<'_>, lhs: &str, rhs: &str) -> Expr {
+    // This emits an explicit nested match: simple and direct, with O(n^2)
+    // generated arms for n variants. If large enums become common, switch to a
+    // tag comparison plus same-variant payload comparison.
+    Expr::synthetic(ExprKind::Match {
+        scrutinee: Box::new(ident(lhs)),
+        arms: input
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(lhs_index, lhs_variant)| {
+                let ord_payload = ord_payload_compare(lhs_variant.payload.as_ref());
+                (
+                    variant_pat_with_payload(lhs_variant, ord_payload.lhs_pattern),
+                    Expr::synthetic(ExprKind::Match {
+                        scrutinee: Box::new(ident(rhs)),
+                        arms: input
+                            .variants
+                            .iter()
+                            .enumerate()
+                            .map(|(rhs_index, rhs_variant)| {
+                                let result = match lhs_index.cmp(&rhs_index) {
+                                    std::cmp::Ordering::Less => ident("LT"),
+                                    std::cmp::Ordering::Greater => ident("GT"),
+                                    std::cmp::Ordering::Equal => ord_payload.compare.clone(),
+                                };
+                                let rhs_payload = if lhs_index == rhs_index {
+                                    ord_payload.rhs_pattern.clone()
+                                } else {
+                                    wildcard_payload(rhs_variant.payload.as_ref())
+                                };
+                                (variant_pat_with_payload(rhs_variant, rhs_payload), result)
+                            })
+                            .collect(),
+                    }),
+                )
+            })
+            .collect(),
+    })
+}
+
+#[derive(Clone)]
+struct OrdPayloadCompare {
+    lhs_pattern: Option<Pattern>,
+    rhs_pattern: Option<Pattern>,
+    compare: Expr,
+}
+
+fn ord_payload_compare(payload: Option<&Type>) -> OrdPayloadCompare {
+    match payload {
+        Some(Type::Tuple(items)) => {
+            let lhs_names = tuple_payload_names("__l", items.len());
+            let rhs_names = tuple_payload_names("__r", items.len());
+            OrdPayloadCompare {
+                lhs_pattern: Some(tuple_payload_pattern(&lhs_names)),
+                rhs_pattern: Some(tuple_payload_pattern(&rhs_names)),
+                compare: compare_tuple_payload_fields(&lhs_names, &rhs_names, 0),
+            }
+        }
+        Some(_) => OrdPayloadCompare {
+            lhs_pattern: Some(var_pat("__l0")),
+            rhs_pattern: Some(var_pat("__r0")),
+            compare: compare_call(ident("__l0"), ident("__r0")),
+        },
+        None => OrdPayloadCompare {
+            lhs_pattern: None,
+            rhs_pattern: None,
+            compare: ident("EQ"),
+        },
+    }
+}
+
+fn tuple_payload_names(prefix: &str, len: usize) -> Vec<String> {
+    (0..len).map(|index| format!("{prefix}{index}")).collect()
+}
+
+fn tuple_payload_pattern(names: &[String]) -> Pattern {
+    Pattern::Tuple(names.iter().map(|name| var_pat(name)).collect())
+}
+
+fn compare_tuple_payload_fields(lhs_names: &[String], rhs_names: &[String], index: usize) -> Expr {
+    if index >= lhs_names.len() {
+        return ident("EQ");
+    }
+    Expr::synthetic(ExprKind::Match {
+        scrutinee: Box::new(compare_call(
+            ident(&lhs_names[index]),
+            ident(&rhs_names[index]),
+        )),
+        arms: vec![
+            (constructor_pat("LT"), ident("LT")),
+            (constructor_pat("GT"), ident("GT")),
+            (
+                constructor_pat("EQ"),
+                compare_tuple_payload_fields(lhs_names, rhs_names, index + 1),
+            ),
+        ],
+    })
+}
+
+fn wildcard_payload(payload: Option<&Type>) -> Option<Pattern> {
+    payload.map(|_| Pattern::Wildcard)
+}
+
 fn impl_def(
     input: &DeriveInput<'_>,
     trait_name: &str,
@@ -212,8 +420,21 @@ fn type_param_bounds(input: &DeriveInput<'_>, trait_name: &str) -> Vec<TypeBound
             collect_used_type_params(payload, input.type_params, &mut used);
         }
     }
-    input
-        .type_params
+    type_param_bounds_from_used(input.type_params, trait_name, used)
+}
+
+fn type_param_bounds_for_type(ty: &Type, params: &[String], trait_name: &str) -> Vec<TypeBound> {
+    let mut used = HashSet::new();
+    collect_used_type_params(ty, params, &mut used);
+    type_param_bounds_from_used(params, trait_name, used)
+}
+
+fn type_param_bounds_from_used(
+    params: &[String],
+    trait_name: &str,
+    used: HashSet<String>,
+) -> Vec<TypeBound> {
+    params
         .iter()
         .filter(|param| used.contains(*param))
         .map(|param| TypeBound {
@@ -275,12 +496,25 @@ fn param(name: &str) -> Param {
 }
 
 fn variant_pat(variant: &Variant, binding: Option<&str>) -> Pattern {
+    variant_pat_with_payload(variant, binding.map(var_pat))
+}
+
+fn variant_pat_with_payload(variant: &Variant, binding: Option<Pattern>) -> Pattern {
     Pattern::Constructor {
         name: variant.name.clone(),
-        binding: binding
-            .map(|name| Pattern::Variable(name.to_string(), SourceSpan::synthetic()))
-            .map(Box::new),
+        binding: binding.map(Box::new),
     }
+}
+
+fn constructor_pat(name: &str) -> Pattern {
+    Pattern::Constructor {
+        name: name.to_string(),
+        binding: None,
+    }
+}
+
+fn var_pat(name: &str) -> Pattern {
+    Pattern::Variable(name.to_string(), SourceSpan::synthetic())
 }
 
 fn ident(name: &str) -> Expr {
@@ -293,6 +527,19 @@ fn bool_lit(value: bool) -> Expr {
 
 fn string_lit(value: impl Into<String>) -> Expr {
     Expr::synthetic(ExprKind::StringLit(value.into()))
+}
+
+fn call(callee: Expr, args: Vec<Expr>) -> Expr {
+    Expr::synthetic(ExprKind::Call {
+        callee: Box::new(callee),
+        args,
+        is_method_call: false,
+        arg_wrappers: vec![],
+        resolved_callee: None,
+        pending_trait_method: None,
+        dict_args: vec![],
+        pending_dict_args: vec![],
+    })
 }
 
 fn binary(lhs: Expr, op: &str, rhs: Expr) -> Expr {
@@ -312,16 +559,36 @@ fn concat(lhs: Expr, rhs: Expr) -> Expr {
     binary(lhs, "<>", rhs)
 }
 
+fn compare_result_eq(value: Expr, ordering: &str) -> Expr {
+    binary(value, "==", ident(ordering))
+}
+
+fn compare_result_ne(value: Expr, ordering: &str) -> Expr {
+    binary(value, "!=", ident(ordering))
+}
+
+fn compare_call(lhs: Expr, rhs: Expr) -> Expr {
+    associated_call("Ord", "compare", vec![lhs, rhs])
+}
+
+fn default_call() -> Expr {
+    associated_call("Default", "default", vec![])
+}
+
 fn to_string_call(value: Expr) -> Expr {
+    associated_call("ToString", "to_string", vec![value])
+}
+
+fn associated_call(target: &str, member: &str, args: Vec<Expr>) -> Expr {
     Expr::synthetic(ExprKind::Call {
         callee: Box::new(Expr::synthetic(ExprKind::AssociatedAccess {
-            target: Type::Ident("ToString".to_string()),
+            target: Type::Ident(target.to_string()),
             target_span: SourceSpan::synthetic(),
-            member: "to_string".to_string(),
+            member: member.to_string(),
             member_span: SourceSpan::synthetic(),
             resolution: None,
         })),
-        args: vec![value],
+        args,
         is_method_call: false,
         arg_wrappers: vec![],
         resolved_callee: None,
@@ -338,37 +605,51 @@ mod tests {
 
     #[test]
     fn expand_derives_inserts_impls_after_type() {
-        let mut program = parse_source("#[derive(Eq, ToString)]\ntype Box('a) = Box('a)\n")
-            .expect("source should parse");
+        let mut program =
+            parse_source("#[derive(Default, Eq, Ord, ToString)]\ntype Box('a) = Box('a)\n")
+                .expect("source should parse");
 
         expand_derives(&mut program);
 
-        assert_eq!(program.stmts.len(), 3);
+        assert_eq!(program.stmts.len(), 5);
         assert!(matches!(program.stmts[0], Stmt::Type(_)));
-        let Stmt::Impl(eq_impl) = &program.stmts[1] else {
+        let Stmt::Impl(default_impl) = &program.stmts[1] else {
+            panic!("expected generated Default impl");
+        };
+        let Stmt::Impl(eq_impl) = &program.stmts[2] else {
             panic!("expected generated Eq impl");
         };
-        let Stmt::Impl(to_string_impl) = &program.stmts[2] else {
+        let Stmt::Impl(ord_impl) = &program.stmts[3] else {
+            panic!("expected generated Ord impl");
+        };
+        let Stmt::Impl(to_string_impl) = &program.stmts[4] else {
             panic!("expected generated ToString impl");
         };
+        assert_eq!(default_impl.trait_name, "Default");
         assert_eq!(eq_impl.trait_name, "Eq");
+        assert_eq!(ord_impl.trait_name, "Ord");
         assert_eq!(to_string_impl.trait_name, "ToString");
+        assert!(default_impl.generated_by.is_some());
         assert!(eq_impl.generated_by.is_some());
+        assert!(ord_impl.generated_by.is_some());
         assert!(to_string_impl.generated_by.is_some());
     }
 
     #[test]
     fn expand_derives_is_idempotent() {
-        let mut program = parse_source("#[derive(Eq, ToString)]\ntype Box('a) = Box('a)\n")
-            .expect("source should parse");
+        let mut program =
+            parse_source("#[derive(Default, Eq, Ord, ToString)]\ntype Box('a) = Box('a)\n")
+                .expect("source should parse");
 
         expand_derives(&mut program);
         expand_derives(&mut program);
 
-        assert_eq!(program.stmts.len(), 3);
+        assert_eq!(program.stmts.len(), 5);
         assert!(matches!(program.stmts[0], Stmt::Type(_)));
         assert!(matches!(program.stmts[1], Stmt::Impl(_)));
         assert!(matches!(program.stmts[2], Stmt::Impl(_)));
+        assert!(matches!(program.stmts[3], Stmt::Impl(_)));
+        assert!(matches!(program.stmts[4], Stmt::Impl(_)));
     }
 
     #[test]
@@ -386,5 +667,19 @@ mod tests {
             eq_impl.type_bounds[0].args.as_slice(),
             [Type::Var(name)] if name == "'a"
         ));
+    }
+
+    #[test]
+    fn default_derive_uses_first_empty_variant_without_payload_bounds() {
+        let mut program =
+            parse_source("#[derive(Default)]\ntype MaybeBox('a) = Present('a) | Missing\n")
+                .expect("source should parse");
+
+        expand_derives(&mut program);
+
+        let Stmt::Impl(default_impl) = &program.stmts[1] else {
+            panic!("expected generated Default impl");
+        };
+        assert!(default_impl.type_bounds.is_empty());
     }
 }

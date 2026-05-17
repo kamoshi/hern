@@ -113,10 +113,11 @@ fn associated_definition_span_in_stmt(
         Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
             associated_definition_span_in_expr(program, body, position)
         }
-        Stmt::Impl(impl_def) => impl_def
+        Stmt::Impl(impl_def) if impl_def.generated_by.is_none() => impl_def
             .methods
             .iter()
             .find_map(|method| associated_definition_span_in_expr(program, &method.body, position)),
+        Stmt::Impl(_) => None,
         Stmt::InherentImpl(impl_def) => impl_def
             .methods
             .iter()

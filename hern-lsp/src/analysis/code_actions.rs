@@ -90,6 +90,9 @@ fn collect_code_actions_for_stmt(stmt: &Stmt, ctx: &mut CodeActionCtx<'_>) {
             collect_code_actions_for_expr(body, ctx);
         }
         Stmt::Impl(impl_def) => {
+            if impl_def.generated_by.is_some() {
+                return;
+            }
             collect_missing_trait_method_action(impl_def, ctx);
             for method in &impl_def.methods {
                 collect_code_actions_for_expr(&method.body, ctx);

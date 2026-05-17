@@ -1,0 +1,4 @@
+#[derive(Default)]
+type Mode = Loading | #[inline] Ready
+
+print("unreachable");

@@ -268,7 +268,14 @@ impl Infer {
 
 fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeError> {
     for method in &td.methods {
-        if method.params.is_empty() {
+        let mentions_trait_param = td.params.iter().any(|param| {
+            method
+                .params
+                .iter()
+                .any(|(_, ty)| ast_type_contains_var(ty, param))
+                || ast_type_contains_var(&method.ret_type, param)
+        });
+        if !mentions_trait_param {
             return Err(TypeError::TraitMethodMissingTarget {
                 trait_name: td.name.clone(),
                 method: method.name.clone(),

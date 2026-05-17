@@ -1,0 +1,23 @@
+#[derive(Eq, Ord, ToString)]
+type Box('a) = Box('a)
+
+#[derive(Eq, Ord, ToString)]
+type Rank = Low | Medium | High
+
+#[derive(Eq, Ord, ToString)]
+type Item = Empty | One(int) | Named(string)
+
+#[derive(Eq, Ord)]
+type PairBox = PairBox((int, int))
+
+print(to_string(compare(Low, Medium)));
+print(to_string(compare(Medium, Medium)));
+print(to_string(compare(High, Medium)));
+print(to_string(Low < Medium));
+print(to_string(High > Medium));
+print(to_string(Medium <= Medium));
+print(to_string(Medium >= Medium));
+print(to_string(Box(1) < Box(2)));
+print(to_string(Empty < One(0) && One(2) < Named("a")));
+print(to_string(compare(PairBox((1, 2)), PairBox((1, 3)))));
+print(to_string(PairBox((2, 0)) > PairBox((1, 99))));

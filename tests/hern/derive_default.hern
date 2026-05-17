@@ -1,0 +1,36 @@
+#[derive(Default, Eq, ToString)]
+type State = Loading | Ready(int) | Failed(string)
+
+#[derive(Default, Eq, ToString)]
+type Box('a) = Box('a)
+
+#[derive(Default, Eq, ToString)]
+type MaybeBox('a) = Present('a) | Missing
+
+#[derive(Default, Eq)]
+type TupleBox('a, 'b) = TupleBox(('a, 'b))
+
+let state: State = default();
+let boxed_int: Box(int) = default();
+let boxed_string: Box(string) = Default::default();
+let maybe: MaybeBox(fn() -> int) = default();
+let tuple_box: TupleBox(int, string) = default();
+let empty: [int] = default();
+let maybe_int: Option(int) = default();
+let default_bool: bool = default();
+let tuple_box_is_default = match tuple_box {
+  TupleBox((n, s)) -> n == 0 && s == ""
+};
+let maybe_is_missing = match maybe {
+  Present(_) -> false,
+  Missing -> true
+};
+
+print(to_string(state));
+print(to_string(boxed_int));
+print(to_string(boxed_string == Box("")));
+print(to_string(tuple_box_is_default));
+print(to_string(maybe_is_missing));
+print(to_string(empty));
+print(to_string(maybe_int));
+print(to_string(default_bool == false));

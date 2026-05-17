@@ -100,6 +100,9 @@ fn find_call_in_stmt<'a>(
         Stmt::Let { value, .. } => find_call_in_expr(value, position, best),
         Stmt::Fn { body, .. } | Stmt::Op { body, .. } => find_call_in_expr(body, position, best),
         Stmt::Impl(impl_def) => {
+            if impl_def.generated_by.is_some() {
+                return;
+            }
             for method in &impl_def.methods {
                 find_call_in_expr(&method.body, position, best);
             }

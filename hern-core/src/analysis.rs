@@ -1,4 +1,4 @@
-use crate::ast::{Expr, ExprKind, NodeId, Program, SourcePosition, SourceSpan, Stmt};
+use crate::ast::{BinOp, Expr, ExprKind, NodeId, Program, SourcePosition, SourceSpan, Stmt};
 use crate::derive::expand_derives;
 use crate::pipeline::{
     infer_program, infer_program_with_seed, parse_source, reassociate_standalone,
@@ -301,11 +301,15 @@ fn find_hover_in_expr(
             find_hover_in_expr(value, expr_types, symbol_types, pos, best);
         }
         ExprKind::Binary {
-            lhs, op_span, rhs, ..
+            lhs,
+            op,
+            op_span,
+            rhs,
+            ..
         } => {
             find_hover_in_expr(lhs, expr_types, symbol_types, pos, best);
             find_hover_in_expr(rhs, expr_types, symbol_types, pos, best);
-            if contains(*op_span, pos) {
+            if contains(*op_span, pos) && !is_synthetic_interpolation_concat(expr, op, *op_span) {
                 let lhs_ty = symbol_types
                     .get(&lhs.id)
                     .or_else(|| expr_types.get(&lhs.id));
@@ -436,6 +440,13 @@ fn hover_target_span(expr: &Expr, pos: SourcePosition) -> Option<SourceSpan> {
         | ExprKind::Block { .. }
         | ExprKind::For { .. } => None,
     }
+}
+
+/// String interpolation lowers through synthetic `<>` nodes whose operator span
+/// covers the interpolation source instead of the two operator characters.
+pub fn is_synthetic_interpolation_concat(expr: &Expr, op: &BinOp, op_span: SourceSpan) -> bool {
+    matches!(op, BinOp::Custom(op) if op == "<>")
+        && (op_span == expr.span || span_len(op_span) > "<>".len())
 }
 
 fn contains(span: SourceSpan, pos: SourcePosition) -> bool {

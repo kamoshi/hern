@@ -72,6 +72,9 @@ fn collect_stmt_hints(
             collect_expr_hints(body, range, binding_types, definition_schemes, hints);
         }
         Stmt::Impl(impl_def) => {
+            if impl_def.generated_by.is_some() {
+                return;
+            }
             for method in &impl_def.methods {
                 let scheme = definition_schemes.and_then(|schemes| schemes.get(&method.name_span));
                 collect_callable_hints(

@@ -546,6 +546,8 @@ impl<'tokens> Parser<'tokens> {
             source_span,
             ExprKind::AssociatedAccess {
                 target: Type::Ident("ToString".to_string()),
+                // Synthetic target/member spans intentionally match; the LSP uses
+                // that shape to avoid hovering this generated call.
                 target_span: source_span,
                 member: "to_string".to_string(),
                 member_span: source_span,
@@ -1361,6 +1363,13 @@ impl<'tokens> Parser<'tokens> {
         }
 
         let alias_shaped_rhs = match tokens.get(ptr).map(|tok| &tok.token) {
+            // Variant attributes are allowed before sum variants; do not confuse
+            // `#[default] Variant` with an alias-shaped record type RHS.
+            Some(Token::Hash)
+                if tokens.get(ptr + 1).map(|tok| &tok.token) == Some(&Token::LBracket) =>
+            {
+                false
+            }
             Some(Token::Hash | Token::LParen | Token::Fn | Token::LBracket) => true,
             Some(Token::Ident(id)) if id.starts_with('\'') => true,
             _ => false,
@@ -1377,8 +1386,11 @@ impl<'tokens> Parser<'tokens> {
         }
 
         let mut variants = Vec::new();
+        let mut default_variant_span = None;
         loop {
             let variant_start = ptr;
+            let (consumed_attrs, attrs) = self.parse_variant_attrs(tokens, ptr)?;
+            ptr += consumed_attrs;
             let (c_vname, vname, vname_span) = self.expect_ident_with_span(&tokens[ptr..])?;
             ptr += c_vname;
             let payload = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::LParen) {
@@ -1390,16 +1402,43 @@ impl<'tokens> Parser<'tokens> {
             } else {
                 None
             };
+            if let Some(default_attr) = attrs.iter().find(|attr| attr.is("default")) {
+                if default_variant_span.is_some() {
+                    return Err(ParseError::new(
+                        "Only one variant can be marked `#[default]`",
+                        attr_error_span(default_attr),
+                    ));
+                }
+                if payload.is_some() {
+                    return Err(ParseError::new(
+                        "Variant marked `#[default]` must not have a payload",
+                        attr_error_span(default_attr),
+                    ));
+                }
+                default_variant_span = Some(attr_error_span(default_attr));
+            }
             variants.push(Variant {
                 span: consumed_span(&tokens[variant_start..], ptr - variant_start),
                 name: vname,
                 name_span: vname_span,
+                attrs,
                 payload,
             });
             if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Pipe) {
                 ptr += 1;
             } else {
                 break;
+            }
+        }
+        if let Some(default_attr_span) = default_variant_span {
+            let derives_default = derives
+                .iter()
+                .any(|derive| derive.traits.contains(&DeriveTrait::Default));
+            if !derives_default {
+                return Err(ParseError::new(
+                    "Variant attribute `#[default]` requires `#[derive(Default)]`",
+                    default_attr_span,
+                ));
             }
         }
         Ok((
@@ -1413,6 +1452,42 @@ impl<'tokens> Parser<'tokens> {
                 derives,
             }),
         ))
+    }
+
+    fn parse_variant_attrs(
+        &self,
+        tokens: &[Spanned],
+        ptr: usize,
+    ) -> Result<(usize, Vec<Attribute>), ParseError> {
+        let (consumed, attrs) = self.parse_outer_attrs(tokens, ptr)?;
+        let mut seen_default = false;
+        for attr in &attrs {
+            if !attr.is("default") {
+                return Err(ParseError::new(
+                    format!(
+                        "Attribute `{}` is not allowed on variants; only `default` is supported",
+                        attr.name
+                    ),
+                    attr_error_span(attr),
+                ));
+            }
+            if !attr.args.is_empty() {
+                return Err(ParseError::new(
+                    "Attribute `default` does not accept arguments",
+                    attr_error_span(attr),
+                ));
+            }
+            if seen_default {
+                // Same-variant duplicates are caught here; duplicates across
+                // variants are caught by the caller while parsing the whole type.
+                return Err(ParseError::new(
+                    "Duplicate variant attribute `default`",
+                    attr_error_span(attr),
+                ));
+            }
+            seen_default = true;
+        }
+        Ok((consumed, attrs))
     }
 
     fn parse_type_alias_after_keyword(
@@ -1509,12 +1584,14 @@ impl<'tokens> Parser<'tokens> {
             let mut traits = Vec::new();
             for arg in &attr.args {
                 let derive_trait = match arg.as_str() {
+                    "Default" => DeriveTrait::Default,
                     "Eq" => DeriveTrait::Eq,
+                    "Ord" => DeriveTrait::Ord,
                     "ToString" => DeriveTrait::ToString,
                     _ => {
                         return Err(ParseError::new(
                             format!(
-                                "Cannot derive `{}`: supported derives are Eq, ToString",
+                                "Cannot derive `{}`: supported derives are Default, Eq, Ord, ToString",
                                 arg
                             ),
                             attr_error_span(attr),

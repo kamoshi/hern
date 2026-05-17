@@ -664,6 +664,38 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn hover_on_interpolated_string_does_not_show_synthetic_concat_operator() {
+        let project = TestProject::new("interpolation-hover");
+        let source = concat!(
+            "let a = 1;\n",
+            "let b = 2;\n",
+            "print($\"a: ${a}\");\n",
+            "print($\"b: ${b}\");\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let text_hover = hover(&state, uri.clone(), Position::new(2, 8))
+            .expect("interpolated string text should have hover");
+        let hole_hover = hover(&state, uri.clone(), Position::new(2, 13))
+            .expect("interpolation hole identifier should have hover");
+        let second_text_hover = hover(&state, uri, Position::new(3, 8))
+            .expect("second interpolated string text should have hover");
+
+        assert_eq!(hover_text(text_hover), "string");
+        assert_eq!(hover_text(hole_hover), "int");
+        assert_eq!(hover_text(second_text_hover), "string");
+    }
+
+    #[test]
+    fn hover_on_derive_attribute_does_not_show_generated_impl_method() {
+        let project = TestProject::new("derive-hover");
+        let source = "#[derive(Default, Ord, ToString)]\ntype Box('a) = Box('a)\n";
+        let (state, uri) = project.open("main.hern", source);
+
+        assert!(hover(&state, uri, Position::new(0, 11)).is_none());
+    }
+
+    #[test]
     fn hover_does_not_show_block_result_on_let_keyword() {
         let project = TestProject::new("hover-let-keyword");
         let source = concat!(

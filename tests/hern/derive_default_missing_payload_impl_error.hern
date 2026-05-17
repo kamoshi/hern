@@ -1,0 +1,7 @@
+#[derive(Default)]
+type Box('a) = Box('a)
+
+extern mk_value: fn() -> fn() -> int = "(function() return function() return 1 end end)";
+
+let value: Box(fn() -> int) = default();
+print("unreachable");

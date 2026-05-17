@@ -1344,7 +1344,7 @@ error_contains = "trait `Eq` is not implemented"
 [tests.trait_method_missing_target]
 path = "tests/hern/trait_method_missing_target.hern"
 expect = "error"
-error_contains = "must have at least one parameter"
+error_contains = "must mention a trait parameter"
 
 [tests.array_spread]
 path = "tests/hern/array_spread.hern"
@@ -1815,10 +1815,49 @@ true
 true
 """
 
+[tests.derive_default]
+path = "tests/hern/derive_default.hern"
+expect = "typecheck"
+output = """
+Loading
+Box(0)
+true
+true
+true
+[]
+None
+true
+"""
+
+[tests.derive_default_marked_variant]
+path = "tests/hern/derive_default_marked_variant.hern"
+expect = "typecheck"
+output = """
+Ready
+true
+"""
+
+[tests.derive_ord]
+path = "tests/hern/derive_ord.hern"
+expect = "typecheck"
+output = """
+LT
+EQ
+GT
+true
+true
+true
+true
+true
+true
+LT
+true
+"""
+
 [tests.derive_unknown_error]
 path = "tests/hern/derive_unknown_error.hern"
 expect = "error"
-error_contains = "Cannot derive `Clone`: supported derives are Eq, ToString"
+error_contains = "Cannot derive `Clone`: supported derives are Default, Eq, Ord, ToString"
 
 [tests.derive_on_function_error]
 path = "tests/hern/derive_on_function_error.hern"
@@ -1857,6 +1896,36 @@ error_contains = "Duplicate derive `Eq`"
 path = "tests/hern/derive_missing_payload_impl_error.hern"
 expect = "error"
 error_contains = "trait `Eq` is not implemented for `Wrap(fn() -> int)`"
+
+[tests.derive_default_missing_payload_impl_error]
+path = "tests/hern/derive_default_missing_payload_impl_error.hern"
+expect = "error"
+error_contains = "could not resolve `Default` implementation"
+
+[tests.derive_default_duplicate_marker_error]
+path = "tests/hern/derive_default_duplicate_marker_error.hern"
+expect = "error"
+error_contains = "Only one variant can be marked `#[default]`"
+
+[tests.derive_default_payload_marker_error]
+path = "tests/hern/derive_default_payload_marker_error.hern"
+expect = "error"
+error_contains = "Variant marked `#[default]` must not have a payload"
+
+[tests.variant_default_without_derive_error]
+path = "tests/hern/variant_default_without_derive_error.hern"
+expect = "error"
+error_contains = "Variant attribute `#[default]` requires `#[derive(Default)]`"
+
+[tests.variant_unknown_attr_error]
+path = "tests/hern/variant_unknown_attr_error.hern"
+expect = "error"
+error_contains = "Attribute `inline` is not allowed on variants; only `default` is supported"
+
+[tests.derive_ord_missing_payload_impl_error]
+path = "tests/hern/derive_ord_missing_payload_impl_error.hern"
+expect = "error"
+error_contains = "trait `Ord` is not implemented for `Wrap(fn() -> int)`"
 
 [tests.test_block_type_decl_error]
 path = "tests/hern/test_block_type_decl_error.hern"

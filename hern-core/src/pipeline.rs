@@ -235,8 +235,9 @@ mod tests {
 
     #[test]
     fn parse_source_accepts_type_derives() {
-        let program = parse_source("#[derive(Eq, ToString)]\ntype Box('a) = Box('a)\n")
-            .expect("source should parse");
+        let program =
+            parse_source("#[derive(Default, Eq, Ord, ToString)]\ntype Box('a) = Box('a)\n")
+                .expect("source should parse");
         let Stmt::Type(type_def) = &program.stmts[0] else {
             panic!("expected type definition");
         };
@@ -244,7 +245,12 @@ mod tests {
         assert_eq!(type_def.derives.len(), 1);
         assert_eq!(
             type_def.derives[0].traits,
-            vec![DeriveTrait::Eq, DeriveTrait::ToString]
+            vec![
+                DeriveTrait::Default,
+                DeriveTrait::Eq,
+                DeriveTrait::Ord,
+                DeriveTrait::ToString
+            ]
         );
     }
 
@@ -437,9 +443,9 @@ mod tests {
     }
 
     #[test]
-    fn trait_methods_require_target_parameter() {
-        let mut program =
-            parse_source("trait Ping 'a {\n    fn ping() -> 'a\n}\n").expect("source should parse");
+    fn trait_methods_must_mention_trait_parameter() {
+        let mut program = parse_source("trait Ping 'a {\n    fn ping() -> string\n}\n")
+            .expect("source should parse");
         reassociate_standalone(&mut program).expect("source should reassociate");
 
         let output = infer_program_collecting(&mut program);
@@ -449,7 +455,7 @@ mod tests {
         assert!(
             output.diagnostics[0]
                 .message
-                .contains("must have at least one parameter")
+                .contains("must mention a trait parameter")
         );
     }
 }

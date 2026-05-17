@@ -1,0 +1,4 @@
+#[derive(Default)]
+type Box('a) = #[default] Box('a)
+
+print("unreachable");

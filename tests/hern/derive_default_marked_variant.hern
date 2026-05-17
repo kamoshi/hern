@@ -1,0 +1,6 @@
+#[derive(Default, Eq, ToString)]
+type Mode = Loading | #[default] Ready | Failed(string)
+
+let mode: Mode = default();
+print(to_string(mode));
+print(to_string(mode == Ready));

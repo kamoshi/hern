@@ -125,14 +125,18 @@ impl Attribute {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeriveTrait {
+    Default,
     Eq,
+    Ord,
     ToString,
 }
 
 impl DeriveTrait {
     pub fn name(self) -> &'static str {
         match self {
+            DeriveTrait::Default => "Default",
             DeriveTrait::Eq => "Eq",
+            DeriveTrait::Ord => "Ord",
             DeriveTrait::ToString => "ToString",
         }
     }
@@ -618,6 +622,7 @@ pub struct Variant {
     pub span: SourceSpan,
     pub name: String,
     pub name_span: SourceSpan,
+    pub attrs: Vec<Attribute>,
     pub payload: Option<Type>,
 }
 

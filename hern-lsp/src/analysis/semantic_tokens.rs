@@ -314,6 +314,9 @@ fn push_associated_access_tokens(
             push_associated_access_tokens_expr(raw, pos_to_idx, source, body)
         }
         Stmt::Impl(impl_def) => {
+            if impl_def.generated_by.is_some() {
+                return;
+            }
             for method in &impl_def.methods {
                 push_associated_access_tokens_expr(raw, pos_to_idx, source, &method.body);
             }

@@ -1,4 +1,4 @@
-// trait method with no parameters — must have at least one to dispatch on
+// trait method does not mention a trait parameter, so there is no dispatch target
 trait Ping 'a {
     fn ping() -> string
 }
