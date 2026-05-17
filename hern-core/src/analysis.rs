@@ -116,6 +116,10 @@ pub fn analyze_prelude() -> Result<PreludeAnalysis, CompilerDiagnostic> {
     analyze_prelude_source(PRELUDE)
 }
 
+pub fn prelude_source() -> &'static str {
+    PRELUDE
+}
+
 pub fn analyze_prelude_source(source: &str) -> Result<PreludeAnalysis, CompilerDiagnostic> {
     let mut program = parse_source(source)?;
     expand_derives(&mut program);
@@ -206,14 +210,18 @@ fn find_hover_in_expr(
     pos: SourcePosition,
     best: &mut Option<HoverInfo>,
 ) {
-    if !contains(expr.span, pos) {
+    let has_real_span = has_real_span(expr.span);
+    if has_real_span && !contains(expr.span, pos) {
         return;
     }
 
-    let ty = symbol_types
-        .get(&expr.id)
-        .or_else(|| expr_types.get(&expr.id));
-    if let (Some(ty), Some(span)) = (ty, hover_target_span(expr, pos))
+    if has_real_span
+        && let (Some(ty), Some(span)) = (
+            symbol_types
+                .get(&expr.id)
+                .or_else(|| expr_types.get(&expr.id)),
+            hover_target_span(expr, pos),
+        )
         && best
             .as_ref()
             .is_none_or(|current| span_len(span) <= span_len(current.span))
@@ -431,11 +439,17 @@ fn hover_target_span(expr: &Expr, pos: SourcePosition) -> Option<SourceSpan> {
 }
 
 fn contains(span: SourceSpan, pos: SourcePosition) -> bool {
-    if span.start_line == 0 {
+    if !has_real_span(span) {
         return false;
     }
     (pos.line, pos.col) >= (span.start_line, span.start_col)
         && (pos.line, pos.col) < (span.end_line, span.end_col)
+}
+
+fn has_real_span(span: SourceSpan) -> bool {
+    span.start_line != 0
+        && span.end_line != 0
+        && (span.start_line, span.start_col) <= (span.end_line, span.end_col)
 }
 
 fn span_len(span: SourceSpan) -> usize {

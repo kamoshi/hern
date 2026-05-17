@@ -25,6 +25,11 @@
 !hern-core/Cargo.toml
 !hern-core/**/*.rs
 
+!hern-doc/
+!hern-doc/**/
+!hern-doc/Cargo.toml
+!hern-doc/**/*.rs
+
 !hern-lsp/
 !hern-lsp/**/
 !hern-lsp/Cargo.toml

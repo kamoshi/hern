@@ -1,6 +1,6 @@
 use crate::ast::{Stmt, Type};
 use crate::types::{EnvInfo, Subst, Ty, TyVar, perf};
-use im_rc::HashMap as ImHashMap;
+use im::HashMap as ImHashMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 

@@ -49,6 +49,61 @@ impl SourceSpan {
     }
 }
 
+/// Converts a 1-based source position to a byte offset in `source`.
+///
+/// Hern source columns are byte columns. This matches the lexer/parser spans
+/// and keeps callers independent of LSP's UTF-16 position model.
+///
+/// Columns past the end of an existing line are clamped to that line's final
+/// byte. This is useful for diagnostics and editor positions that point at
+/// virtual end-of-line columns, but it means malformed positions do not
+/// necessarily round-trip through [`byte_to_source_position`].
+pub fn source_position_to_byte(source: &str, position: SourcePosition) -> Option<usize> {
+    let mut line_start = 0;
+    for (idx, line) in source.split_inclusive('\n').enumerate() {
+        if idx + 1 == position.line {
+            let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+            return Some(
+                line_start
+                    + position
+                        .col
+                        .saturating_sub(1)
+                        .min(line_without_newline.len()),
+            );
+        }
+        line_start += line.len();
+    }
+    if position.line == source.lines().count() + 1 && position.col == 1 {
+        Some(source.len())
+    } else {
+        None
+    }
+}
+
+/// Converts a byte offset in `source` to a 1-based Hern source position.
+///
+/// The returned column is the natural byte column for `byte`; it is not clamped.
+pub fn byte_to_source_position(source: &str, byte: usize) -> Option<SourcePosition> {
+    if byte > source.len() {
+        return None;
+    }
+    let mut line = 1;
+    let mut line_start = 0;
+    for (idx, ch) in source.char_indices() {
+        if idx >= byte {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = idx + ch.len_utf8();
+        }
+    }
+    Some(SourcePosition {
+        line,
+        col: byte.saturating_sub(line_start) + 1,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub stmts: Vec<Stmt>,

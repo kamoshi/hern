@@ -5,7 +5,8 @@ use super::workspace::document_source;
 use hern_core::analysis::{PreludeAnalysis, analyze_prelude_source, hover_at};
 use hern_core::ast::{
     BinOp, Expr, ExprKind, Fixity, ImplMethod, InherentMethod, Param, Pattern, Program,
-    SourcePosition, SourceSpan, Stmt, TraitDef, TraitMethod, walk_program_exprs,
+    SourcePosition, SourceSpan, Stmt, TraitDef, TraitMethod, byte_to_source_position,
+    source_position_to_byte, walk_program_exprs,
 };
 use hern_core::module::{GraphInference, ModuleEnv, ModuleGraph};
 use hern_core::source_index::{Definition, DefinitionKind, ImportMemberReference, index_program};
@@ -531,49 +532,6 @@ fn find_keyword(source: &str, keyword: &str) -> Option<usize> {
         offset = end;
     }
     None
-}
-
-fn source_position_to_byte(source: &str, position: SourcePosition) -> Option<usize> {
-    let mut line_start = 0;
-    for (idx, line) in source.split_inclusive('\n').enumerate() {
-        if idx + 1 == position.line {
-            let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
-            return Some(
-                line_start
-                    + position
-                        .col
-                        .saturating_sub(1)
-                        .min(line_without_newline.len()),
-            );
-        }
-        line_start += line.len();
-    }
-    if position.line == source.lines().count() + 1 && position.col == 1 {
-        Some(source.len())
-    } else {
-        None
-    }
-}
-
-fn byte_to_source_position(source: &str, byte: usize) -> Option<SourcePosition> {
-    if byte > source.len() {
-        return None;
-    }
-    let mut line = 1;
-    let mut line_start = 0;
-    for (idx, ch) in source.char_indices() {
-        if idx >= byte {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            line_start = idx + ch.len_utf8();
-        }
-    }
-    Some(SourcePosition {
-        line,
-        col: byte.saturating_sub(line_start) + 1,
-    })
 }
 
 fn is_identifier_char(ch: char) -> bool {

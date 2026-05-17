@@ -32,35 +32,42 @@ pub fn build_fixity_table(program: &Program) -> FixityTable {
 }
 
 pub fn reassoc_program(program: &mut Program, table: &FixityTable) -> Result<(), ReassocError> {
+    let mut next_node_id = next_program_node_id(program);
     for stmt in &mut program.stmts {
-        reassoc_stmt(stmt, table)?;
+        reassoc_stmt(stmt, table, &mut next_node_id)?;
     }
     Ok(())
 }
 
-fn reassoc_stmt(stmt: &mut Stmt, table: &FixityTable) -> Result<(), ReassocError> {
+fn reassoc_stmt(
+    stmt: &mut Stmt,
+    table: &FixityTable,
+    next_node_id: &mut NodeId,
+) -> Result<(), ReassocError> {
     match stmt {
-        Stmt::Let { value, .. } => reassoc_expr(value, table)?,
-        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => reassoc_expr(body, table)?,
-        Stmt::Expr(e) => reassoc_expr(e, table)?,
+        Stmt::Let { value, .. } => reassoc_expr_with_ids(value, table, next_node_id)?,
+        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
+            reassoc_expr_with_ids(body, table, next_node_id)?
+        }
+        Stmt::Expr(e) => reassoc_expr_with_ids(e, table, next_node_id)?,
         Stmt::Impl(id) => {
             for m in &mut id.methods {
-                reassoc_expr(&mut m.body, table)?;
+                reassoc_expr_with_ids(&mut m.body, table, next_node_id)?;
             }
         }
         Stmt::InherentImpl(id) => {
             for m in &mut id.methods {
-                reassoc_expr(&mut m.body, table)?;
+                reassoc_expr_with_ids(&mut m.body, table, next_node_id)?;
             }
         }
         Stmt::TestBlock { stmts, .. } => {
             for stmt in stmts {
-                reassoc_stmt(stmt, table)?;
+                reassoc_stmt(stmt, table, next_node_id)?;
             }
         }
         Stmt::RecBlock { stmts, .. } => {
             for stmt in stmts {
-                reassoc_stmt(stmt, table)?;
+                reassoc_stmt(stmt, table, next_node_id)?;
             }
         }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
@@ -68,47 +75,59 @@ fn reassoc_stmt(stmt: &mut Stmt, table: &FixityTable) -> Result<(), ReassocError
     Ok(())
 }
 
+#[cfg(test)]
 fn reassoc_expr(expr: &mut Expr, table: &FixityTable) -> Result<(), ReassocError> {
+    let mut next_node_id = max_expr_node_id(expr).saturating_add(1).max(1);
+    reassoc_expr_with_ids(expr, table, &mut next_node_id)
+}
+
+fn reassoc_expr_with_ids(
+    expr: &mut Expr,
+    table: &FixityTable,
+    next_node_id: &mut NodeId,
+) -> Result<(), ReassocError> {
     // If this is a custom-op binary chain, flatten and re-Pratt it.
     if is_custom_binary(expr) {
         let owned = expr.clone();
         let mut parts: VecDeque<(String, SourceSpan, Expr)> = VecDeque::new();
         let head = flatten(owned, &mut parts);
         // Reassoc atoms
-        let head = reassoc_owned(head, table)?;
+        let head = reassoc_owned(head, table, next_node_id)?;
         let parts: VecDeque<(String, SourceSpan, Expr)> = parts
             .into_iter()
-            .map(|(op, op_span, e)| reassoc_owned(e, table).map(|e| (op, op_span, e)))
+            .map(|(op, op_span, e)| {
+                reassoc_owned(e, table, next_node_id).map(|e| (op, op_span, e))
+            })
             .collect::<Result<_, _>>()?;
         validate_operator_chain(&parts, table)?;
-        *expr = pratt(head, &mut { parts }, 0, table);
+        *expr = pratt(head, &mut { parts }, 0, table, next_node_id);
         return Ok(());
     }
 
     // Otherwise recurse into sub-expressions.
     match &mut expr.kind {
-        ExprKind::Grouped(e) | ExprKind::Not(e) => reassoc_expr(e, table)?,
-        ExprKind::Neg { operand, .. } => reassoc_expr(operand, table)?,
+        ExprKind::Grouped(e) | ExprKind::Not(e) => reassoc_expr_with_ids(e, table, next_node_id)?,
+        ExprKind::Neg { operand, .. } => reassoc_expr_with_ids(operand, table, next_node_id)?,
         ExprKind::Assign { target, value } => {
-            reassoc_expr(target, table)?;
-            reassoc_expr(value, table)?;
+            reassoc_expr_with_ids(target, table, next_node_id)?;
+            reassoc_expr_with_ids(value, table, next_node_id)?;
         }
         ExprKind::Binary { lhs, rhs, .. } => {
-            reassoc_expr(lhs, table)?;
-            reassoc_expr(rhs, table)?;
+            reassoc_expr_with_ids(lhs, table, next_node_id)?;
+            reassoc_expr_with_ids(rhs, table, next_node_id)?;
         }
         ExprKind::Range { start, end, .. } => {
             if let Some(start) = start {
-                reassoc_expr(start, table)?;
+                reassoc_expr_with_ids(start, table, next_node_id)?;
             }
             if let Some(end) = end {
-                reassoc_expr(end, table)?;
+                reassoc_expr_with_ids(end, table, next_node_id)?;
             }
         }
         ExprKind::Call { callee, args, .. } => {
-            reassoc_expr(callee, table)?;
+            reassoc_expr_with_ids(callee, table, next_node_id)?;
             for a in args {
-                reassoc_expr(a, table)?;
+                reassoc_expr_with_ids(a, table, next_node_id)?;
             }
         }
         ExprKind::If {
@@ -116,60 +135,62 @@ fn reassoc_expr(expr: &mut Expr, table: &FixityTable) -> Result<(), ReassocError
             then_branch,
             else_branch,
         } => {
-            reassoc_expr(cond, table)?;
-            reassoc_expr(then_branch, table)?;
-            reassoc_expr(else_branch, table)?;
+            reassoc_expr_with_ids(cond, table, next_node_id)?;
+            reassoc_expr_with_ids(then_branch, table, next_node_id)?;
+            reassoc_expr_with_ids(else_branch, table, next_node_id)?;
         }
         ExprKind::Match { scrutinee, arms } => {
-            reassoc_expr(scrutinee, table)?;
+            reassoc_expr_with_ids(scrutinee, table, next_node_id)?;
             for (_, body) in arms {
-                reassoc_expr(body, table)?;
+                reassoc_expr_with_ids(body, table, next_node_id)?;
             }
         }
-        ExprKind::Loop(body) => reassoc_expr(body, table)?,
+        ExprKind::Loop(body) => reassoc_expr_with_ids(body, table, next_node_id)?,
         ExprKind::Break(val) => {
             if let Some(e) = val {
-                reassoc_expr(e, table)?;
+                reassoc_expr_with_ids(e, table, next_node_id)?;
             }
         }
         ExprKind::Return(val) => {
             if let Some(e) = val {
-                reassoc_expr(e, table)?;
+                reassoc_expr_with_ids(e, table, next_node_id)?;
             }
         }
         ExprKind::Block { stmts, final_expr } => {
             for s in stmts {
-                reassoc_stmt(s, table)?;
+                reassoc_stmt(s, table, next_node_id)?;
             }
             if let Some(e) = final_expr {
-                reassoc_expr(e, table)?;
+                reassoc_expr_with_ids(e, table, next_node_id)?;
             }
         }
         ExprKind::Tuple(es) => {
             for e in es {
-                reassoc_expr(e, table)?;
+                reassoc_expr_with_ids(e, table, next_node_id)?;
             }
         }
         ExprKind::Array(entries) => {
             for entry in entries {
-                reassoc_expr(entry.expr_mut(), table)?;
+                reassoc_expr_with_ids(entry.expr_mut(), table, next_node_id)?;
             }
         }
         ExprKind::Record(entries) => {
             for entry in entries {
-                reassoc_expr(entry.expr_mut(), table)?;
+                reassoc_expr_with_ids(entry.expr_mut(), table, next_node_id)?;
             }
         }
-        ExprKind::FieldAccess { expr, .. } => reassoc_expr(expr, table)?,
+        ExprKind::FieldAccess { expr, .. } => {
+            reassoc_expr_with_ids(expr, table, next_node_id)?
+        }
         ExprKind::Index { receiver, key, .. } => {
-            reassoc_expr(receiver, table)?;
-            reassoc_expr(key, table)?;
+            reassoc_expr_with_ids(receiver, table, next_node_id)?;
+            reassoc_expr_with_ids(key, table, next_node_id)?;
         }
         ExprKind::AssociatedAccess { .. } => {}
-        ExprKind::Lambda { body, .. } => reassoc_expr(body, table)?,
+        ExprKind::Lambda { body, .. } => reassoc_expr_with_ids(body, table, next_node_id)?,
         ExprKind::For { iterable, body, .. } => {
-            reassoc_expr(iterable, table)?;
-            reassoc_expr(body, table)?;
+            reassoc_expr_with_ids(iterable, table, next_node_id)?;
+            reassoc_expr_with_ids(body, table, next_node_id)?;
         }
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
@@ -182,10 +203,129 @@ fn reassoc_expr(expr: &mut Expr, table: &FixityTable) -> Result<(), ReassocError
     Ok(())
 }
 
-fn reassoc_owned(expr: Expr, table: &FixityTable) -> Result<Expr, ReassocError> {
+fn reassoc_owned(
+    expr: Expr,
+    table: &FixityTable,
+    next_node_id: &mut NodeId,
+) -> Result<Expr, ReassocError> {
     let mut e = expr;
-    reassoc_expr(&mut e, table)?;
+    reassoc_expr_with_ids(&mut e, table, next_node_id)?;
     Ok(e)
+}
+
+fn next_program_node_id(program: &Program) -> NodeId {
+    // NodeId is currently an expression-only identifier. If other AST nodes grow
+    // NodeIds later, include them here before generating reassociation nodes.
+    program
+        .stmts
+        .iter()
+        .map(max_stmt_node_id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1)
+}
+
+fn next_id(next_node_id: &mut NodeId) -> NodeId {
+    let id = *next_node_id;
+    *next_node_id = next_node_id.saturating_add(1);
+    id
+}
+
+fn max_stmt_node_id(stmt: &Stmt) -> NodeId {
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Expr(value) => max_expr_node_id(value),
+        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => max_expr_node_id(body),
+        Stmt::Impl(id) => id
+            .methods
+            .iter()
+            .map(|method| max_expr_node_id(&method.body))
+            .max()
+            .unwrap_or(0),
+        Stmt::InherentImpl(id) => id
+            .methods
+            .iter()
+            .map(|method| max_expr_node_id(&method.body))
+            .max()
+            .unwrap_or(0),
+        Stmt::TestBlock { stmts, .. } | Stmt::RecBlock { stmts, .. } => stmts
+            .iter()
+            .map(max_stmt_node_id)
+            .max()
+            .unwrap_or(0),
+        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => 0,
+    }
+}
+
+fn max_expr_node_id(expr: &Expr) -> NodeId {
+    let child_max = match &expr.kind {
+        ExprKind::Grouped(e)
+        | ExprKind::Not(e)
+        | ExprKind::Neg { operand: e, .. }
+        | ExprKind::Loop(e)
+        | ExprKind::Break(Some(e))
+        | ExprKind::Return(Some(e))
+        | ExprKind::FieldAccess { expr: e, .. }
+        | ExprKind::Lambda { body: e, .. } => max_expr_node_id(e),
+        ExprKind::Index { receiver, key, .. } => {
+            max_expr_node_id(receiver).max(max_expr_node_id(key))
+        }
+        ExprKind::Assign { target, value } => {
+            max_expr_node_id(target).max(max_expr_node_id(value))
+        }
+        ExprKind::Binary { lhs, rhs, .. } => max_expr_node_id(lhs).max(max_expr_node_id(rhs)),
+        ExprKind::Range { start, end, .. } => start
+            .as_deref()
+            .map(max_expr_node_id)
+            .unwrap_or(0)
+            .max(end.as_deref().map(max_expr_node_id).unwrap_or(0)),
+        ExprKind::Call { callee, args, .. } => args
+            .iter()
+            .map(max_expr_node_id)
+            .fold(max_expr_node_id(callee), NodeId::max),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => max_expr_node_id(cond)
+            .max(max_expr_node_id(then_branch))
+            .max(max_expr_node_id(else_branch)),
+        ExprKind::Match { scrutinee, arms } => arms
+            .iter()
+            .map(|(_, body)| max_expr_node_id(body))
+            .fold(max_expr_node_id(scrutinee), NodeId::max),
+        ExprKind::Block { stmts, final_expr } => stmts
+            .iter()
+            .map(max_stmt_node_id)
+            .chain(final_expr.as_deref().map(max_expr_node_id))
+            .max()
+            .unwrap_or(0),
+        ExprKind::Tuple(items) => items.iter().map(max_expr_node_id).max().unwrap_or(0),
+        ExprKind::Array(entries) => entries
+            .iter()
+            .map(|entry| max_expr_node_id(entry.expr()))
+            .max()
+            .unwrap_or(0),
+        ExprKind::Record(entries) => entries
+            .iter()
+            .map(|entry| max_expr_node_id(entry.expr()))
+            .max()
+            .unwrap_or(0),
+        ExprKind::For { iterable, body, .. } => {
+            max_expr_node_id(iterable).max(max_expr_node_id(body))
+        }
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Import(_)
+        | ExprKind::Unit
+        | ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None)
+        | ExprKind::AssociatedAccess { .. } => 0,
+    };
+    expr.id.max(child_max)
 }
 
 fn is_custom_binary(expr: &Expr) -> bool {
@@ -298,6 +438,7 @@ fn pratt(
     tail: &mut VecDeque<(String, SourceSpan, Expr)>,
     min_prec: u8,
     table: &FixityTable,
+    next_node_id: &mut NodeId,
 ) -> Expr {
     let mut lhs = lhs;
     while let Some((op, _, _)) = tail.front() {
@@ -313,7 +454,7 @@ fn pratt(
             Fixity::Left | Fixity::Non => prec + 1,
             Fixity::Right => prec,
         };
-        let rhs = pratt(rhs_atom, tail, next_min, table);
+        let rhs = pratt(rhs_atom, tail, next_min, table, next_node_id);
         let span = SourceSpan {
             start_line: lhs.span.start_line,
             start_col: lhs.span.start_col,
@@ -321,7 +462,7 @@ fn pratt(
             end_col: rhs.span.end_col,
         };
         lhs = Expr::new(
-            0,
+            next_id(next_node_id),
             span,
             ExprKind::Binary {
                 lhs: Box::new(lhs),

@@ -7,4 +7,4 @@ edition = "2024"
 perf-counters = []
 
 [dependencies]
-im-rc = "15.1"
+im = "15.1"

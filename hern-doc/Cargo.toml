@@ -1,0 +1,7 @@
+[package]
+name = "hern-doc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hern-core = { path = "../hern-core" }

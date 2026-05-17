@@ -624,7 +624,14 @@ dependencies = [
 name = "hern-core"
 version = "0.1.0"
 dependencies = [
- "im-rc",
+ "im",
+]
+
+[[package]]
+name = "hern-doc"
+version = "0.1.0"
+dependencies = [
+ "hern-core",
 ]
 
 [[package]]
@@ -671,10 +678,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
-name = "im-rc"
+name = "im"
 version = "15.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af1955a75fa080c677d3972822ec4bad316169ab1cfc6c257a942c2265dbe5fe"
+checksum = "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9"
 dependencies = [
  "bitmaps",
  "rand_core",

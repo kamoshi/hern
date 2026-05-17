@@ -2,6 +2,7 @@
 members = [
     "hern",
     "hern-core",
+    "hern-doc",
     "hern-lsp",
     "hern-repl",
 ]
