@@ -1,6 +1,14 @@
+//! Error recovery for source-driven inference.
+//!
+//! Recovery keeps useful module metadata after a failing declaration by
+//! snapshotting state, restoring around errors, and skipping declarations whose
+//! dependencies are known unavailable.
+
 use crate::ast::{Expr, ExprKind, Pattern, Stmt, Type};
 use crate::types::patterns::insert_pattern_bindings;
 use std::collections::HashSet;
+
+use super::ty_helpers::walk_ast_type;
 
 /// Top-level names tracked for recovery decisions.
 ///
@@ -381,36 +389,13 @@ fn collect_type_referenced_names(
     refs: &mut CollectedNames,
     type_scope: &HashSet<String>,
 ) {
-    match ty {
-        Type::Ident(name) => {
-            if !type_scope.contains(name) {
-                refs.types.insert(name.clone());
-            }
+    walk_ast_type(ty, &mut |node| {
+        if let Type::Ident(name) = node
+            && !type_scope.contains(name.as_str())
+        {
+            refs.types.insert(name.clone());
         }
-        Type::App(con, args) => {
-            collect_type_referenced_names(con, refs, type_scope);
-            for arg in args {
-                collect_type_referenced_names(arg, refs, type_scope);
-            }
-        }
-        Type::Func(params, ret) => {
-            for param in params {
-                collect_type_referenced_names(&param.ty, refs, type_scope);
-            }
-            collect_type_referenced_names(&ret.ty, refs, type_scope);
-        }
-        Type::Tuple(items) => {
-            for item in items {
-                collect_type_referenced_names(item, refs, type_scope);
-            }
-        }
-        Type::Record(fields, _) => {
-            for (_, field_ty) in fields {
-                collect_type_referenced_names(field_ty, refs, type_scope);
-            }
-        }
-        Type::Var(_) | Type::Unit | Type::Never | Type::Hole => {}
-    }
+    });
 }
 
 fn collect_pattern_referenced_names(pat: &Pattern, refs: &mut CollectedNames) {

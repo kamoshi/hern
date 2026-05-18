@@ -1,3 +1,9 @@
+//! Lexical type rules for local bindings and statements.
+//!
+//! This module owns scope-local environment changes: `let` bindings, statement
+//! sequencing, block results, and the let-generalization boundary between local
+//! polymorphism and expression inference.
+
 use crate::ast::{BinOp, Expr, ExprKind, Param, Pattern, Stmt};
 use std::collections::{HashMap, HashSet};
 

@@ -309,7 +309,7 @@ fn witness_patterns(ty: &Ty, variant_env: &VariantEnv, depth: usize) -> Option<V
             if variants.is_empty() {
                 return Some(vec![Pattern::Wildcard]);
             }
-            variants.sort_by(|(left, _), (right, _)| left.cmp(right));
+            variants.sort_by_key(|(variant_name, _)| *variant_name);
 
             let mut witnesses = Vec::new();
             for (variant_name, info) in variants {

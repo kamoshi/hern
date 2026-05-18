@@ -1,4 +1,16 @@
+//! Function, method, and trait-call inference.
+//!
+//! Calls are where plain function application, receiver methods, associated
+//! methods, mutable-place requirements, and dictionary arguments meet. This
+//! module preserves the call-shaped flow so overload and trait dispatch decisions
+//! remain visible in one place.
+
 use super::*;
+
+mod apply;
+mod associated;
+mod dispatch;
+mod receiver;
 
 pub(super) struct AppliedCall {
     pub(super) ret_ty: Ty,
@@ -44,1864 +56,186 @@ struct ReceiverTraitMethodResolution {
 }
 
 impl Infer {
-    pub(super) fn associated_inherent_method(
-        &self,
-        target: &Type,
-        target_span: SourceSpan,
-        member: &str,
-        member_span: SourceSpan,
-    ) -> Result<(String, InherentMethodInfo), SpannedTypeError> {
-        let target_names = inherent_impl_target_keys_from_ast(target, &self.declared_types)
-            .map_err(|err| err.at(target_span))?;
-        for target_name in &target_names {
-            let method_info = self
-                .inherent_methods
-                .get(target_name)
-                .and_then(|methods| methods.get(member))
-                .or_else(|| {
-                    self.scoped_inherent_methods
-                        .get(target_name)
-                        .and_then(|methods| methods.get(member))
-                })
-                .cloned();
-            if let Some(method_info) = method_info {
-                return Ok((target_name.clone(), method_info));
-            }
-        }
-        Err(TypeError::UnknownAssociatedFunction {
-            target: target_names[0].clone(),
-            function: member.to_string(),
-        }
-        .at(member_span))
-    }
-
-    pub(super) fn instantiate_associated_inherent_method(
-        &mut self,
-        target: &Type,
-        target_span: SourceSpan,
-        method_info: &InherentMethodInfo,
-    ) -> Result<AssociatedInherentMethodInstance, SpannedTypeError> {
-        let instantiated = self.instantiate_scheme(&method_info.scheme);
-        let mut callable_ty = instantiated.ty;
-        let mut constraints = instantiated.constraints;
-        if let Ty::Qualified(existing, inner) = callable_ty {
-            constraints.extend(existing);
-            callable_ty = *inner;
-        }
-        if method_info.has_receiver && matches!(target, Type::App(..)) {
-            // Bare `Type::method` stays generic; its receiver is pinned when the
-            // function value is called. Explicit `Type(Args)::method` should
-            // specialize the receiver immediately.
-            let receiver_ty = self
-                .ast_to_ty_with_vars(target, &mut HashMap::new())
-                .map_err(|err| err.at(target_span))?;
-            let Some(receiver_param) = func_receiver_param(&callable_ty) else {
-                return Err(TypeError::NotAFunction(callable_ty).at(target_span));
-            };
-            unify(&mut self.subst, receiver_param, receiver_ty)
-                .map_err(|err| err.at(target_span))?;
-            callable_ty = self.subst.apply(&callable_ty);
-        }
-        let value_ty = if constraints.is_empty() {
-            callable_ty.clone()
-        } else {
-            Ty::Qualified(constraints.clone(), Box::new(callable_ty.clone()))
-        };
-        Ok(AssociatedInherentMethodInstance {
-            callable_ty,
-            constraints,
-            value_ty,
-            resolved_callee: method_info.resolved_callee.clone(),
-        })
-    }
-
-    pub(super) fn associated_trait_method(
-        &self,
-        target: &Type,
-        member: &str,
-        member_span: SourceSpan,
-    ) -> Result<Option<AssociatedTraitMethodLookup>, SpannedTypeError> {
-        let Type::Ident(trait_name) = target else {
-            if let Type::App(con, args) = target
-                && let Type::Ident(trait_name) = con.as_ref()
-                && let Some(trait_def) = self.trait_env.get(trait_name).cloned()
-            {
-                let method = trait_def
-                    .methods
-                    .iter()
-                    .find(|method| method.name == member)
-                    .ok_or_else(|| {
-                        TypeError::UnknownTraitMethod {
-                            trait_name: trait_name.clone(),
-                            method: member.to_string(),
-                        }
-                        .at(member_span)
-                    })?
-                    .clone();
-                return Ok(Some(AssociatedTraitMethodLookup {
-                    trait_def,
-                    method,
-                    explicit_args: Some(args.clone()),
-                }));
-            }
-            return Ok(None);
-        };
-        let Some(trait_def) = self.trait_env.get(trait_name).cloned() else {
-            return Ok(None);
-        };
-        let method = trait_def
-            .methods
-            .iter()
-            .find(|method| method.name == member)
-            .ok_or_else(|| {
-                TypeError::UnknownTraitMethod {
-                    trait_name: trait_name.clone(),
-                    method: member.to_string(),
-                }
-                .at(member_span)
-            })?
-            .clone();
-        Ok(Some(AssociatedTraitMethodLookup {
-            trait_def,
-            method,
-            explicit_args: None,
-        }))
-    }
-
-    pub(super) fn instantiate_associated_trait_method(
-        &mut self,
-        env: &TypeEnv,
-        trait_def: &TraitDef,
-        method: &TraitMethod,
-        explicit_args: Option<&[Type]>,
-        target_span: SourceSpan,
-    ) -> Result<AssociatedTraitMethodInstance, SpannedTypeError> {
-        let mut param_vars = HashMap::new();
-        let trait_arg_tys = if let Some(args) = explicit_args {
-            if args.len() != trait_def.params.len() {
-                return Err(TypeError::TraitArityMismatch {
-                    trait_name: trait_def.name.clone(),
-                    expected: trait_def.params.len(),
-                    got: args.len(),
-                }
-                .at(target_span));
-            }
-            trait_def
-                .params
-                .iter()
-                .zip(args)
-                .map(|(param, arg)| {
-                    let ty = self.ast_to_ty_with_vars(arg, &mut param_vars)?;
-                    if let Ty::Var(var) = ty {
-                        param_vars.insert(param.clone(), var);
-                    }
-                    Ok(ty)
-                })
-                .collect::<Result<Vec<_>, TypeError>>()
-                .map_err(|err| err.at(target_span))?
-        } else {
-            trait_def
-                .params
-                .iter()
-                .map(|param| {
-                    let var = self.fresh_var();
-                    param_vars.insert(param.clone(), var);
-                    Ty::Var(var)
-                })
-                .collect()
-        };
-
-        let method_param_types = if let Some(args) = explicit_args {
-            method
-                .params
-                .iter()
-                .map(|(_, ty)| {
-                    trait_def
-                        .params
-                        .iter()
-                        .zip(args)
-                        .fold(ty.clone(), |acc, (param, arg)| {
-                            subst_hkt_param(&acc, param, arg)
-                        })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            method
-                .params
-                .iter()
-                .map(|(_, ty)| ty.clone())
-                .collect::<Vec<_>>()
-        };
-        let method_ret_type = if let Some(args) = explicit_args {
-            trait_def
-                .params
-                .iter()
-                .zip(args)
-                .fold(method.ret_type.clone(), |acc, (param, arg)| {
-                    subst_hkt_param(&acc, param, arg)
-                })
-        } else {
-            method.ret_type.clone()
-        };
-
-        let method_param_tys = method_param_types
-            .iter()
-            .map(|ty| self.ast_to_ty_with_vars(ty, &mut param_vars))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| err.at(target_span))?;
-        let ret_ty = self
-            .ast_to_ty_with_vars(&method_ret_type, &mut param_vars)
-            .map_err(|err| err.at(target_span))?;
-        let callable_ty = Ty::Func(
-            value_func_params(method_param_tys),
-            value_func_return(ret_ty),
-        );
-        let determinant_indexes = trait_dict_indexes(trait_def);
-        let dict = if explicit_args.is_some() {
-            Some(
-                resolve_concrete_from_args_unifying(
-                    &trait_def.name,
-                    &trait_arg_tys,
-                    &determinant_indexes,
-                    env,
-                    &self.known_impl_dicts,
-                    &self.known_impl_schemes,
-                    &mut self.subst,
-                )
-                .ok_or_else(|| {
-                    TypeError::MissingTraitImpl {
-                        trait_name: trait_def.name.clone(),
-                        impl_target: trait_arg_tys
-                            .iter()
-                            .map(|ty| ty.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    }
-                    .at(target_span)
-                })?,
-            )
-        } else {
-            None
-        };
-        let constraints = if dict.is_none() {
-            let var = primary_trait_var(&trait_arg_tys, &determinant_indexes)
-                .or_else(|| trait_arg_tys.iter().find_map(first_ty_var))
-                .ok_or_else(|| {
-                    TypeError::UnresolvedTrait {
-                        context: "trait method value".to_string(),
-                        trait_name: trait_def.name.clone(),
-                    }
-                    .at(target_span)
-                })?;
-            vec![TraitConstraint::predicate(
-                &trait_def.name,
-                trait_arg_tys,
-                var,
-                determinant_indexes,
-            )]
-        } else {
-            Vec::new()
-        };
-        let value_ty = if constraints.is_empty() {
-            callable_ty.clone()
-        } else {
-            Ty::Qualified(constraints.clone(), Box::new(callable_ty.clone()))
-        };
-        Ok(AssociatedTraitMethodInstance {
-            callable_ty,
-            constraints,
-            value_ty,
-            dict,
-            method: method.name.clone(),
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolve_multi_param_trait_dispatch(
+    pub(super) fn infer_call_expr(
         &mut self,
         env: &TypeEnv,
-        trait_name: &str,
-        method_name: &str,
-        trait_args: Vec<Ty>,
-        determinant_indexes: Vec<usize>,
-        method_arg_tys: Vec<Ty>,
-        ret_ty: Ty,
-        resolved_callee: &mut Option<ResolvedCallee>,
-        pending_trait_method: &mut Option<(PendingDictArg, String)>,
-        concrete_dict_expect: &'static str,
-    ) -> Result<Option<Ty>, SpannedTypeError> {
-        if let Some(dict) = resolve_concrete_from_args_unifying(
-            trait_name,
-            &trait_args,
-            &determinant_indexes,
-            env,
-            &self.known_impl_dicts,
-            &self.known_impl_schemes,
-            &mut self.subst,
-        ) {
-            let dict_name = dict_ref_concrete_name(&dict)
-                .expect(concrete_dict_expect)
-                .to_string();
-            if let Some(dict_scheme) = env
-                .get(&dict_name)
-                .map(|info| info.scheme.clone())
-                .or_else(|| self.known_impl_schemes.get(&dict_name).cloned())
-            {
-                let dict_ty = self.instantiate(&dict_scheme);
-                let dict_method_ty = record_field_ty(&self.subst.apply(&dict_ty), method_name)
-                    .ok_or_else(|| TypeError::UnknownTraitMethod {
-                        trait_name: trait_name.to_string(),
-                        method: method_name.to_string(),
-                    })?;
-                let checked_ret = Ty::Var(self.fresh_var());
-                unify(
-                    &mut self.subst,
-                    dict_method_ty,
-                    Ty::Func(
-                        value_func_params(method_arg_tys),
-                        value_func_return(checked_ret.clone()),
-                    ),
-                )?;
-                unify(&mut self.subst, ret_ty.clone(), checked_ret)?;
-            }
-            *resolved_callee = Some(ResolvedCallee::DictMethod {
-                dict,
-                method: method_name.to_string(),
-            });
-            return Ok(Some(self.subst.apply(&ret_ty)));
-        }
-
-        if let Some(var) = primary_trait_var(&trait_args, &determinant_indexes) {
-            let constraint = TraitConstraint::predicate(
-                trait_name,
-                trait_args.clone(),
-                var,
-                determinant_indexes.clone(),
-            );
-            self.pending_constraints.push(constraint);
-            let pending = PendingDictArg {
-                var,
-                trait_name: trait_name.to_string(),
-                args: trait_args,
-                determinant_indexes,
-            };
-            *pending_trait_method = Some((pending, method_name.to_string()));
-            return Ok(Some(self.subst.apply(&ret_ty)));
-        }
-
-        Ok(None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolve_operator_dispatch(
-        &mut self,
-        env: &TypeEnv,
-        trait_name: &str,
-        op: &str,
-        resolved_target: &Ty,
-        resolved_op: &mut Option<ResolvedCallee>,
-        pending_op: &mut Option<PendingDictArg>,
-        _dict_args: &mut Vec<DictRef>,
-        _pending_dict_args: &mut Vec<PendingDictArg>,
-    ) -> Result<(), SpannedTypeError> {
-        match self
-            .resolve_trait_dict(env, trait_name, resolved_target.clone())
-            .map_err(SpannedTypeError::from)?
-        {
-            DictResolution::Resolved(dict) => {
-                *resolved_op = Some(ResolvedCallee::DictMethod {
-                    dict,
-                    method: op.to_string(),
-                });
-            }
-            DictResolution::Pending(pending) => {
-                *pending_op = Some(pending);
-            }
-        }
-        Ok(())
-    }
-
-    fn resolve_trait_dict(
-        &mut self,
-        env: &TypeEnv,
-        trait_name: &str,
-        target: Ty,
-    ) -> Result<DictResolution, TypeError> {
-        let target = self.subst.apply(&target);
-        if let Ty::Var(var) = target {
-            let constraint = TraitConstraint::unary(var, trait_name.to_string());
-            self.pending_constraints.push(constraint.clone());
-            return Ok(DictResolution::Pending(PendingDictArg {
-                var,
-                trait_name: trait_name.to_string(),
-                args: vec![Ty::Var(var)],
-                determinant_indexes: vec![0],
-            }));
-        }
-        if let Some(dict) = self.resolve_structural_dict(env, trait_name, &target)? {
-            return Ok(DictResolution::Resolved(dict));
-        }
-        resolve_concrete_dict_ref(
-            trait_name,
-            &target,
-            env,
-            &self.known_impl_dicts,
-            &self.known_impl_schemes,
-        )
-        .map(DictResolution::Resolved)
-        .ok_or_else(|| TypeError::MissingTraitImpl {
-            trait_name: trait_name.to_string(),
-            impl_target: format!("{}", target),
-        })
-    }
-
-    fn resolve_structural_dict(
-        &mut self,
-        env: &TypeEnv,
-        trait_name: &str,
-        target: &Ty,
-    ) -> Result<Option<DictRef>, TypeError> {
-        match (trait_name, target) {
-            ("Eq", Ty::Tuple(items)) => Ok(Some(DictRef::Structural(StructuralDictRef {
-                trait_name: "Eq".to_string(),
-                target: DictTarget::Tuple(items.len()),
-                args: items
-                    .iter()
-                    .map(|item| self.resolve_eq_child_dict(env, item))
-                    .collect::<Result<_, _>>()?,
-            }))),
-            _ => Ok(None),
-        }
-    }
-
-    fn resolve_eq_child_dict(&mut self, env: &TypeEnv, ty: &Ty) -> Result<DictRef, TypeError> {
-        match self.subst.apply(ty) {
-            Ty::Tuple(items) => self
-                .resolve_structural_dict(env, "Eq", &Ty::Tuple(items))?
-                .ok_or_else(|| TypeError::MissingTraitImpl {
-                    trait_name: "Eq".to_string(),
-                    impl_target: format!("{}", ty),
-                }),
-            Ty::Var(var) => {
-                let constraint = TraitConstraint::unary(var, "Eq");
-                self.pending_constraints.push(constraint.clone());
-                Ok(DictRef::Param(dict_param_name(&constraint)))
-            }
-            resolved => {
-                let target_keys = trait_impl_target_keys_from_ty(&resolved);
-                if target_keys.is_empty() {
-                    return Err(TypeError::MissingTraitImpl {
-                        trait_name: "Eq".to_string(),
-                        impl_target: format!("{}", resolved),
-                    });
-                }
-                resolve_concrete_dict_ref(
-                    "Eq",
-                    &resolved,
-                    env,
-                    &self.known_impl_dicts,
-                    &self.known_impl_schemes,
-                )
-                .ok_or_else(|| TypeError::MissingTraitImpl {
-                    trait_name: "Eq".to_string(),
-                    impl_target: format!("{}", resolved),
-                })
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolve_trait_method_call(
-        &mut self,
-        env: &TypeEnv,
+        expr_id: NodeId,
+        expr_span: SourceSpan,
+        callee: &mut Box<Expr>,
         args: &mut [Expr],
+        is_method_call: &mut bool,
         arg_wrappers: &mut Vec<Option<ArgWrapper>>,
         resolved_callee: &mut Option<ResolvedCallee>,
         pending_trait_method: &mut Option<(PendingDictArg, String)>,
-        trait_def: TraitDef,
-        method: TraitMethod,
-        context: &str,
-    ) -> Result<Ty, SpannedTypeError> {
-        let trait_name = trait_def.name.clone();
-        let method_name = method.name.clone();
-
-        if trait_def.params.len() > 1 || !trait_def.fundeps.is_empty() {
-            return self.resolve_multi_param_trait_method_call(
-                env,
-                args,
-                arg_wrappers,
-                resolved_callee,
-                pending_trait_method,
-                trait_def,
-                method,
-                context,
-            );
-        }
-
-        // Decide dispatch strategy based on whether the first parameter's type
-        // contains the trait's HKT variable (e.g. `'f` in `map(fa: 'f('a), ...)`).
-        // If it does, we can read the impl target directly from the first argument's
-        // concrete type.  If not (e.g. `pure(a: 'a)`), the target is only known from
-        // context, so we fall back to abstract unification and a pending marker.
-        let trait_param = primary_param_or_panic(&trait_def);
-        let first_param_has_trait_var = method
-            .params
-            .first()
-            .map(|(_, ty)| type_contains_var(ty, trait_param))
-            .unwrap_or(false);
-
-        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-        if arg_tys.len() != method.params.len() {
-            return Err(TypeError::ArityMismatch {
-                expected: method.params.len(),
-                got: arg_tys.len(),
-            }
-            .into());
-        }
-
-        if first_param_has_trait_var {
-            // ── First-arg dispatch ────────────────────────────────────────────
-            // Extract the impl target from the first argument's concrete type,
-            // then look up the concrete dict and unify against its method type.
-            // This avoids abstract HKT unification, which breaks for multi-arg
-            // type constructors like `Result('a, 'e)` vs `'f('a)`.
-            let resolved_target = self.subst.apply(&arg_tys[0]);
-            let target_keys = trait_impl_target_keys_from_ty(&resolved_target);
-            if target_keys.is_empty() {
-                if let Some(target_var) = variable_trait_target(&resolved_target) {
-                    let (ret_ty, resolved_var) = self.check_trait_method_signature_allow_pending(
-                        &trait_def, &method, arg_tys, context,
-                    )?;
-                    let pending = PendingDictArg {
-                        var: resolved_var.unwrap_or(target_var),
-                        trait_name: trait_name.clone(),
-                        args: vec![Ty::Var(resolved_var.unwrap_or(target_var))],
-                        determinant_indexes: vec![0],
-                    };
-                    self.pending_constraints.push(TraitConstraint::unary(
-                        pending.var,
-                        pending.trait_name.clone(),
-                    ));
-                    *pending_trait_method = Some((pending, method_name));
-                    return Ok(self.subst.apply(&ret_ty));
-                }
-                return Err(TypeError::UnresolvedTrait {
-                    context: context.to_string(),
-                    trait_name: trait_name.clone(),
-                }
-                .into());
-            }
-            let Some(dict) = resolve_concrete_dict_ref(
-                &trait_name,
-                &resolved_target,
-                env,
-                &self.known_impl_dicts,
-                &self.known_impl_schemes,
-            ) else {
-                return Err(TypeError::MissingTraitImpl {
-                    trait_name: trait_name.clone(),
-                    impl_target: format!("{}", resolved_target),
-                }
-                .into());
-            };
-            let dict_name = dict_ref_concrete_name(&dict)
-                .expect("non-structural trait method dict should have a concrete name")
-                .to_string();
-
-            let dict_scheme = env
-                .get(&dict_name)
-                .map(|info| info.scheme.clone())
-                .or_else(|| self.known_impl_schemes.get(&dict_name).cloned());
-            let ret_ty = if let Some(dict_scheme) = dict_scheme {
-                let dict_ty = self.instantiate(&dict_scheme);
-                let method_ty = record_field_ty(&self.subst.apply(&dict_ty), &method_name)
-                    .ok_or_else(|| TypeError::UnknownTraitMethod {
-                        trait_name: trait_name.clone(),
-                        method: method_name.clone(),
-                    })?;
-                let ret_ty = Ty::Var(self.fresh_var());
-                unify(
-                    &mut self.subst,
-                    method_ty,
-                    Ty::Func(
-                        value_func_params(arg_tys),
-                        value_func_return(ret_ty.clone()),
-                    ),
-                )?;
-                ret_ty
-            } else {
-                self.check_trait_method_signature(&trait_def, &method, arg_tys, context)?
-            };
-
-            *resolved_callee = Some(ResolvedCallee::DictMethod {
-                dict,
-                method: method_name.clone(),
-            });
-            Ok(self.subst.apply(&ret_ty))
-        } else {
-            // ── Abstract unification + pending dispatch ───────────────────────
-            // Used for methods like `pure(a: 'a) -> 'f('a)` where the first
-            // parameter doesn't reveal the impl target.  We unify the value
-            // arguments against the abstract method signature, then defer target
-            // resolution to `resolve_dict_uses_expr` once the outer context has
-            // pinned the type variable.
-            let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-            let target_var = self.fresh_var();
-            param_vars.insert(trait_param.to_string(), target_var);
-
-            let method_param_tys: Vec<Ty> = method
-                .params
-                .iter()
-                .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
-                .collect::<Result<_, _>>()?;
-            let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-
-            for (arg_ty, param_ty) in arg_tys.into_iter().zip(method_param_tys) {
-                unify(&mut self.subst, arg_ty, param_ty)?;
-            }
-
-            let resolved_target = self.subst.apply(&Ty::Var(target_var));
-            let target_keys = trait_impl_target_keys_from_ty(&resolved_target);
-            if target_keys.is_empty() {
-                match resolved_target {
-                    Ty::Var(v) => {
-                        let pending = PendingDictArg {
-                            var: v,
-                            trait_name: trait_name.clone(),
-                            args: vec![Ty::Var(v)],
-                            determinant_indexes: vec![0],
-                        };
-                        self.pending_constraints.push(TraitConstraint::unary(
-                            pending.var,
-                            pending.trait_name.clone(),
-                        ));
-                        *pending_trait_method = Some((pending, method_name));
-                        Ok(self.subst.apply(&ret_ty))
-                    }
-                    _ => Err(TypeError::MissingTraitImpl {
-                        trait_name: trait_name.clone(),
-                        impl_target: format!("{}", resolved_target),
-                    }
-                    .into()),
-                }
-            } else {
-                match resolve_concrete_dict_ref(
-                    &trait_name,
-                    &resolved_target,
-                    env,
-                    &self.known_impl_dicts,
-                    &self.known_impl_schemes,
-                ) {
-                    Some(dict) => {
-                        *resolved_callee = Some(ResolvedCallee::DictMethod {
-                            dict,
-                            method: method_name.clone(),
-                        });
-                        Ok(self.subst.apply(&ret_ty))
-                    }
-                    None => Err(TypeError::MissingTraitImpl {
-                        trait_name: trait_name.clone(),
-                        impl_target: format!("{}", resolved_target),
-                    }
-                    .into()),
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_multi_param_trait_method_call(
-        &mut self,
-        env: &TypeEnv,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        resolved_callee: &mut Option<ResolvedCallee>,
-        pending_trait_method: &mut Option<(PendingDictArg, String)>,
-        trait_def: TraitDef,
-        method: TraitMethod,
-        context: &str,
-    ) -> Result<Ty, SpannedTypeError> {
-        let trait_name = trait_def.name.clone();
-        let method_name = method.name.clone();
-        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-        if arg_tys.len() != method.params.len() {
-            return Err(TypeError::ArityMismatch {
-                expected: method.params.len(),
-                got: arg_tys.len(),
-            }
-            .into());
-        }
-
-        let mut param_vars: HashMap<String, TyVar> = HashMap::new();
-        let trait_param_vars = trait_def
-            .params
-            .iter()
-            .map(|param| {
-                let var = self.fresh_var();
-                param_vars.insert(param.clone(), var);
-                var
-            })
-            .collect::<Vec<_>>();
-        let method_param_tys: Vec<Ty> = method
-            .params
-            .iter()
-            .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
-            .collect::<Result<_, _>>()?;
-        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-
-        for (arg_ty, param_ty) in arg_tys.iter().cloned().zip(method_param_tys) {
-            unify(&mut self.subst, arg_ty, param_ty)?;
-        }
-
-        let trait_args = trait_param_vars
-            .iter()
-            .map(|var| self.subst.apply(&Ty::Var(*var)))
-            .collect::<Vec<_>>();
-        let determinant_indexes = trait_dict_indexes(&trait_def);
-        if let Some(ret_ty) = self.resolve_multi_param_trait_dispatch(
-            env,
-            &trait_name,
-            method_name.as_str(),
-            trait_args,
-            determinant_indexes,
-            arg_tys,
-            ret_ty,
-            resolved_callee,
-            pending_trait_method,
-            "multi-parameter trait dictionaries should be concrete",
-        )? {
-            return Ok(ret_ty);
-        }
-
-        Err(TypeError::UnresolvedTrait {
-            context: context.to_string(),
-            trait_name,
-        }
-        .into())
-    }
-
-    fn check_trait_method_signature(
-        &mut self,
-        trait_def: &TraitDef,
-        method: &TraitMethod,
-        arg_tys: Vec<Ty>,
-        context: &str,
-    ) -> Result<Ty, SpannedTypeError> {
-        let mut param_vars = HashMap::new();
-        let target_var = self.fresh_var();
-        let trait_param = primary_param_or_panic(trait_def);
-        param_vars.insert(trait_param.to_string(), target_var);
-        let method_param_tys: Vec<Ty> = method
-            .params
-            .iter()
-            .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
-            .collect::<Result<_, _>>()?;
-        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-        for (arg_ty, expected_ty) in arg_tys.into_iter().zip(method_param_tys) {
-            unify(&mut self.subst, expected_ty, arg_ty)?;
-        }
-        let resolved_target = self.subst.apply(&Ty::Var(target_var));
-        if trait_impl_target_keys_from_ty(&resolved_target).is_empty() {
-            return Err(TypeError::UnresolvedTrait {
-                context: context.to_string(),
-                trait_name: trait_def.name.clone(),
-            }
-            .into());
-        }
-        Ok(ret_ty)
-    }
-
-    fn check_trait_method_signature_allow_pending(
-        &mut self,
-        trait_def: &TraitDef,
-        method: &TraitMethod,
-        arg_tys: Vec<Ty>,
-        context: &str,
-    ) -> Result<(Ty, Option<TyVar>), SpannedTypeError> {
-        let mut param_vars = HashMap::new();
-        let target_var = self.fresh_var();
-        let trait_param = primary_param_or_panic(trait_def);
-        param_vars.insert(trait_param.to_string(), target_var);
-        let method_param_tys: Vec<Ty> = method
-            .params
-            .iter()
-            .map(|(_, p_ty)| self.ast_to_ty_with_vars(p_ty, &mut param_vars))
-            .collect::<Result<_, _>>()?;
-        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-        for (arg_ty, expected_ty) in arg_tys.into_iter().zip(method_param_tys) {
-            unify(&mut self.subst, expected_ty, arg_ty)?;
-        }
-        match self.subst.apply(&Ty::Var(target_var)) {
-            Ty::Var(var) => Ok((ret_ty, Some(var))),
-            other if trait_impl_target_keys_from_ty(&other).is_empty() => {
-                Err(TypeError::UnresolvedTrait {
-                    context: context.to_string(),
-                    trait_name: trait_def.name.clone(),
-                }
-                .into())
-            }
-            _ => Ok((ret_ty, None)),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolve_associated_call(
-        &mut self,
-        env: &TypeEnv,
-        call_expr_id: NodeId,
-        callee_id: NodeId,
-        target: &Type,
-        target_span: SourceSpan,
-        member: &str,
-        member_span: SourceSpan,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        resolved_callee: &mut Option<ResolvedCallee>,
         dict_args: &mut Vec<DictRef>,
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<Ty, SpannedTypeError> {
-        let (_target_name, method_info) =
-            self.associated_inherent_method(target, target_span, member, member_span)?;
-        let instance =
-            self.instantiate_associated_inherent_method(target, target_span, &method_info)?;
-        self.record_symbol_type(callee_id, instance.value_ty.clone());
+        if let ExprKind::AssociatedAccess {
+            target,
+            target_span,
+            member,
+            member_span,
+            ..
+        } = &callee.kind
+        {
+            match self.associated_trait_method(target, member, *member_span) {
+                Ok(Some(lookup)) => {
+                    if lookup.explicit_args.is_none() {
+                        return self.resolve_trait_method_call(
+                            env,
+                            args,
+                            arg_wrappers,
+                            resolved_callee,
+                            pending_trait_method,
+                            lookup.trait_def,
+                            lookup.method,
+                            "trait method call",
+                        );
+                    }
+                    let instance = self.instantiate_associated_trait_method(
+                        env,
+                        &lookup.trait_def,
+                        &lookup.method,
+                        lookup.explicit_args.as_deref(),
+                        *target_span,
+                    )?;
+                    let param_capabilities = match &instance.callable_ty {
+                        Ty::Func(params, _) => func_param_capabilities(params),
+                        _ => Vec::new(),
+                    };
+                    let applied = self.apply_callable_type(
+                        env,
+                        args,
+                        arg_wrappers,
+                        instance.callable_ty,
+                        instance.constraints,
+                        Vec::new(),
+                        param_capabilities,
+                        0,
+                        *member_span,
+                        dict_args,
+                        pending_dict_args,
+                    )?;
+                    self.record_symbol_type(callee.id, applied.call_ty);
+                    if let Some(dict) = instance.dict {
+                        *resolved_callee = Some(ResolvedCallee::DictMethod {
+                            dict,
+                            method: instance.method,
+                        });
+                    }
+                    if applied.fresh_return && expr_id != NO_NODE_ID {
+                        self.metadata.mark_fresh_place(expr_id);
+                    }
+                    return Ok(applied.ret_ty);
+                }
+                Ok(None) => {}
+                Err(trait_err) if is_unknown_trait_method_error(&trait_err) => {
+                    match self.resolve_associated_call(
+                        env,
+                        expr_id,
+                        callee.id,
+                        target,
+                        *target_span,
+                        member,
+                        *member_span,
+                        args,
+                        arg_wrappers,
+                        resolved_callee,
+                        dict_args,
+                        pending_dict_args,
+                    ) {
+                        Ok(ty) => return Ok(ty),
+                        Err(_) => return Err(trait_err),
+                    }
+                }
+                Err(err) => return Err(err),
+            }
 
-        let param_capabilities = match &instance.callable_ty {
+            return self.resolve_associated_call(
+                env,
+                expr_id,
+                callee.id,
+                target,
+                *target_span,
+                member,
+                *member_span,
+                args,
+                arg_wrappers,
+                resolved_callee,
+                dict_args,
+                pending_dict_args,
+            );
+        }
+
+        if let ExprKind::FieldAccess { expr, field, .. } = &mut callee.kind {
+            return self.resolve_receiver_call(
+                env,
+                expr_id,
+                callee.id,
+                expr,
+                field,
+                args,
+                is_method_call,
+                arg_wrappers,
+                resolved_callee,
+                dict_args,
+                pending_dict_args,
+                None,
+            );
+        }
+
+        if let ExprKind::Ident(callee_name) = &callee.kind
+            && let Some(info) = env.get(callee_name.as_str())
+        {
+            let scheme = info.scheme.clone();
+            if !scheme.constraints.is_empty() {
+                if callee.id != NO_NODE_ID {
+                    let instantiated = self.instantiate_value(&scheme);
+                    self.metadata.record_symbol_type(callee.id, instantiated);
+                }
+                let applied = self.apply_scheme_callable(
+                    env,
+                    args,
+                    arg_wrappers,
+                    &scheme,
+                    Vec::new(),
+                    0,
+                    dict_args,
+                    pending_dict_args,
+                )?;
+                return Ok(applied.ret_ty);
+            }
+        }
+
+        let mut callee_ty = self.infer_expr(env, callee)?;
+        callee_ty = self.subst.apply(&callee_ty);
+        let callee_constraints = if let Ty::Qualified(constraints, inner) = callee_ty {
+            callee_ty = *inner;
+            constraints
+        } else {
+            Vec::new()
+        };
+        let param_capabilities = match &callee_ty {
             Ty::Func(params, _) => func_param_capabilities(params),
-            _ => Vec::new(),
+            _ => self.callable_capabilities_for(callee.id),
         };
         let applied = self.apply_callable_type(
             env,
             args,
             arg_wrappers,
-            instance.callable_ty.clone(),
-            instance.constraints,
+            callee_ty,
+            callee_constraints,
             Vec::new(),
             param_capabilities,
             0,
-            member_span,
+            expr_span,
             dict_args,
             pending_dict_args,
         )?;
-        self.record_symbol_type(callee_id, applied.call_ty);
-        *resolved_callee = Some(instance.resolved_callee);
-        if applied.fresh_return && call_expr_id != NO_NODE_ID {
-            self.metadata.mark_fresh_place(call_expr_id);
+        if applied.fresh_return && expr_id != NO_NODE_ID {
+            self.metadata.mark_fresh_place(expr_id);
         }
         Ok(applied.ret_ty)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolve_receiver_call(
-        &mut self,
-        env: &TypeEnv,
-        call_expr_id: NodeId,
-        callee_id: NodeId,
-        receiver: &mut Box<Expr>,
-        method_name: &str,
-        args: &mut [Expr],
-        is_method_call: &mut bool,
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        resolved_callee: &mut Option<ResolvedCallee>,
-        dict_args: &mut Vec<DictRef>,
-        pending_dict_args: &mut Vec<PendingDictArg>,
-        expected_ret: Option<Ty>,
-    ) -> Result<Ty, SpannedTypeError> {
-        let inferred_receiver_ty = self.infer_expr(env, receiver)?;
-        let receiver_ty = self.subst.apply(&inferred_receiver_ty);
-        let imported_member_scheme = self.imported_member_scheme(receiver, method_name);
-        if let Some(scheme) = &imported_member_scheme {
-            if matches!(scheme.ty, Ty::Func(_, _)) {
-                self.record_callable_capabilities(callee_id, scheme_param_capabilities(scheme));
-            }
-        } else if let ExprKind::Ident(base_name) = &receiver.kind
-            && let Some(param_capabilities) = self
-                .record_field_callables
-                .get(base_name)
-                .and_then(|fields| fields.get(method_name))
-                .cloned()
-        {
-            self.record_callable_capabilities(callee_id, param_capabilities);
-        }
-
-        if let Some(scheme) = imported_member_scheme {
-            let instantiated = self.instantiate_scheme(&scheme);
-            let mut field_ty = instantiated.ty;
-            let mut constraints = instantiated.constraints;
-            if let Ty::Qualified(existing, inner) = field_ty {
-                constraints.extend(existing);
-                field_ty = *inner;
-            }
-            if !constraints.is_empty() {
-                attach_dict_args(
-                    env,
-                    &self.known_impl_dicts,
-                    &self.known_impl_schemes,
-                    dict_args,
-                    pending_dict_args,
-                    &mut self.pending_constraints,
-                    &constraints,
-                    &mut self.subst,
-                )
-                .map_err(|e| e.at(receiver.span))?;
-            }
-            self.record_symbol_type(callee_id, field_ty.clone());
-            let param_capabilities = match &field_ty {
-                Ty::Func(params, _) => func_param_capabilities(params),
-                _ => self.callable_capabilities_for(callee_id),
-            };
-            let applied = self.apply_callable_type(
-                env,
-                args,
-                arg_wrappers,
-                field_ty,
-                Vec::new(),
-                Vec::new(),
-                param_capabilities,
-                0,
-                receiver.span,
-                dict_args,
-                pending_dict_args,
-            )?;
-            self.record_symbol_type(callee_id, applied.call_ty);
-            if applied.fresh_return && call_expr_id != NO_NODE_ID {
-                self.metadata.mark_fresh_place(call_expr_id);
-            }
-            return Ok(applied.ret_ty);
-        }
-
-        if let Some(mut field_ty) = record_field_ty(&receiver_ty, method_name) {
-            if let Ty::Qualified(constraints, inner) = field_ty {
-                attach_dict_args(
-                    env,
-                    &self.known_impl_dicts,
-                    &self.known_impl_schemes,
-                    dict_args,
-                    pending_dict_args,
-                    &mut self.pending_constraints,
-                    &constraints,
-                    &mut self.subst,
-                )
-                .map_err(|e| e.at(receiver.span))?;
-                field_ty = *inner;
-            }
-            self.record_symbol_type(callee_id, field_ty.clone());
-            let param_capabilities = match &field_ty {
-                Ty::Func(params, _) => func_param_capabilities(params),
-                _ => self.callable_capabilities_for(callee_id),
-            };
-            let applied = self.apply_callable_type(
-                env,
-                args,
-                arg_wrappers,
-                field_ty,
-                Vec::new(),
-                Vec::new(),
-                param_capabilities,
-                0,
-                receiver.span,
-                dict_args,
-                pending_dict_args,
-            )?;
-            self.record_symbol_type(callee_id, applied.call_ty);
-            if applied.fresh_return && call_expr_id != NO_NODE_ID {
-                self.metadata.mark_fresh_place(call_expr_id);
-            }
-            return Ok(applied.ret_ty);
-        }
-
-        if matches!(receiver_ty, Ty::Var(_)) {
-            // Unconstrained receiver: default to row-polymorphic record field access.
-            // If the caller wants method dispatch on a specific type (Map, ['a], …),
-            // they must annotate the parameter; annotation drives type resolution.
-            let field_ty = Ty::Var(self.fresh_var());
-            let tail_ty = Ty::Var(self.fresh_var());
-            unify(
-                &mut self.subst,
-                receiver_ty,
-                Ty::Record(Row {
-                    fields: vec![(method_name.to_string(), field_ty.clone())],
-                    tail: Box::new(tail_ty),
-                }),
-            )?;
-            let applied = self.apply_callable_type(
-                env,
-                args,
-                arg_wrappers,
-                field_ty,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                0,
-                receiver.span,
-                dict_args,
-                pending_dict_args,
-            )?;
-            self.record_symbol_type(callee_id, applied.call_ty);
-            return Ok(applied.ret_ty);
-        }
-
-        for target_name in inherent_impl_target_keys_from_ty(&receiver_ty) {
-            let method_info = self
-                .inherent_methods
-                .get(&target_name)
-                .and_then(|methods| methods.get(method_name))
-                .or_else(|| {
-                    self.scoped_inherent_methods
-                        .get(&target_name)
-                        .and_then(|methods| methods.get(method_name))
-                })
-                .cloned();
-            let Some(method_info) = method_info else {
-                continue;
-            };
-            let method_ty = self.instantiate_value(&method_info.scheme);
-            self.record_symbol_type(callee_id, method_ty);
-            if !method_info.has_receiver {
-                return Err(TypeError::AssociatedFunctionAsMethod {
-                    target: target_name,
-                    function: method_name.to_string(),
-                }
-                .into());
-            }
-            if scheme_param_capability(&method_info.scheme, 0).is_mut_place() {
-                self.check_mutable_place_arg(env, receiver, 0)?;
-            }
-            let applied = self.apply_scheme_callable(
-                env,
-                args,
-                arg_wrappers,
-                &method_info.scheme,
-                vec![receiver_ty],
-                1,
-                dict_args,
-                pending_dict_args,
-            )?;
-            self.record_symbol_type(
-                callee_id,
-                Ty::Func(
-                    value_func_params(applied.arg_tys),
-                    value_func_return(applied.ret_ty.clone()),
-                ),
-            );
-            *is_method_call = true;
-            *resolved_callee = Some(method_info.resolved_callee);
-            return Ok(applied.ret_ty);
-        }
-
-        if let Some(ret_ty) = self.resolve_receiver_trait_call(
-            env,
-            callee_id,
-            &receiver_ty,
-            method_name,
-            args,
-            arg_wrappers,
-            is_method_call,
-            resolved_callee,
-        )? {
-            return Ok(ret_ty);
-        }
-
-        if let Some(info) = env.get(method_name) {
-            let scheme = info.scheme.clone();
-            let method_ty = self.instantiate_value(&scheme);
-            self.record_symbol_type(callee_id, method_ty);
-            if scheme_param_capability(&scheme, 0).is_mut_place() {
-                self.check_mutable_place_arg(env, receiver, 0)?;
-            }
-            let applied = self.apply_scheme_callable(
-                env,
-                args,
-                arg_wrappers,
-                &scheme,
-                vec![receiver_ty],
-                1,
-                dict_args,
-                pending_dict_args,
-            )?;
-            self.record_symbol_type(
-                callee_id,
-                Ty::Func(
-                    value_func_params(applied.arg_tys),
-                    value_func_return(applied.ret_ty.clone()),
-                ),
-            );
-            *is_method_call = true;
-            *resolved_callee = Some(ResolvedCallee::Function(method_name.to_string()));
-            return Ok(applied.ret_ty);
-        }
-
-        if let Some(expected_ret) = expected_ret
-            && args.is_empty()
-            && is_array_with_unresolved_element(&receiver_ty)
-            && let Some((target_name, method_info, expected_receiver_ty)) =
-                self.array_method_matching_expected_return(method_name, &expected_ret)
-        {
-            unify(
-                &mut self.subst,
-                receiver_ty.clone(),
-                expected_receiver_ty.clone(),
-            )?;
-            let method_ty = self.instantiate_value(&method_info.scheme);
-            self.record_symbol_type(callee_id, method_ty);
-            if !method_info.has_receiver {
-                return Err(TypeError::AssociatedFunctionAsMethod {
-                    target: target_name,
-                    function: method_name.to_string(),
-                }
-                .into());
-            }
-            if scheme_param_capability(&method_info.scheme, 0).is_mut_place() {
-                self.check_mutable_place_arg(env, receiver, 0)?;
-            }
-            let applied = self.apply_scheme_callable(
-                env,
-                args,
-                arg_wrappers,
-                &method_info.scheme,
-                vec![expected_receiver_ty],
-                1,
-                dict_args,
-                pending_dict_args,
-            )?;
-            unify(&mut self.subst, applied.ret_ty.clone(), expected_ret)?;
-            self.record_symbol_type(
-                callee_id,
-                Ty::Func(
-                    value_func_params(applied.arg_tys),
-                    value_func_return(applied.ret_ty.clone()),
-                ),
-            );
-            *is_method_call = true;
-            *resolved_callee = Some(method_info.resolved_callee);
-            return Ok(applied.ret_ty);
-        }
-
-        let receiver = pretty_method_receiver_for_error(&receiver_ty);
-        let candidates = self.inherent_method_candidates(method_name);
-        if candidates.is_empty() {
-            Err(TypeError::UnknownMethod {
-                receiver,
-                method: method_name.to_string(),
-            }
-            .into())
-        } else if is_array_with_unresolved_element(&receiver_ty)
-            && candidates
-                .iter()
-                .any(|candidate| candidate.starts_with('['))
-        {
-            Err(TypeError::UnknownMethodOnUnresolvedArray {
-                receiver,
-                method: method_name.to_string(),
-                candidates,
-            }
-            .into())
-        } else {
-            Err(TypeError::UnknownMethodWithCandidates {
-                receiver,
-                method: method_name.to_string(),
-                candidates,
-            }
-            .into())
-        }
-    }
-
-    fn inherent_method_candidates(&self, method_name: &str) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut candidates = Vec::new();
-        for methods_by_target in [&self.inherent_methods, &self.scoped_inherent_methods] {
-            for (target, methods) in methods_by_target {
-                let Some(info) = methods.get(method_name) else {
-                    continue;
-                };
-                if !info.has_receiver {
-                    continue;
-                }
-                let candidate = format!(
-                    "{}.{}",
-                    format_inherent_target_for_error(target),
-                    method_name
-                );
-                if seen.insert(candidate.clone()) {
-                    candidates.push(candidate);
-                }
-            }
-        }
-        candidates.sort();
-        candidates
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_receiver_trait_call(
-        &mut self,
-        env: &TypeEnv,
-        callee_id: NodeId,
-        receiver_ty: &Ty,
-        method_name: &str,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        is_method_call: &mut bool,
-        resolved_callee: &mut Option<ResolvedCallee>,
-    ) -> Result<Option<Ty>, SpannedTypeError> {
-        let candidates = self.receiver_trait_method_candidates(method_name);
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-
-        let mut matches = Vec::new();
-        let mut receiver_matches = Vec::new();
-        for candidate in &candidates {
-            let snapshot = self.subst.checkpoint();
-            let mut probe_args = args.to_vec();
-            let mut probe_arg_wrappers = Vec::new();
-            let matched = self
-                .infer_args(env, &mut probe_args, &mut probe_arg_wrappers)
-                .and_then(|arg_tys| {
-                    self.try_receiver_trait_method(env, receiver_ty, &arg_tys, candidate)
-                })
-                .is_ok();
-            self.subst.restore_checkpoint(snapshot);
-            if matched {
-                matches.push(candidate.clone());
-                receiver_matches.push(candidate.clone());
-                continue;
-            }
-
-            let snapshot = self.subst.checkpoint();
-            let receiver_matched =
-                self.receiver_trait_method_matches_receiver(env, receiver_ty, candidate);
-            self.subst.restore_checkpoint(snapshot);
-            if receiver_matched {
-                receiver_matches.push(candidate.clone());
-            }
-        }
-
-        if matches.len() > 1 {
-            return Err(TypeError::AmbiguousTraitMethod {
-                method: method_name.to_string(),
-                candidates: matches
-                    .iter()
-                    .map(|candidate| candidate.trait_def.name.clone())
-                    .collect(),
-            }
-            .into());
-        }
-
-        let Some(candidate) = matches.into_iter().next() else {
-            if receiver_matches.len() == 1 {
-                let candidate = receiver_matches
-                    .into_iter()
-                    .next()
-                    .expect("single receiver match exists");
-                if candidate.method.params.len() != args.len() + 1 {
-                    return Err(TypeError::ArityMismatch {
-                        expected: candidate.method.params.len().saturating_sub(1),
-                        got: args.len(),
-                    }
-                    .into());
-                }
-                let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-                let resolved =
-                    self.try_receiver_trait_method(env, receiver_ty, &arg_tys, &candidate)?;
-                self.record_symbol_type(
-                    callee_id,
-                    Ty::Func(
-                        value_func_params(arg_tys),
-                        value_func_return(resolved.ret_ty.clone()),
-                    ),
-                );
-                *is_method_call = true;
-                *resolved_callee = Some(resolved.resolved_callee);
-                return Ok(Some(resolved.ret_ty));
-            }
-            return Ok(None);
-        };
-
-        let arg_tys = self.infer_args(env, args, arg_wrappers)?;
-        let resolved = self.try_receiver_trait_method(env, receiver_ty, &arg_tys, &candidate)?;
-        self.record_symbol_type(
-            callee_id,
-            Ty::Func(
-                value_func_params(arg_tys),
-                value_func_return(resolved.ret_ty.clone()),
-            ),
-        );
-        *is_method_call = true;
-        *resolved_callee = Some(resolved.resolved_callee);
-        Ok(Some(resolved.ret_ty))
-    }
-
-    fn receiver_trait_method_candidates(&self, method_name: &str) -> Vec<ReceiverTraitMethodMatch> {
-        let mut candidates = self
-            .trait_env
-            .values()
-            .filter_map(|trait_def| {
-                trait_def
-                    .methods
-                    .iter()
-                    .find(|method| method.name == method_name)
-                    .map(|method| ReceiverTraitMethodMatch {
-                        trait_def: trait_def.clone(),
-                        method: method.clone(),
-                    })
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| left.trait_def.name.cmp(&right.trait_def.name));
-        candidates
-    }
-
-    fn try_receiver_trait_method(
-        &mut self,
-        env: &TypeEnv,
-        receiver_ty: &Ty,
-        arg_tys: &[Ty],
-        candidate: &ReceiverTraitMethodMatch,
-    ) -> Result<ReceiverTraitMethodResolution, SpannedTypeError> {
-        let trait_def = &candidate.trait_def;
-        let method = &candidate.method;
-        if method.params.len() != arg_tys.len() + 1 {
-            return Err(TypeError::ArityMismatch {
-                expected: method.params.len().saturating_sub(1),
-                got: arg_tys.len(),
-            }
-            .into());
-        }
-
-        let mut param_vars = HashMap::new();
-        let trait_vars = trait_def
-            .params
-            .iter()
-            .map(|param| {
-                let var = self.fresh_var();
-                param_vars.insert(param.clone(), var);
-                var
-            })
-            .collect::<Vec<_>>();
-        let method_param_tys = method
-            .params
-            .iter()
-            .map(|(_, ty)| self.ast_to_ty_with_vars(ty, &mut param_vars))
-            .collect::<Result<Vec<_>, _>>()?;
-        let ret_ty = self.ast_to_ty_with_vars(&method.ret_type, &mut param_vars)?;
-
-        unify(
-            &mut self.subst,
-            method_param_tys[0].clone(),
-            receiver_ty.clone(),
-        )?;
-        for (actual, expected) in arg_tys
-            .iter()
-            .cloned()
-            .zip(method_param_tys.into_iter().skip(1))
-        {
-            unify(&mut self.subst, actual, expected)?;
-        }
-
-        let trait_args = trait_vars
-            .into_iter()
-            .map(|var| self.subst.apply(&Ty::Var(var)))
-            .collect::<Vec<_>>();
-        let determinant_indexes = trait_dict_indexes(trait_def);
-        let dict = resolve_concrete_from_args_unifying(
-            &trait_def.name,
-            &trait_args,
-            &determinant_indexes,
-            env,
-            &self.known_impl_dicts,
-            &self.known_impl_schemes,
-            &mut self.subst,
-        )
-        .ok_or_else(|| TypeError::MissingTraitImpl {
-            trait_name: trait_def.name.clone(),
-            impl_target: format_trait_target_for_receiver_error(&trait_args, &determinant_indexes),
-        })?;
-
-        let dict_name = dict_ref_concrete_name(&dict)
-            .expect("receiver trait method dictionaries should be concrete")
-            .to_string();
-        if let Some(dict_scheme) = env
-            .get(&dict_name)
-            .map(|info| info.scheme.clone())
-            .or_else(|| self.known_impl_schemes.get(&dict_name).cloned())
-        {
-            let dict_ty = self.instantiate(&dict_scheme);
-            let method_ty =
-                record_field_ty(&self.subst.apply(&dict_ty), &method.name).ok_or_else(|| {
-                    TypeError::UnknownTraitMethod {
-                        trait_name: trait_def.name.clone(),
-                        method: method.name.clone(),
-                    }
-                })?;
-            let checked_ret = Ty::Var(self.fresh_var());
-            let mut all_args = Vec::with_capacity(arg_tys.len() + 1);
-            all_args.push(receiver_ty.clone());
-            all_args.extend(arg_tys.iter().cloned());
-            unify(
-                &mut self.subst,
-                method_ty,
-                Ty::Func(
-                    value_func_params(all_args),
-                    value_func_return(checked_ret.clone()),
-                ),
-            )?;
-            unify(&mut self.subst, ret_ty.clone(), checked_ret)?;
-        }
-
-        Ok(ReceiverTraitMethodResolution {
-            ret_ty: self.subst.apply(&ret_ty),
-            resolved_callee: ResolvedCallee::DictMethod {
-                dict,
-                method: method.name.clone(),
-            },
-        })
-    }
-
-    fn receiver_trait_method_matches_receiver(
-        &mut self,
-        env: &TypeEnv,
-        receiver_ty: &Ty,
-        candidate: &ReceiverTraitMethodMatch,
-    ) -> bool {
-        let trait_def = &candidate.trait_def;
-        let method = &candidate.method;
-        let Some((_, receiver_ast_ty)) = method.params.first() else {
-            return false;
-        };
-
-        let mut param_vars = HashMap::new();
-        let trait_vars = trait_def
-            .params
-            .iter()
-            .map(|param| {
-                let var = self.fresh_var();
-                param_vars.insert(param.clone(), var);
-                var
-            })
-            .collect::<Vec<_>>();
-        let Ok(expected_receiver_ty) = self.ast_to_ty_with_vars(receiver_ast_ty, &mut param_vars)
-        else {
-            return false;
-        };
-        if unify(&mut self.subst, expected_receiver_ty, receiver_ty.clone()).is_err() {
-            return false;
-        }
-
-        let trait_args = trait_vars
-            .into_iter()
-            .map(|var| self.subst.apply(&Ty::Var(var)))
-            .collect::<Vec<_>>();
-        let determinant_indexes = trait_dict_indexes(trait_def);
-        resolve_concrete_from_args_unifying(
-            &trait_def.name,
-            &trait_args,
-            &determinant_indexes,
-            env,
-            &self.known_impl_dicts,
-            &self.known_impl_schemes,
-            &mut self.subst,
-        )
-        .is_some()
-    }
-
-    fn array_method_matching_expected_return(
-        &mut self,
-        method_name: &str,
-        expected_ret: &Ty,
-    ) -> Option<(String, InherentMethodInfo, Ty)> {
-        let mut candidates = Vec::new();
-        let mut seen = HashSet::new();
-        for methods_by_target in [&self.inherent_methods, &self.scoped_inherent_methods] {
-            for (target, methods) in methods_by_target {
-                let Some(receiver_ty) = array_receiver_ty_from_target_key(target) else {
-                    continue;
-                };
-                let Some(method_info) = methods.get(method_name) else {
-                    continue;
-                };
-                if !seen.insert(target.clone()) {
-                    continue;
-                }
-                if !method_info.has_receiver {
-                    continue;
-                }
-                candidates.push((target.clone(), method_info.clone(), receiver_ty));
-            }
-        }
-
-        let mut matches = Vec::new();
-        for (target, method_info, receiver_ty) in candidates {
-            let Some(method_ret) = scheme_return_ty(&method_info.scheme) else {
-                continue;
-            };
-            let snapshot = self.subst.checkpoint();
-            let matched = unify(&mut self.subst, method_ret, expected_ret.clone()).is_ok();
-            self.subst.restore_checkpoint(snapshot);
-            if matched {
-                matches.push((target, method_info, receiver_ty));
-            }
-        }
-        (matches.len() == 1).then(|| matches.remove(0))
-    }
-
-    pub(super) fn infer_args(
-        &mut self,
-        env: &TypeEnv,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-    ) -> Result<Vec<Ty>, SpannedTypeError> {
-        arg_wrappers.clear();
-        let mut arg_tys = Vec::with_capacity(args.len());
-        for arg in args {
-            let inferred = self.infer_expr(env, arg)?;
-            if has_mut_place_func_params(&self.subst.apply(&inferred))
-                || self
-                    .metadata
-                    .callable_capabilities(arg.id)
-                    .is_some_and(|capabilities| {
-                        capabilities
-                            .param_capabilities
-                            .iter()
-                            .any(|capability| capability.is_mut_place())
-                    })
-            {
-                return Err(TypeError::MutableFunctionCapabilityMismatch.at(arg.span));
-            }
-            let (constraints, inner) = split_qualified(inferred);
-            let arg_ty = self.subst.apply(&inner);
-            let wrapper = if !constraints.is_empty() {
-                let mut wrapper = ArgWrapper {
-                    dict_args: Vec::new(),
-                    pending_dict_args: Vec::new(),
-                };
-                attach_dict_args(
-                    env,
-                    &self.known_impl_dicts,
-                    &self.known_impl_schemes,
-                    &mut wrapper.dict_args,
-                    &mut wrapper.pending_dict_args,
-                    &mut self.pending_constraints,
-                    &constraints,
-                    &mut self.subst,
-                )
-                .map_err(|e| e.at(arg.span))?;
-                Some(wrapper)
-            } else {
-                None
-            };
-            arg_wrappers.push(wrapper);
-            arg_tys.push(arg_ty);
-        }
-        Ok(arg_tys)
-    }
-
-    fn infer_checked_args_with_expected(
-        &mut self,
-        env: &TypeEnv,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        expected_params: &[FuncParam],
-        param_offset: usize,
-    ) -> Result<Vec<Ty>, SpannedTypeError> {
-        arg_wrappers.clear();
-        let mut arg_tys = Vec::with_capacity(args.len());
-        for (idx, arg) in args.iter_mut().enumerate() {
-            let expected_param = expected_params.get(param_offset + idx);
-            let inferred = if let Some(expected_param) = expected_param
-                && matches!(arg.kind, ExprKind::Lambda { .. })
-            {
-                self.infer_expr_expected(env, arg, expected_param.ty.clone())?
-            } else {
-                self.infer_expr(env, arg)?
-            };
-            if has_mut_place_func_params(&self.subst.apply(&inferred))
-                || self
-                    .metadata
-                    .callable_capabilities(arg.id)
-                    .is_some_and(|capabilities| {
-                        capabilities
-                            .param_capabilities
-                            .iter()
-                            .any(|capability| capability.is_mut_place())
-                    })
-            {
-                return Err(TypeError::MutableFunctionCapabilityMismatch.at(arg.span));
-            }
-            let (constraints, inner) = split_qualified(inferred);
-            let arg_ty = self.subst.apply(&inner);
-            let wrapper = if !constraints.is_empty() {
-                let mut wrapper = ArgWrapper {
-                    dict_args: Vec::new(),
-                    pending_dict_args: Vec::new(),
-                };
-                attach_dict_args(
-                    env,
-                    &self.known_impl_dicts,
-                    &self.known_impl_schemes,
-                    &mut wrapper.dict_args,
-                    &mut wrapper.pending_dict_args,
-                    &mut self.pending_constraints,
-                    &constraints,
-                    &mut self.subst,
-                )
-                .map_err(|e| e.at(arg.span))?;
-                Some(wrapper)
-            } else {
-                None
-            };
-            arg_wrappers.push(wrapper);
-            arg_tys.push(arg_ty);
-        }
-        self.check_mutable_place_args_from(
-            env,
-            args,
-            &func_param_capabilities(expected_params),
-            param_offset,
-        )?;
-        Ok(arg_tys)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn apply_scheme_callable(
-        &mut self,
-        env: &TypeEnv,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        scheme: &Scheme,
-        leading_arg_tys: Vec<Ty>,
-        param_offset: usize,
-        dict_args: &mut Vec<DictRef>,
-        pending_dict_args: &mut Vec<PendingDictArg>,
-    ) -> Result<AppliedSchemeCall, SpannedTypeError> {
-        let instantiated = self.instantiate_scheme(scheme);
-        let expected_params = match &instantiated.ty {
-            Ty::Func(params, _) => params.clone(),
-            _ => Vec::new(),
-        };
-        let mut arg_tys = leading_arg_tys;
-        for (idx, leading_ty) in arg_tys.iter().enumerate() {
-            if let Some(expected_param) = expected_params.get(idx) {
-                unify(
-                    &mut self.subst,
-                    leading_ty.clone(),
-                    expected_param.ty.clone(),
-                )?;
-            }
-        }
-        arg_tys.extend(self.infer_checked_args_with_expected(
-            env,
-            args,
-            arg_wrappers,
-            &expected_params,
-            param_offset,
-        )?);
-        let ret_ty = Ty::Var(self.fresh_var());
-        let expected_params = expected_func_params(&instantiated.ty, arg_tys.clone());
-        let expected_ret = expected_func_return(&instantiated.ty, ret_ty.clone());
-        unify(
-            &mut self.subst,
-            instantiated.ty,
-            Ty::Func(expected_params, expected_ret),
-        )?;
-        attach_dict_args(
-            env,
-            &self.known_impl_dicts,
-            &self.known_impl_schemes,
-            dict_args,
-            pending_dict_args,
-            &mut self.pending_constraints,
-            &instantiated.constraints,
-            &mut self.subst,
-        )
-        .map_err(TypeError::unspanned)?;
-        Ok(AppliedSchemeCall {
-            ret_ty: self.subst.apply(&ret_ty),
-            arg_tys,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn apply_callable_type(
-        &mut self,
-        env: &TypeEnv,
-        args: &mut [Expr],
-        arg_wrappers: &mut Vec<Option<ArgWrapper>>,
-        callable_ty: Ty,
-        constraints: Vec<TraitConstraint>,
-        leading_arg_tys: Vec<Ty>,
-        param_capabilities: Vec<ParamCapability>,
-        param_offset: usize,
-        dict_error_span: SourceSpan,
-        dict_args: &mut Vec<DictRef>,
-        pending_dict_args: &mut Vec<PendingDictArg>,
-    ) -> Result<AppliedCall, SpannedTypeError> {
-        let fresh_return = func_return_capability(&callable_ty) == ReturnCapability::FreshPlace;
-        let expected_params = match &callable_ty {
-            Ty::Func(params, _) => params.clone(),
-            _ => Vec::new(),
-        };
-        let mut arg_tys = leading_arg_tys;
-        for (idx, leading_ty) in arg_tys.iter().enumerate() {
-            if let Some(expected_param) = expected_params.get(idx) {
-                unify(
-                    &mut self.subst,
-                    leading_ty.clone(),
-                    expected_param.ty.clone(),
-                )?;
-            }
-        }
-        arg_tys.extend(self.infer_checked_args_with_expected(
-            env,
-            args,
-            arg_wrappers,
-            &expected_params,
-            param_offset,
-        )?);
-        if expected_params.is_empty() {
-            self.check_mutable_place_args_from(env, args, &param_capabilities, param_offset)?;
-        }
-        let ret_ty = Ty::Var(self.fresh_var());
-        let call_ty = Ty::Func(
-            expected_func_params(&callable_ty, arg_tys.clone()),
-            expected_func_return(&callable_ty, ret_ty.clone()),
-        );
-        unify(&mut self.subst, callable_ty, call_ty.clone())?;
-        attach_dict_args(
-            env,
-            &self.known_impl_dicts,
-            &self.known_impl_schemes,
-            dict_args,
-            pending_dict_args,
-            &mut self.pending_constraints,
-            &constraints,
-            &mut self.subst,
-        )
-        .map_err(|err| err.at(dict_error_span))?;
-        Ok(AppliedCall {
-            ret_ty: self.subst.apply(&ret_ty),
-            call_ty,
-            fresh_return,
-        })
-    }
-
-    pub(super) fn infer_constrained_apply(
-        &mut self,
-        env: &TypeEnv,
-        scheme: &Scheme,
-        arg_tys: Vec<Ty>,
-        dict_args: &mut Vec<DictRef>,
-        pending_dict_args: &mut Vec<PendingDictArg>,
-    ) -> Result<Ty, SpannedTypeError> {
-        let instantiated = self.instantiate_scheme(scheme);
-        let ret_ty = Ty::Var(self.fresh_var());
-        let expected_params = expected_func_params(&instantiated.ty, arg_tys);
-        let expected_ret = expected_func_return(&instantiated.ty, ret_ty.clone());
-        unify(
-            &mut self.subst,
-            instantiated.ty,
-            Ty::Func(expected_params, expected_ret),
-        )?;
-        attach_dict_args(
-            env,
-            &self.known_impl_dicts,
-            &self.known_impl_schemes,
-            dict_args,
-            pending_dict_args,
-            &mut self.pending_constraints,
-            &instantiated.constraints,
-            &mut self.subst,
-        )
-        .map_err(TypeError::unspanned)?;
-        Ok(self.subst.apply(&ret_ty))
-    }
-}
-
-fn format_inherent_target_for_error(target: &str) -> String {
-    if target == "Array" {
-        return "['a]".to_string();
-    }
-    if let Some(element) = target.strip_prefix("Array__app1__") {
-        return format!("[{}]", format_inherent_target_for_error(element));
-    }
-    target.to_string()
-}
-
-fn array_receiver_ty_from_target_key(target: &str) -> Option<Ty> {
-    let element = target.strip_prefix("Array__app1__")?;
-    let element_ty = match element {
-        "int" => Ty::Int,
-        "float" => Ty::Float,
-        "string" => Ty::Con("string".to_string()),
-        "bool" => Ty::Con("bool".to_string()),
-        _ => return None,
-    };
-    Some(Ty::App(
-        Box::new(Ty::Con("Array".to_string())),
-        vec![element_ty],
-    ))
-}
-
-fn scheme_return_ty(scheme: &Scheme) -> Option<Ty> {
-    match &scheme.ty {
-        Ty::Func(_, ret) => Some((*ret.ty).clone()),
-        _ => None,
-    }
-}
-
-fn func_receiver_param(ty: &Ty) -> Option<Ty> {
-    match ty {
-        Ty::Func(params, _) => params.first().map(|param| param.ty.clone()),
-        Ty::Qualified(_, inner) => func_receiver_param(inner),
-        _ => None,
-    }
-}
-
-fn split_qualified(ty: Ty) -> (Vec<TraitConstraint>, Ty) {
-    match ty {
-        Ty::Qualified(constraints, inner) => (constraints, *inner),
-        other => (Vec::new(), other),
-    }
-}
-
-fn pretty_method_receiver_for_error(receiver: &Ty) -> String {
-    let names: HashMap<_, _> = free_type_vars_in_display_order(receiver)
-        .into_iter()
-        .enumerate()
-        .map(|(index, var)| (var, type_var_name(index)))
-        .collect();
-    display_ty_with_var_names(receiver, &names)
-}
-
-fn format_trait_target_for_receiver_error(args: &[Ty], determinant_indexes: &[usize]) -> String {
-    let target = determinant_indexes
-        .first()
-        .and_then(|index| args.get(*index))
-        .or_else(|| args.first());
-    target
-        .map(|ty| pretty_method_receiver_for_error(ty))
-        .unwrap_or_else(|| "<unknown>".to_string())
-}
-
-fn is_array_with_unresolved_element(receiver: &Ty) -> bool {
-    matches!(
-        receiver,
-        Ty::App(con, args)
-            if matches!(con.as_ref(), Ty::Con(name) if name == "Array")
-                && matches!(args.as_slice(), [Ty::Var(_)])
-    )
-}
-
-fn variable_trait_target(ty: &Ty) -> Option<TyVar> {
-    match ty {
-        Ty::Var(var) => Some(*var),
-        Ty::App(con, _) => variable_trait_target(con),
-        Ty::Qualified(_, inner) => variable_trait_target(inner),
-        Ty::Int
-        | Ty::Float
-        | Ty::Unit
-        | Ty::Never
-        | Ty::Con(_)
-        | Ty::Tuple(_)
-        | Ty::Func(_, _)
-        | Ty::Record(_) => None,
     }
 }

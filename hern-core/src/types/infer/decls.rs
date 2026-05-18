@@ -1,3 +1,9 @@
+//! Inference for top-level declarations and declared type surfaces.
+//!
+//! Declarations establish names, schemes, variant constructors, trait
+//! definitions, and inherent method entries that expression inference later
+//! consumes.
+
 use super::*;
 
 impl Infer {
@@ -6,8 +12,8 @@ impl Infer {
         seed_stmts: &[Stmt],
         stmts: &[Stmt],
     ) -> Result<(), SpannedTypeError> {
-        let mut in_scope_type_names = self.declared_types.clone();
-        let mut in_scope_trait_names: HashSet<String> = self.trait_env.keys().cloned().collect();
+        let mut in_scope_type_names = self.types.declared.clone();
+        let mut in_scope_trait_names: HashSet<String> = self.traits.env.keys().cloned().collect();
         for stmt in seed_stmts {
             match stmt {
                 Stmt::Type(td) => {
@@ -60,13 +66,14 @@ impl Infer {
         for stmt in stmts {
             match stmt {
                 Stmt::Type(td) => {
-                    self.declared_types.insert(td.name.clone());
+                    self.types.declared.insert(td.name.clone());
                 }
                 Stmt::TypeAlias {
                     name, params, ty, ..
                 } => {
-                    self.declared_types.insert(name.clone());
-                    self.type_aliases
+                    self.types.declared.insert(name.clone());
+                    self.types
+                        .aliases
                         .insert(name.clone(), (params.clone(), ty.clone()));
                 }
                 _ => {}
@@ -84,7 +91,7 @@ impl Infer {
                 continue;
             };
             validate_trait_methods_have_target(td)?;
-            self.trait_env.insert(td.name.clone(), td.clone());
+            self.traits.env.insert(td.name.clone(), td.clone());
             for method in &td.methods {
                 if method.fixity.is_none() {
                     continue;
@@ -98,7 +105,7 @@ impl Infer {
                     }
                     .at(method.span));
                 }
-                match self.op_trait_map.get(&method.name) {
+                match self.traits.op_trait_map.get(&method.name) {
                     Some(existing) if existing != &td.name => {
                         return Err(
                             TypeError::DuplicateOperator(method.name.clone()).at(stmt.span())
@@ -106,7 +113,8 @@ impl Infer {
                     }
                     Some(_) => {}
                     None => {
-                        self.op_trait_map
+                        self.traits
+                            .op_trait_map
                             .insert(method.name.clone(), td.name.clone());
                     }
                 }
@@ -154,7 +162,7 @@ impl Infer {
             if let Stmt::Impl(impl_def) = stmt
                 && let Some(dict_name) = impl_dict_name(impl_def)
             {
-                self.known_impl_dicts.insert(dict_name);
+                self.impls.known_dicts.insert(dict_name);
             }
         }
     }
@@ -167,7 +175,7 @@ impl Infer {
             if let Stmt::Impl(impl_def) = stmt
                 && let Some(dict_name) = impl_dict_name(impl_def)
             {
-                self.known_impl_dicts.remove(&dict_name);
+                self.impls.known_dicts.remove(&dict_name);
             }
         }
     }
@@ -230,6 +238,7 @@ impl Infer {
 
     fn resolve_variant_payload_types(&mut self) {
         let variants: Vec<(String, Vec<String>, Option<Type>)> = self
+            .types
             .variant_env
             .0
             .iter()
@@ -251,7 +260,7 @@ impl Infer {
                 .as_ref()
                 .and_then(|ty| self.ast_to_ty_with_vars(ty, &mut param_vars).ok());
 
-            if let Some(info) = self.variant_env.0.get_mut(&name) {
+            if let Some(info) = self.types.variant_env.0.get_mut(&name) {
                 info.type_param_vars = type_param_vars;
                 info.payload_ty = payload_ty;
             }
@@ -259,9 +268,9 @@ impl Infer {
     }
 
     pub(super) fn discard_failed_type_decl(&mut self, td: &TypeDef) {
-        self.declared_types.remove(&td.name);
+        self.types.declared.remove(&td.name);
         for variant in &td.variants {
-            self.variant_env.0.remove(&variant.name);
+            self.types.variant_env.0.remove(&variant.name);
         }
     }
 }
@@ -272,8 +281,8 @@ fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeEr
             method
                 .params
                 .iter()
-                .any(|(_, ty)| ast_type_contains_var(ty, param))
-                || ast_type_contains_var(&method.ret_type, param)
+                .any(|(_, ty)| type_contains_var(ty, param))
+                || type_contains_var(&method.ret_type, param)
         });
         if !mentions_trait_param {
             return Err(TypeError::TraitMethodMissingTarget {
@@ -292,8 +301,8 @@ fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeEr
                 method
                     .params
                     .iter()
-                    .any(|(_, ty)| ast_type_contains_var(ty, param))
-                    || ast_type_contains_var(&method.ret_type, param)
+                    .any(|(_, ty)| type_contains_var(ty, param))
+                    || type_contains_var(&method.ret_type, param)
             });
             if !reachable {
                 return Err(TypeError::FunctionalDependencyViolation {
@@ -308,29 +317,6 @@ fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeEr
         }
     }
     Ok(())
-}
-
-fn ast_type_contains_var(ty: &Type, var_name: &str) -> bool {
-    match ty {
-        Type::Var(name) => name == var_name,
-        Type::App(con, args) => {
-            ast_type_contains_var(con, var_name)
-                || args.iter().any(|arg| ast_type_contains_var(arg, var_name))
-        }
-        Type::Func(params, ret) => {
-            params
-                .iter()
-                .any(|param| ast_type_contains_var(&param.ty, var_name))
-                || ast_type_contains_var(&ret.ty, var_name)
-        }
-        Type::Tuple(items) => items
-            .iter()
-            .any(|item| ast_type_contains_var(item, var_name)),
-        Type::Record(fields, _) => fields
-            .iter()
-            .any(|(_, field_ty)| ast_type_contains_var(field_ty, var_name)),
-        Type::Ident(_) | Type::Unit | Type::Never | Type::Hole => false,
-    }
 }
 
 fn impl_dict_name(impl_def: &ImplDef) -> Option<String> {

@@ -1,3 +1,9 @@
+//! Dictionary resolution and final AST dictionary attachment.
+//!
+//! Trait constraints become concrete dictionary references where possible, or
+//! remain pending when generic code must receive dictionaries from its caller.
+//! This module owns that transition and the final dictionary-attachment pass.
+
 use crate::ast::*;
 use crate::types::{
     Scheme, Subst, TraitConstraint, Ty, TypeEnv,
@@ -369,7 +375,7 @@ fn resolve_concrete_from_impl_schemes_unifying(
     // Deterministic fallback for shape-based scheme lookup. Hern does not yet
     // report overlapping parameterized impls as ambiguity here, so sorted names
     // keep selection stable until a real ambiguity diagnostic exists.
-    candidates.sort_by(|(left, _), (right, _)| left.cmp(right));
+    candidates.sort_by_key(|(dict_name, _)| *dict_name);
 
     for (dict_name, scheme) in candidates {
         let mut trial = subst.clone();
@@ -378,7 +384,7 @@ fn resolve_concrete_from_impl_schemes_unifying(
         }
         let resolved_args = args.iter().map(|arg| trial.apply(arg)).collect::<Vec<_>>();
         let Some(dict_args) = dict_ref_args_for_scheme_args(
-            &scheme,
+            scheme,
             &resolved_args,
             env,
             known_impl_dicts,
@@ -745,7 +751,7 @@ pub(super) fn resolve_dict_uses_expr(
     resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
 ) -> Result<(), TypeError> {
-    resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, true)
+    resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, DictResolveMode::HardUnresolved)
 }
 
 pub(super) fn resolve_dict_uses_expr_lenient(
@@ -753,14 +759,26 @@ pub(super) fn resolve_dict_uses_expr_lenient(
     resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
 ) -> Result<(), TypeError> {
-    resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, false)
+    resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, DictResolveMode::Lenient)
+}
+
+#[derive(Clone, Copy)]
+enum DictResolveMode {
+    HardUnresolved,
+    Lenient,
+}
+
+impl DictResolveMode {
+    fn is_hard(self) -> bool {
+        matches!(self, Self::HardUnresolved)
+    }
 }
 
 fn resolve_dict_uses_expr_with_mode(
     expr: &mut Expr,
     resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
-    hard_unresolved: bool,
+    mode: DictResolveMode,
 ) -> Result<(), TypeError> {
     match &mut expr.kind {
         ExprKind::Binary {
@@ -782,17 +800,17 @@ fn resolve_dict_uses_expr_with_mode(
                         method: op_str.clone(),
                     });
                     *pending_op = None;
-                } else if hard_unresolved {
+                } else if mode.is_hard() {
                     return Err(unresolved_pending_error("operator", pending));
                 }
             }
-            if hard_unresolved {
+            if mode.is_hard() {
                 drain_pending(pending_dict_args, dict_args, "call", resolve)?;
             } else {
                 drain_pending_lenient(pending_dict_args, dict_args, resolve);
             }
-            resolve_dict_uses_expr_with_mode(lhs, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(rhs, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(lhs, resolve, process_fn, mode)?;
+            resolve_dict_uses_expr_with_mode(rhs, resolve, process_fn, mode)?;
             Ok(())
         }
         ExprKind::Neg {
@@ -808,11 +826,11 @@ fn resolve_dict_uses_expr_with_mode(
                         method: "-".to_string(),
                     });
                     *pending_op = None;
-                } else if hard_unresolved {
+                } else if mode.is_hard() {
                     return Err(unresolved_pending_error("operator", pending));
                 }
             }
-            resolve_dict_uses_expr_with_mode(operand, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(operand, resolve, process_fn, mode)?;
             Ok(())
         }
         ExprKind::Call {
@@ -832,7 +850,7 @@ fn resolve_dict_uses_expr_with_mode(
                         method: method_name.clone(),
                     });
                 } else {
-                    if hard_unresolved {
+                    if mode.is_hard() {
                         return Err(TypeError::UnresolvedTrait {
                             context: "method call".to_string(),
                             trait_name: pending.trait_name.clone(),
@@ -841,7 +859,7 @@ fn resolve_dict_uses_expr_with_mode(
                     *pending_trait_method = Some((pending, method_name));
                 }
             }
-            if hard_unresolved {
+            if mode.is_hard() {
                 drain_pending(pending_dict_args, dict_args, "call", resolve)?;
             } else {
                 drain_pending_lenient(pending_dict_args, dict_args, resolve);
@@ -853,18 +871,18 @@ fn resolve_dict_uses_expr_with_mode(
                     resolve,
                 );
             }
-            resolve_dict_uses_expr_with_mode(callee, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(callee, resolve, process_fn, mode)?;
             for arg in args {
-                resolve_dict_uses_expr_with_mode(arg, resolve, process_fn, hard_unresolved)?;
+                resolve_dict_uses_expr_with_mode(arg, resolve, process_fn, mode)?;
             }
             Ok(())
         }
         ExprKind::Block { stmts, final_expr } => {
             for stmt in stmts {
-                resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, hard_unresolved)?;
+                resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, mode)?;
             }
             if let Some(e) = final_expr {
-                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)?;
+                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, mode)?;
             }
             Ok(())
         }
@@ -873,74 +891,60 @@ fn resolve_dict_uses_expr_with_mode(
             then_branch,
             else_branch,
         } => {
-            resolve_dict_uses_expr_with_mode(cond, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(then_branch, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(else_branch, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(cond, resolve, process_fn, mode)?;
+            resolve_dict_uses_expr_with_mode(then_branch, resolve, process_fn, mode)?;
+            resolve_dict_uses_expr_with_mode(else_branch, resolve, process_fn, mode)?;
             Ok(())
         }
         ExprKind::Lambda { body, .. } => {
-            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)
+            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, mode)
         }
         ExprKind::Match { scrutinee, arms } => {
-            resolve_dict_uses_expr_with_mode(scrutinee, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(scrutinee, resolve, process_fn, mode)?;
             for (_, arm_expr) in arms {
-                resolve_dict_uses_expr_with_mode(arm_expr, resolve, process_fn, hard_unresolved)?;
+                resolve_dict_uses_expr_with_mode(arm_expr, resolve, process_fn, mode)?;
             }
             Ok(())
         }
-        ExprKind::Loop(body) => {
-            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)
-        }
+        ExprKind::Loop(body) => resolve_dict_uses_expr_with_mode(body, resolve, process_fn, mode),
         ExprKind::Assign { target, value } => {
-            resolve_dict_uses_expr_with_mode(target, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(value, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(target, resolve, process_fn, mode)?;
+            resolve_dict_uses_expr_with_mode(value, resolve, process_fn, mode)?;
             Ok(())
         }
         ExprKind::Range { start, end, .. } => {
             if let Some(start) = start {
-                resolve_dict_uses_expr_with_mode(start, resolve, process_fn, hard_unresolved)?;
+                resolve_dict_uses_expr_with_mode(start, resolve, process_fn, mode)?;
             }
             if let Some(end) = end {
-                resolve_dict_uses_expr_with_mode(end, resolve, process_fn, hard_unresolved)?;
+                resolve_dict_uses_expr_with_mode(end, resolve, process_fn, mode)?;
             }
             Ok(())
         }
-        ExprKind::Not(e) => {
-            resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)
-        }
+        ExprKind::Not(e) => resolve_dict_uses_expr_with_mode(e, resolve, process_fn, mode),
         ExprKind::Break(Some(e)) | ExprKind::Return(Some(e)) => {
-            resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)
+            resolve_dict_uses_expr_with_mode(e, resolve, process_fn, mode)
         }
         ExprKind::Tuple(es) => {
             for e in es {
-                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved)?;
+                resolve_dict_uses_expr_with_mode(e, resolve, process_fn, mode)?;
             }
             Ok(())
         }
         ExprKind::Array(entries) => {
             for entry in entries {
-                resolve_dict_uses_expr_with_mode(
-                    entry.expr_mut(),
-                    resolve,
-                    process_fn,
-                    hard_unresolved,
-                )?;
+                resolve_dict_uses_expr_with_mode(entry.expr_mut(), resolve, process_fn, mode)?;
             }
             Ok(())
         }
         ExprKind::Record(entries) => {
             for entry in entries {
-                resolve_dict_uses_expr_with_mode(
-                    entry.expr_mut(),
-                    resolve,
-                    process_fn,
-                    hard_unresolved,
-                )?;
+                resolve_dict_uses_expr_with_mode(entry.expr_mut(), resolve, process_fn, mode)?;
             }
             Ok(())
         }
         ExprKind::FieldAccess { expr, .. } => {
-            resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, hard_unresolved)
+            resolve_dict_uses_expr_with_mode(expr, resolve, process_fn, mode)
         }
         ExprKind::Index {
             receiver,
@@ -958,7 +962,7 @@ fn resolve_dict_uses_expr_with_mode(
                         method: method_name.clone(),
                     });
                 } else {
-                    if hard_unresolved {
+                    if mode.is_hard() {
                         return Err(TypeError::UnresolvedTrait {
                             context: "index expression".to_string(),
                             trait_name: pending.trait_name.clone(),
@@ -967,13 +971,13 @@ fn resolve_dict_uses_expr_with_mode(
                     *pending_trait_method = Some((pending, method_name));
                 }
             }
-            if hard_unresolved {
+            if mode.is_hard() {
                 drain_pending(pending_dict_args, dict_args, "index expression", resolve)?;
             } else {
                 drain_pending_lenient(pending_dict_args, dict_args, resolve);
             }
-            resolve_dict_uses_expr_with_mode(receiver, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(key, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(receiver, resolve, process_fn, mode)?;
+            resolve_dict_uses_expr_with_mode(key, resolve, process_fn, mode)?;
             Ok(())
         }
         ExprKind::For {
@@ -990,15 +994,15 @@ fn resolve_dict_uses_expr_with_mode(
                         method: "iter".to_string(),
                     });
                     *pending_iter = None;
-                } else if hard_unresolved {
+                } else if mode.is_hard() {
                     return Err(TypeError::UnresolvedTrait {
                         context: "iterator".to_string(),
                         trait_name: pending.trait_name.clone(),
                     });
                 }
             }
-            resolve_dict_uses_expr_with_mode(iterable, resolve, process_fn, hard_unresolved)?;
-            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)?;
+            resolve_dict_uses_expr_with_mode(iterable, resolve, process_fn, mode)?;
+            resolve_dict_uses_expr_with_mode(body, resolve, process_fn, mode)?;
             Ok(())
         }
         ExprKind::Import(_) => Ok(()),
@@ -1011,52 +1015,47 @@ fn resolve_dict_uses_stmt_inner(
     resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
 ) -> Result<(), TypeError> {
-    resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, true)
+    resolve_dict_uses_stmt_inner_with_mode(
+        stmt,
+        resolve,
+        process_fn,
+        DictResolveMode::HardUnresolved,
+    )
 }
 
 fn resolve_dict_uses_stmt_inner_with_mode(
     stmt: &mut Stmt,
     resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
     process_fn: bool,
-    hard_unresolved: bool,
+    mode: DictResolveMode,
 ) -> Result<(), TypeError> {
     match stmt {
         Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
             if process_fn {
-                resolve_dict_uses_expr_with_mode(body, resolve, process_fn, hard_unresolved)
+                resolve_dict_uses_expr_with_mode(body, resolve, process_fn, mode)
             } else {
                 Ok(()) // handled during that function's own inference
             }
         }
         Stmt::Let { value, .. } => {
-            resolve_dict_uses_expr_with_mode(value, resolve, process_fn, hard_unresolved)
+            resolve_dict_uses_expr_with_mode(value, resolve, process_fn, mode)
         }
-        Stmt::Expr(e) => resolve_dict_uses_expr_with_mode(e, resolve, process_fn, hard_unresolved),
+        Stmt::Expr(e) => resolve_dict_uses_expr_with_mode(e, resolve, process_fn, mode),
         Stmt::Impl(id) => {
             for method in &mut id.methods {
-                resolve_dict_uses_expr_with_mode(
-                    &mut method.body,
-                    resolve,
-                    process_fn,
-                    hard_unresolved,
-                )?;
+                resolve_dict_uses_expr_with_mode(&mut method.body, resolve, process_fn, mode)?;
             }
             Ok(())
         }
         Stmt::InherentImpl(id) => {
             for method in &mut id.methods {
-                resolve_dict_uses_expr_with_mode(
-                    &mut method.body,
-                    resolve,
-                    process_fn,
-                    hard_unresolved,
-                )?;
+                resolve_dict_uses_expr_with_mode(&mut method.body, resolve, process_fn, mode)?;
             }
             Ok(())
         }
         Stmt::RecBlock { stmts, .. } => {
             for stmt in stmts {
-                resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, hard_unresolved)?;
+                resolve_dict_uses_stmt_inner_with_mode(stmt, resolve, process_fn, mode)?;
             }
             Ok(())
         }

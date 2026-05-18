@@ -1,3 +1,9 @@
+//! Snapshots of mutable inference state.
+//!
+//! Recovery needs to try a declaration, keep useful metadata, and roll back
+//! type-checking state when the declaration fails. This module captures the
+//! pieces of `Infer` that participate in that rollback.
+
 use super::metadata::{FailedStatementMetadata, TypeMetadataSnapshot};
 use super::*;
 use crate::types::SubstCheckpoint;
@@ -34,12 +40,12 @@ impl InferSnapshot {
     pub(super) fn capture(infer: &mut Infer, env: &TypeEnv) -> Self {
         Self {
             subst_checkpoint: infer.subst.checkpoint(),
-            pending_constraints: infer.pending_constraints.clone(),
-            loop_break_tys: infer.loop_break_tys.clone(),
-            fn_return_tys: infer.fn_return_tys.clone(),
+            pending_constraints: infer.constraints.pending.clone(),
+            loop_break_tys: infer.flow.loop_break_tys.clone(),
+            fn_return_tys: infer.flow.fn_return_tys.clone(),
             metadata: infer.metadata.snapshot(),
-            record_field_callables: infer.record_field_callables.clone(),
-            inherent_methods: infer.inherent_methods.clone(),
+            record_field_callables: infer.inherent.record_field_callables.clone(),
+            inherent_methods: infer.inherent.methods.clone(),
             env: env.clone(),
         }
     }
@@ -52,12 +58,12 @@ impl InferSnapshot {
 
     pub(super) fn restore(self, infer: &mut Infer, env: &mut TypeEnv) {
         infer.subst.restore_checkpoint(self.subst_checkpoint);
-        infer.pending_constraints = self.pending_constraints;
-        infer.loop_break_tys = self.loop_break_tys;
-        infer.fn_return_tys = self.fn_return_tys;
+        infer.constraints.pending = self.pending_constraints;
+        infer.flow.loop_break_tys = self.loop_break_tys;
+        infer.flow.fn_return_tys = self.fn_return_tys;
         infer.metadata.restore(self.metadata);
-        infer.record_field_callables = self.record_field_callables;
-        infer.inherent_methods = self.inherent_methods;
+        infer.inherent.record_field_callables = self.record_field_callables;
+        infer.inherent.methods = self.inherent_methods;
         *env = self.env;
     }
 

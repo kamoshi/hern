@@ -1,5 +1,13 @@
+//! Inference metadata collection.
+//!
+//! The checker records expression types, symbol types, binding schemes,
+//! capabilities, and fresh-place markers for diagnostics, IDE features, and
+//! lowering passes.
+
 use super::*;
 use std::hash::Hash;
+
+pub(super) const NO_NODE_ID: NodeId = 0;
 
 #[derive(Default)]
 pub(super) struct TypeMetadata {

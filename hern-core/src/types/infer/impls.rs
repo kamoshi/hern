@@ -1,3 +1,9 @@
+//! Trait and inherent implementation checking.
+//!
+//! Impl blocks validate that methods match their declared trait or inherent
+//! surface, produce concrete dictionary schemes, and populate the known-impl
+//! state used by later trait dispatch.
+
 use super::*;
 
 struct PreparedInherentMethod {
@@ -21,7 +27,8 @@ impl Infer {
     pub(super) fn export_inherent_method_schemes(
         &self,
     ) -> HashMap<String, HashMap<String, InherentMethodScheme>> {
-        self.inherent_methods
+        self.inherent
+            .methods
             .iter()
             .map(|(target, methods)| {
                 (
@@ -49,7 +56,8 @@ impl Infer {
         id: &mut ImplDef,
     ) -> Result<(), SpannedTypeError> {
         let trait_def = self
-            .trait_env
+            .traits
+            .env
             .get(&id.trait_name)
             .ok_or_else(|| TypeError::UnknownTrait(id.trait_name.clone()))?
             .clone();
@@ -186,7 +194,7 @@ impl Infer {
                                 TypeError::MutableFunctionCapabilityMismatch.at(impl_method.span)
                             );
                         }
-                        if !is_irrefutable_param(&param.pat, &this.variant_env) {
+                        if !is_irrefutable_param(&param.pat, &this.types.variant_env) {
                             return Err(TypeError::RefutableParamPattern.at(impl_method.body.span));
                         }
                         let p_ty = this.ast_to_ty_with_vars(derived_ty, &mut param_vars)?;
@@ -235,15 +243,15 @@ impl Infer {
             tail: Box::new(Ty::Unit),
         });
         let finalized = self.finalize_constraints_at(env, dict_ty, fn_constraints, ambient);
-        self.pending_constraints.extend(finalized.bubbled.clone());
+        self.constraints.pending.extend(finalized.bubbled.clone());
         id.dict_params = finalized.owned.iter().map(dict_param_name).collect();
         let resolver = |p: &PendingDictArg| {
             resolve_local_or_concrete(
                 p,
                 &finalized.owned,
                 env,
-                &self.known_impl_dicts,
-                &self.known_impl_schemes,
+                &self.impls.known_dicts,
+                &self.impls.known_schemes,
                 &self.subst,
             )
         };
@@ -292,7 +300,7 @@ impl Infer {
         env: &mut TypeEnv,
         id: &mut InherentImplDef,
     ) -> Result<(), SpannedTypeError> {
-        let target_name = inherent_impl_target_key_from_ast(&id.target, &self.declared_types)
+        let target_name = inherent_impl_target_key_from_ast(&id.target, &self.types.declared)
             .map_err(|err| err.at(id.span))?;
         let dict_name = inherent_impl_dict_name(&target_name);
         let mut seen_methods = HashSet::new();
@@ -300,7 +308,8 @@ impl Infer {
         for method in &id.methods {
             if !seen_methods.insert(method.name.clone())
                 || self
-                    .inherent_methods
+                    .inherent
+                    .methods
                     .get(&target_name)
                     .is_some_and(|methods| methods.contains_key(&method.name))
             {
@@ -319,7 +328,7 @@ impl Infer {
                 prepared_methods.push(this.prepare_inherent_method(id, method)?);
             }
 
-            let previous_methods = this.inherent_methods.get(&target_name).cloned();
+            let previous_methods = this.inherent.methods.get(&target_name).cloned();
             let mut provisional_methods = previous_methods.clone().unwrap_or_default();
             for prepared in &prepared_methods {
                 provisional_methods.insert(
@@ -334,7 +343,8 @@ impl Infer {
                     },
                 );
             }
-            this.inherent_methods
+            this.inherent
+                .methods
                 .insert(target_name.clone(), provisional_methods);
 
             let result = (|| {
@@ -387,10 +397,10 @@ impl Infer {
 
             match previous_methods {
                 Some(methods) => {
-                    this.inherent_methods.insert(target_name.clone(), methods);
+                    this.inherent.methods.insert(target_name.clone(), methods);
                 }
                 None => {
-                    this.inherent_methods.remove(&target_name);
+                    this.inherent.methods.remove(&target_name);
                 }
             }
 
@@ -403,7 +413,7 @@ impl Infer {
             let fn_ty = checked.fn_ty;
             let finalized =
                 self.finalize_constraints_at(env, fn_ty.clone(), checked.constraints, ambient);
-            self.pending_constraints.extend(finalized.bubbled.clone());
+            self.constraints.pending.extend(finalized.bubbled.clone());
             inferred_method.dict_params = finalized.owned.iter().map(dict_param_name).collect();
 
             let resolver = |p: &PendingDictArg| {
@@ -411,8 +421,8 @@ impl Infer {
                     p,
                     &finalized.owned,
                     env,
-                    &self.known_impl_dicts,
-                    &self.known_impl_schemes,
+                    &self.impls.known_dicts,
+                    &self.impls.known_schemes,
                     &self.subst,
                 )
             };
@@ -421,7 +431,8 @@ impl Infer {
             let scheme = finalized.scheme.clone();
             self.metadata
                 .record_definition_scheme(inferred_method.name_span, scheme.clone());
-            self.inherent_methods
+            self.inherent
+                .methods
                 .entry(target_name.clone())
                 .or_default()
                 .insert(
@@ -474,7 +485,7 @@ impl Infer {
         let mut param_tys = Vec::new();
 
         for (idx, param) in inferred_method.params.iter().enumerate() {
-            if !is_irrefutable_param(&param.pat, &self.variant_env) {
+            if !is_irrefutable_param(&param.pat, &self.types.variant_env) {
                 return Err(TypeError::RefutableParamPattern.at(inferred_method.body.span));
             }
             let p_ty = if has_receiver && idx == 0 {
@@ -590,72 +601,22 @@ fn validate_fundep_coverage(
 }
 
 fn collect_type_vars(ty: &Type, vars: &mut HashSet<String>) {
-    match ty {
-        Type::Var(var) => {
+    walk_ast_type(ty, &mut |node| {
+        if let Type::Var(var) = node {
             vars.insert(var.clone());
         }
-        Type::App(con, args) => {
-            collect_type_vars(con, vars);
-            for arg in args {
-                collect_type_vars(arg, vars);
-            }
-        }
-        Type::Func(params, ret) => {
-            for param in params {
-                collect_type_vars(&param.ty, vars);
-            }
-            collect_type_vars(&ret.ty, vars);
-        }
-        Type::Tuple(items) => {
-            for item in items {
-                collect_type_vars(item, vars);
-            }
-        }
-        Type::Record(fields, _) => {
-            for (_, field_ty) in fields {
-                collect_type_vars(field_ty, vars);
-            }
-        }
-        Type::Ident(_) | Type::Unit | Type::Never | Type::Hole => {}
-    }
+    });
 }
 
 fn type_uses_var_as_constructor(ty: &Type, var_name: &str) -> bool {
-    match ty {
-        Type::App(con, args) => {
-            matches!(con.as_ref(), Type::Var(name) if name == var_name)
-                || type_uses_var_as_constructor(con, var_name)
-                || args
-                    .iter()
-                    .any(|arg| type_uses_var_as_constructor(arg, var_name))
-        }
-        Type::Func(params, ret) => {
-            params
-                .iter()
-                .any(|param| type_uses_var_as_constructor(&param.ty, var_name))
-                || type_uses_var_as_constructor(&ret.ty, var_name)
-        }
-        Type::Tuple(items) => items
-            .iter()
-            .any(|item| type_uses_var_as_constructor(item, var_name)),
-        Type::Record(fields, _) => fields
-            .iter()
-            .any(|(_, field_ty)| type_uses_var_as_constructor(field_ty, var_name)),
-        Type::Ident(_) | Type::Var(_) | Type::Unit | Type::Never | Type::Hole => false,
-    }
+    any_ast_type(
+        ty,
+        |node| matches!(node, Type::App(con, _) if matches!(con.as_ref(), Type::Var(name) if name == var_name)),
+    )
 }
 
 fn type_has_hole(ty: &Type) -> bool {
-    match ty {
-        Type::Hole => true,
-        Type::App(con, args) => type_has_hole(con) || args.iter().any(type_has_hole),
-        Type::Func(params, ret) => {
-            params.iter().any(|param| type_has_hole(&param.ty)) || type_has_hole(&ret.ty)
-        }
-        Type::Tuple(items) => items.iter().any(type_has_hole),
-        Type::Record(fields, _) => fields.iter().any(|(_, field_ty)| type_has_hole(field_ty)),
-        Type::Ident(_) | Type::Var(_) | Type::Unit | Type::Never => false,
-    }
+    any_ast_type(ty, |node| matches!(node, Type::Hole))
 }
 
 fn type_name_for_error_ast(target: &Type) -> String {
