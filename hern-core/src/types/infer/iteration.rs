@@ -58,9 +58,9 @@ impl Infer {
         let elem_ty_applied = self.subst.apply(&elem_ty);
         self.check_pattern(pat, elem_ty_applied, &mut body_env, false)?;
 
-        self.flow.loop_break_tys.push(Ty::Unit);
-        self.infer_expr(&body_env, body)?;
-        self.flow.loop_break_tys.pop();
+        self.with_loop_break_scope(Ty::Unit, |this| {
+            this.infer_expr(&body_env, body).map(|_| ())
+        })?;
 
         Ok(Ty::Unit)
     }
@@ -99,7 +99,7 @@ impl Infer {
             .into_iter()
             .map(|key| trait_impl_dict_name("Iterable", &key))
             .find(|dict_name| {
-                env.get(dict_name).is_some() || self.impls.known_dicts.contains(dict_name)
+                env.get(dict_name).is_some() || self.impls.active_dicts.contains(dict_name)
             });
         match dict_name {
             Some(dict_name) => {

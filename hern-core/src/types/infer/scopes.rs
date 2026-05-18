@@ -219,6 +219,17 @@ impl Infer {
         result
     }
 
+    pub(super) fn with_loop_break_scope<T>(
+        &mut self,
+        break_ty: Ty,
+        f: impl FnOnce(&mut Self) -> Result<T, SpannedTypeError>,
+    ) -> Result<T, SpannedTypeError> {
+        self.flow.loop_break_tys.push(break_ty);
+        let result = f(self);
+        self.flow.loop_break_tys.pop();
+        result
+    }
+
     /// Finalizes the constraints collected while inferring a function-like body.
     ///
     /// Constraints whose dispatch variable is generalized by this function become

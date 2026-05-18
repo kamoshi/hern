@@ -1,10 +1,27 @@
 use crate::ast::*;
 use std::collections::HashSet;
 
+const TRAIT_EQ: &str = "Eq";
+const TRAIT_ORD: &str = "Ord";
+const TRAIT_DEFAULT: &str = "Default";
+const TRAIT_TO_STRING: &str = "ToString";
+const METHOD_COMPARE: &str = "compare";
+const METHOD_DEFAULT: &str = "default";
+const METHOD_TO_STRING: &str = "to_string";
+
+/// Expands all derive attributes in-place.
+///
+/// Derive expansion is deliberately infallible: unsupported generated impls are
+/// reported later by type inference at the originating derive span.
 pub fn expand_derives(program: &mut Program) {
     expand_derives_recovering(program);
 }
 
+/// Recovery-friendly derive expansion.
+///
+/// This currently performs the same infallible lowering as [`expand_derives`].
+/// The separate entry point lets parser/type-checking recovery call the same
+/// pass without implying that expansion itself can emit diagnostics.
 pub fn expand_derives_recovering(program: &mut Program) {
     let mut expanded = Vec::with_capacity(program.stmts.len());
 
@@ -60,8 +77,8 @@ fn derive_eq(input: &DeriveInput<'_>) -> ImplDef {
 
     impl_def(
         input,
-        "Eq",
-        type_param_bounds(input, "Eq"),
+        TRAIT_EQ,
+        type_param_bounds(input, TRAIT_EQ),
         vec![
             impl_method(
                 "==",
@@ -139,29 +156,32 @@ fn derive_to_string(input: &DeriveInput<'_>) -> ImplDef {
             .variants
             .iter()
             .map(|variant| {
-                let binding = variant.payload.as_ref().map(|_| "__value".to_string());
-                let expr = if variant.payload.is_some() {
+                let payload = to_string_payload(variant.payload.as_ref());
+                let expr = if let Some(payload) = &payload {
                     concat(
                         concat(
                             string_lit(format!("{}(", variant.name)),
-                            to_string_call(ident("__value")),
+                            payload.expr.clone(),
                         ),
                         string_lit(")"),
                     )
                 } else {
                     string_lit(&variant.name)
                 };
-                (variant_pat(variant, binding.as_deref()), expr)
+                (
+                    variant_pat_with_payload(variant, payload.map(|payload| payload.pattern)),
+                    expr,
+                )
             })
             .collect(),
     });
 
     impl_def(
         input,
-        "ToString",
-        type_param_bounds(input, "ToString"),
+        TRAIT_TO_STRING,
+        type_param_bounds(input, TRAIT_TO_STRING),
         vec![impl_method(
-            "to_string",
+            METHOD_TO_STRING,
             vec![param(self_name)],
             body,
             input.source_span,
@@ -169,19 +189,62 @@ fn derive_to_string(input: &DeriveInput<'_>) -> ImplDef {
     )
 }
 
+#[derive(Clone)]
+struct ToStringPayload {
+    pattern: Pattern,
+    expr: Expr,
+}
+
+fn to_string_payload(payload: Option<&Type>) -> Option<ToStringPayload> {
+    match payload {
+        Some(Type::Tuple(items)) => {
+            let names = tuple_payload_names("__value", items.len());
+            Some(ToStringPayload {
+                pattern: tuple_payload_pattern(&names),
+                expr: concat_to_string_fields(&names),
+            })
+        }
+        Some(_) => Some(ToStringPayload {
+            pattern: var_pat("__value"),
+            expr: to_string_call(ident("__value")),
+        }),
+        None => None,
+    }
+}
+
+fn concat_to_string_fields(names: &[String]) -> Expr {
+    debug_assert!(
+        !names.is_empty(),
+        "tuple payload ToString generation expects at least one field"
+    );
+    let mut parts = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        if index > 0 {
+            parts.push(string_lit(", "));
+        }
+        parts.push(to_string_call(ident(name)));
+    }
+    concat_exprs(parts)
+        .expect("tuple payload ToString generation should have at least one expression")
+}
+
+fn concat_exprs(parts: Vec<Expr>) -> Option<Expr> {
+    parts.into_iter().reduce(concat)
+}
+
 fn derive_default(input: &DeriveInput<'_>) -> ImplDef {
     let variant = default_variant(input);
     let type_bounds = variant
         .payload
         .as_ref()
-        .map(|payload| type_param_bounds_for_type(payload, input.type_params, "Default"))
+        .map(|payload| type_param_bounds_for_type(payload, input.type_params, TRAIT_DEFAULT))
         .unwrap_or_default();
     impl_def(
         input,
-        "Default",
+        TRAIT_DEFAULT,
         type_bounds,
         vec![impl_method(
-            "default",
+            METHOD_DEFAULT,
             vec![],
             default_value_for_variant(variant),
             input.source_span,
@@ -234,8 +297,8 @@ fn derive_ord(input: &DeriveInput<'_>) -> ImplDef {
     let rhs = "rhs";
     impl_def(
         input,
-        "Ord",
-        type_param_bounds(input, "Ord"),
+        TRAIT_ORD,
+        type_param_bounds(input, TRAIT_ORD),
         vec![
             impl_method(
                 "<",
@@ -262,7 +325,7 @@ fn derive_ord(input: &DeriveInput<'_>) -> ImplDef {
                 input.source_span,
             ),
             impl_method(
-                "compare",
+                METHOD_COMPARE,
                 vec![param(lhs), param(rhs)],
                 derive_ord_compare_body(input, lhs, rhs),
                 input.source_span,
@@ -568,40 +631,37 @@ fn compare_result_ne(value: Expr, ordering: &str) -> Expr {
 }
 
 fn compare_call(lhs: Expr, rhs: Expr) -> Expr {
-    associated_call("Ord", "compare", vec![lhs, rhs])
+    associated_call(TRAIT_ORD, METHOD_COMPARE, vec![lhs, rhs])
 }
 
 fn default_call() -> Expr {
-    associated_call("Default", "default", vec![])
+    associated_call(TRAIT_DEFAULT, METHOD_DEFAULT, vec![])
 }
 
 fn to_string_call(value: Expr) -> Expr {
-    associated_call("ToString", "to_string", vec![value])
+    associated_call(TRAIT_TO_STRING, METHOD_TO_STRING, vec![value])
 }
 
 fn associated_call(target: &str, member: &str, args: Vec<Expr>) -> Expr {
-    Expr::synthetic(ExprKind::Call {
-        callee: Box::new(Expr::synthetic(ExprKind::AssociatedAccess {
+    call(
+        Expr::synthetic(ExprKind::AssociatedAccess {
             target: Type::Ident(target.to_string()),
             target_span: SourceSpan::synthetic(),
             member: member.to_string(),
             member_span: SourceSpan::synthetic(),
             resolution: None,
-        })),
+        }),
         args,
-        is_method_call: false,
-        arg_wrappers: vec![],
-        resolved_callee: None,
-        pending_trait_method: None,
-        dict_args: vec![],
-        pending_dict_args: vec![],
-    })
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pipeline::parse_source;
+    use crate::pipeline::reassociate_standalone;
+    use crate::types::error::{SpannedTypeError, TypeError};
+    use crate::types::infer::Infer;
 
     #[test]
     fn expand_derives_inserts_impls_after_type() {
@@ -670,6 +730,29 @@ mod tests {
     }
 
     #[test]
+    fn to_string_derive_for_tuple_payload_checks_elements() {
+        let mut program = parse_source("#[derive(ToString)]\ntype Pair('a, 'b) = Pair(('a, 'b))\n")
+            .expect("source should parse");
+        expand_derives(&mut program);
+
+        let Stmt::Impl(to_string_impl) = &program.stmts[1] else {
+            panic!("expected generated ToString impl");
+        };
+        let ExprKind::Match { arms, .. } = &to_string_impl.methods[0].body.kind else {
+            panic!("ToString body should match on self");
+        };
+        let (pattern, expr) = &arms[0];
+        assert!(matches!(
+            pattern,
+            Pattern::Constructor {
+                binding: Some(binding),
+                ..
+            } if matches!(binding.as_ref(), Pattern::Tuple(items) if items.len() == 2)
+        ));
+        assert_eq!(to_string_call_arg_names(expr), vec!["__value0", "__value1"]);
+    }
+
+    #[test]
     fn default_derive_uses_first_empty_variant_without_payload_bounds() {
         let mut program =
             parse_source("#[derive(Default)]\ntype MaybeBox('a) = Present('a) | Missing\n")
@@ -681,5 +764,111 @@ mod tests {
             panic!("expected generated Default impl");
         };
         assert!(default_impl.type_bounds.is_empty());
+    }
+
+    #[test]
+    fn default_derive_for_function_payload_reports_derive_span() {
+        let err = derive_infer_error(
+            "trait Default 'a {
+               fn default() -> 'a
+             }
+
+             #[derive(Default)]
+             type Box = Box(fn(int) -> int)\n",
+        );
+
+        assert!(
+            matches!(
+                err.error.as_ref(),
+                TypeError::DerivedImplFailure {
+                    trait_name,
+                    error,
+                } if trait_name == "Default"
+                    && matches!(
+                        error.as_ref(),
+                        TypeError::UnresolvedTrait { context, trait_name }
+                            if context == "method call" && trait_name == "Default"
+                    )
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(err.span.expect("derive span").start_line, 5);
+    }
+
+    #[test]
+    fn eq_derive_for_concrete_payload_reports_derive_span() {
+        let err = derive_infer_error(
+            "trait Eq 'a {
+               fn infix 4 ==(lhs: 'a, rhs: 'a) -> bool
+               fn infix 4 !=(lhs: 'a, rhs: 'a) -> bool
+             }
+
+             #[derive(Eq)]
+             type Box = Box(float)\n",
+        );
+
+        assert!(
+            matches!(
+                err.error.as_ref(),
+                TypeError::DerivedImplFailure {
+                    trait_name,
+                    error,
+                } if trait_name == "Eq"
+                    && matches!(
+                        error.as_ref(),
+                        TypeError::MissingTraitImpl { trait_name, impl_target }
+                            if trait_name == "Eq" && impl_target == "float"
+                    )
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(err.span.expect("derive span").start_line, 6);
+    }
+
+    fn derive_infer_error(source: &str) -> SpannedTypeError {
+        let mut program = parse_source(source).expect("source should parse");
+        expand_derives(&mut program);
+        reassociate_standalone(&mut program).expect("source should reassociate");
+
+        Infer::new()
+            .infer_program(&mut program)
+            .expect_err("derived impl should fail inference")
+    }
+
+    fn to_string_call_arg_names(expr: &Expr) -> Vec<&str> {
+        let mut names = Vec::new();
+        collect_to_string_call_arg_names(expr, &mut names);
+        names
+    }
+
+    fn collect_to_string_call_arg_names<'a>(expr: &'a Expr, names: &mut Vec<&'a str>) {
+        match &expr.kind {
+            ExprKind::Call { callee, args, .. } => {
+                if let ExprKind::AssociatedAccess { member, .. } = &callee.kind
+                    && member == METHOD_TO_STRING
+                    && let Some(Expr {
+                        kind: ExprKind::Ident(name),
+                        ..
+                    }) = args.first()
+                {
+                    names.push(name);
+                }
+                collect_to_string_call_arg_names(callee, names);
+                for arg in args {
+                    collect_to_string_call_arg_names(arg, names);
+                }
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                collect_to_string_call_arg_names(lhs, names);
+                collect_to_string_call_arg_names(rhs, names);
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                collect_to_string_call_arg_names(scrutinee, names);
+                for (_, body) in arms {
+                    collect_to_string_call_arg_names(body, names);
+                }
+            }
+            _ => {}
+        }
     }
 }

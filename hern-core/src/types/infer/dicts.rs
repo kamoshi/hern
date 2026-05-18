@@ -60,37 +60,42 @@ pub(super) fn attach_dict_args(
 ) -> Result<(), TypeError> {
     for constraint in constraints {
         let resolved = subst.apply(&Ty::Var(constraint.var));
+        let applied_args = constraint
+            .args
+            .iter()
+            .map(|arg| subst.apply(arg))
+            .collect::<Vec<_>>();
         if let Ty::Var(var) = resolved {
             pending_constraints.push(TraitConstraint {
                 var,
                 trait_name: constraint.trait_name.clone(),
-                args: constraint.args.iter().map(|arg| subst.apply(arg)).collect(),
+                args: applied_args.clone(),
                 determinant_indexes: constraint.determinant_indexes.clone(),
             });
             pending_dict_args.push(PendingDictArg {
                 var,
                 trait_name: constraint.trait_name.clone(),
-                args: constraint.args.iter().map(|arg| subst.apply(arg)).collect(),
+                args: applied_args,
                 determinant_indexes: constraint.determinant_indexes.clone(),
             });
         } else if let Some(dict_ref) = resolve_concrete_from_args_unifying(
             &constraint.trait_name,
-            &constraint
-                .args
-                .iter()
-                .map(|arg| subst.apply(arg))
-                .collect::<Vec<_>>(),
+            &applied_args,
             &constraint.determinant_indexes,
             env,
             known_impl_dicts,
             known_impl_schemes,
             subst,
-        ) {
+        )? {
             dict_args.push(dict_ref);
         } else {
             return Err(TypeError::MissingTraitImpl {
                 trait_name: constraint.trait_name.clone(),
-                impl_target: format!("{}", resolved),
+                impl_target: format_missing_impl_target(
+                    &applied_args,
+                    &constraint.determinant_indexes,
+                    &resolved,
+                ),
             });
         }
     }
@@ -285,19 +290,22 @@ pub(super) fn resolve_concrete_from_args_unifying(
     known_impl_dicts: &HashSet<String>,
     known_impl_schemes: &HashMap<String, Scheme>,
     subst: &mut Subst,
-) -> Option<DictRef> {
+) -> Result<Option<DictRef>, TypeError> {
     if args.len() == 1 {
-        return resolve_concrete_dict_ref(
+        return Ok(resolve_concrete_dict_ref(
             trait_name,
             &args[0],
             env,
             known_impl_dicts,
             known_impl_schemes,
-        );
+        ));
     }
     let mut candidate_sets = Vec::new();
     for index in determinant_indexes {
-        let candidates = trait_impl_arg_key_candidates_from_ty(args.get(*index)?);
+        let Some(arg) = args.get(*index) else {
+            return Ok(None);
+        };
+        let candidates = trait_impl_arg_key_candidates_from_ty(arg);
         if candidates.is_empty() {
             return resolve_concrete_from_impl_schemes_unifying(
                 trait_name,
@@ -310,7 +318,7 @@ pub(super) fn resolve_concrete_from_args_unifying(
         }
         candidate_sets.push(candidates);
     }
-    find_cartesian_key_match(&candidate_sets, |keys| {
+    let keyed_match = find_cartesian_key_match(&candidate_sets, |keys| {
         let dict_name = trait_impl_dict_name_from_keys(trait_name, keys);
         let scheme = env
             .get(&dict_name)
@@ -343,17 +351,18 @@ pub(super) fn resolve_concrete_from_args_unifying(
                 args: dict_args,
             })
         }
-    })
-    .or_else(|| {
-        resolve_concrete_from_impl_schemes_unifying(
-            trait_name,
-            args,
-            env,
-            known_impl_dicts,
-            known_impl_schemes,
-            subst,
-        )
-    })
+    });
+    if keyed_match.is_some() {
+        return Ok(keyed_match);
+    }
+    resolve_concrete_from_impl_schemes_unifying(
+        trait_name,
+        args,
+        env,
+        known_impl_dicts,
+        known_impl_schemes,
+        subst,
+    )
 }
 
 fn resolve_concrete_from_impl_schemes_unifying(
@@ -363,20 +372,18 @@ fn resolve_concrete_from_impl_schemes_unifying(
     known_impl_dicts: &HashSet<String>,
     known_impl_schemes: &HashMap<String, Scheme>,
     subst: &mut Subst,
-) -> Option<DictRef> {
+) -> Result<Option<DictRef>, TypeError> {
     if !args
         .iter()
         .any(|arg| ty_has_concrete_shape(&subst.apply(arg)))
     {
-        return None;
+        return Ok(None);
     }
 
     let mut candidates = impl_scheme_candidates(trait_name, env, known_impl_schemes);
-    // Deterministic fallback for shape-based scheme lookup. Hern does not yet
-    // report overlapping parameterized impls as ambiguity here, so sorted names
-    // keep selection stable until a real ambiguity diagnostic exists.
     candidates.sort_by_key(|(dict_name, _)| *dict_name);
 
+    let mut matches = Vec::new();
     for (dict_name, scheme) in candidates {
         let mut trial = subst.clone();
         if !unify_scheme_method_actuals(&scheme.ty, args, &mut trial) {
@@ -392,18 +399,40 @@ fn resolve_concrete_from_impl_schemes_unifying(
         ) else {
             continue;
         };
-        *subst = trial;
-        return if dict_args.is_empty() {
-            Some(DictRef::Concrete(dict_name.to_string()))
+        let dict_ref = if dict_args.is_empty() {
+            DictRef::Concrete(dict_name.to_string())
         } else {
-            Some(DictRef::Applied {
+            DictRef::Applied {
                 dict: dict_name.to_string(),
                 args: dict_args,
-            })
+            }
         };
+        matches.push((dict_name.to_string(), dict_ref, trial));
     }
 
-    None
+    match matches.len() {
+        0 => Ok(None),
+        1 => {
+            let (_, dict_ref, trial) = matches
+                .into_iter()
+                .next()
+                .expect("one matching impl candidate");
+            *subst = trial;
+            Ok(Some(dict_ref))
+        }
+        _ => Err(TypeError::AmbiguousTraitImpl {
+            trait_name: trait_name.to_string(),
+            impl_target: args
+                .iter()
+                .map(|arg| subst.apply(arg).to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            candidates: matches
+                .into_iter()
+                .map(|(dict_name, _, _)| dict_name)
+                .collect(),
+        }),
+    }
 }
 
 fn impl_scheme_candidates<'a>(
@@ -595,21 +624,86 @@ fn dict_ref_args_for_scheme_args(
         .constraints
         .iter()
         .map(|constraint| {
-            let ty = bindings.get(&constraint.var)?;
+            let args = constraint
+                .args
+                .iter()
+                .map(|arg| substitute_bound_vars(arg, &bindings))
+                .collect::<Option<Vec<_>>>()?;
             // Dictionary arguments can only be materialized once their dispatch
-            // type is concrete; unresolved arguments stay pending for a later pass.
-            if ty_has_unresolved_var(ty) {
+            // predicate is concrete; unresolved arguments stay pending for a later pass.
+            if args.iter().any(ty_has_unresolved_var) {
                 return None;
             }
-            resolve_concrete_dict_ref(
+            resolve_concrete_multi_dict_ref(
                 &constraint.trait_name,
-                ty,
+                &args,
+                &constraint.determinant_indexes,
                 env,
                 known_impl_dicts,
                 known_impl_schemes,
             )
         })
         .collect()
+}
+
+fn substitute_bound_vars(ty: &Ty, bindings: &HashMap<u32, Ty>) -> Option<Ty> {
+    Some(match ty {
+        Ty::Var(var) => bindings.get(var)?.clone(),
+        Ty::Qualified(constraints, inner) => Ty::Qualified(
+            constraints
+                .iter()
+                .map(|constraint| {
+                    Some(TraitConstraint {
+                        var: constraint.var,
+                        trait_name: constraint.trait_name.clone(),
+                        args: constraint
+                            .args
+                            .iter()
+                            .map(|arg| substitute_bound_vars(arg, bindings))
+                            .collect::<Option<Vec<_>>>()?,
+                        determinant_indexes: constraint.determinant_indexes.clone(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            Box::new(substitute_bound_vars(inner, bindings)?),
+        ),
+        Ty::Func(params, ret) => Ty::Func(
+            params
+                .iter()
+                .map(|param| {
+                    Some(crate::types::FuncParam {
+                        ty: substitute_bound_vars(&param.ty, bindings)?,
+                        capability: param.capability,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            crate::types::FuncReturn {
+                ty: Box::new(substitute_bound_vars(&ret.ty, bindings)?),
+                capability: ret.capability,
+            },
+        ),
+        Ty::Tuple(items) => Ty::Tuple(
+            items
+                .iter()
+                .map(|item| substitute_bound_vars(item, bindings))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        Ty::App(con, args) => Ty::App(
+            Box::new(substitute_bound_vars(con, bindings)?),
+            args.iter()
+                .map(|arg| substitute_bound_vars(arg, bindings))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        Ty::Record(row) => Ty::Record(crate::types::Row {
+            fields: row
+                .fields
+                .iter()
+                .map(|(name, ty)| Some((name.clone(), substitute_bound_vars(ty, bindings)?)))
+                .collect::<Option<Vec<_>>>()?,
+            tail: Box::new(substitute_bound_vars(&row.tail, bindings)?),
+        }),
+        Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => ty.clone(),
+    })
 }
 
 fn bind_scheme_target_vars(
@@ -712,8 +806,33 @@ fn bind_ty_vars_to_actual(pattern: &Ty, actual: &Ty, bindings: &mut HashMap<u32,
                     .zip(a_args)
                     .all(|(p, a)| bind_ty_vars_to_actual(p, a, bindings))
         }
+        (Ty::Tuple(p_items), Ty::Tuple(a_items)) if p_items.len() == a_items.len() => p_items
+            .iter()
+            .zip(a_items)
+            .all(|(p, a)| bind_ty_vars_to_actual(p, a, bindings)),
+        (Ty::Record(p_row), Ty::Record(a_row)) if p_row.fields.len() == a_row.fields.len() => {
+            p_row
+                .fields
+                .iter()
+                .zip(&a_row.fields)
+                .all(|((p_name, p_ty), (a_name, a_ty))| {
+                    p_name == a_name && bind_ty_vars_to_actual(p_ty, a_ty, bindings)
+                })
+                && bind_ty_vars_to_actual(&p_row.tail, &a_row.tail, bindings)
+        }
+        (Ty::Func(p_params, p_ret), Ty::Func(a_params, a_ret))
+            if p_params.len() == a_params.len() =>
+        {
+            p_params.iter().zip(a_params).all(|(p, a)| {
+                p.capability == a.capability && bind_ty_vars_to_actual(&p.ty, &a.ty, bindings)
+            }) && p_ret.capability == a_ret.capability
+                && bind_ty_vars_to_actual(&p_ret.ty, &a_ret.ty, bindings)
+        }
         (Ty::Con(p), Ty::Con(a)) => p == a,
-        (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) | (Ty::Unit, Ty::Unit) => true,
+        (Ty::Int, Ty::Int)
+        | (Ty::Float, Ty::Float)
+        | (Ty::Unit, Ty::Unit)
+        | (Ty::Never, Ty::Never) => true,
         (Ty::Qualified(_, p), a) => bind_ty_vars_to_actual(p, a, bindings),
         (p, Ty::Qualified(_, a)) => bind_ty_vars_to_actual(p, a, bindings),
         _ => false,
@@ -781,6 +900,9 @@ fn resolve_dict_uses_expr_with_mode(
     mode: DictResolveMode,
 ) -> Result<(), TypeError> {
     match &mut expr.kind {
+        ExprKind::Grouped(inner) => {
+            resolve_dict_uses_expr_with_mode(inner, resolve, process_fn, mode)
+        }
         ExprKind::Binary {
             lhs,
             rhs,
@@ -1079,11 +1201,11 @@ fn drain_pending(
     context: &str,
     resolve: &impl Fn(&PendingDictArg) -> Option<DictRef>,
 ) -> Result<(), TypeError> {
-    let names: Result<Vec<_>, _> = pending
+    let dicts: Result<Vec<_>, _> = pending
         .iter()
         .map(|p| resolve(p).ok_or_else(|| unresolved_pending_error(context, p)))
         .collect();
-    resolved.extend(names?);
+    resolved.extend(dicts?);
     pending.clear();
     Ok(())
 }
@@ -1112,6 +1234,22 @@ fn unresolved_pending_error(context: &str, pending: &PendingDictArg) -> TypeErro
     TypeError::UnresolvedTrait {
         context: context.to_string(),
         trait_name: pending.trait_name.clone(),
+    }
+}
+
+fn format_missing_impl_target(args: &[Ty], determinant_indexes: &[usize], fallback: &Ty) -> String {
+    let determinant_args = determinant_indexes
+        .iter()
+        .filter_map(|index| args.get(*index))
+        .collect::<Vec<_>>();
+    if determinant_args.is_empty() {
+        fallback.to_string()
+    } else {
+        determinant_args
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 

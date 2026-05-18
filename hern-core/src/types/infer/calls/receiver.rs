@@ -51,7 +51,7 @@ impl Infer {
             if !constraints.is_empty() {
                 attach_dict_args(
                     env,
-                    &self.impls.known_dicts,
+                    &self.impls.active_dicts,
                     &self.impls.known_schemes,
                     dict_args,
                     pending_dict_args,
@@ -73,6 +73,7 @@ impl Infer {
                 field_ty,
                 Vec::new(),
                 Vec::new(),
+                None,
                 param_capabilities,
                 0,
                 receiver.span,
@@ -90,7 +91,7 @@ impl Infer {
             if let Ty::Qualified(constraints, inner) = field_ty {
                 attach_dict_args(
                     env,
-                    &self.impls.known_dicts,
+                    &self.impls.active_dicts,
                     &self.impls.known_schemes,
                     dict_args,
                     pending_dict_args,
@@ -113,6 +114,7 @@ impl Infer {
                 field_ty,
                 Vec::new(),
                 Vec::new(),
+                None,
                 param_capabilities,
                 0,
                 receiver.span,
@@ -147,6 +149,7 @@ impl Infer {
                 field_ty,
                 Vec::new(),
                 Vec::new(),
+                None,
                 Vec::new(),
                 0,
                 receiver.span,
@@ -191,6 +194,7 @@ impl Infer {
                 arg_wrappers,
                 &method_info.scheme,
                 vec![receiver_ty],
+                Some(receiver.span),
                 1,
                 dict_args,
                 pending_dict_args,
@@ -233,6 +237,7 @@ impl Infer {
                 arg_wrappers,
                 &scheme,
                 vec![receiver_ty],
+                Some(receiver.span),
                 1,
                 dict_args,
                 pending_dict_args,
@@ -278,6 +283,7 @@ impl Infer {
                 arg_wrappers,
                 &method_info.scheme,
                 vec![expected_receiver_ty],
+                Some(receiver.span),
                 1,
                 dict_args,
                 pending_dict_args,
@@ -526,10 +532,11 @@ impl Infer {
             &trait_args,
             &determinant_indexes,
             env,
-            &self.impls.known_dicts,
+            &self.impls.active_dicts,
             &self.impls.known_schemes,
             &mut self.subst,
         )
+        .map_err(SpannedTypeError::from)?
         .ok_or_else(|| TypeError::MissingTraitImpl {
             trait_name: trait_def.name.clone(),
             impl_target: format_trait_target_for_receiver_error(&trait_args, &determinant_indexes),
@@ -615,10 +622,12 @@ impl Infer {
             &trait_args,
             &determinant_indexes,
             env,
-            &self.impls.known_dicts,
+            &self.impls.active_dicts,
             &self.impls.known_schemes,
             &mut self.subst,
         )
+        .ok()
+        .flatten()
         .is_some()
     }
 

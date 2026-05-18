@@ -18,14 +18,16 @@ pub(crate) fn default_bg() -> Option<(u8, u8, u8)> {
     default_colors().map(|colors| colors.bg)
 }
 
-pub(crate) fn best_color(target: (u8, u8, u8)) -> Color {
+pub(crate) fn best_color_if_supported(target: (u8, u8, u8)) -> Option<Color> {
     match stdout_color_level() {
-        StdoutColorLevel::TrueColor => Color::Rgb(target.0, target.1, target.2),
-        StdoutColorLevel::Ansi256 => xterm_fixed_colors()
-            .min_by_key(|(_, color)| color_distance(*color, target))
-            .map(|(idx, _)| Color::Indexed(idx))
-            .unwrap_or_default(),
-        StdoutColorLevel::Ansi16 | StdoutColorLevel::Unknown => Color::default(),
+        StdoutColorLevel::TrueColor => Some(Color::Rgb(target.0, target.1, target.2)),
+        StdoutColorLevel::Ansi256 => Some(
+            xterm_fixed_colors()
+                .min_by_key(|(_, color)| color_distance(*color, target))
+                .map(|(idx, _)| Color::Indexed(idx))
+                .unwrap_or_default(),
+        ),
+        StdoutColorLevel::Ansi16 | StdoutColorLevel::Unknown => None,
     }
 }
 

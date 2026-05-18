@@ -28,6 +28,22 @@ const TY_TYPE_PARAMETER: u32 = 12;
 
 const MOD_DECLARATION: u32 = 1 << 0;
 
+const SEMANTIC_TOKEN_TYPES: [SemanticTokenType; 13] = [
+    SemanticTokenType::KEYWORD,
+    SemanticTokenType::VARIABLE,
+    SemanticTokenType::TYPE,
+    SemanticTokenType::NUMBER,
+    SemanticTokenType::STRING,
+    SemanticTokenType::OPERATOR,
+    SemanticTokenType::COMMENT,
+    SemanticTokenType::FUNCTION,
+    SemanticTokenType::METHOD,
+    SemanticTokenType::ENUM_MEMBER,
+    SemanticTokenType::PARAMETER,
+    SemanticTokenType::PROPERTY,
+    SemanticTokenType::TYPE_PARAMETER,
+];
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct RawToken {
     line: u32,
@@ -38,57 +54,8 @@ struct RawToken {
 }
 
 pub(crate) fn legend() -> SemanticTokensLegend {
-    let token_types = vec![
-        SemanticTokenType::KEYWORD,        // TY_KEYWORD = 0
-        SemanticTokenType::VARIABLE,       // TY_VARIABLE = 1
-        SemanticTokenType::TYPE,           // TY_TYPE = 2
-        SemanticTokenType::NUMBER,         // TY_NUMBER = 3
-        SemanticTokenType::STRING,         // TY_STRING = 4
-        SemanticTokenType::OPERATOR,       // TY_OPERATOR = 5
-        SemanticTokenType::COMMENT,        // TY_COMMENT = 6
-        SemanticTokenType::FUNCTION,       // TY_FUNCTION = 7
-        SemanticTokenType::METHOD,         // TY_METHOD = 8
-        SemanticTokenType::ENUM_MEMBER,    // TY_ENUM_MEMBER = 9
-        SemanticTokenType::PARAMETER,      // TY_PARAMETER = 10
-        SemanticTokenType::PROPERTY,       // TY_PROPERTY = 11
-        SemanticTokenType::TYPE_PARAMETER, // TY_TYPE_PARAMETER = 12
-    ];
-    debug_assert_eq!(token_types[TY_KEYWORD as usize], SemanticTokenType::KEYWORD);
-    debug_assert_eq!(
-        token_types[TY_VARIABLE as usize],
-        SemanticTokenType::VARIABLE
-    );
-    debug_assert_eq!(token_types[TY_TYPE as usize], SemanticTokenType::TYPE);
-    debug_assert_eq!(token_types[TY_NUMBER as usize], SemanticTokenType::NUMBER);
-    debug_assert_eq!(token_types[TY_STRING as usize], SemanticTokenType::STRING);
-    debug_assert_eq!(
-        token_types[TY_OPERATOR as usize],
-        SemanticTokenType::OPERATOR
-    );
-    debug_assert_eq!(token_types[TY_COMMENT as usize], SemanticTokenType::COMMENT);
-    debug_assert_eq!(
-        token_types[TY_FUNCTION as usize],
-        SemanticTokenType::FUNCTION
-    );
-    debug_assert_eq!(token_types[TY_METHOD as usize], SemanticTokenType::METHOD);
-    debug_assert_eq!(
-        token_types[TY_ENUM_MEMBER as usize],
-        SemanticTokenType::ENUM_MEMBER
-    );
-    debug_assert_eq!(
-        token_types[TY_PARAMETER as usize],
-        SemanticTokenType::PARAMETER
-    );
-    debug_assert_eq!(
-        token_types[TY_PROPERTY as usize],
-        SemanticTokenType::PROPERTY
-    );
-    debug_assert_eq!(
-        token_types[TY_TYPE_PARAMETER as usize],
-        SemanticTokenType::TYPE_PARAMETER
-    );
     SemanticTokensLegend {
-        token_types,
+        token_types: SEMANTIC_TOKEN_TYPES.to_vec(),
         token_modifiers: vec![SemanticTokenModifier::DECLARATION],
     }
 }
@@ -116,22 +83,29 @@ fn semantic_tokens_for_source_inner(
     context: Option<SemanticContext<'_>>,
     range: Option<Range>,
 ) -> SemanticTokensResult {
+    let lines = source.lines().collect::<Vec<_>>();
     let mut raw = lex_tokens(source);
     if let Some(program) = program {
-        apply_semantic_overrides(&mut raw, program, &index_program(program), source, context);
+        apply_semantic_overrides(&mut raw, program, &index_program(program), &lines, context);
     }
-    if let Some(range) = range {
+    let delta_origin = if let Some(range) = range {
         raw.retain(|token| raw_token_intersects_range(token, range));
-    }
+        (range.start.line, range.start.character)
+    } else {
+        (0, 0)
+    };
     raw.sort_by_key(|token| (token.line, token.col, token.len));
     raw.dedup_by_key(|token| (token.line, token.col, token.len));
     SemanticTokensResult::Tokens(SemanticTokens {
         result_id: None,
-        data: delta_encode(raw),
+        data: delta_encode(raw, delta_origin),
     })
 }
 
 fn raw_token_intersects_range(token: &RawToken, range: Range) -> bool {
+    // Raw semantic tokens are intentionally single-line. Lexed tokens come from
+    // lexer spans, and AST/index overrides are rejected in `span_to_token_position`
+    // when the source span crosses a line boundary.
     let token_start = (token.line, token.col);
     let token_end = (token.line, token.col.saturating_add(token.len));
     let range_start = (range.start.line, range.start.character);
@@ -145,16 +119,17 @@ pub(crate) struct SemanticContext<'a> {
 }
 
 impl<'a> SemanticContext<'a> {
-    pub(crate) fn new(inference: &'a GraphInference, module_name: &'a str) -> Option<Self> {
-        Some(Self {
+    pub(crate) fn new(inference: &'a GraphInference, module_name: &'a str) -> Self {
+        Self {
             inference,
             module_name,
-        })
+        }
     }
 }
 
 fn lex_tokens(source: &str) -> Vec<RawToken> {
     let mut raw = Vec::new();
+    let lines: Vec<&str> = source.lines().collect();
     let Ok(tokens) = Lexer::new(source).tokenize() else {
         scan_line_comments(source, &mut raw);
         return raw;
@@ -167,10 +142,21 @@ fn lex_tokens(source: &str) -> Vec<RawToken> {
         if token.span.len == 0 {
             continue;
         }
+        let line_idx = token.span.line.saturating_sub(1);
+        let Some(line) = lines.get(line_idx) else {
+            continue;
+        };
+        let start_byte = token.span.col.saturating_sub(1).min(line.len());
+        let end_byte = start_byte.saturating_add(token.span.len).min(line.len());
+        let col = byte_to_utf16_col(line, start_byte);
+        let len = byte_to_utf16_col(line, end_byte).saturating_sub(col);
+        if len == 0 {
+            continue;
+        }
         raw.push(RawToken {
-            line: token.span.line.saturating_sub(1) as u32,
-            col: token.span.col.saturating_sub(1) as u32,
-            len: token.span.len as u32,
+            line: line_idx as u32,
+            col,
+            len,
             token_type,
             token_mods: 0,
         });
@@ -242,14 +228,14 @@ fn apply_semantic_overrides(
     raw: &mut Vec<RawToken>,
     program: &Program,
     index: &SourceIndex,
-    source: &str,
+    lines: &[&str],
     context: Option<SemanticContext<'_>>,
 ) {
     // Build a position index into `raw` for O(1) override lookups instead of O(n) scans.
-    let mut pos_to_idx: HashMap<(u32, u32), usize> = raw
+    let mut pos_to_idx: HashMap<(u32, u32, u32), usize> = raw
         .iter()
         .enumerate()
-        .map(|(i, t)| ((t.line, t.col), i))
+        .map(|(i, t)| ((t.line, t.col, t.len), i))
         .collect();
 
     let mut by_symbol = HashMap::new();
@@ -262,7 +248,7 @@ fn apply_semantic_overrides(
         push_semantic_span(
             raw,
             &mut pos_to_idx,
-            source,
+            lines,
             definition.location.span,
             token_type,
             MOD_DECLARATION,
@@ -275,7 +261,7 @@ fn apply_semantic_overrides(
         push_semantic_span(
             raw,
             &mut pos_to_idx,
-            source,
+            lines,
             reference.location.span,
             token_type,
             0,
@@ -285,7 +271,7 @@ fn apply_semantic_overrides(
         push_semantic_span(
             raw,
             &mut pos_to_idx,
-            source,
+            lines,
             reference.location.span,
             import_member_token_type(
                 context.as_ref(),
@@ -296,54 +282,56 @@ fn apply_semantic_overrides(
         );
     }
     for stmt in &program.stmts {
-        push_associated_access_tokens(raw, &mut pos_to_idx, source, stmt);
+        push_associated_access_tokens(raw, &mut pos_to_idx, lines, stmt);
     }
 }
 
 fn push_associated_access_tokens(
     raw: &mut Vec<RawToken>,
-    pos_to_idx: &mut HashMap<(u32, u32), usize>,
-    source: &str,
+    pos_to_idx: &mut HashMap<(u32, u32, u32), usize>,
+    lines: &[&str],
     stmt: &Stmt,
 ) {
     match stmt {
         Stmt::Let { value, .. } | Stmt::Expr(value) => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, value)
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, value)
         }
         Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, body)
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, body)
         }
         Stmt::Impl(impl_def) => {
             if impl_def.generated_by.is_some() {
                 return;
             }
             for method in &impl_def.methods {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, &method.body);
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, &method.body);
             }
         }
         Stmt::InherentImpl(impl_def) => {
             for method in &impl_def.methods {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, &method.body);
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, &method.body);
             }
         }
         Stmt::TestBlock { stmts, .. } => {
             for stmt in stmts {
-                push_associated_access_tokens(raw, pos_to_idx, source, stmt);
+                push_associated_access_tokens(raw, pos_to_idx, lines, stmt);
             }
         }
         Stmt::RecBlock { stmts, .. } => {
             for stmt in stmts {
-                push_associated_access_tokens(raw, pos_to_idx, source, stmt);
+                push_associated_access_tokens(raw, pos_to_idx, lines, stmt);
             }
         }
+        // Associated access is an expression form today; declaration-only
+        // statements have no expression bodies to traverse.
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
     }
 }
 
 fn push_associated_access_tokens_expr(
     raw: &mut Vec<RawToken>,
-    pos_to_idx: &mut HashMap<(u32, u32), usize>,
-    source: &str,
+    pos_to_idx: &mut HashMap<(u32, u32, u32), usize>,
+    lines: &[&str],
     expr: &Expr,
 ) {
     match &expr.kind {
@@ -352,13 +340,13 @@ fn push_associated_access_tokens_expr(
             member_span,
             ..
         } => {
-            push_semantic_span(raw, pos_to_idx, source, *target_span, TY_TYPE, 0);
-            push_semantic_span(raw, pos_to_idx, source, *member_span, TY_METHOD, 0);
+            push_semantic_span(raw, pos_to_idx, lines, *target_span, TY_TYPE, 0);
+            push_semantic_span(raw, pos_to_idx, lines, *member_span, TY_METHOD, 0);
         }
         ExprKind::Call { callee, args, .. } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, callee);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, callee);
             for arg in args {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, arg);
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, arg);
             }
         }
         ExprKind::Grouped(inner)
@@ -367,25 +355,25 @@ fn push_associated_access_tokens_expr(
         | ExprKind::Break(Some(inner))
         | ExprKind::Return(Some(inner))
         | ExprKind::FieldAccess { expr: inner, .. } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, inner)
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, inner)
         }
         ExprKind::Neg { operand, .. } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, operand)
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, operand)
         }
         ExprKind::Assign { target, value } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, target);
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, value);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, target);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, value);
         }
         ExprKind::Binary { lhs, rhs, .. } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, lhs);
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, rhs);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, lhs);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, rhs);
         }
         ExprKind::Range { start, end, .. } => {
             if let Some(start) = start {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, start);
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, start);
             }
             if let Some(end) = end {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, end);
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, end);
             }
         }
         ExprKind::If {
@@ -393,49 +381,49 @@ fn push_associated_access_tokens_expr(
             then_branch,
             else_branch,
         } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, cond);
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, then_branch);
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, else_branch);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, cond);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, then_branch);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, else_branch);
         }
         ExprKind::Match { scrutinee, arms } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, scrutinee);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, scrutinee);
             for (_, body) in arms {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, body);
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, body);
             }
         }
         ExprKind::Block { stmts, final_expr } => {
             for stmt in stmts {
-                push_associated_access_tokens(raw, pos_to_idx, source, stmt);
+                push_associated_access_tokens(raw, pos_to_idx, lines, stmt);
             }
             if let Some(expr) = final_expr {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, expr);
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, expr);
             }
         }
         ExprKind::Tuple(items) => {
             for item in items {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, item);
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, item);
             }
         }
         ExprKind::Array(entries) => {
             for entry in entries {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, entry.expr());
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, entry.expr());
             }
         }
         ExprKind::Record(entries) => {
             for entry in entries {
-                push_associated_access_tokens_expr(raw, pos_to_idx, source, entry.expr());
+                push_associated_access_tokens_expr(raw, pos_to_idx, lines, entry.expr());
             }
         }
         ExprKind::Lambda { body, .. } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, body)
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, body)
         }
         ExprKind::For { iterable, body, .. } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, iterable);
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, body);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, iterable);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, body);
         }
         ExprKind::Index { receiver, key, .. } => {
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, receiver);
-            push_associated_access_tokens_expr(raw, pos_to_idx, source, key);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, receiver);
+            push_associated_access_tokens_expr(raw, pos_to_idx, lines, key);
         }
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
@@ -521,22 +509,22 @@ fn is_function_type(ty: &Ty) -> bool {
 
 fn push_semantic_span(
     raw: &mut Vec<RawToken>,
-    pos_to_idx: &mut HashMap<(u32, u32), usize>,
-    source: &str,
+    pos_to_idx: &mut HashMap<(u32, u32, u32), usize>,
+    lines: &[&str],
     span: SourceSpan,
     token_type: u32,
     token_mods: u32,
 ) {
-    let Some((line, col, len)) = span_to_token_position(source, span) else {
+    let Some((line, col, len)) = span_to_token_position(lines, span) else {
         return;
     };
-    if let Some(&idx) = pos_to_idx.get(&(line, col)) {
+    if let Some(&idx) = pos_to_idx.get(&(line, col, len)) {
         raw[idx].token_type = token_type;
         raw[idx].token_mods = token_mods;
         raw[idx].len = len;
     } else {
         let idx = raw.len();
-        pos_to_idx.insert((line, col), idx);
+        pos_to_idx.insert((line, col, len), idx);
         raw.push(RawToken {
             line,
             col,
@@ -547,8 +535,14 @@ fn push_semantic_span(
     }
 }
 
-fn span_to_token_position(source: &str, span: SourceSpan) -> Option<(u32, u32, u32)> {
-    let line = source.lines().nth(span.start_line.checked_sub(1)?)?;
+fn span_to_token_position(lines: &[&str], span: SourceSpan) -> Option<(u32, u32, u32)> {
+    // Hern source spans store byte columns; LSP semantic tokens require UTF-16 columns.
+    // Semantic tokens are single-line, so multi-line AST spans are skipped instead
+    // of being silently truncated to the first line.
+    if span.start_line != span.end_line {
+        return None;
+    }
+    let line = lines.get(span.start_line.checked_sub(1)?)?;
     let start_byte = span.start_col.checked_sub(1)?;
     let end_byte = span.end_col.checked_sub(1)?.min(line.len());
     if start_byte >= end_byte || start_byte > line.len() {
@@ -566,14 +560,13 @@ fn byte_to_utf16_col(line: &str, byte: usize) -> u32 {
         .sum()
 }
 
-fn delta_encode(raw: Vec<RawToken>) -> Vec<SemanticToken> {
+fn delta_encode(raw: Vec<RawToken>, origin: (u32, u32)) -> Vec<SemanticToken> {
     let mut out = Vec::with_capacity(raw.len());
-    let mut prev_line = 0;
-    let mut prev_col = 0;
+    let (mut prev_line, mut prev_col) = origin;
     for token in raw {
-        let delta_line = token.line - prev_line;
+        let delta_line = token.line.saturating_sub(prev_line);
         let delta_start = if delta_line == 0 {
-            token.col - prev_col
+            token.col.saturating_sub(prev_col)
         } else {
             token.col
         };
@@ -630,11 +623,17 @@ mod tests {
     use hern_core::types::Row;
 
     fn token_tuples(result: SemanticTokensResult) -> Vec<(u32, u32, u32, u32, u32)> {
+        token_tuples_from(result, (0, 0))
+    }
+
+    fn token_tuples_from(
+        result: SemanticTokensResult,
+        origin: (u32, u32),
+    ) -> Vec<(u32, u32, u32, u32, u32)> {
         let SemanticTokensResult::Tokens(tokens) = result else {
             panic!("expected full semantic tokens");
         };
-        let mut line = 0;
-        let mut col = 0;
+        let (mut line, mut col) = origin;
         tokens
             .data
             .into_iter()
@@ -700,7 +699,7 @@ mod tests {
         let tokens = token_tuples(semantic_tokens_for_source(
             source,
             Some(&program),
-            SemanticContext::new(&graph_inference, "main"),
+            Some(SemanticContext::new(&graph_inference, "main")),
         ));
 
         assert!(tokens.iter().any(|token| {
@@ -735,7 +734,7 @@ mod tests {
         let tokens = token_tuples(semantic_tokens_for_source(
             source,
             Some(&program),
-            SemanticContext::new(&graph_inference, "main"),
+            Some(SemanticContext::new(&graph_inference, "main")),
         ));
 
         assert!(
@@ -765,15 +764,14 @@ mod tests {
     #[test]
     fn semantic_token_range_filters_to_requested_lines() {
         let source = "let first = 1;\nlet second = 2;\nlet third = 3;\n";
-        let tokens = token_tuples(semantic_tokens_for_source_range(
-            source,
-            None,
-            None,
-            Range::new(
-                lsp_types::Position::new(1, 0),
-                lsp_types::Position::new(2, 0),
-            ),
-        ));
+        let range = Range::new(
+            lsp_types::Position::new(1, 0),
+            lsp_types::Position::new(2, 0),
+        );
+        let tokens = token_tuples_from(
+            semantic_tokens_for_source_range(source, None, None, range),
+            (range.start.line, range.start.character),
+        );
 
         assert!(!tokens.is_empty());
         assert!(tokens.iter().all(|token| token.0 == 1), "{tokens:?}");

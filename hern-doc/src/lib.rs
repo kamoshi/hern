@@ -9,8 +9,8 @@ use hern_core::analysis::{
     prelude_source,
 };
 use hern_core::ast::{
-    Expr, ExprKind, Pattern, Program, SourcePosition, SourceSpan, Stmt, byte_to_source_position,
-    source_position_to_byte,
+    Expr, ExprKind, NodeId, Pattern, Program, SourcePosition, SourceSpan, Stmt,
+    byte_to_source_position, source_position_to_byte,
 };
 use hern_core::source_index::{DefinitionKind, SymbolId, index_program};
 use hern_core::types::{Scheme, Ty, display_ty_with_var_names, free_type_vars_in_display_order};
@@ -70,6 +70,11 @@ pub fn analyze_snippet(source: &str) -> Result<SnippetAnalysis, Diagnostic> {
 /// Each snippet is analyzed against the accumulated virtual source. This keeps
 /// cross-snippet references and type information simple and deterministic, at
 /// the cost of re-analyzing earlier snippets on every call.
+///
+/// Use one session per rendered documentation page when snippets can reference
+/// each other or share generated definition IDs. Independent calls to
+/// [`Analyzer::analyze_snippet`] intentionally treat each snippet as its own
+/// module and may produce the same local anchor IDs on the same HTML page.
 #[derive(Debug)]
 pub struct SnippetSession<'a> {
     analyzer: &'a Analyzer,
@@ -135,10 +140,20 @@ impl<'a> SnippetSession<'a> {
             }
             Err(diagnostic) => {
                 let diagnostic = Diagnostic::from_compiler(&self.source, diagnostic);
+                let diagnostics = remap_diagnostic(diagnostic, current_start, current_end)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let diagnostics = if diagnostics.is_empty() {
+                    vec![Diagnostic {
+                        range: Some(TextRange::new(0, 0)),
+                        message: "previous snippet failed; this snippet was not analyzed"
+                            .to_string(),
+                    }]
+                } else {
+                    diagnostics
+                };
                 SnippetAnalysis {
-                    diagnostics: remap_diagnostic(diagnostic, current_start, current_end)
-                        .into_iter()
-                        .collect(),
+                    diagnostics,
                     hovers: Vec::new(),
                     annotations: Vec::new(),
                 }
@@ -269,11 +284,7 @@ fn remap_hover(hover: HoverAnnotation, start: usize, end: usize) -> Option<Hover
     })
 }
 
-fn remap_annotation(
-    annotation: Annotation,
-    start: usize,
-    end: usize,
-) -> Option<Annotation> {
+fn remap_annotation(annotation: Annotation, start: usize, end: usize) -> Option<Annotation> {
     Some(Annotation {
         range: annotation.range.remap_from_window(start, end)?,
         highlight: annotation.highlight.remap_from_window(start, end)?,
@@ -334,6 +345,21 @@ fn collect_annotations(
         });
     }
 
+    for reference in &index.import_member_references {
+        let Some(range) = TextRange::from_span(source, reference.location.span) else {
+            continue;
+        };
+        let Some(target_id) = definition_ids.get(&reference.import_symbol).cloned() else {
+            continue;
+        };
+        upsert_annotation(&mut annotations, range, |annotation| {
+            annotation.link = Some(Link { target_id });
+            if annotation.kind != AnnotationKind::Definition {
+                annotation.kind = AnnotationKind::Reference;
+            }
+        });
+    }
+
     for hover in hovers {
         upsert_annotation(&mut annotations, hover.trigger, |annotation| {
             annotation.highlight = hover.highlight;
@@ -345,9 +371,7 @@ fn collect_annotations(
     annotations
 }
 
-fn definition_ids(
-    index: &hern_core::source_index::SourceIndex,
-) -> HashMap<SymbolId, String> {
+fn definition_ids(index: &hern_core::source_index::SourceIndex) -> HashMap<SymbolId, String> {
     let mut counts = HashMap::<String, usize>::new();
     let mut ids = HashMap::new();
     for definition in &index.definitions {
@@ -410,7 +434,10 @@ fn upsert_annotation(
     range: TextRange,
     update: impl FnOnce(&mut Annotation),
 ) {
-    if let Some(annotation) = annotations.iter_mut().find(|annotation| annotation.range == range) {
+    if let Some(annotation) = annotations
+        .iter_mut()
+        .find(|annotation| annotation.range == range)
+    {
         update(annotation);
         return;
     }
@@ -441,6 +468,7 @@ fn collect_hovers(
         binding_types,
         &mut hovers,
     );
+    collect_associated_access_hovers(source, program, &inference.symbol_types, &mut hovers);
     collect_expr_hovers(source, program, inference, &mut hovers);
     hovers.sort_by_key(|hover| (hover.trigger.start, hover.trigger.end, hover.highlight.end));
     hovers
@@ -594,7 +622,13 @@ fn collect_param_hovers(
     hovers: &mut Vec<HoverAnnotation>,
 ) {
     for param in params {
-        collect_pattern_hovers(source, &param.pat, definition_schemes, binding_types, hovers);
+        collect_pattern_hovers(
+            source,
+            &param.pat,
+            definition_schemes,
+            binding_types,
+            hovers,
+        );
     }
 }
 
@@ -607,11 +641,7 @@ fn collect_pattern_hovers(
 ) {
     match pattern {
         Pattern::Variable(_, span) => {
-            if let Some(scheme) = definition_schemes.get(span) {
-                push_hover(source, *span, *span, scheme_to_doc_string(scheme), hovers);
-            } else if let Some(ty) = binding_types.get(span) {
-                push_hover(source, *span, *span, ty_to_doc_string(ty), hovers);
-            }
+            collect_pattern_binding_hover(source, *span, definition_schemes, binding_types, hovers);
         }
         Pattern::Constructor { binding, .. } => {
             if let Some(binding) = binding {
@@ -627,32 +657,34 @@ fn collect_pattern_hovers(
             for elem in elements {
                 collect_pattern_hovers(source, elem, definition_schemes, binding_types, hovers);
             }
-            if let Some(Some((_, span))) = rest
-                && let Some(scheme) = definition_schemes.get(span)
-            {
-                push_hover(source, *span, *span, scheme_to_doc_string(scheme), hovers);
-            } else if let Some(Some((_, span))) = rest
-                && let Some(ty) = binding_types.get(span)
-            {
-                push_hover(source, *span, *span, ty_to_doc_string(ty), hovers);
+            if let Some(Some((_, span))) = rest {
+                collect_pattern_binding_hover(
+                    source,
+                    *span,
+                    definition_schemes,
+                    binding_types,
+                    hovers,
+                );
             }
         }
         Pattern::Record { fields, rest, .. } => {
             for (_, _, span) in fields {
-                if let Some(scheme) = definition_schemes.get(span) {
-                    push_hover(source, *span, *span, scheme_to_doc_string(scheme), hovers);
-                } else if let Some(ty) = binding_types.get(span) {
-                    push_hover(source, *span, *span, ty_to_doc_string(ty), hovers);
-                }
+                collect_pattern_binding_hover(
+                    source,
+                    *span,
+                    definition_schemes,
+                    binding_types,
+                    hovers,
+                );
             }
-            if let Some(Some((_, span))) = rest
-                && let Some(scheme) = definition_schemes.get(span)
-            {
-                push_hover(source, *span, *span, scheme_to_doc_string(scheme), hovers);
-            } else if let Some(Some((_, span))) = rest
-                && let Some(ty) = binding_types.get(span)
-            {
-                push_hover(source, *span, *span, ty_to_doc_string(ty), hovers);
+            if let Some(Some((_, span))) = rest {
+                collect_pattern_binding_hover(
+                    source,
+                    *span,
+                    definition_schemes,
+                    binding_types,
+                    hovers,
+                );
             }
         }
         Pattern::Wildcard
@@ -660,6 +692,20 @@ fn collect_pattern_hovers(
         | Pattern::StringLit(_)
         | Pattern::BoolLit(_)
         | Pattern::IntRange { .. } => {}
+    }
+}
+
+fn collect_pattern_binding_hover(
+    source: &str,
+    span: SourceSpan,
+    definition_schemes: &HashMap<SourceSpan, Scheme>,
+    binding_types: &HashMap<SourceSpan, Ty>,
+    hovers: &mut Vec<HoverAnnotation>,
+) {
+    if let Some(scheme) = definition_schemes.get(&span) {
+        push_hover(source, span, span, scheme_to_doc_string(scheme), hovers);
+    } else if let Some(ty) = binding_types.get(&span) {
+        push_hover(source, span, span, ty_to_doc_string(ty), hovers);
     }
 }
 
@@ -791,6 +837,162 @@ fn collect_expr_stmt_hovers(
         | ExprKind::Continue
         | ExprKind::Return(None)
         | ExprKind::AssociatedAccess { .. } => {}
+    }
+}
+
+fn collect_associated_access_hovers(
+    source: &str,
+    program: &Program,
+    symbol_types: &HashMap<NodeId, Ty>,
+    hovers: &mut Vec<HoverAnnotation>,
+) {
+    for stmt in &program.stmts {
+        collect_associated_access_stmt_hovers(source, stmt, symbol_types, hovers);
+    }
+}
+
+fn collect_associated_access_stmt_hovers(
+    source: &str,
+    stmt: &Stmt,
+    symbol_types: &HashMap<NodeId, Ty>,
+    hovers: &mut Vec<HoverAnnotation>,
+) {
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Expr(value) => {
+            collect_associated_access_expr_hovers(source, value, symbol_types, hovers);
+        }
+        Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
+            collect_associated_access_expr_hovers(source, body, symbol_types, hovers);
+        }
+        Stmt::Impl(impl_def) => {
+            if impl_def.generated_by.is_some() {
+                return;
+            }
+            for method in &impl_def.methods {
+                collect_associated_access_expr_hovers(source, &method.body, symbol_types, hovers);
+            }
+        }
+        Stmt::InherentImpl(impl_def) => {
+            for method in &impl_def.methods {
+                collect_associated_access_expr_hovers(source, &method.body, symbol_types, hovers);
+            }
+        }
+        Stmt::TestBlock { stmts, .. } | Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                collect_associated_access_stmt_hovers(source, stmt, symbol_types, hovers);
+            }
+        }
+        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
+    }
+}
+
+fn collect_associated_access_expr_hovers(
+    source: &str,
+    expr: &Expr,
+    symbol_types: &HashMap<NodeId, Ty>,
+    hovers: &mut Vec<HoverAnnotation>,
+) {
+    match &expr.kind {
+        ExprKind::AssociatedAccess { member_span, .. } => {
+            if let Some(ty) = symbol_types.get(&expr.id) {
+                push_hover(
+                    source,
+                    *member_span,
+                    *member_span,
+                    ty_to_doc_string(ty),
+                    hovers,
+                );
+            }
+        }
+        ExprKind::Lambda { body, .. } => {
+            collect_associated_access_expr_hovers(source, body, symbol_types, hovers);
+        }
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
+        | ExprKind::Neg { operand: inner, .. }
+        | ExprKind::Loop(inner)
+        | ExprKind::Break(Some(inner))
+        | ExprKind::Return(Some(inner))
+        | ExprKind::FieldAccess { expr: inner, .. } => {
+            collect_associated_access_expr_hovers(source, inner, symbol_types, hovers);
+        }
+        ExprKind::Assign { target, value } => {
+            collect_associated_access_expr_hovers(source, target, symbol_types, hovers);
+            collect_associated_access_expr_hovers(source, value, symbol_types, hovers);
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_associated_access_expr_hovers(source, lhs, symbol_types, hovers);
+            collect_associated_access_expr_hovers(source, rhs, symbol_types, hovers);
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                collect_associated_access_expr_hovers(source, start, symbol_types, hovers);
+            }
+            if let Some(end) = end {
+                collect_associated_access_expr_hovers(source, end, symbol_types, hovers);
+            }
+        }
+        ExprKind::Call { callee, args, .. } => {
+            collect_associated_access_expr_hovers(source, callee, symbol_types, hovers);
+            for arg in args {
+                collect_associated_access_expr_hovers(source, arg, symbol_types, hovers);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_associated_access_expr_hovers(source, cond, symbol_types, hovers);
+            collect_associated_access_expr_hovers(source, then_branch, symbol_types, hovers);
+            collect_associated_access_expr_hovers(source, else_branch, symbol_types, hovers);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_associated_access_expr_hovers(source, scrutinee, symbol_types, hovers);
+            for (_, body) in arms {
+                collect_associated_access_expr_hovers(source, body, symbol_types, hovers);
+            }
+        }
+        ExprKind::Block { stmts, final_expr } => {
+            for stmt in stmts {
+                collect_associated_access_stmt_hovers(source, stmt, symbol_types, hovers);
+            }
+            if let Some(expr) = final_expr {
+                collect_associated_access_expr_hovers(source, expr, symbol_types, hovers);
+            }
+        }
+        ExprKind::Tuple(items) => {
+            for item in items {
+                collect_associated_access_expr_hovers(source, item, symbol_types, hovers);
+            }
+        }
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                collect_associated_access_expr_hovers(source, entry.expr(), symbol_types, hovers);
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                collect_associated_access_expr_hovers(source, entry.expr(), symbol_types, hovers);
+            }
+        }
+        ExprKind::Index { receiver, key, .. } => {
+            collect_associated_access_expr_hovers(source, receiver, symbol_types, hovers);
+            collect_associated_access_expr_hovers(source, key, symbol_types, hovers);
+        }
+        ExprKind::For { iterable, body, .. } => {
+            collect_associated_access_expr_hovers(source, iterable, symbol_types, hovers);
+            collect_associated_access_expr_hovers(source, body, symbol_types, hovers);
+        }
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Import(_)
+        | ExprKind::Unit
+        | ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None) => {}
     }
 }
 
@@ -938,31 +1140,30 @@ fn trait_method_signature(method: &hern_core::ast::TraitMethod) -> String {
 }
 
 fn impl_method_signature(method: &hern_core::ast::ImplMethod) -> String {
-    let params = method
-        .params
-        .iter()
-        .map(|param| param_signature(param))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let ret = method
-        .ret_type
-        .as_ref()
-        .map(|ret| ast_type_to_string(&ret.ty))
-        .unwrap_or_else(|| "()".to_string());
-    format!("fn({params}) -> {ret}")
+    method_signature(
+        &method.params,
+        method.ret_type.as_ref().map(|ret| ret.ty.as_ref()),
+    )
 }
 
 fn inherent_method_signature(method: &hern_core::ast::InherentMethod) -> String {
-    let params = method
-        .params
+    method_signature(
+        &method.params,
+        method.ret_type.as_ref().map(|ret| ret.ty.as_ref()),
+    )
+}
+
+fn method_signature(
+    params: &[hern_core::ast::Param],
+    ret_type: Option<&hern_core::ast::Type>,
+) -> String {
+    let params = params
         .iter()
-        .map(|param| param_signature(param))
+        .map(param_signature)
         .collect::<Vec<_>>()
         .join(", ");
-    let ret = method
-        .ret_type
-        .as_ref()
-        .map(|ret| ast_type_to_string(&ret.ty))
+    let ret = ret_type
+        .map(ast_type_to_string)
         .unwrap_or_else(|| "()".to_string());
     format!("fn({params}) -> {ret}")
 }
@@ -1102,13 +1303,18 @@ fn is_identifier_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hern_core::pipeline::parse_source;
 
     #[test]
     fn analyzes_function_name_and_fn_keyword_hovers() {
         let source = "fn a(x) { x }\n";
         let analysis = analyze_snippet(source).expect("prelude should analyze");
 
-        assert!(analysis.diagnostics.is_empty());
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "unexpected diagnostics: {:#?}",
+            analysis.diagnostics
+        );
         assert_hover(&analysis, source, "fn", "fn('a) -> 'a");
         assert_hover(&analysis, source, "a", "fn('a) -> 'a");
         assert_hover_with_highlight(
@@ -1158,6 +1364,26 @@ mod tests {
     }
 
     #[test]
+    fn session_reports_previous_snippet_failure_in_later_snippet() {
+        let analyzer = Analyzer::new().expect("prelude should analyze");
+        let mut session = analyzer.session();
+
+        let first = session.analyze_snippet("let broken: bool = 1;\n");
+        let second = session.analyze_snippet("let later = 2;\n");
+
+        assert_eq!(first.diagnostics.len(), 1);
+        assert_eq!(second.diagnostics.len(), 1);
+        assert_eq!(second.diagnostics[0].range, Some(TextRange::new(0, 0)));
+        assert!(
+            second.diagnostics[0]
+                .message
+                .contains("previous snippet failed")
+        );
+        assert!(second.hovers.is_empty());
+        assert!(second.annotations.is_empty());
+    }
+
+    #[test]
     fn free_function_matches_reused_analyzer_for_single_snippet() {
         let source = "fn id(x) { x }\n";
         let free = analyze_snippet(source).expect("prelude should analyze");
@@ -1190,7 +1416,11 @@ impl Boxed {
 ";
         let analysis = analyze_snippet(source).expect("prelude should analyze");
 
-        assert!(analysis.diagnostics.is_empty());
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "unexpected diagnostics: {:#?}",
+            analysis.diagnostics
+        );
         assert_hover(&analysis, source, "|++", "fn(int, int) -> int");
         assert_hover(&analysis, source, "double", "fn('a) -> 'a");
         assert_hover_at_occurrence(&analysis, source, "double", 1, "fn(int) -> int");
@@ -1286,8 +1516,20 @@ let result = do {
 
         assert!(analysis.diagnostics.is_empty());
         assert_hover(&analysis, source, "8", "int");
-        assert_hover_at_occurrence(&analysis, source, "half_if_even", 1, "fn(int) -> Option(int)");
-        assert_hover_at_occurrence(&analysis, source, "half_if_even", 2, "fn(int) -> Option(int)");
+        assert_hover_at_occurrence(
+            &analysis,
+            source,
+            "half_if_even",
+            1,
+            "fn(int) -> Option(int)",
+        );
+        assert_hover_at_occurrence(
+            &analysis,
+            source,
+            "half_if_even",
+            2,
+            "fn(int) -> Option(int)",
+        );
         assert_hover_inside(&analysis, source, "half_if_even(a)", "a", "int");
         assert_hover_inside(&analysis, source, "a + b", "+", "fn(int, int) -> int");
         assert_hover_inside(&analysis, source, "a + b", "b", "int");
@@ -1351,6 +1593,49 @@ let result = {
                 .all(|annotation| annotation.id.as_deref() != Some(target_id.as_str())),
             "later snippet should link to earlier id without redefining it locally"
         );
+    }
+
+    #[test]
+    fn import_member_references_link_to_import_binding() {
+        let source = "let dep = import \"dep\";\ndep.value\n";
+        let program = parse_source(source).expect("source should parse");
+
+        let annotations = collect_annotations(source, &program, &[]);
+        let analysis = SnippetAnalysis {
+            diagnostics: Vec::new(),
+            hovers: Vec::new(),
+            annotations,
+        };
+
+        let target_id = assert_definition_id(&analysis, source, "dep");
+        assert_reference_link(&analysis, source, "dep.value", "value", &target_id);
+    }
+
+    #[test]
+    fn associated_access_members_link_to_method_definitions() {
+        let source = "\
+trait DocShow 'a {
+  fn show(value: 'a) -> string
+}
+
+type Boxed = Boxed(int)
+
+impl DocShow for Boxed {
+  fn show(value) { \"boxed\" }
+}
+
+let value = DocShow::show(Boxed(1));
+";
+        let analysis = analyze_snippet(source).expect("snippet should analyze");
+
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "unexpected diagnostics: {:#?}",
+            analysis.diagnostics
+        );
+        assert_hover_at_occurrence(&analysis, source, "show", 2, "fn(Boxed) -> string");
+        let method_id = assert_definition_id_inside(&analysis, source, "fn show(value)", "show");
+        assert_reference_link(&analysis, source, "DocShow::show", "show", &method_id);
     }
 
     fn assert_hover(analysis: &SnippetAnalysis, source: &str, needle: &str, text: &str) {

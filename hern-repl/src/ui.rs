@@ -12,6 +12,9 @@ use std::io;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MAX_COMPOSER_INNER: u16 = 3;
+// spacer(1) + status(1) + composer(1..3 inner +2 pad) + hint(1) + hint_spacer(1)
+// + completions(3..1) + bottom_spacer(1) + footer(1) = always 12
+pub(crate) const VIEWPORT_HEIGHT: u16 = 12;
 
 fn composer_inner_height(app: &App) -> u16 {
     (app.input.split('\n').count() as u16).clamp(1, MAX_COMPOSER_INNER)
@@ -51,13 +54,20 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let _ = hint_completions_spacer_area;
     render_completion_preview(frame, completions_area, app);
     let _ = spacer_area;
-    render_footer(frame, footer_area, app);
+    render_footer(frame, footer_area);
     if app.bindings_overlay.open {
-        render_bindings_popover(frame, area, app);
+        let (cursor_x, cursor_y) = render_bindings_popover(frame, area, app);
+        frame.set_cursor_position((cursor_x, cursor_y));
+        return;
     }
 
-    let (cursor_row, cursor_col, _) = cursor_metrics(app, input_area.height, input_area.width);
-    frame.set_cursor_position((input_area.x + cursor_col, input_area.y + cursor_row));
+    if input_area.width > 0 && input_area.height > 0 {
+        let (cursor_row, cursor_col, _) = cursor_metrics(app, input_area.height, input_area.width);
+        frame.set_cursor_position((
+            input_area.x + cursor_col.min(input_area.width.saturating_sub(1)),
+            input_area.y + cursor_row.min(input_area.height.saturating_sub(1)),
+        ));
+    }
 }
 
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -73,7 +83,7 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect) {
 
 fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) -> Rect {
     let inner = Rect {
-        x: area.x.saturating_add(2),
+        x: area.x.saturating_add(2).min(area.right()),
         y: area.y.saturating_add(1),
         width: area.width.saturating_sub(3),
         height: area.height.saturating_sub(2),
@@ -98,33 +108,23 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) -> Rec
         },
     );
 
-    let lines = composer_lines(app);
     let (_, _, scroll) = cursor_metrics(app, inner.height, inner.width);
-    let visible: Vec<Line<'static>> = lines
-        .into_iter()
-        .skip(scroll as usize)
-        .take(inner.height as usize)
-        .collect();
     frame.render_widget(
-        Paragraph::new(visible)
+        Paragraph::new(composer_lines(app))
             .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
             .style(input_style),
         inner,
     );
     inner
 }
 
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let newline_key = if app.enhanced_keys {
-        "shift+enter"
-    } else {
-        "ctrl+j"
-    };
+fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let footer = Line::from(vec![
         "  ".into(),
         "enter".cyan().bold(),
         " run   ".into(),
-        newline_key.to_string().cyan().bold(),
+        "ctrl+j".cyan().bold(),
         " newline   ".into(),
         "up/down".cyan().bold(),
         " history   ".into(),
@@ -171,8 +171,7 @@ fn completion_preview_row(
     row_width: usize,
 ) -> Line<'static> {
     let prefix = "  ";
-    let reserved = prefix.len() + binding.name.len() + 2;
-    let ty_width = row_width.saturating_sub(reserved);
+    let ty_width = binding_type_width(row_width, prefix, &binding.name);
     Line::from(vec![
         Span::raw(prefix.to_string()),
         Span::styled(
@@ -189,11 +188,11 @@ fn completion_preview_row(
     ])
 }
 
-fn render_bindings_popover(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn render_bindings_popover(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) -> (u16, u16) {
     let width = area
         .width
         .saturating_sub(2)
-        .min((area.width * 3 / 4).max(48))
+        .min(((u32::from(area.width) * 3 / 4) as u16).max(48))
         .max(1);
     let height = area.height.saturating_sub(2).max(1);
     let x = area.x + area.width.saturating_sub(width) / 2;
@@ -240,6 +239,7 @@ fn render_bindings_popover(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
         ])),
         query_area,
     );
+    let query_cursor_col = 2 + UnicodeWidthStr::width(app.bindings_overlay.query.as_str()) as u16;
 
     let bindings = app.filtered_bindings();
     let visible_rows = list_area.height as usize;
@@ -273,6 +273,10 @@ fn render_bindings_popover(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
         rows
     };
     frame.render_widget(Paragraph::new(rows), list_area);
+    (
+        query_area.x + query_cursor_col.min(query_area.width.saturating_sub(1)),
+        query_area.y,
+    )
 }
 
 fn binding_row(
@@ -282,8 +286,7 @@ fn binding_row(
     row_width: usize,
 ) -> Line<'static> {
     let marker = if selected { "> " } else { "  " };
-    let reserved = marker.len() + binding.name.len() + 2;
-    let ty_width = row_width.saturating_sub(reserved);
+    let ty_width = binding_type_width(row_width, marker, &binding.name);
     let ty = truncate_to_width(&binding.ty, ty_width);
     Line::from(vec![
         Span::styled(marker.to_string(), base),
@@ -298,6 +301,11 @@ fn binding_row(
             }),
         ),
     ])
+}
+
+fn binding_type_width(row_width: usize, marker: &str, name: &str) -> usize {
+    let reserved = marker.len() + UnicodeWidthStr::width(name) + 2;
+    row_width.saturating_sub(reserved)
 }
 
 fn truncate_to_width(text: &str, max_width: usize) -> String {
@@ -343,8 +351,8 @@ fn composer_lines(app: &App) -> Vec<Line<'static>> {
         .collect()
 }
 
-// Returns (cursor_row, cursor_col, logical_scroll) where cursor_row and cursor_col
-// are relative to the first visible line after applying logical_scroll.
+// Returns (cursor_row, cursor_col, visual_scroll) where cursor_row and cursor_col
+// are relative to the first visible wrapped row after applying visual_scroll.
 // All three account for visual line wrapping at `width` columns.
 fn cursor_metrics(app: &App, height: u16, width: u16) -> (u16, u16, u16) {
     let cursor = clamp_to_char_boundary(&app.input, app.cursor);
@@ -370,25 +378,16 @@ fn cursor_metrics(app: &App, height: u16, width: u16) -> (u16, u16, u16) {
         + (cursor_logical_col / w) as u16;
     let visual_col = (cursor_logical_col % w) as u16;
 
-    let (logical_scroll, skipped_visual) = if height == 0 || cursor_visual_row < height {
-        (0u16, 0u16)
+    let visual_scroll = if height == 0 || cursor_visual_row < height {
+        0u16
     } else {
-        let mut skip = 0u16;
-        let mut skipped = 0u16;
-        for &vrows in &visual_rows_per_line[..cursor_logical_line] {
-            if cursor_visual_row - skipped < height {
-                break;
-            }
-            skip += 1;
-            skipped += vrows;
-        }
-        (skip, skipped)
+        cursor_visual_row.saturating_add(1).saturating_sub(height)
     };
 
     (
-        cursor_visual_row - skipped_visual,
+        cursor_visual_row.saturating_sub(visual_scroll),
         visual_col,
-        logical_scroll,
+        visual_scroll,
     )
 }
 
@@ -424,19 +423,80 @@ fn render_history(buf: &mut Buffer, lines: &[Line<'static>]) {
 }
 
 fn rendered_height(lines: &[Line<'static>], width: u16) -> u16 {
-    let width = usize::from(width.max(1));
+    let width = width.max(1);
     lines
         .iter()
-        .map(|line| {
-            let text_width: usize = line
-                .spans
-                .iter()
-                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-                .sum();
-            text_width.max(1).div_ceil(width) as u16
-        })
+        .map(|line| wrapped_line_height(line, width))
         .sum::<u16>()
         .max(1)
+}
+
+fn wrapped_line_height(line: &Line<'static>, width: u16) -> u16 {
+    let mut rendered = 0u16;
+    let mut line_width = 0u16;
+    let mut word_width = 0u16;
+    let mut whitespace_width = 0u16;
+    let mut non_whitespace_previous = false;
+
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let is_whitespace = grapheme.is_whitespace();
+        let symbol_width = grapheme.symbol.width() as u16;
+        if symbol_width > width {
+            continue;
+        }
+
+        let word_found = non_whitespace_previous && is_whitespace;
+        let untrimmed_overflow = line_width == 0
+            && word_width
+                .saturating_add(whitespace_width)
+                .saturating_add(symbol_width)
+                > width;
+        if word_found || untrimmed_overflow {
+            line_width = line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width);
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= width;
+        let pending_word_overflow = symbol_width > 0
+            && line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width)
+                >= width;
+        if line_full || pending_word_overflow {
+            rendered = rendered.saturating_add(1);
+            let mut remaining_width = width.saturating_sub(line_width);
+            line_width = 0;
+
+            while whitespace_width > 0 {
+                if remaining_width == 0 {
+                    break;
+                }
+                whitespace_width = whitespace_width.saturating_sub(1);
+                remaining_width = remaining_width.saturating_sub(1);
+            }
+            if is_whitespace && whitespace_width == 0 {
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width = whitespace_width.saturating_add(symbol_width);
+        } else {
+            word_width = word_width.saturating_add(symbol_width);
+        }
+        non_whitespace_previous = !is_whitespace;
+    }
+
+    let tail_width = line_width
+        .saturating_add(whitespace_width)
+        .saturating_add(word_width);
+    if tail_width > 0 {
+        rendered = rendered.saturating_add(1);
+    }
+    rendered.max(1)
 }
 
 fn entries_to_lines(entries: &[Entry]) -> Vec<Line<'static>> {
@@ -458,7 +518,7 @@ fn entries_to_lines(entries: &[Entry]) -> Vec<Line<'static>> {
             };
             entry
                 .text
-                .lines()
+                .split('\n')
                 .enumerate()
                 .map(move |(idx, line)| {
                     let prefix = if idx == 0 { prefix } else { "  " };
@@ -530,6 +590,43 @@ mod tests {
         assert!(lines[1].spans.iter().any(|s| s.content == "error line 1"));
         assert!(lines[2].spans.iter().any(|s| s.content == "  "));
         assert!(lines[2].spans.iter().any(|s| s.content == "error line 2"));
+    }
+
+    #[test]
+    fn entries_to_lines_preserves_trailing_empty_lines() {
+        let entries = vec![Entry {
+            kind: EntryKind::Error,
+            text: "first\n".to_string(),
+        }];
+        let lines = entries_to_lines(&entries);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].spans.iter().any(|s| s.content == "first"));
+        assert!(lines[1].spans.iter().any(|s| s.content == "  "));
+    }
+
+    #[test]
+    fn rendered_height_matches_word_wrapping_with_spaces() {
+        let lines = vec![Line::from(
+            "This is a long line of text that should wrap      and contains a superultramegagigalong word.",
+        )];
+        assert_eq!(rendered_height(&lines, 20), 6);
+        assert_eq!(rendered_height(&lines, 12), 9);
+    }
+
+    #[test]
+    fn rendered_height_preserves_wrapped_indentation() {
+        let lines = vec![Line::from("AAAAAAAAAAAAAAAAAAAA    AAA")];
+        assert_eq!(rendered_height(&lines, 20), 2);
+    }
+
+    #[test]
+    fn rendered_height_handles_highlighted_multi_span_input() {
+        let lines = vec![Line::from(vec![
+            Span::raw("let "),
+            Span::styled("answer", Style::default().fg(Color::Cyan)),
+            Span::raw(" = 1234567890"),
+        ])];
+        assert_eq!(rendered_height(&lines, 10), 3);
     }
 
     #[test]

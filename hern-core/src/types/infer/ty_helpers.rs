@@ -14,11 +14,20 @@ pub(super) fn range_ty(name: &str) -> Ty {
     Ty::App(Box::new(Ty::Con(name.to_string())), vec![Ty::Int])
 }
 
-pub(super) fn merge_record_field(fields: &mut Vec<(String, Ty)>, name: String, ty: Ty) {
-    if let Some(pos) = fields.iter().position(|(existing, _)| existing == &name) {
-        fields[pos].1 = ty;
+pub(super) fn array_ty(element: Ty) -> Ty {
+    Ty::App(Box::new(Ty::Con("Array".to_string())), vec![element])
+}
+
+pub(super) fn merge_record_field(
+    fields: &mut Vec<(String, Ty)>,
+    name: String,
+    ty: Ty,
+) -> Result<(), TypeError> {
+    if fields.iter().any(|(existing, _)| existing == &name) {
+        Err(TypeError::DuplicateRecordField(name))
     } else {
         fields.push((name, ty));
+        Ok(())
     }
 }
 
@@ -114,7 +123,10 @@ pub(super) fn pattern_unknown_constructor_error(name: &str, scrutinee_ty: &Ty) -
             variant: name.to_string(),
         }
     } else {
-        TypeError::UnboundVariable(name.to_string())
+        TypeError::UnknownPatternConstructor {
+            constructor: name.to_string(),
+            scrutinee: scrutinee_ty.clone(),
+        }
     }
 }
 
@@ -137,6 +149,10 @@ pub(super) fn primary_trait_var(args: &[Ty], determinant_indexes: &[usize]) -> O
     // Pending dictionary parameters are named by the first unresolved determinant.
     // Other determinants remain in the full predicate and are checked again when
     // final-pass dictionary resolution has more substitution information.
+    // If every determinant is concrete but a dependent is still unresolved, use
+    // that dependent only as a stable pending-dictionary name; matching still
+    // compares the concrete determinant arguments before applying the fundep.
+    debug_assert!(determinant_indexes.iter().all(|index| *index < args.len()));
     determinant_indexes
         .iter()
         .filter_map(|index| args.get(*index))
@@ -166,6 +182,16 @@ pub(super) fn determinants_share_var(
     determinant_indexes: &[usize],
     subst: &Subst,
 ) -> bool {
+    debug_assert!(determinant_indexes.iter().all(|index| *index < left.len()));
+    debug_assert!(determinant_indexes.iter().all(|index| *index < right.len()));
+    if determinant_indexes.iter().all(|index| {
+        let left = left.get(*index).map(|arg| subst.apply(arg));
+        let right = right.get(*index).map(|arg| subst.apply(arg));
+        left.is_some() && left == right
+    }) {
+        return true;
+    }
+
     let mut left_vars = HashSet::new();
     for index in determinant_indexes {
         if let Some(arg) = left.get(*index) {
@@ -258,39 +284,55 @@ pub(super) fn first_ty_var(ty: &Ty) -> Option<TyVar> {
     }
 }
 
-pub(super) fn walk_ast_type(ty: &Type, visit: &mut impl FnMut(&Type)) {
-    visit(ty);
+pub(super) fn walk_ast_type(ty: &Type, visit: &mut impl FnMut(&Type) -> bool) -> bool {
+    if !visit(ty) {
+        return false;
+    }
     match ty {
         Type::App(con, args) => {
-            walk_ast_type(con, visit);
+            if !walk_ast_type(con, visit) {
+                return false;
+            }
             for arg in args {
-                walk_ast_type(arg, visit);
+                if !walk_ast_type(arg, visit) {
+                    return false;
+                }
             }
         }
         Type::Func(params, ret) => {
             for param in params {
-                walk_ast_type(&param.ty, visit);
+                if !walk_ast_type(&param.ty, visit) {
+                    return false;
+                }
             }
-            walk_ast_type(&ret.ty, visit);
+            if !walk_ast_type(&ret.ty, visit) {
+                return false;
+            }
         }
         Type::Tuple(items) => {
             for item in items {
-                walk_ast_type(item, visit);
+                if !walk_ast_type(item, visit) {
+                    return false;
+                }
             }
         }
         Type::Record(fields, _) => {
             for (_, field_ty) in fields {
-                walk_ast_type(field_ty, visit);
+                if !walk_ast_type(field_ty, visit) {
+                    return false;
+                }
             }
         }
         Type::Ident(_) | Type::Var(_) | Type::Unit | Type::Never | Type::Hole => {}
     }
+    true
 }
 
 pub(super) fn any_ast_type(ty: &Type, mut predicate: impl FnMut(&Type) -> bool) -> bool {
     let mut found = false;
     walk_ast_type(ty, &mut |node| {
-        found |= !found && predicate(node);
+        found = predicate(node);
+        !found
     });
     found
 }
@@ -304,4 +346,26 @@ pub(super) fn type_contains_var(ty: &Type, var_name: &str) -> bool {
         ty,
         |node| matches!(node, Type::Var(name) if name == var_name),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn determinant_matching_accepts_equal_concrete_determinants() {
+        let subst = Subst::new();
+        assert!(determinants_share_var(
+            &[Ty::Con("Map".to_string()), Ty::Var(1)],
+            &[Ty::Con("Map".to_string()), Ty::Var(2)],
+            &[0],
+            &subst,
+        ));
+        assert!(!determinants_share_var(
+            &[Ty::Con("Map".to_string()), Ty::Var(1)],
+            &[Ty::Con("Array".to_string()), Ty::Var(2)],
+            &[0],
+            &subst,
+        ));
+    }
 }

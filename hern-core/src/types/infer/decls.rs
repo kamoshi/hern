@@ -62,16 +62,31 @@ impl Infer {
         Ok(())
     }
 
-    pub(super) fn register_type_declarations<'a>(&mut self, stmts: impl Iterator<Item = &'a Stmt>) {
+    pub(super) fn register_type_declarations<'a>(
+        &mut self,
+        stmts: impl Iterator<Item = &'a Stmt>,
+    ) -> Result<(), SpannedTypeError> {
         for stmt in stmts {
             match stmt {
                 Stmt::Type(td) => {
+                    validate_unique_type_params(&td.name, &td.params, td.name_span)?;
                     self.types.declared.insert(td.name.clone());
+                    self.types
+                        .constructor_arities
+                        .insert(td.name.clone(), td.params.len());
                 }
                 Stmt::TypeAlias {
-                    name, params, ty, ..
+                    name,
+                    name_span,
+                    params,
+                    ty,
+                    ..
                 } => {
+                    validate_unique_type_params(name, params, *name_span)?;
                     self.types.declared.insert(name.clone());
+                    self.types
+                        .constructor_arities
+                        .insert(name.clone(), params.len());
                     self.types
                         .aliases
                         .insert(name.clone(), (params.clone(), ty.clone()));
@@ -79,6 +94,10 @@ impl Infer {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn resolve_registered_variant_payload_types(&mut self) {
         self.resolve_variant_payload_types();
     }
 
@@ -91,34 +110,7 @@ impl Infer {
                 continue;
             };
             validate_trait_methods_have_target(td)?;
-            self.traits.env.insert(td.name.clone(), td.clone());
-            for method in &td.methods {
-                if method.fixity.is_none() {
-                    continue;
-                }
-                if method.params.len() != 2 {
-                    return Err(TypeError::TraitMethodArityMismatch {
-                        trait_name: td.name.clone(),
-                        method: method.name.clone(),
-                        expected: 2,
-                        got: method.params.len(),
-                    }
-                    .at(method.span));
-                }
-                match self.traits.op_trait_map.get(&method.name) {
-                    Some(existing) if existing != &td.name => {
-                        return Err(
-                            TypeError::DuplicateOperator(method.name.clone()).at(stmt.span())
-                        );
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.traits
-                            .op_trait_map
-                            .insert(method.name.clone(), td.name.clone());
-                    }
-                }
-            }
+            self.traits.insert_trait(td.clone(), stmt.span())?;
         }
         Ok(())
     }
@@ -162,7 +154,7 @@ impl Infer {
             if let Stmt::Impl(impl_def) = stmt
                 && let Some(dict_name) = impl_dict_name(impl_def)
             {
-                self.impls.known_dicts.insert(dict_name);
+                self.impls.active_dicts.insert(dict_name);
             }
         }
     }
@@ -175,7 +167,7 @@ impl Infer {
             if let Stmt::Impl(impl_def) = stmt
                 && let Some(dict_name) = impl_dict_name(impl_def)
             {
-                self.impls.known_dicts.remove(&dict_name);
+                self.impls.active_dicts.remove(&dict_name);
             }
         }
     }
@@ -269,10 +261,29 @@ impl Infer {
 
     pub(super) fn discard_failed_type_decl(&mut self, td: &TypeDef) {
         self.types.declared.remove(&td.name);
+        self.types.constructor_arities.remove(&td.name);
         for variant in &td.variants {
             self.types.variant_env.0.remove(&variant.name);
         }
     }
+}
+
+fn validate_unique_type_params(
+    owner: &str,
+    params: &[String],
+    span: SourceSpan,
+) -> Result<(), SpannedTypeError> {
+    let mut seen = HashSet::new();
+    for param in params {
+        if !seen.insert(param) {
+            return Err(TypeError::DuplicateTypeParameter {
+                owner: owner.to_string(),
+                param: param.clone(),
+            }
+            .at(span));
+        }
+    }
+    Ok(())
 }
 
 fn validate_trait_methods_have_target(td: &TraitDef) -> Result<(), SpannedTypeError> {

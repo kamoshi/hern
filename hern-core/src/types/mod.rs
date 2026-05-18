@@ -204,10 +204,7 @@ impl fmt::Display for DisplayTy<'_> {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    match names.get(&c.var) {
-                        Some(name) => write!(f, "'{}: {}", name, c.trait_name)?,
-                        None => write!(f, "'{}: {}", c.var, c.trait_name)?,
-                    }
+                    write!(f, "{}", DisplayTraitConstraint(c, names))?;
                 }
                 write!(f, "] {}", DisplayTy(inner, names))
             }
@@ -433,15 +430,40 @@ impl fmt::Display for Scheme {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    match names.get(&c.var) {
-                        Some(name) => write!(f, "'{}: {}", name, c.trait_name)?,
-                        None => write!(f, "'{}: {}", c.var, c.trait_name)?,
-                    }
+                    write!(f, "{}", DisplayTraitConstraint(c, &names))?;
                 }
                 write!(f, "]")?;
             }
             write!(f, ". {}", DisplayTy(&self.ty, &names))
         }
+    }
+}
+
+struct DisplayTraitConstraint<'a>(&'a TraitConstraint, &'a HashMap<TyVar, String>);
+
+impl fmt::Display for DisplayTraitConstraint<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (constraint, names) = (self.0, self.1);
+        if matches!(constraint.args.as_slice(), [Ty::Var(var)] if *var == constraint.var) {
+            return match names.get(&constraint.var) {
+                Some(name) => write!(f, "'{}: {}", name, constraint.trait_name),
+                None => write!(f, "'{}: {}", constraint.var, constraint.trait_name),
+            };
+        }
+
+        write!(f, "{}[", constraint.trait_name)?;
+        let determinant_count = constraint.determinant_indexes.len();
+        for (idx, arg) in constraint.args.iter().enumerate() {
+            if idx > 0 {
+                if idx == determinant_count {
+                    write!(f, " -> ")?;
+                } else {
+                    write!(f, ", ")?;
+                }
+            }
+            write!(f, "{}", DisplayTy(arg, names))?;
+        }
+        write!(f, "]")
     }
 }
 
@@ -673,14 +695,24 @@ impl Subst {
             Ty::Qualified(constraints, ty) => Ty::Qualified(
                 constraints
                     .iter()
-                    .filter_map(|c| match self.apply(&Ty::Var(c.var)) {
-                        Ty::Var(var) => Some(TraitConstraint {
+                    .filter_map(|c| {
+                        let args = c.args.iter().map(|arg| self.apply(arg)).collect::<Vec<_>>();
+                        let var = match self.apply(&Ty::Var(c.var)) {
+                            Ty::Var(var) => Some(var),
+                            // Fully concrete qualified predicates cannot stay as
+                            // `TraitConstraint` values because constraints are keyed
+                            // by a dispatch type variable. Concrete obligations are
+                            // resolved before this normalization path; if no argument
+                            // still carries a variable, the predicate has no generic
+                            // dictionary parameter left to preserve.
+                            _ => args.iter().find_map(first_type_var),
+                        }?;
+                        Some(TraitConstraint {
                             var,
                             trait_name: c.trait_name.clone(),
-                            args: c.args.iter().map(|arg| self.apply(arg)).collect(),
+                            args,
                             determinant_indexes: c.determinant_indexes.clone(),
-                        }),
-                        _ => None,
+                        })
                     })
                     .collect(),
                 Box::new(self.apply(ty)),
@@ -820,7 +852,10 @@ impl Subst {
         }
         if type_contains_var(&t, v) {
             if option_type_contains_var(&t, v) {
-                return Err(error::TypeError::Mismatch(t, Ty::Var(v)));
+                return Err(error::TypeError::Mismatch {
+                    expected: t,
+                    got: Ty::Var(v),
+                });
             }
             return Err(error::TypeError::OccursCheck(v));
         }
@@ -830,10 +865,12 @@ impl Subst {
             .unwrap_or_else(|| self.level_of(v));
         self.lower_var_level(v, target_level);
         self.lower_levels_in_ty(&t, target_level);
-        self.journal.push(SubstJournalEntry::Binding {
-            var: v,
-            previous: self.map.get(&v).cloned(),
-        });
+        if self.active_checkpoints > 0 {
+            self.journal.push(SubstJournalEntry::Binding {
+                var: v,
+                previous: self.map.get(&v).cloned(),
+            });
+        }
         self.map.insert(v, t);
         Ok(())
     }
@@ -928,8 +965,10 @@ impl Subst {
     fn lower_var_level(&mut self, var: TyVar, target: TypeLevel) {
         let old = self.level_of(var);
         if target < old {
-            self.journal
-                .push(SubstJournalEntry::Level { var, previous: old });
+            if self.active_checkpoints > 0 {
+                self.journal
+                    .push(SubstJournalEntry::Level { var, previous: old });
+            }
             self.set_level(var, target);
         }
     }
@@ -949,10 +988,13 @@ fn type_contains_var(ty: &Ty, needle: TyVar) -> bool {
     match ty {
         Ty::Var(v) => *v == needle,
         Ty::Qualified(constraints, ty) => {
-            constraints
-                .iter()
-                .any(|constraint| constraint.var == needle)
-                || type_contains_var(ty, needle)
+            constraints.iter().any(|constraint| {
+                constraint.var == needle
+                    || constraint
+                        .args
+                        .iter()
+                        .any(|arg| type_contains_var(arg, needle))
+            }) || type_contains_var(ty, needle)
         }
         Ty::Func(params, ret) => {
             params
@@ -971,6 +1013,28 @@ fn type_contains_var(ty: &Ty, needle: TyVar) -> bool {
                 || type_contains_var(&row.tail, needle)
         }
         Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => false,
+    }
+}
+
+fn first_type_var(ty: &Ty) -> Option<TyVar> {
+    match ty {
+        Ty::Var(var) => Some(*var),
+        Ty::Qualified(constraints, inner) => constraints
+            .iter()
+            .find_map(|constraint| constraint.args.iter().find_map(first_type_var))
+            .or_else(|| first_type_var(inner)),
+        Ty::Func(params, ret) => params
+            .iter()
+            .find_map(|param| first_type_var(&param.ty))
+            .or_else(|| first_type_var(&ret.ty)),
+        Ty::Tuple(items) => items.iter().find_map(first_type_var),
+        Ty::App(con, args) => first_type_var(con).or_else(|| args.iter().find_map(first_type_var)),
+        Ty::Record(row) => row
+            .fields
+            .iter()
+            .find_map(|(_, ty)| first_type_var(ty))
+            .or_else(|| first_type_var(&row.tail)),
+        Ty::Int | Ty::Float | Ty::Unit | Ty::Never | Ty::Con(_) => None,
     }
 }
 
@@ -1054,8 +1118,8 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
         (Ty::Func(p1, r1), Ty::Func(p2, r2)) => {
             if p1.len() != p2.len() {
                 return Err(error::TypeError::ArityMismatch {
-                    expected: p1.len(),
-                    got: p2.len(),
+                    expected: p2.len(),
+                    got: p1.len(),
                 });
             }
             for (index, (a, b)) in p1.into_iter().zip(p2).enumerate() {
@@ -1074,7 +1138,10 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
         }
         (Ty::Tuple(t1s), Ty::Tuple(t2s)) => {
             if t1s.len() != t2s.len() {
-                return Err(error::TypeError::Mismatch(Ty::Tuple(t1s), Ty::Tuple(t2s)));
+                return Err(error::TypeError::Mismatch {
+                    expected: Ty::Tuple(t2s),
+                    got: Ty::Tuple(t1s),
+                });
             }
             for (index, (a, b)) in t1s.into_iter().zip(t2s).enumerate() {
                 unify(s, a, b).map_err(|err| {
@@ -1086,7 +1153,10 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
         (Ty::App(c1, a1), Ty::App(c2, a2)) => {
             unify(s, (*c1).clone(), (*c2).clone())?;
             if a1.len() != a2.len() {
-                return Err(error::TypeError::Mismatch(Ty::App(c1, a1), Ty::App(c2, a2)));
+                return Err(error::TypeError::Mismatch {
+                    expected: Ty::App(c2, a2),
+                    got: Ty::App(c1, a1),
+                });
             }
             for (index, (v1, v2)) in a1.into_iter().zip(a2).enumerate() {
                 unify(s, v1, v2).map_err(|err| {
@@ -1096,7 +1166,10 @@ pub fn unify(s: &mut Subst, t1: Ty, t2: Ty) -> Result<(), error::TypeError> {
             Ok(())
         }
         (Ty::Record(r1), Ty::Record(r2)) => unify_rows(s, r1, r2),
-        (t1, t2) => Err(error::TypeError::Mismatch(t2, t1)),
+        (t1, t2) => Err(error::TypeError::Mismatch {
+            expected: t2,
+            got: t1,
+        }),
     }
 }
 
@@ -1165,7 +1238,10 @@ fn unify_rows(s: &mut Subst, r1: Row, r2: Row) -> Result<(), error::TypeError> {
                     fields: extras2,
                     tail: Box::new(Ty::Unit),
                 });
-                Err(error::TypeError::Mismatch(left, right))
+                Err(error::TypeError::Mismatch {
+                    expected: right,
+                    got: left,
+                })
             }
         }
         (Ty::Var(v), Ty::Unit) => {
@@ -1174,7 +1250,10 @@ fn unify_rows(s: &mut Subst, r1: Row, r2: Row) -> Result<(), error::TypeError> {
                     fields: extras1,
                     tail: Box::new(Ty::Unit),
                 });
-                return Err(error::TypeError::Mismatch(extra, Ty::Unit));
+                return Err(error::TypeError::Mismatch {
+                    expected: Ty::Unit,
+                    got: extra,
+                });
             }
             s.bind_ty(
                 v,
@@ -1190,7 +1269,10 @@ fn unify_rows(s: &mut Subst, r1: Row, r2: Row) -> Result<(), error::TypeError> {
                     fields: extras2,
                     tail: Box::new(Ty::Unit),
                 });
-                return Err(error::TypeError::Mismatch(Ty::Unit, extra));
+                return Err(error::TypeError::Mismatch {
+                    expected: extra,
+                    got: Ty::Unit,
+                });
             }
             s.bind_ty(
                 v,
@@ -1228,7 +1310,7 @@ fn unify_rows(s: &mut Subst, r1: Row, r2: Row) -> Result<(), error::TypeError> {
         (Ty::Record(row1), other) => {
             let mut new_fields = row1.fields;
             new_fields.extend(extras1);
-            new_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+            sort_record_fields(&mut new_fields);
             unify_rows(
                 s,
                 Row {
@@ -1244,7 +1326,7 @@ fn unify_rows(s: &mut Subst, r1: Row, r2: Row) -> Result<(), error::TypeError> {
         (other, Ty::Record(row2)) => {
             let mut new_fields = row2.fields;
             new_fields.extend(extras2);
-            new_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+            sort_record_fields(&mut new_fields);
             unify_rows(
                 s,
                 Row {
@@ -1257,7 +1339,10 @@ fn unify_rows(s: &mut Subst, r1: Row, r2: Row) -> Result<(), error::TypeError> {
                 },
             )
         }
-        (t1, t2) => Err(error::TypeError::Mismatch(t1, t2)),
+        (t1, t2) => Err(error::TypeError::Mismatch {
+            expected: t2,
+            got: t1,
+        }),
     }
 }
 
@@ -1298,6 +1383,43 @@ mod tests {
         assert_eq!(
             scheme.to_string(),
             "∀ 'a ['a: Iterable]. fn('a(float)) -> float"
+        );
+    }
+
+    #[test]
+    fn scheme_display_includes_multi_parameter_constraint_args() {
+        let scheme = Scheme {
+            vars: vec![1, 2],
+            constraints: vec![TraitConstraint::predicate(
+                "Index",
+                vec![Ty::Var(1), Ty::Int, Ty::Var(2)],
+                2,
+                vec![0, 1],
+            )],
+            ty: Ty::Var(2),
+        };
+
+        assert_eq!(scheme.to_string(), "∀ 'a 'b [Index['a, int -> 'b]]. 'b");
+    }
+
+    #[test]
+    fn qualified_type_display_includes_multi_parameter_constraint_args() {
+        let mut names = HashMap::new();
+        names.insert(1, "a".to_string());
+        names.insert(2, "b".to_string());
+        let ty = Ty::Qualified(
+            vec![TraitConstraint::predicate(
+                "Lookup",
+                vec![Ty::Var(1), Ty::Con("Key".to_string()), Ty::Var(2)],
+                2,
+                vec![0, 1],
+            )],
+            Box::new(Ty::Var(2)),
+        );
+
+        assert_eq!(
+            DisplayTy(&ty, &names).to_string(),
+            "[Lookup['a, Key -> 'b]] 'b"
         );
     }
 
@@ -1657,7 +1779,13 @@ mod tests {
             .bind_ty(0, option_self.clone())
             .expect_err("option recursion should be rejected");
 
-        assert_eq!(err, error::TypeError::Mismatch(option_self, Ty::Var(0)));
+        assert_eq!(
+            err,
+            error::TypeError::Mismatch {
+                expected: option_self,
+                got: Ty::Var(0),
+            }
+        );
     }
 
     #[test]
@@ -1719,13 +1847,77 @@ mod tests {
 
         assert_eq!(
             err,
-            error::TypeError::Mismatch(
-                Ty::App(Box::new(Ty::Con("Map".to_string())), vec![Ty::Float]),
-                Ty::App(
+            error::TypeError::Mismatch {
+                expected: Ty::App(
                     Box::new(Ty::Con("Map".to_string())),
                     vec![Ty::Float, Ty::Con("string".to_string())],
                 ),
-            )
+                got: Ty::App(Box::new(Ty::Con("Map".to_string())), vec![Ty::Float]),
+            }
+        );
+    }
+
+    #[test]
+    fn structural_mismatches_report_second_type_as_expected() {
+        let mut subst = Subst::new();
+        let err = unify(
+            &mut subst,
+            Ty::Func(
+                value_func_params(vec![Ty::Int, Ty::Float]),
+                value_func_return(Ty::Unit),
+            ),
+            Ty::Func(
+                value_func_params(vec![Ty::Int]),
+                value_func_return(Ty::Unit),
+            ),
+        )
+        .expect_err("function arity mismatch should fail");
+        assert_eq!(
+            err,
+            error::TypeError::ArityMismatch {
+                expected: 1,
+                got: 2
+            }
+        );
+
+        let err = unify(
+            &mut subst,
+            Ty::Tuple(vec![Ty::Int, Ty::Float]),
+            Ty::Tuple(vec![Ty::Int]),
+        )
+        .expect_err("tuple arity mismatch should fail");
+        assert_eq!(
+            err,
+            error::TypeError::Mismatch {
+                expected: Ty::Tuple(vec![Ty::Int]),
+                got: Ty::Tuple(vec![Ty::Int, Ty::Float]),
+            }
+        );
+
+        let err = unify(
+            &mut subst,
+            Ty::Record(Row {
+                fields: vec![("extra".to_string(), Ty::Int)],
+                tail: Box::new(Ty::Unit),
+            }),
+            Ty::Record(Row {
+                fields: vec![],
+                tail: Box::new(Ty::Unit),
+            }),
+        )
+        .expect_err("closed record extra field should fail");
+        assert_eq!(
+            err,
+            error::TypeError::Mismatch {
+                expected: Ty::Record(Row {
+                    fields: vec![],
+                    tail: Box::new(Ty::Unit),
+                }),
+                got: Ty::Record(Row {
+                    fields: vec![("extra".to_string(), Ty::Int)],
+                    tail: Box::new(Ty::Unit),
+                }),
+            }
         );
     }
 
@@ -1735,7 +1927,13 @@ mod tests {
 
         let err = unify(&mut subst, Ty::Int, Ty::Float).expect_err("int should not unify as float");
 
-        assert_eq!(err, error::TypeError::Mismatch(Ty::Float, Ty::Int));
+        assert_eq!(
+            err,
+            error::TypeError::Mismatch {
+                expected: Ty::Float,
+                got: Ty::Int,
+            }
+        );
         assert_eq!(
             err.to_string(),
             "type mismatch: expected `float`, got `int`"

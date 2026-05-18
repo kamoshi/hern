@@ -8,8 +8,8 @@ use hern_core::ast::{
 use hern_core::module::{GraphInference, ModuleGraph};
 use hern_core::types::Ty;
 use lsp_types::{
-    CodeAction, CodeActionContext, CodeActionKind, CodeActionOrCommand, Position, Range, TextEdit,
-    Uri, WorkspaceEdit,
+    CodeAction, CodeActionContext, CodeActionKind, CodeActionOrCommand, Diagnostic, Position,
+    Range, TextEdit, Uri, WorkspaceEdit,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -17,7 +17,7 @@ pub(crate) fn code_actions(
     state: &ServerState,
     uri: Uri,
     range: Range,
-    _context: CodeActionContext,
+    context: CodeActionContext,
 ) -> Vec<CodeActionOrCommand> {
     let Some(snapshot) = analysis_snapshot(state, &uri, SnapshotMode::PreferTyped) else {
         return Vec::new();
@@ -40,6 +40,7 @@ pub(crate) fn code_actions(
         inference,
         module_name,
         binding_types,
+        diagnostics: &context.diagnostics,
         actions: &mut actions,
     };
     for stmt in &program.stmts {
@@ -56,6 +57,7 @@ struct CodeActionCtx<'a> {
     inference: Option<&'a GraphInference>,
     module_name: &'a str,
     binding_types: Option<&'a HashMap<SourceSpan, Ty>>,
+    diagnostics: &'a [Diagnostic],
     actions: &'a mut Vec<CodeActionOrCommand>,
 }
 
@@ -283,12 +285,13 @@ fn collect_missing_trait_method_action(impl_def: &ImplDef, ctx: &mut CodeActionC
             trait_def.name
         )
     };
+    let diagnostics = missing_trait_method_diagnostics(ctx.diagnostics, impl_def, &trait_def);
 
     ctx.actions
         .push(CodeActionOrCommand::CodeAction(CodeAction {
             title,
             kind: Some(CodeActionKind::QUICKFIX),
-            diagnostics: None,
+            diagnostics: (!diagnostics.is_empty()).then_some(diagnostics),
             edit: Some(WorkspaceEdit {
                 changes: Some(HashMap::from([(
                     ctx.uri.clone(),
@@ -305,6 +308,23 @@ fn collect_missing_trait_method_action(impl_def: &ImplDef, ctx: &mut CodeActionC
             disabled: None,
             data: None,
         }));
+}
+
+fn missing_trait_method_diagnostics(
+    diagnostics: &[Diagnostic],
+    impl_def: &ImplDef,
+    trait_def: &TraitDef,
+) -> Vec<Diagnostic> {
+    let impl_range = source_span_to_range(impl_def.span);
+    diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            ranges_intersect(diagnostic.range, impl_range)
+                && diagnostic.message.contains("missing method")
+                && diagnostic.message.contains(&trait_def.name)
+        })
+        .cloned()
+        .collect()
 }
 
 fn trait_def_for_impl(
@@ -325,12 +345,6 @@ fn trait_def_for_impl(
         .get(module_name)
         .and_then(|program| trait_def_in_program(program, &impl_def.trait_name))
         .or_else(|| trait_def_in_program(&graph.prelude, &impl_def.trait_name))
-        .or_else(|| {
-            graph
-                .modules
-                .values()
-                .find_map(|program| trait_def_in_program(program, &impl_def.trait_name))
-        })
         .cloned()
 }
 
@@ -396,6 +410,9 @@ fn trait_method_stub(
 }
 
 fn substitute_impl_trait_args(ty: &Type, impl_def: &ImplDef, trait_def: &TraitDef) -> Type {
+    if trait_def.params.len() != impl_def.trait_args.len() {
+        return ty.clone();
+    }
     trait_def
         .params
         .iter()
@@ -539,11 +556,21 @@ fn annotation_type_text(ty: &Ty) -> Option<String> {
 }
 
 fn ranges_intersect(lhs: Range, rhs: Range) -> bool {
-    position_le(lhs.start, rhs.end) && position_le(rhs.start, lhs.end)
+    if lhs.start == lhs.end {
+        return position_le(rhs.start, lhs.start) && position_le(lhs.start, rhs.end);
+    }
+    if rhs.start == rhs.end {
+        return position_le(lhs.start, rhs.start) && position_le(rhs.start, lhs.end);
+    }
+    position_lt(lhs.start, rhs.end) && position_lt(rhs.start, lhs.end)
 }
 
 fn position_le(lhs: Position, rhs: Position) -> bool {
     (lhs.line, lhs.character) <= (rhs.line, rhs.character)
+}
+
+fn position_lt(lhs: Position, rhs: Position) -> bool {
+    (lhs.line, lhs.character) < (rhs.line, rhs.character)
 }
 
 #[cfg(test)]
@@ -748,5 +775,73 @@ impl Ghost for Boxed {
             }),
             "unimported traits should not produce missing-method stubs"
         );
+    }
+
+    #[test]
+    fn missing_trait_method_action_attaches_matching_diagnostics_only() {
+        let project = TestProject::new("code-action-diagnostic-filter");
+        let source = "\
+trait Label 'a {
+  fn label(value: 'a) -> string
+}
+
+type Boxed = Boxed(int)
+
+impl Label for Boxed {
+}
+";
+        let (state, uri) = project.open("main.hern", source);
+        let matching = Diagnostic::new_simple(
+            Range::new(Position::new(6, 0), Position::new(7, 1)),
+            "missing method `label` for trait Label".to_string(),
+        );
+        let unrelated = Diagnostic::new_simple(
+            Range::new(Position::new(0, 0), Position::new(0, 5)),
+            "missing method elsewhere for OtherTrait".to_string(),
+        );
+
+        let action = code_actions(
+            &state,
+            uri,
+            Range::new(Position::new(6, 0), Position::new(7, 1)),
+            CodeActionContext {
+                diagnostics: vec![matching.clone(), unrelated],
+                ..CodeActionContext::default()
+            },
+        )
+        .into_iter()
+        .find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action)
+                if action.title == "Add missing `label` method for `Label`" =>
+            {
+                Some(action)
+            }
+            _ => None,
+        })
+        .expect("missing method action should be available");
+
+        assert_eq!(action.diagnostics, Some(vec![matching]));
+    }
+
+    #[test]
+    fn ranges_intersect_handles_cursor_boundaries() {
+        let span = Range::new(Position::new(2, 4), Position::new(2, 9));
+
+        assert!(ranges_intersect(
+            span,
+            Range::new(Position::new(2, 4), Position::new(2, 4))
+        ));
+        assert!(ranges_intersect(
+            span,
+            Range::new(Position::new(2, 9), Position::new(2, 9))
+        ));
+        assert!(!ranges_intersect(
+            span,
+            Range::new(Position::new(2, 10), Position::new(2, 10))
+        ));
+        assert!(!ranges_intersect(
+            span,
+            Range::new(Position::new(2, 0), Position::new(2, 4))
+        ));
     }
 }

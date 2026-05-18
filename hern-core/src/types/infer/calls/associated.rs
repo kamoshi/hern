@@ -228,10 +228,11 @@ impl Infer {
                     &trait_arg_tys,
                     &determinant_indexes,
                     env,
-                    &self.impls.known_dicts,
+                    &self.impls.active_dicts,
                     &self.impls.known_schemes,
                     &mut self.subst,
                 )
+                .map_err(|err| err.at(target_span))?
                 .ok_or_else(|| {
                     TypeError::MissingTraitImpl {
                         trait_name: trait_def.name.clone(),
@@ -313,6 +314,7 @@ impl Infer {
             instance.callable_ty.clone(),
             instance.constraints,
             Vec::new(),
+            None,
             param_capabilities,
             0,
             member_span,

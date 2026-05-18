@@ -132,9 +132,9 @@ pub(super) fn check_exhaustive_match(
         });
     };
 
-    if let Some(missing) = first_uncovered_witness(patterns, witnesses) {
+    if let Some(missing) = first_uncovered_witness(patterns, witnesses.patterns) {
         return Err(TypeError::NonExhaustiveMatch {
-            missing: format!("missing pattern: {}", pattern_for_message(&missing)),
+            missing: missing_pattern_message(&missing, witnesses.approximate),
         });
     }
 
@@ -178,33 +178,37 @@ fn check_array_exhaustive(
     }
 
     let element_ty = array_element_ty(scrutinee_ty).expect("array element type exists");
-    let element_witnesses =
-        witness_patterns(element_ty, variant_env, 0).unwrap_or_else(|| vec![Pattern::Wildcard]);
+    let element_witnesses = witness_patterns(element_ty, variant_env, 0)
+        .unwrap_or_else(|| WitnessSet::exact(vec![Pattern::Wildcard]));
     let max_open = *open_lens.iter().max().unwrap();
 
     // List patterns only inspect a finite prefix. Cover every exact length below
     // the largest open prefix, then cover one open witness at that prefix length;
     // extensions of that final witness exercise all longer arrays.
     for len in 0..max_open {
-        for candidate in list_witnesses_of_len(&element_witnesses, len, false) {
+        let candidates = list_witnesses_of_len(&element_witnesses.patterns, len, false);
+        let approximate = element_witnesses.approximate || candidates.approximate;
+        for candidate in candidates.patterns {
             if !patterns
                 .iter()
                 .any(|pattern| pattern_covers(pattern, &candidate))
             {
                 return Err(TypeError::NonExhaustiveMatch {
-                    missing: format!("missing pattern: {}", pattern_for_message(&candidate)),
+                    missing: missing_pattern_message(&candidate, approximate),
                 });
             }
         }
     }
 
-    for candidate in list_witnesses_of_len(&element_witnesses, max_open, true) {
+    let candidates = list_witnesses_of_len(&element_witnesses.patterns, max_open, true);
+    let approximate = element_witnesses.approximate || candidates.approximate;
+    for candidate in candidates.patterns {
         if !patterns
             .iter()
             .any(|pattern| pattern_covers(pattern, &candidate))
         {
             return Err(TypeError::NonExhaustiveMatch {
-                missing: format!("missing pattern: {}", pattern_for_message(&candidate)),
+                missing: missing_pattern_message(&candidate, approximate),
             });
         }
     }
@@ -213,9 +217,45 @@ fn check_array_exhaustive(
 }
 
 const MAX_WITNESS_DEPTH: usize = 4;
-const MAX_WITNESSES: usize = 128;
+// Witness generation is bounded. When a finite product grows beyond this cap,
+// callers surface an approximation-limit diagnostic instead of pretending the
+// wildcard-shaped fallback is a precise missing witness.
+const MAX_WITNESSES: usize = 4096;
 
-fn list_witnesses_of_len(element_witnesses: &[Pattern], len: usize, open: bool) -> Vec<Pattern> {
+#[derive(Debug, Clone)]
+struct WitnessSet {
+    patterns: Vec<Pattern>,
+    approximate: bool,
+}
+
+impl WitnessSet {
+    fn exact(patterns: Vec<Pattern>) -> Self {
+        Self {
+            patterns,
+            approximate: false,
+        }
+    }
+
+    fn approximate(patterns: Vec<Pattern>) -> Self {
+        Self {
+            patterns,
+            approximate: true,
+        }
+    }
+}
+
+fn missing_pattern_message(missing: &Pattern, approximate: bool) -> String {
+    if approximate {
+        format!(
+            "missing pattern: {} (witness limit reached; add a wildcard (_) arm if the match is intentionally exhaustive)",
+            pattern_for_message(missing)
+        )
+    } else {
+        format!("missing pattern: {}", pattern_for_message(missing))
+    }
+}
+
+fn list_witnesses_of_len(element_witnesses: &[Pattern], len: usize, open: bool) -> WitnessSet {
     let mut product = vec![Vec::new()];
     for _ in 0..len {
         let mut next = Vec::new();
@@ -225,49 +265,56 @@ fn list_witnesses_of_len(element_witnesses: &[Pattern], len: usize, open: bool) 
                 row.push(witness.clone());
                 next.push(row);
                 if next.len() > MAX_WITNESSES {
-                    return vec![Pattern::List {
+                    return WitnessSet::approximate(vec![Pattern::List {
                         elements: vec![Pattern::Wildcard; len],
                         rest: open.then_some(None),
-                    }];
+                    }]);
                 }
             }
         }
         product = next;
     }
 
-    product
-        .into_iter()
-        .map(|elements| Pattern::List {
-            elements,
-            rest: open.then_some(None),
-        })
-        .collect()
+    WitnessSet::exact(
+        product
+            .into_iter()
+            .map(|elements| Pattern::List {
+                elements,
+                rest: open.then_some(None),
+            })
+            .collect(),
+    )
 }
 
-fn witness_patterns(ty: &Ty, variant_env: &VariantEnv, depth: usize) -> Option<Vec<Pattern>> {
+fn witness_patterns(ty: &Ty, variant_env: &VariantEnv, depth: usize) -> Option<WitnessSet> {
     if depth > MAX_WITNESS_DEPTH {
-        return Some(vec![Pattern::Wildcard]);
+        return Some(WitnessSet::approximate(vec![Pattern::Wildcard]));
     }
 
     match ty {
         Ty::Tuple(items) => {
             let mut product = vec![Vec::new()];
+            let mut approximate = false;
             for item_ty in items {
                 let item_witnesses = witness_patterns(item_ty, variant_env, depth + 1)?;
+                approximate |= item_witnesses.approximate;
                 let mut next = Vec::new();
                 for prefix in &product {
-                    for witness in &item_witnesses {
+                    for witness in &item_witnesses.patterns {
                         let mut row = prefix.clone();
                         row.push(witness.clone());
                         next.push(row);
                         if next.len() > MAX_WITNESSES {
-                            return Some(vec![Pattern::Wildcard]);
+                            return Some(WitnessSet::approximate(vec![Pattern::Wildcard]));
                         }
                     }
                 }
                 product = next;
             }
-            Some(product.into_iter().map(Pattern::Tuple).collect())
+            Some(WitnessSet {
+                patterns: product.into_iter().map(Pattern::Tuple).collect(),
+                approximate,
+            })
         }
         Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if name == "Array") => {
             let elem_ty = args.first()?;
@@ -275,21 +322,26 @@ fn witness_patterns(ty: &Ty, variant_env: &VariantEnv, depth: usize) -> Option<V
                 elements: vec![],
                 rest: None,
             }];
-            for elem in witness_patterns(elem_ty, variant_env, depth + 1)? {
+            let element_witnesses = witness_patterns(elem_ty, variant_env, depth + 1)?;
+            for elem in element_witnesses.patterns {
                 witnesses.push(Pattern::List {
                     elements: vec![elem],
                     rest: Some(None),
                 });
             }
-            Some(witnesses)
+            Some(WitnessSet {
+                patterns: witnesses,
+                approximate: element_witnesses.approximate,
+            })
         }
-        Ty::Con(name) if name == "bool" => {
-            Some(vec![Pattern::BoolLit(true), Pattern::BoolLit(false)])
-        }
+        Ty::Con(name) if name == "bool" => Some(WitnessSet::exact(vec![
+            Pattern::BoolLit(true),
+            Pattern::BoolLit(false),
+        ])),
         Ty::Con(_) | Ty::App(_, _) => {
             let type_name = nominal_type_name(ty)?;
             if type_name == "Array" {
-                return Some(vec![
+                return Some(WitnessSet::exact(vec![
                     Pattern::List {
                         elements: vec![],
                         rest: None,
@@ -298,7 +350,7 @@ fn witness_patterns(ty: &Ty, variant_env: &VariantEnv, depth: usize) -> Option<V
                         elements: vec![Pattern::Wildcard],
                         rest: Some(None),
                     },
-                ]);
+                ]));
             }
 
             let mut variants = variant_env
@@ -307,22 +359,24 @@ fn witness_patterns(ty: &Ty, variant_env: &VariantEnv, depth: usize) -> Option<V
                 .filter(|(_, info)| info.type_name == type_name)
                 .collect::<Vec<_>>();
             if variants.is_empty() {
-                return Some(vec![Pattern::Wildcard]);
+                return Some(WitnessSet::exact(vec![Pattern::Wildcard]));
             }
             variants.sort_by_key(|(variant_name, _)| *variant_name);
 
             let mut witnesses = Vec::new();
+            let mut approximate = false;
             for (variant_name, info) in variants {
                 if let Some(payload_ty) = instantiated_payload_ty(ty, info) {
-                    for payload in witness_patterns(&payload_ty, variant_env, depth + 1)
-                        .unwrap_or_else(|| vec![Pattern::Wildcard])
-                    {
+                    let payload_witnesses = witness_patterns(&payload_ty, variant_env, depth + 1)
+                        .unwrap_or_else(|| WitnessSet::exact(vec![Pattern::Wildcard]));
+                    approximate |= payload_witnesses.approximate;
+                    for payload in payload_witnesses.patterns {
                         witnesses.push(Pattern::Constructor {
                             name: variant_name.clone(),
                             binding: Some(Box::new(payload)),
                         });
                         if witnesses.len() > MAX_WITNESSES {
-                            return Some(vec![Pattern::Wildcard]);
+                            return Some(WitnessSet::approximate(vec![Pattern::Wildcard]));
                         }
                     }
                 } else {
@@ -332,15 +386,15 @@ fn witness_patterns(ty: &Ty, variant_env: &VariantEnv, depth: usize) -> Option<V
                     });
                 }
             }
-            Some(witnesses)
+            Some(WitnessSet {
+                patterns: witnesses,
+                approximate,
+            })
         }
-        Ty::Record(_)
-        | Ty::Int
-        | Ty::Float
-        | Ty::Unit
-        | Ty::Never
-        | Ty::Var(_)
-        | Ty::Func(_, _) => Some(vec![Pattern::Wildcard]),
+        Ty::Never => Some(WitnessSet::exact(vec![])),
+        Ty::Record(_) | Ty::Int | Ty::Float | Ty::Unit | Ty::Var(_) | Ty::Func(_, _) => {
+            Some(WitnessSet::exact(vec![Pattern::Wildcard]))
+        }
         Ty::Qualified(_, inner) => witness_patterns(inner, variant_env, depth),
     }
 }
@@ -545,5 +599,44 @@ fn pattern_for_message(pattern: &Pattern) -> String {
             }
             format!("[{}]", parts.join(", "))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn witness_limit_diagnostic_mentions_approximation() {
+        let tuple_ty = Ty::Tuple(vec![Ty::Con("bool".to_string()); 13]);
+        let err = check_exhaustive_match(&[], &tuple_ty, &VariantEnv::default())
+            .expect_err("empty match should be non-exhaustive");
+
+        assert!(matches!(
+            err,
+            TypeError::NonExhaustiveMatch { missing } if missing.contains("witness limit reached")
+        ));
+    }
+
+    #[test]
+    fn exhaustive_large_bool_product_under_cap_is_accepted() {
+        let tuple_ty = Ty::Tuple(vec![Ty::Con("bool".to_string()); 8]);
+        let patterns = bool_tuple_patterns(8);
+        let pattern_refs = patterns.iter().collect::<Vec<_>>();
+
+        check_exhaustive_match(&pattern_refs, &tuple_ty, &VariantEnv::default())
+            .expect("all boolean tuple combinations should be exhaustive");
+    }
+
+    fn bool_tuple_patterns(width: usize) -> Vec<Pattern> {
+        (0..(1usize << width))
+            .map(|bits| {
+                Pattern::Tuple(
+                    (0..width)
+                        .map(|idx| Pattern::BoolLit((bits & (1 << idx)) != 0))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 }

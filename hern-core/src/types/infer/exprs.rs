@@ -382,9 +382,10 @@ impl Infer {
             }
             ExprKind::Loop(body) => {
                 let break_ty = self.fresh_ty();
-                self.flow.loop_break_tys.push(break_ty.clone());
-                let _body_ty = self.infer_expr(env, body)?;
-                self.flow.loop_break_tys.pop();
+                self.with_loop_break_scope(break_ty.clone(), |this| {
+                    let _body_ty = this.infer_expr(env, body)?;
+                    Ok(())
+                })?;
                 Ok(break_ty)
             }
             ExprKind::Break(val) => {
@@ -557,5 +558,9 @@ pub(super) fn constructor_pattern_refinement_mismatch(
         return err;
     }
 
-    TypeError::Mismatch(scrutinee_after_pattern, scrutinee_before_pattern).at(span)
+    TypeError::Mismatch {
+        expected: scrutinee_after_pattern,
+        got: scrutinee_before_pattern,
+    }
+    .at(span)
 }

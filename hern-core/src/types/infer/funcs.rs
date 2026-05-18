@@ -14,9 +14,10 @@ impl Infer {
     ) -> Result<(), SpannedTypeError> {
         if ret.capability == ReturnCapability::FreshPlace && !self.is_fresh_mutable_place_expr(expr)
         {
-            return Err(TypeError::ExpectedMutablePlace(
-                "return value must be a fresh mutable place".to_string(),
-            )
+            return Err(TypeError::ExpectedMutablePlace {
+                subject: MutablePlaceSubject::ReturnValue,
+                reason: MutablePlaceErrorReason::NotFresh,
+            }
             .at(expr.span));
         }
         Ok(())
@@ -107,7 +108,7 @@ impl Infer {
                 p,
                 &finalized.owned,
                 env,
-                &self.impls.known_dicts,
+                &self.impls.active_dicts,
                 &self.impls.known_schemes,
                 &self.subst,
             )
@@ -256,7 +257,7 @@ impl Infer {
                 p,
                 &finalized.owned,
                 env,
-                &self.impls.known_dicts,
+                &self.impls.active_dicts,
                 &self.impls.known_schemes,
                 &self.subst,
             )

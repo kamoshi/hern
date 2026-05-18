@@ -15,59 +15,30 @@ impl Infer {
         end: Option<&mut Expr>,
         inclusive: bool,
     ) -> Result<Ty, SpannedTypeError> {
-        let int_ty = Ty::Int;
         match (start, end, inclusive) {
             (Some(start), Some(end), false) => {
-                let start_ty = self.infer_expr(env, start)?;
-                unify(&mut self.subst, start_ty, int_ty.clone()).map_err(|err| {
-                    err.with_mismatch_context(TypeMismatchContext::RangeStart)
-                        .at(start.span)
-                })?;
-                let end_ty = self.infer_expr(env, end)?;
-                unify(&mut self.subst, end_ty, int_ty.clone()).map_err(|err| {
-                    err.with_mismatch_context(TypeMismatchContext::RangeEnd)
-                        .at(end.span)
-                })?;
+                self.infer_int_range_bound(env, start, TypeMismatchContext::RangeStart)?;
+                self.infer_int_range_bound(env, end, TypeMismatchContext::RangeEnd)?;
                 Ok(range_ty("Range"))
             }
             (Some(start), Some(end), true) => {
-                let start_ty = self.infer_expr(env, start)?;
-                unify(&mut self.subst, start_ty, int_ty.clone()).map_err(|err| {
-                    err.with_mismatch_context(TypeMismatchContext::RangeStart)
-                        .at(start.span)
-                })?;
-                let end_ty = self.infer_expr(env, end)?;
-                unify(&mut self.subst, end_ty, int_ty.clone()).map_err(|err| {
-                    err.with_mismatch_context(TypeMismatchContext::RangeEnd)
-                        .at(end.span)
-                })?;
+                self.infer_int_range_bound(env, start, TypeMismatchContext::RangeStart)?;
+                self.infer_int_range_bound(env, end, TypeMismatchContext::RangeEnd)?;
                 Ok(range_ty("RangeInclusive"))
             }
             (Some(start), None, false) => {
-                let start_ty = self.infer_expr(env, start)?;
-                unify(&mut self.subst, start_ty, int_ty).map_err(|err| {
-                    err.with_mismatch_context(TypeMismatchContext::RangeStart)
-                        .at(start.span)
-                })?;
+                self.infer_int_range_bound(env, start, TypeMismatchContext::RangeStart)?;
                 Ok(range_ty("RangeFrom"))
             }
             (Some(_), None, true) => {
                 unreachable!("parser rejects inclusive ranges without end bounds")
             }
             (None, Some(end), false) => {
-                let end_ty = self.infer_expr(env, end)?;
-                unify(&mut self.subst, end_ty, int_ty).map_err(|err| {
-                    err.with_mismatch_context(TypeMismatchContext::RangeEnd)
-                        .at(end.span)
-                })?;
+                self.infer_int_range_bound(env, end, TypeMismatchContext::RangeEnd)?;
                 Ok(range_ty("RangeTo"))
             }
             (None, Some(end), true) => {
-                let end_ty = self.infer_expr(env, end)?;
-                unify(&mut self.subst, end_ty, int_ty).map_err(|err| {
-                    err.with_mismatch_context(TypeMismatchContext::RangeEnd)
-                        .at(end.span)
-                })?;
+                self.infer_int_range_bound(env, end, TypeMismatchContext::RangeEnd)?;
                 Ok(range_ty("RangeToInclusive"))
             }
             (None, None, false) => Ok(Ty::Con("RangeFull".to_string())),
@@ -77,11 +48,22 @@ impl Infer {
         }
     }
 
+    fn infer_int_range_bound(
+        &mut self,
+        env: &TypeEnv,
+        expr: &mut Expr,
+        context: TypeMismatchContext,
+    ) -> Result<(), SpannedTypeError> {
+        let ty = self.infer_expr(env, expr)?;
+        unify(&mut self.subst, ty, Ty::Int)
+            .map_err(|err| err.with_mismatch_context(context).at(expr.span))
+    }
+
     pub(super) fn infer_record_expr(
         &mut self,
         env: &TypeEnv,
         entries: &mut [RecordEntry],
-        span: SourceSpan,
+        _span: SourceSpan,
     ) -> Result<Ty, SpannedTypeError> {
         let mut field_tys: Vec<(String, Ty)> = Vec::new();
         let mut tail = Ty::Unit;
@@ -89,7 +71,8 @@ impl Infer {
             match entry {
                 RecordEntry::Field(name, expr) => {
                     let ty = self.infer_expr(env, expr)?;
-                    merge_record_field(&mut field_tys, name.clone(), ty);
+                    merge_record_field(&mut field_tys, name.clone(), ty)
+                        .map_err(|err| err.at(expr.span))?;
                 }
                 RecordEntry::Spread(expr) => {
                     let spread_ty = self.infer_expr(env, expr)?;
@@ -101,23 +84,25 @@ impl Infer {
                             fields: vec![],
                             tail: Box::new(tail_var),
                         }),
-                    )?;
+                    )
+                    .map_err(|err| err.at(expr.span))?;
                     let resolved_spread = self.subst.apply(&spread_ty);
                     let Ty::Record(row) = resolved_spread else {
-                        return Err(TypeError::Mismatch(
-                            Ty::Record(Row {
+                        return Err(TypeError::Mismatch {
+                            expected: Ty::Record(Row {
                                 fields: vec![],
                                 tail: Box::new(self.fresh_ty()),
                             }),
-                            resolved_spread,
-                        )
-                        .at(span));
+                            got: resolved_spread,
+                        }
+                        .at(expr.span));
                     };
                     for (name, ty) in row.fields {
-                        merge_record_field(&mut field_tys, name, ty);
+                        merge_record_field(&mut field_tys, name, ty)
+                            .map_err(|err| err.at(expr.span))?;
                     }
                     tail = merge_record_spread_tail(&mut self.subst, tail, *row.tail)
-                        .map_err(|err| err.at(span))?;
+                        .map_err(|err| err.at(expr.span))?;
                 }
             }
         }
@@ -145,21 +130,20 @@ impl Infer {
                     } else {
                         self.infer_expr(env, expr)?
                     };
-                    unify(&mut self.subst, elt_ty.clone(), ty)?;
+                    unify(&mut self.subst, elt_ty.clone(), ty).map_err(|err| err.at(expr.span))?;
                 }
                 ArrayEntry::Spread(expr) => {
-                    let expected_array =
-                        Ty::App(Box::new(Ty::Con("Array".to_string())), vec![elt_ty.clone()]);
+                    let expected_array = array_ty(elt_ty.clone());
                     let ty = if expected_element.is_some() {
                         self.infer_expr_expected(env, expr, expected_array.clone())?
                     } else {
                         self.infer_expr(env, expr)?
                     };
-                    unify(&mut self.subst, ty, expected_array)?;
+                    unify(&mut self.subst, ty, expected_array).map_err(|err| err.at(expr.span))?;
                 }
             }
         }
-        let array_ty = Ty::App(Box::new(Ty::Con("Array".to_string())), vec![elt_ty]);
+        let array_ty = array_ty(elt_ty);
         if let Some(expected) = expected {
             unify(&mut self.subst, array_ty.clone(), expected).map_err(|err| err.at(span))?;
         }

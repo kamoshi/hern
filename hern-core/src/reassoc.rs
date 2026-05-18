@@ -95,9 +95,7 @@ fn reassoc_expr_with_ids(
         let head = reassoc_owned(head, table, next_node_id)?;
         let parts: VecDeque<(String, SourceSpan, Expr)> = parts
             .into_iter()
-            .map(|(op, op_span, e)| {
-                reassoc_owned(e, table, next_node_id).map(|e| (op, op_span, e))
-            })
+            .map(|(op, op_span, e)| reassoc_owned(e, table, next_node_id).map(|e| (op, op_span, e)))
             .collect::<Result<_, _>>()?;
         validate_operator_chain(&parts, table)?;
         *expr = pratt(head, &mut { parts }, 0, table, next_node_id);
@@ -179,9 +177,7 @@ fn reassoc_expr_with_ids(
                 reassoc_expr_with_ids(entry.expr_mut(), table, next_node_id)?;
             }
         }
-        ExprKind::FieldAccess { expr, .. } => {
-            reassoc_expr_with_ids(expr, table, next_node_id)?
-        }
+        ExprKind::FieldAccess { expr, .. } => reassoc_expr_with_ids(expr, table, next_node_id)?,
         ExprKind::Index { receiver, key, .. } => {
             reassoc_expr_with_ids(receiver, table, next_node_id)?;
             reassoc_expr_with_ids(key, table, next_node_id)?;
@@ -248,11 +244,9 @@ fn max_stmt_node_id(stmt: &Stmt) -> NodeId {
             .map(|method| max_expr_node_id(&method.body))
             .max()
             .unwrap_or(0),
-        Stmt::TestBlock { stmts, .. } | Stmt::RecBlock { stmts, .. } => stmts
-            .iter()
-            .map(max_stmt_node_id)
-            .max()
-            .unwrap_or(0),
+        Stmt::TestBlock { stmts, .. } | Stmt::RecBlock { stmts, .. } => {
+            stmts.iter().map(max_stmt_node_id).max().unwrap_or(0)
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => 0,
     }
 }
@@ -270,9 +264,7 @@ fn max_expr_node_id(expr: &Expr) -> NodeId {
         ExprKind::Index { receiver, key, .. } => {
             max_expr_node_id(receiver).max(max_expr_node_id(key))
         }
-        ExprKind::Assign { target, value } => {
-            max_expr_node_id(target).max(max_expr_node_id(value))
-        }
+        ExprKind::Assign { target, value } => max_expr_node_id(target).max(max_expr_node_id(value)),
         ExprKind::Binary { lhs, rhs, .. } => max_expr_node_id(lhs).max(max_expr_node_id(rhs)),
         ExprKind::Range { start, end, .. } => start
             .as_deref()

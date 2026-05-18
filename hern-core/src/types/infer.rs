@@ -53,7 +53,10 @@ use crate::types::{
     InherentMethodScheme, ParamCapability, ROOT_LEVEL, ReturnCapability, Row, Scheme, Subst,
     TraitConstraint, Ty, TyVar, TypeLevel, display_ty_with_var_names,
     env::build_variant_env_from_stmts,
-    error::{SpannedTypeError, TypeError, TypeMismatchContext},
+    error::{
+        MutablePlaceErrorReason, MutablePlaceSubject, SpannedTypeError, TypeError,
+        TypeMismatchContext,
+    },
     free_type_vars, free_type_vars_in_display_order, free_type_vars_into, perf, type_var_name,
     unify, value_func_params, value_func_return,
 };
@@ -181,7 +184,8 @@ impl Infer {
     }
 
     pub fn set_known_impl_dicts(&mut self, dicts: HashSet<String>) {
-        self.impls.known_dicts = dicts;
+        self.impls.active_dicts = dicts.clone();
+        self.impls.scoped_dicts = dicts;
     }
 
     pub fn set_known_impl_schemes(&mut self, schemes: HashMap<String, Scheme>) {
@@ -193,8 +197,10 @@ impl Infer {
         traits: HashMap<String, TraitDef>,
         op_trait_map: HashMap<String, String>,
     ) {
-        self.traits.env = traits;
-        self.traits.op_trait_map = op_trait_map;
+        self.traits.env = traits.clone();
+        self.traits.scoped_env = traits;
+        self.traits.op_trait_map = op_trait_map.clone();
+        self.traits.scoped_op_trait_map = op_trait_map;
     }
 
     pub fn set_type_scope(&mut self, type_names: HashSet<String>) {
@@ -300,10 +306,10 @@ impl Infer {
             return Ok(());
         }
         let Some(name) = find_assignment_base_name(arg) else {
-            return Err(TypeError::ExpectedMutablePlace(format!(
-                "argument {} must be a mutable place",
-                idx + 1
-            ))
+            return Err(TypeError::ExpectedMutablePlace {
+                subject: MutablePlaceSubject::Argument(idx + 1),
+                reason: MutablePlaceErrorReason::NotAPlace,
+            }
             .at(arg.span));
         };
         let info = env
@@ -312,11 +318,10 @@ impl Infer {
         if info.is_place_mutable() {
             Ok(())
         } else {
-            Err(TypeError::ExpectedMutablePlace(format!(
-                "argument {} must be a mutable place, but `{}` is not mutable",
-                idx + 1,
-                name
-            ))
+            Err(TypeError::ExpectedMutablePlace {
+                subject: MutablePlaceSubject::Argument(idx + 1),
+                reason: MutablePlaceErrorReason::NotMutable(name),
+            }
             .at(arg.span))
         }
     }
@@ -438,8 +443,15 @@ impl Infer {
 
         let mut env = seed_env.cloned().unwrap_or_else(TypeEnv::new);
         self.validate_type_trait_name_collisions(seed_stmts, &program.stmts)?;
-        self.validate_duplicate_test_function_names(&program.stmts)?;
-        self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()));
+        if let Some(err) = self
+            .validate_duplicate_test_function_names(&program.stmts)
+            .into_iter()
+            .next()
+        {
+            return Err(err);
+        }
+        self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()))?;
+        self.resolve_registered_variant_payload_types();
         self.register_traits_and_ops(seed_stmts.iter().chain(program.stmts.iter()))?;
         // Fail-fast inference may resolve calls before reaching a later impl statement.
         // Since any failed impl aborts the whole pass, these speculative names cannot
@@ -464,7 +476,7 @@ impl Infer {
                 resolve_concrete(
                     p,
                     &env,
-                    &self.impls.known_dicts,
+                    &self.impls.active_dicts,
                     &self.impls.known_schemes,
                     &self.subst,
                 )
@@ -493,7 +505,9 @@ impl Infer {
     /// declarations rather than stopping at the first error.
     ///
     /// Recovery model:
-    /// - Pre-pass 1 (type aliases) cannot fail.
+    /// - Pre-pass 1 (type/type alias registry) is fail-fast: malformed generic
+    ///   parameters would corrupt later alias/type conversion, so a single
+    ///   accurate diagnostic beats partial-recovery noise.
     /// - Pre-pass 2 (operator-to-trait registry) is fail-fast: a duplicate operator across
     ///   traits would corrupt every later operator inference, so a single accurate
     ///   diagnostic beats partial-recovery noise. The returned `ModuleInference` is empty.
@@ -520,21 +534,30 @@ impl Infer {
         if let Err(err) = self.validate_type_trait_name_collisions(seed_stmts, &program.stmts) {
             return (ModuleInference::default(), vec![err]);
         }
-        let duplicate_test_name_error = self.validate_duplicate_test_function_names(&program.stmts);
-        self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()));
+        let duplicate_test_name_errors =
+            self.validate_duplicate_test_function_names(&program.stmts);
+        if let Err(err) =
+            self.register_type_declarations(seed_stmts.iter().chain(program.stmts.iter()))
+        {
+            let mut diagnostics = duplicate_test_name_errors;
+            diagnostics.push(err);
+            return (ModuleInference::default(), diagnostics);
+        }
+        self.resolve_registered_variant_payload_types();
         if let Err(err) =
             self.register_traits_and_ops(seed_stmts.iter().chain(program.stmts.iter()))
         {
-            return (ModuleInference::default(), vec![err]);
+            let mut diagnostics = duplicate_test_name_errors;
+            diagnostics.push(err);
+            return (ModuleInference::default(), diagnostics);
         }
         // Collecting inference returns partial state after failures, so current-module
         // impl dictionaries must become visible only after their impl statement succeeds.
-        // Module-scope discovery may have preloaded them into `known_impl_dicts`; remove
+        // Module-scope discovery may have preloaded them into active dictionaries; remove
         // only this program's impl names while preserving imported/prelude impls.
         self.remove_program_impl_dict_names(program.stmts.iter());
 
-        let mut diagnostics: Vec<SpannedTypeError> =
-            duplicate_test_name_error.err().into_iter().collect();
+        let mut diagnostics: Vec<SpannedTypeError> = duplicate_test_name_errors;
         let mut unavailable = CollectedNames::default();
 
         self.add_constructors_and_externs_collecting(
@@ -655,7 +678,8 @@ impl Infer {
                 continue;
             }
 
-            let snapshot = InferSnapshot::capture(self, env);
+            let subst_checkpoint = self.subst.checkpoint();
+            let snapshot = InferSnapshot::capture(self, env, subst_checkpoint);
 
             match self.infer_stmt(env, stmt) {
                 Ok(stmt_ty) => {
@@ -701,7 +725,7 @@ impl Infer {
                 resolve_concrete(
                     p,
                     env,
-                    &self.impls.known_dicts,
+                    &self.impls.active_dicts,
                     &self.impls.known_schemes,
                     &self.subst,
                 )
@@ -714,18 +738,12 @@ impl Infer {
 
     fn reset_program_state(&mut self) {
         self.subst.clear_map_keep_counter();
-        self.types.aliases.clear();
-        self.types.declared.clear();
-        self.types
-            .declared
-            .extend(["string", "bool", "int", "float", "Array", "Iter"].map(str::to_string));
-        self.types
-            .declared
-            .extend(self.types.scoped_declared.iter().cloned());
+        self.types.reset_for_program();
+        self.traits.reset_for_program();
+        self.impls.reset_for_program();
         self.inherent.methods.clear();
-        self.constraints.pending.clear();
-        self.flow.loop_break_tys.clear();
-        self.flow.fn_return_tys.clear();
+        self.constraints.clear();
+        self.flow.clear();
         self.metadata.clear();
         self.imports.bindings.clear();
         self.inherent.record_field_callables.clear();
@@ -932,9 +950,20 @@ impl Infer {
         })();
         result.map_err(|err| match stmt {
             Stmt::Impl(ImplDef {
-                generated_by: Some(GeneratedBy::Derive { source_span, .. }),
+                generated_by:
+                    Some(GeneratedBy::Derive {
+                        trait_name,
+                        source_span,
+                    }),
                 ..
-            }) => err.with_span_if_absent_or_synthetic(*source_span),
+            }) => {
+                let mut err = err.with_span_if_absent_or_synthetic(*source_span);
+                err.error = Box::new(TypeError::DerivedImplFailure {
+                    trait_name: trait_name.clone(),
+                    error: err.error,
+                });
+                err
+            }
             _ => err.with_span_if_absent(span),
         })
     }

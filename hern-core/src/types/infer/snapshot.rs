@@ -8,9 +8,9 @@ use super::metadata::{FailedStatementMetadata, TypeMetadataSnapshot};
 use super::*;
 use crate::types::SubstCheckpoint;
 
-/// Snapshot of mutable per-statement state inside [`Infer`], taken before each top-level
-/// statement during collecting inference. On statement failure the snapshot is restored so
-/// the next statement starts from a clean baseline.
+/// Snapshot of collecting-inference rollback state inside [`Infer`], taken before each
+/// top-level statement and each statement inside a `test { ... }` block. On statement failure
+/// the snapshot is restored so the next statement starts from a clean baseline.
 ///
 /// Note: the substitution checkpoint restores solved substitutions, but not
 /// `Subst::next_var`. Fresh type variable IDs keep advancing across recovery —
@@ -25,25 +25,32 @@ use crate::types::SubstCheckpoint;
 /// `variant_env` is intentionally omitted here: it is finalized before the main recovery loop,
 /// and failed type declarations are pruned from it during pre-pass 3, so later statements never
 /// observe variants from declarations whose constructor environment was discarded.
+///
+/// Rollback coverage checklist for `Infer` fields:
+/// - captured here: substitutions, pending constraints, flow stacks, metadata, per-statement
+///   import bindings, record-field callables, inherent methods, and the visible value environment;
+/// - pre-pass/program declarations: traits, type aliases/declared names, impl dictionaries, and
+///   scoped inherent methods are reset or rebuilt before collecting statements;
+/// - session counters: `current_level` and `Subst::next_var` intentionally keep advancing.
 pub(super) struct InferSnapshot {
     subst_checkpoint: SubstCheckpoint,
-    pending_constraints: Vec<TraitConstraint>,
-    loop_break_tys: Vec<Ty>,
-    fn_return_tys: Vec<FuncReturn>,
+    constraints: ConstraintState,
+    flow: FlowState,
     metadata: TypeMetadataSnapshot,
+    import_bindings: HashMap<String, String>,
     record_field_callables: HashMap<String, HashMap<String, Vec<ParamCapability>>>,
     inherent_methods: HashMap<String, HashMap<String, InherentMethodInfo>>,
     env: TypeEnv,
 }
 
 impl InferSnapshot {
-    pub(super) fn capture(infer: &mut Infer, env: &TypeEnv) -> Self {
+    pub(super) fn capture(infer: &Infer, env: &TypeEnv, subst_checkpoint: SubstCheckpoint) -> Self {
         Self {
-            subst_checkpoint: infer.subst.checkpoint(),
-            pending_constraints: infer.constraints.pending.clone(),
-            loop_break_tys: infer.flow.loop_break_tys.clone(),
-            fn_return_tys: infer.flow.fn_return_tys.clone(),
+            subst_checkpoint,
+            constraints: infer.constraints.clone(),
+            flow: infer.flow.clone(),
             metadata: infer.metadata.snapshot(),
+            import_bindings: infer.imports.bindings.clone(),
             record_field_callables: infer.inherent.record_field_callables.clone(),
             inherent_methods: infer.inherent.methods.clone(),
             env: env.clone(),
@@ -58,10 +65,10 @@ impl InferSnapshot {
 
     pub(super) fn restore(self, infer: &mut Infer, env: &mut TypeEnv) {
         infer.subst.restore_checkpoint(self.subst_checkpoint);
-        infer.constraints.pending = self.pending_constraints;
-        infer.flow.loop_break_tys = self.loop_break_tys;
-        infer.flow.fn_return_tys = self.fn_return_tys;
+        infer.constraints = self.constraints;
+        infer.flow = self.flow;
         infer.metadata.restore(self.metadata);
+        infer.imports.bindings = self.import_bindings;
         infer.inherent.record_field_callables = self.record_field_callables;
         infer.inherent.methods = self.inherent_methods;
         *env = self.env;

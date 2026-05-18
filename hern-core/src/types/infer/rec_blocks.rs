@@ -137,7 +137,7 @@ impl Infer {
                     p,
                     &info.owned_constraints,
                     env,
-                    &self.impls.known_dicts,
+                    &self.impls.active_dicts,
                     &self.impls.known_schemes,
                     &self.subst,
                 )

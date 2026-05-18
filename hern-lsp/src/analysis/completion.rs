@@ -106,6 +106,10 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
         col: lsp_position.character as usize + 1,
     };
 
+    if let Some(items) = associated_completion(state, &uri, inference, module_name, lsp_position) {
+        return items;
+    }
+
     let index = state.timed("source indexing", || index_program(program));
     let prelude_index = state.timed("prelude source indexing", || index_program(&graph.prelude));
     if is_binding_declaration_position(state, &uri, lsp_position) {
@@ -116,10 +120,6 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
     let binding_types = inference.binding_types_for_module(module_name);
     let definition_schemes = inference.definition_schemes_for_module(module_name);
     let replacement_range = completion_replacement_range(state, &uri, lsp_position);
-
-    if let Some(items) = associated_completion(state, &uri, inference, module_name, lsp_position) {
-        return items;
-    }
 
     if let Some(items) = member_completion(
         state,
@@ -165,24 +165,7 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
                 CompletionCandidateKind::ImportBinding => CompletionItemKind::MODULE,
                 _ => CompletionItemKind::VARIABLE,
             });
-            CompletionItem {
-                label: candidate.name.clone(),
-                kind,
-                filter_text: Some(candidate.name.clone()),
-                insert_text: Some(candidate.name.clone()),
-                text_edit: replacement_range.map(|range| {
-                    CompletionTextEdit::Edit(TextEdit {
-                        range,
-                        new_text: candidate.name.clone(),
-                    })
-                }),
-                label_details: detail.as_ref().map(|detail| CompletionItemLabelDetails {
-                    detail: Some(format!(": {detail}")),
-                    description: None,
-                }),
-                detail,
-                ..Default::default()
-            }
+            completion_item(candidate.name, kind, detail, replacement_range)
         })
         .collect();
 
@@ -203,24 +186,12 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
                         trait_name,
                         trait_def.params.join(" ")
                     ));
-                    CompletionItem {
-                        label: trait_name.to_string(),
-                        kind: Some(CompletionItemKind::INTERFACE),
-                        detail: detail.clone(),
-                        filter_text: Some(trait_name.to_string()),
-                        insert_text: Some(trait_name.to_string()),
-                        text_edit: replacement_range.map(|range| {
-                            CompletionTextEdit::Edit(TextEdit {
-                                range,
-                                new_text: trait_name.to_string(),
-                            })
-                        }),
-                        label_details: detail.map(|d| CompletionItemLabelDetails {
-                            detail: Some(format!(": {d}")),
-                            description: None,
-                        }),
-                        ..Default::default()
-                    }
+                    completion_item(
+                        trait_name.to_string(),
+                        Some(CompletionItemKind::INTERFACE),
+                        detail,
+                        replacement_range,
+                    )
                 })
                 .collect::<Vec<_>>()
         };
@@ -241,7 +212,10 @@ fn import_path_completion(
     let cursor_byte = utf16_col_to_byte(line, position.character).min(line.len());
     let before = &line[..cursor_byte];
     let quote = before.rfind('"')?;
-    if before[..quote].contains('"') || !before[..quote].contains("import") {
+    if before[..quote].contains('"')
+        || line_comment_start(&before[..quote]).is_some()
+        || !before[..quote].contains("import")
+    {
         return None;
     }
     let prefix = &before[quote + 1..];
@@ -300,16 +274,31 @@ fn path_completion_item(
     kind: CompletionItemKind,
     range: Range,
 ) -> CompletionItem {
+    completion_item(label, Some(kind), Some(detail.to_string()), Some(range))
+}
+
+fn completion_item(
+    label: String,
+    kind: Option<CompletionItemKind>,
+    detail: Option<String>,
+    replacement_range: Option<Range>,
+) -> CompletionItem {
     CompletionItem {
         label: label.clone(),
-        kind: Some(kind),
+        kind,
+        detail: detail.clone(),
         filter_text: Some(label.clone()),
         insert_text: Some(label.clone()),
-        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-            range,
-            new_text: label,
-        })),
-        detail: Some(detail.to_string()),
+        text_edit: replacement_range.map(|range| {
+            CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: label,
+            })
+        }),
+        label_details: detail.map(|detail| CompletionItemLabelDetails {
+            detail: Some(format!(": {detail}")),
+            description: None,
+        }),
         ..Default::default()
     }
 }
@@ -485,14 +474,25 @@ fn byte_to_source_position(source: &str, byte: usize) -> SourcePosition {
 fn member_access_bounds(source: &str, cursor_byte: usize) -> Option<(usize, usize, usize)> {
     let cursor_byte = cursor_byte.min(source.len());
     let before = &source[..cursor_byte];
+    let line_start = before.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let line_end = source[cursor_byte..]
+        .find('\n')
+        .map(|idx| cursor_byte + idx)
+        .unwrap_or(source.len());
+    let line = &source[line_start..line_end];
     let partial_start = before
         .rfind(|c: char| !is_completion_identifier_char(c))
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    if partial_start > 0 && before.as_bytes().get(partial_start - 1) == Some(&b'.') {
+    if partial_start > 0
+        && before.as_bytes().get(partial_start - 1) == Some(&b'.')
+        && !line_byte_is_in_string_or_comment(line, partial_start - 1 - line_start)
+    {
         return Some((partial_start - 1, partial_start, cursor_byte));
     }
-    if source.as_bytes().get(cursor_byte) == Some(&b'.') {
+    if source.as_bytes().get(cursor_byte) == Some(&b'.')
+        && !line_byte_is_in_string_or_comment(line, cursor_byte - line_start)
+    {
         return Some((cursor_byte, cursor_byte + 1, cursor_byte + 1));
     }
     None
@@ -531,19 +531,23 @@ fn associated_access_bounds(line: &str, cursor_byte: usize) -> Option<(usize, us
     if let Some(colon_start) = before.rfind("::") {
         let member_start = colon_start + 2;
         let partial = &before[member_start..];
-        if partial.chars().all(is_completion_identifier_char) {
+        if partial.chars().all(is_completion_identifier_char)
+            && !line_byte_is_in_string_or_comment(line, colon_start)
+        {
             return Some((colon_start, member_start, cursor_byte));
         }
     }
     if cursor_byte > 0
         && line.as_bytes().get(cursor_byte - 1) == Some(&b':')
         && line.as_bytes().get(cursor_byte) == Some(&b':')
+        && !line_byte_is_in_string_or_comment(line, cursor_byte - 1)
     {
         return Some((cursor_byte - 1, cursor_byte + 1, cursor_byte + 1));
     }
     if cursor_byte + 1 < line.len()
         && line.as_bytes().get(cursor_byte) == Some(&b':')
         && line.as_bytes().get(cursor_byte + 1) == Some(&b':')
+        && !line_byte_is_in_string_or_comment(line, cursor_byte)
     {
         return Some((cursor_byte, cursor_byte + 2, cursor_byte + 2));
     }
@@ -741,22 +745,12 @@ fn method_completion_item(
     replacement_range: Range,
 ) -> CompletionItem {
     let detail = Some(completion_scheme_to_string(scheme));
-    CompletionItem {
-        label: name.to_string(),
-        kind: Some(kind),
-        detail: detail.clone(),
-        filter_text: Some(name.to_string()),
-        insert_text: Some(name.to_string()),
-        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-            range: replacement_range,
-            new_text: name.to_string(),
-        })),
-        label_details: detail.map(|d| CompletionItemLabelDetails {
-            detail: Some(format!(": {d}")),
-            description: None,
-        }),
-        ..Default::default()
-    }
+    completion_item(
+        name.to_string(),
+        Some(kind),
+        detail,
+        Some(replacement_range),
+    )
 }
 
 fn imported_member_completion_items(
@@ -771,18 +765,12 @@ fn imported_member_completion_items(
             if is_internal_completion_name(name) {
                 continue;
             }
-            items.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::FIELD),
-                filter_text: Some(name.clone()),
-                insert_text: Some(name.clone()),
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: name.clone(),
-                })),
-                detail: Some(completion_ty_to_display_string(ty)),
-                ..Default::default()
-            });
+            items.push(completion_item(
+                name.clone(),
+                Some(CompletionItemKind::FIELD),
+                Some(completion_ty_to_display_string(ty)),
+                Some(replacement_range),
+            ));
         }
     } else if let Some(program) = graph.module(module_name) {
         if let Some(fields) = exported_record_fields(program) {
@@ -790,17 +778,12 @@ fn imported_member_completion_items(
                 if is_internal_completion_name(&name) {
                     continue;
                 }
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::FIELD),
-                    filter_text: Some(name.clone()),
-                    insert_text: Some(name.clone()),
-                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                        range: replacement_range,
-                        new_text: name,
-                    })),
-                    ..Default::default()
-                });
+                items.push(completion_item(
+                    name,
+                    Some(CompletionItemKind::FIELD),
+                    None,
+                    Some(replacement_range),
+                ));
             }
             items.sort_by(|a, b| a.label.cmp(&b.label));
             items.dedup_by(|a, b| a.label == b.label);
@@ -815,22 +798,17 @@ fn imported_member_completion_items(
             {
                 continue;
             }
-            items.push(CompletionItem {
-                label: definition.name.clone(),
-                kind: Some(match definition.kind {
+            items.push(completion_item(
+                definition.name,
+                Some(match definition.kind {
                     DefinitionKind::Function | DefinitionKind::Extern => {
                         CompletionItemKind::FUNCTION
                     }
                     _ => CompletionItemKind::VARIABLE,
                 }),
-                filter_text: Some(definition.name.clone()),
-                insert_text: Some(definition.name.clone()),
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: definition.name,
-                })),
-                ..Default::default()
-            });
+                None,
+                Some(replacement_range),
+            ));
         }
     }
     items.sort_by(|a, b| a.label.cmp(&b.label));
@@ -850,17 +828,13 @@ fn record_field_completion_items(ty: &Ty, replacement_range: Range) -> Vec<Compl
         .fields
         .iter()
         .filter(|(name, _)| !is_internal_completion_name(name))
-        .map(|(name, ty)| CompletionItem {
-            label: name.clone(),
-            kind: Some(CompletionItemKind::FIELD),
-            filter_text: Some(name.clone()),
-            insert_text: Some(name.clone()),
-            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                range: replacement_range,
-                new_text: name.clone(),
-            })),
-            detail: Some(completion_ty_to_display_string(ty)),
-            ..Default::default()
+        .map(|(name, ty)| {
+            completion_item(
+                name.clone(),
+                Some(CompletionItemKind::FIELD),
+                Some(completion_ty_to_display_string(ty)),
+                Some(replacement_range),
+            )
         })
         .collect::<Vec<_>>();
     items.sort_by(|a, b| a.label.cmp(&b.label));
@@ -887,22 +861,12 @@ fn trait_method_completion_items(
                 params,
                 ast_type_to_string(&method.ret_type)
             ));
-            CompletionItem {
-                label: method.name.clone(),
-                kind: Some(CompletionItemKind::METHOD),
-                detail: detail.clone(),
-                filter_text: Some(method.name.clone()),
-                insert_text: Some(method.name.clone()),
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: method.name.clone(),
-                })),
-                label_details: detail.map(|d| CompletionItemLabelDetails {
-                    detail: Some(format!(": {d}")),
-                    description: None,
-                }),
-                ..Default::default()
-            }
+            completion_item(
+                method.name.clone(),
+                Some(CompletionItemKind::METHOD),
+                detail,
+                Some(replacement_range),
+            )
         })
         .collect();
     items.sort_by(|a, b| a.label.cmp(&b.label));
@@ -942,19 +906,7 @@ fn type_position_completion(
                 DefinitionKind::Trait => CompletionItemKind::INTERFACE,
                 _ => CompletionItemKind::STRUCT,
             };
-            CompletionItem {
-                label: definition.name.clone(),
-                kind: Some(kind),
-                filter_text: Some(definition.name.clone()),
-                insert_text: Some(definition.name.clone()),
-                text_edit: replacement_range.map(|range| {
-                    CompletionTextEdit::Edit(TextEdit {
-                        range,
-                        new_text: definition.name.clone(),
-                    })
-                }),
-                ..Default::default()
-            }
+            completion_item(definition.name.clone(), Some(kind), None, replacement_range)
         })
         .collect::<Vec<_>>();
     items.sort_by(|a, b| a.label.cmp(&b.label));
@@ -979,7 +931,7 @@ fn is_binding_declaration_position(state: &ServerState, uri: &Uri, position: Pos
     };
     let cursor_byte = utf16_col_to_byte(line, position.character).min(line.len());
     let before = line[..cursor_byte].trim_end();
-    before.ends_with("let") || before.ends_with("let mut")
+    prefix_ends_with_let_binding(before)
 }
 
 fn is_type_position(state: &ServerState, uri: &Uri, position: Position) -> bool {
@@ -995,9 +947,88 @@ fn is_type_position(state: &ServerState, uri: &Uri, position: Position) -> bool 
     let Some(colon) = before.rfind(':') else {
         return false;
     };
-    !before[colon + 1..].contains('=')
-        && !before[colon + 1..].contains('{')
-        && !before[colon + 1..].contains('}')
+    if line_byte_is_in_string_or_comment(line, colon) {
+        return false;
+    }
+    let suffix = &before[colon + 1..];
+    if suffix.contains('=') || suffix.contains('{') || suffix.contains('}') {
+        return false;
+    }
+    is_type_annotation_prefix(&before[..colon])
+}
+
+fn is_type_annotation_prefix(prefix: &str) -> bool {
+    let prefix = prefix.trim_end();
+    let Some(name_start) = prefix.rfind(|c: char| !is_completion_identifier_char(c)) else {
+        return false;
+    };
+    let before_name = prefix[..name_start].trim_end();
+    if prefix_ends_with_let_binding(before_name) {
+        return true;
+    }
+    let delimiter = prefix[name_start..].chars().next();
+    matches!(delimiter, Some('(' | ','))
+        && (before_name.contains("fn ") || before_name.contains("fn("))
+}
+
+fn prefix_ends_with_let_binding(prefix: &str) -> bool {
+    let last = prefix
+        .rsplit(|c: char| !is_completion_identifier_char(c))
+        .find(|part| !part.is_empty());
+    if last == Some("let") {
+        return true;
+    }
+    if last != Some("mut") {
+        return false;
+    }
+    let mut words = prefix
+        .rsplit(|c: char| !is_completion_identifier_char(c))
+        .filter(|part| !part.is_empty());
+    matches!((words.next(), words.next()), (Some("mut"), Some("let")))
+}
+
+fn line_byte_is_in_string_or_comment(line: &str, byte: usize) -> bool {
+    if let Some(comment_start) = line_comment_start(&line[..byte.min(line.len())])
+        && comment_start <= byte
+    {
+        return true;
+    }
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in line[..byte.min(line.len())].chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            _ => {}
+        }
+    }
+    in_string
+}
+
+fn line_comment_start(prefix: &str) -> Option<usize> {
+    let bytes = prefix.as_bytes();
+    let mut idx = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while idx < bytes.len() {
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+        match bytes[idx] {
+            b'\\' if in_string => escaped = true,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && bytes.get(idx + 1) == Some(&b'/') => return Some(idx),
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
 }
 
 fn completion_type_for_definition(
@@ -1090,7 +1121,7 @@ fn find_expr_ending_at_in_expr(expr: &Expr, end: SourcePosition) -> Option<&Expr
             best = Some(match best {
                 Some(current)
                     if (current.span.start_line, current.span.start_col)
-                        <= (candidate.span.start_line, candidate.span.start_col) =>
+                        > (candidate.span.start_line, candidate.span.start_col) =>
                 {
                     current
                 }
@@ -1153,6 +1184,12 @@ fn first_expr_in_stmt(stmt: &hern_core::ast::Stmt) -> Option<&Expr> {
     match stmt {
         hern_core::ast::Stmt::Let { value, .. } | hern_core::ast::Stmt::Expr(value) => Some(value),
         hern_core::ast::Stmt::Fn { body, .. } | hern_core::ast::Stmt::Op { body, .. } => Some(body),
+        hern_core::ast::Stmt::Impl(def) => def.methods.iter().find_map(|method| Some(&method.body)),
+        hern_core::ast::Stmt::InherentImpl(def) => {
+            def.methods.iter().find_map(|method| Some(&method.body))
+        }
+        hern_core::ast::Stmt::TestBlock { stmts, .. }
+        | hern_core::ast::Stmt::RecBlock { stmts, .. } => stmts.iter().find_map(first_expr_in_stmt),
         _ => None,
     }
 }
@@ -1419,6 +1456,14 @@ mod tests {
     }
 
     #[test]
+    fn let_type_position_uses_keyword_boundaries() {
+        assert!(prefix_ends_with_let_binding("let"));
+        assert!(prefix_ends_with_let_binding("let mut"));
+        assert!(!prefix_ends_with_let_binding("applet"));
+        assert!(!prefix_ends_with_let_binding("applet mut"));
+    }
+
+    #[test]
     fn receiver_completion_lists_methods_for_mutable_map_place() {
         let project = TestProject::new("completion-map-mut-methods");
         let source = "let mut g = Map::new();\ng.\n";
@@ -1625,6 +1670,30 @@ mod tests {
 
         assert!(labels.iter().any(|label| label == "g"));
         assert!(!labels.iter().any(|label| label.starts_with("__")));
+    }
+
+    #[test]
+    fn completion_after_record_literal_colon_uses_value_scope() {
+        let project = TestProject::new("completion-record-literal-colon");
+        let (source, position) =
+            source_with_cursor("let answer = 1;\nlet row = #{ value: <|> };\n");
+        let (state, uri) = project.open("main.hern", &source);
+
+        let labels = labels(completion(&state, uri, position));
+
+        assert!(labels.iter().any(|label| label == "answer"), "{labels:?}");
+    }
+
+    #[test]
+    fn completion_after_let_annotation_colon_uses_type_scope() {
+        let project = TestProject::new("completion-let-type-colon");
+        let (source, position) = source_with_cursor("type Boxed = Boxed(int)\nlet value: <|>\n");
+        let (state, uri) = project.open("main.hern", &source);
+
+        let labels = labels(completion(&state, uri, position));
+
+        assert!(labels.iter().any(|label| label == "Boxed"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "value"), "{labels:?}");
     }
 
     #[test]

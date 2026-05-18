@@ -53,7 +53,7 @@ fn semantic_tokens_inner(
         module.and_then(|(module_name, _)| {
             snapshot
                 .inference()
-                .and_then(|inference| semantic_tokens::SemanticContext::new(inference, module_name))
+                .map(|inference| semantic_tokens::SemanticContext::new(inference, module_name))
         })
     } else {
         None
@@ -1738,7 +1738,7 @@ pub(super) mod tests {
             messages
                 .iter()
                 .any(|message| message.contains("array element type is unknown")
-                    && message.contains("available candidates: [float].sum, [int].sum")),
+                    && message.contains("available candidates: `[float].sum`, `[int].sum`")),
             "expected candidate-rich method diagnostic, got {messages:?}"
         );
     }

@@ -395,6 +395,7 @@ fn collect_type_referenced_names(
         {
             refs.types.insert(name.clone());
         }
+        true
     });
 }
 

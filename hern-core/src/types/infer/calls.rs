@@ -21,6 +21,7 @@ pub(super) struct AppliedCall {
 pub(super) struct AppliedSchemeCall {
     pub(super) ret_ty: Ty,
     pub(super) arg_tys: Vec<Ty>,
+    pub(super) fresh_return: bool,
 }
 
 pub(super) struct AssociatedInherentMethodInstance {
@@ -84,6 +85,7 @@ impl Infer {
                     if lookup.explicit_args.is_none() {
                         return self.resolve_trait_method_call(
                             env,
+                            callee.id,
                             args,
                             arg_wrappers,
                             resolved_callee,
@@ -111,6 +113,7 @@ impl Infer {
                         instance.callable_ty,
                         instance.constraints,
                         Vec::new(),
+                        None,
                         param_capabilities,
                         0,
                         *member_span,
@@ -146,7 +149,16 @@ impl Infer {
                         pending_dict_args,
                     ) {
                         Ok(ty) => return Ok(ty),
-                        Err(_) => return Err(trait_err),
+                        Err(inherent_err)
+                            if matches!(
+                                inherent_err.error.as_ref(),
+                                TypeError::UnknownAssociatedFunction { .. }
+                                    | TypeError::InvalidInherentImplTarget(_)
+                            ) =>
+                        {
+                            return Err(trait_err);
+                        }
+                        Err(inherent_err) => return Err(inherent_err),
                     }
                 }
                 Err(err) => return Err(err),
@@ -190,6 +202,10 @@ impl Infer {
         {
             let scheme = info.scheme.clone();
             if !scheme.constraints.is_empty() {
+                // Qualified values need dictionary arguments attached during
+                // application. Inferring the callee expression first would strip
+                // the `Ty::Qualified` wrapper and lose the constraints before
+                // `apply_scheme_callable` can turn them into dict args.
                 if callee.id != NO_NODE_ID {
                     let instantiated = self.instantiate_value(&scheme);
                     self.metadata.record_symbol_type(callee.id, instantiated);
@@ -200,10 +216,14 @@ impl Infer {
                     arg_wrappers,
                     &scheme,
                     Vec::new(),
+                    None,
                     0,
                     dict_args,
                     pending_dict_args,
                 )?;
+                if applied.fresh_return && expr_id != NO_NODE_ID {
+                    self.metadata.mark_fresh_place(expr_id);
+                }
                 return Ok(applied.ret_ty);
             }
         }
@@ -227,6 +247,7 @@ impl Infer {
             callee_ty,
             callee_constraints,
             Vec::new(),
+            None,
             param_capabilities,
             0,
             expr_span,

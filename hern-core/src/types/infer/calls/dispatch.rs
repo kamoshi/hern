@@ -25,10 +25,12 @@ impl Infer {
             &trait_args,
             &determinant_indexes,
             env,
-            &self.impls.known_dicts,
+            &self.impls.active_dicts,
             &self.impls.known_schemes,
             &mut self.subst,
-        ) {
+        )
+        .map_err(SpannedTypeError::from)?
+        {
             let dict_name = dict_ref_concrete_name(&dict)
                 .expect(concrete_dict_expect)
                 .to_string();
@@ -135,7 +137,7 @@ impl Infer {
             trait_name,
             &target,
             env,
-            &self.impls.known_dicts,
+            &self.impls.active_dicts,
             &self.impls.known_schemes,
         )
         .map(DictResolution::Resolved)
@@ -189,7 +191,7 @@ impl Infer {
                     "Eq",
                     &resolved,
                     env,
-                    &self.impls.known_dicts,
+                    &self.impls.active_dicts,
                     &self.impls.known_schemes,
                 )
                 .ok_or_else(|| TypeError::MissingTraitImpl {
@@ -204,6 +206,7 @@ impl Infer {
     pub(in crate::types::infer) fn resolve_trait_method_call(
         &mut self,
         env: &TypeEnv,
+        callee_id: NodeId,
         args: &mut [Expr],
         arg_wrappers: &mut Vec<Option<ArgWrapper>>,
         resolved_callee: &mut Option<ResolvedCallee>,
@@ -248,6 +251,10 @@ impl Infer {
             }
             .into());
         }
+        let call_param_tys = arg_tys
+            .iter()
+            .map(|ty| self.subst.apply(ty))
+            .collect::<Vec<_>>();
 
         if first_param_has_trait_var {
             // ── First-arg dispatch ────────────────────────────────────────────
@@ -262,6 +269,8 @@ impl Infer {
                     let (ret_ty, resolved_var) = self.check_trait_method_signature_allow_pending(
                         &trait_def, &method, arg_tys, context,
                     )?;
+                    let ret_ty = self.subst.apply(&ret_ty);
+                    self.record_trait_method_callee_type(callee_id, call_param_tys, ret_ty.clone());
                     let pending = PendingDictArg {
                         var: resolved_var.unwrap_or(target_var),
                         trait_name: trait_name.clone(),
@@ -273,7 +282,7 @@ impl Infer {
                         pending.trait_name.clone(),
                     ));
                     *pending_trait_method = Some((pending, method_name));
-                    return Ok(self.subst.apply(&ret_ty));
+                    return Ok(ret_ty);
                 }
                 return Err(TypeError::UnresolvedTrait {
                     context: context.to_string(),
@@ -285,7 +294,7 @@ impl Infer {
                 &trait_name,
                 &resolved_target,
                 env,
-                &self.impls.known_dicts,
+                &self.impls.active_dicts,
                 &self.impls.known_schemes,
             ) else {
                 return Err(TypeError::MissingTraitImpl {
@@ -327,7 +336,9 @@ impl Infer {
                 dict,
                 method: method_name.clone(),
             });
-            Ok(self.subst.apply(&ret_ty))
+            let ret_ty = self.subst.apply(&ret_ty);
+            self.record_trait_method_callee_type(callee_id, call_param_tys, ret_ty.clone());
+            Ok(ret_ty)
         } else {
             // ── Abstract unification + pending dispatch ───────────────────────
             // Used for methods like `pure(a: 'a) -> 'f('a)` where the first
@@ -366,7 +377,13 @@ impl Infer {
                             pending.trait_name.clone(),
                         ));
                         *pending_trait_method = Some((pending, method_name));
-                        Ok(self.subst.apply(&ret_ty))
+                        let ret_ty = self.subst.apply(&ret_ty);
+                        self.record_trait_method_callee_type(
+                            callee_id,
+                            call_param_tys,
+                            ret_ty.clone(),
+                        );
+                        Ok(ret_ty)
                     }
                     _ => Err(TypeError::MissingTraitImpl {
                         trait_name: trait_name.clone(),
@@ -379,7 +396,7 @@ impl Infer {
                     &trait_name,
                     &resolved_target,
                     env,
-                    &self.impls.known_dicts,
+                    &self.impls.active_dicts,
                     &self.impls.known_schemes,
                 ) {
                     Some(dict) => {
@@ -387,7 +404,13 @@ impl Infer {
                             dict,
                             method: method_name.clone(),
                         });
-                        Ok(self.subst.apply(&ret_ty))
+                        let ret_ty = self.subst.apply(&ret_ty);
+                        self.record_trait_method_callee_type(
+                            callee_id,
+                            call_param_tys,
+                            ret_ty.clone(),
+                        );
+                        Ok(ret_ty)
                     }
                     None => Err(TypeError::MissingTraitImpl {
                         trait_name: trait_name.clone(),
@@ -396,6 +419,15 @@ impl Infer {
                     .into()),
                 }
             }
+        }
+    }
+
+    fn record_trait_method_callee_type(&mut self, callee_id: NodeId, params: Vec<Ty>, ret_ty: Ty) {
+        if callee_id != NO_NODE_ID {
+            self.record_symbol_type(
+                callee_id,
+                Ty::Func(value_func_params(params), value_func_return(ret_ty)),
+            );
         }
     }
 

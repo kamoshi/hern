@@ -250,7 +250,7 @@ impl Infer {
                 p,
                 &finalized.owned,
                 env,
-                &self.impls.known_dicts,
+                &self.impls.active_dicts,
                 &self.impls.known_schemes,
                 &self.subst,
             )
@@ -421,7 +421,7 @@ impl Infer {
                     p,
                     &finalized.owned,
                     env,
-                    &self.impls.known_dicts,
+                    &self.impls.active_dicts,
                     &self.impls.known_schemes,
                     &self.subst,
                 )
@@ -605,6 +605,7 @@ fn collect_type_vars(ty: &Type, vars: &mut HashSet<String>) {
         if let Type::Var(var) = node {
             vars.insert(var.clone());
         }
+        true
     });
 }
 

@@ -5,7 +5,10 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeError {
-    Mismatch(Ty, Ty),
+    Mismatch {
+        expected: Ty,
+        got: Ty,
+    },
     MismatchWithContext {
         context: Vec<TypeMismatchContext>,
         expected: Ty,
@@ -15,7 +18,10 @@ pub enum TypeError {
     UnboundVariable(String),
     ImmutableAssignment(String),
     ImmutablePlace(String),
-    ExpectedMutablePlace(String),
+    ExpectedMutablePlace {
+        subject: MutablePlaceSubject,
+        reason: MutablePlaceErrorReason,
+    },
     MutableParamMustBindName,
     MutableFunctionCapabilityMismatch,
     NotAFunction(Ty),
@@ -46,6 +52,10 @@ pub enum TypeError {
     },
     DuplicateOperator(String),
     DuplicateTestFunction(String),
+    InvalidTestFunction {
+        name: String,
+        message: String,
+    },
     DuplicateFunctionInGroup(String),
     MissingTraitMethod {
         trait_name: String,
@@ -61,6 +71,10 @@ pub enum TypeError {
     TraitMethodMissingTarget {
         trait_name: String,
         method: String,
+    },
+    DuplicateTypeParameter {
+        owner: String,
+        param: String,
     },
     DuplicateTypeTraitName(String),
     ExtraTraitMethod {
@@ -85,15 +99,33 @@ pub enum TypeError {
         type_name: String,
         variant: String,
     },
+    UnknownPatternConstructor {
+        constructor: String,
+        scrutinee: Ty,
+    },
     TypeAliasArityMismatch {
         name: String,
         expected: usize,
         got: usize,
     },
-    RecursiveTypeAlias(String),
+    TypeConstructorArityMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
+    DuplicateRecordField(String),
+    RecursiveTypeAlias {
+        name: String,
+        cycle: Vec<String>,
+    },
     MissingTraitImpl {
         trait_name: String,
         impl_target: String,
+    },
+    AmbiguousTraitImpl {
+        trait_name: String,
+        impl_target: String,
+        candidates: Vec<String>,
     },
     AmbiguousTraitMethod {
         method: String,
@@ -138,12 +170,38 @@ pub enum TypeError {
         target: String,
         method: String,
     },
+    DerivedImplFailure {
+        trait_name: String,
+        error: Box<TypeError>,
+    },
     /// A refutable pattern was used in a function-parameter position.
     /// Only irrefutable patterns (variable, wildcard, record, `[..rest]`) are allowed.
     RefutableParamPattern,
     /// A refutable pattern was used in a `let` binding.
     /// Only irrefutable patterns are allowed here; use `match` for refutable ones.
     RefutableLetPattern,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MutablePlaceSubject {
+    Argument(usize),
+    ReturnValue,
+}
+
+impl fmt::Display for MutablePlaceSubject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MutablePlaceSubject::Argument(idx) => write!(f, "argument {}", idx),
+            MutablePlaceSubject::ReturnValue => write!(f, "return value"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MutablePlaceErrorReason {
+    NotAPlace,
+    NotMutable(String),
+    NotFresh,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +238,7 @@ impl TypeError {
 
     pub fn with_mismatch_context(self, context: TypeMismatchContext) -> Self {
         match self {
-            TypeError::Mismatch(expected, got) => TypeError::MismatchWithContext {
+            TypeError::Mismatch { expected, got } => TypeError::MismatchWithContext {
                 context: vec![context],
                 expected,
                 got,
@@ -215,6 +273,18 @@ impl fmt::Display for TypeMismatchContext {
             TypeMismatchContext::RangeStart => write!(f, "range start bound"),
             TypeMismatchContext::RangeEnd => write!(f, "range end bound"),
         }
+    }
+}
+
+fn format_candidates(candidates: &[String]) -> String {
+    if candidates.is_empty() {
+        "none".to_string()
+    } else {
+        candidates
+            .iter()
+            .map(|candidate| format!("`{}`", candidate))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -266,11 +336,20 @@ fn display_mismatch_types(expected: &Ty, got: &Ty) -> (String, String) {
     )
 }
 
+fn display_ty_for_error(ty: &Ty) -> String {
+    let names: HashMap<_, _> = free_type_vars_in_display_order(ty)
+        .into_iter()
+        .enumerate()
+        .map(|(index, var)| (var, type_var_name(index)))
+        .collect();
+    display_ty_with_var_names(ty, &names)
+}
+
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TypeError::Mismatch(t1, t2) => {
-                let (expected, got) = display_mismatch_types(t1, t2);
+            TypeError::Mismatch { expected, got } => {
+                let (expected, got) = display_mismatch_types(expected, got);
                 write!(f, "type mismatch: expected `{}`, got `{}`", expected, got)
             }
             TypeError::MismatchWithContext {
@@ -292,7 +371,11 @@ impl fmt::Display for TypeError {
                 write!(f, ": expected `{}`, got `{}`", expected, got)
             }
             TypeError::OccursCheck(v) => {
-                write!(f, "infinite type: '{} occurs in its own definition", v)
+                write!(
+                    f,
+                    "infinite type: type variable `{}` occurs in its own definition",
+                    format!("'{}", type_var_name(*v as usize))
+                )
             }
             TypeError::UnboundVariable(name) => write!(f, "unbound variable: `{}`", name),
             TypeError::ImmutableAssignment(name) => {
@@ -305,7 +388,16 @@ impl fmt::Display for TypeError {
                     name
                 )
             }
-            TypeError::ExpectedMutablePlace(message) => write!(f, "{}", message),
+            TypeError::ExpectedMutablePlace { subject, reason } => {
+                write!(f, "{} must be a mutable place", subject)?;
+                match reason {
+                    MutablePlaceErrorReason::NotAPlace => Ok(()),
+                    MutablePlaceErrorReason::NotMutable(name) => {
+                        write!(f, ", but `{}` is not mutable", name)
+                    }
+                    MutablePlaceErrorReason::NotFresh => write!(f, " created by this expression"),
+                }
+            }
             TypeError::MutableParamMustBindName => {
                 write!(f, "mutable place parameters must bind a single name")
             }
@@ -313,7 +405,19 @@ impl fmt::Display for TypeError {
                 f,
                 "mutable function parameter requirements are incompatible with this function type"
             ),
-            TypeError::NotAFunction(ty) => write!(f, "expected a function, got `{}`", ty),
+            TypeError::NotAFunction(ty) => {
+                let vars = free_type_vars_in_display_order(ty);
+                let names: HashMap<_, _> = vars
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, var)| (var, type_var_name(index)))
+                    .collect();
+                write!(
+                    f,
+                    "expected a function, got `{}`",
+                    display_ty_with_var_names(ty, &names)
+                )
+            }
             TypeError::ArityMismatch { expected, got } => {
                 write!(
                     f,
@@ -367,6 +471,9 @@ impl fmt::Display for TypeError {
             TypeError::DuplicateTestFunction(name) => {
                 write!(f, "test function `{}` is defined multiple times", name)
             }
+            TypeError::InvalidTestFunction { name, message } => {
+                write!(f, "invalid test function `{}`: {}", name, message)
+            }
             TypeError::DuplicateFunctionInGroup(name) => {
                 write!(
                     f,
@@ -398,6 +505,13 @@ impl fmt::Display for TypeError {
                 "trait method `{}` in trait `{}` must mention a trait parameter",
                 method, trait_name
             ),
+            TypeError::DuplicateTypeParameter { owner, param } => {
+                write!(
+                    f,
+                    "type `{}` declares duplicate type parameter `{}`",
+                    owner, param
+                )
+            }
             TypeError::DuplicateTypeTraitName(name) => write!(
                 f,
                 "name `{}` is already defined as both a type and a trait in this scope",
@@ -430,6 +544,15 @@ impl fmt::Display for TypeError {
             TypeError::UnknownVariant { type_name, variant } => {
                 write!(f, "type `{}` has no variant `{}`", type_name, variant)
             }
+            TypeError::UnknownPatternConstructor {
+                constructor,
+                scrutinee,
+            } => write!(
+                f,
+                "cannot resolve constructor `{}` for scrutinee type `{}`; expected a nominal type",
+                constructor,
+                display_ty_for_error(scrutinee)
+            ),
             TypeError::TypeAliasArityMismatch {
                 name,
                 expected,
@@ -442,11 +565,36 @@ impl fmt::Display for TypeError {
                 if *expected == 1 { "" } else { "s" },
                 got
             ),
-            TypeError::RecursiveTypeAlias(name) => write!(
+            TypeError::TypeConstructorArityMismatch {
+                name,
+                expected,
+                got,
+            } => write!(
                 f,
-                "recursive type alias `{}` is not supported; use a nominal type constructor instead",
-                name
+                "type constructor `{}` expects {} type argument{}, got {}",
+                name,
+                expected,
+                if *expected == 1 { "" } else { "s" },
+                got
             ),
+            TypeError::DuplicateRecordField(name) => {
+                write!(f, "duplicate record field `{}`", name)
+            }
+            TypeError::RecursiveTypeAlias { name, cycle } => {
+                if cycle.is_empty() {
+                    write!(
+                        f,
+                        "recursive type alias `{}` is not supported; use a nominal type constructor instead",
+                        name
+                    )
+                } else {
+                    write!(
+                        f,
+                        "recursive type alias cycle `{}` is not supported; use a nominal type constructor instead",
+                        cycle.join(" -> ")
+                    )
+                }
+            }
             TypeError::MissingTraitImpl {
                 trait_name,
                 impl_target,
@@ -455,14 +603,27 @@ impl fmt::Display for TypeError {
                 "trait `{}` is not implemented for `{}`",
                 trait_name, impl_target
             ),
-            TypeError::AmbiguousTraitMethod { method, candidates } => write!(
-                f,
-                "ambiguous method `{}`: defined in multiple traits ({}); \
-                 use explicit TraitName::{}() syntax to disambiguate",
-                method,
-                candidates.join(", "),
-                method,
-            ),
+            TypeError::AmbiguousTraitImpl {
+                trait_name,
+                impl_target,
+                candidates,
+            } => {
+                let candidates = format_candidates(candidates);
+                write!(
+                    f,
+                    "ambiguous impl for trait `{}` on `{}` ({})",
+                    trait_name, impl_target, candidates
+                )
+            }
+            TypeError::AmbiguousTraitMethod { method, candidates } => {
+                let candidates = format_candidates(candidates);
+                write!(
+                    f,
+                    "ambiguous method `{}`: defined in multiple traits ({}); \
+                     use explicit TraitName::{}() syntax to disambiguate",
+                    method, candidates, method,
+                )
+            }
             TypeError::UnknownMethod { receiver, method } => {
                 write!(f, "type `{}` has no method `{}`", receiver, method)
             }
@@ -476,13 +637,11 @@ impl fmt::Display for TypeError {
                 } else {
                     ""
                 };
+                let candidates = format_candidates(candidates);
                 write!(
                     f,
                     "type `{}` has no method `{}`{}; available candidates: {}",
-                    receiver,
-                    method,
-                    note,
-                    candidates.join(", ")
+                    receiver, method, note, candidates
                 )
             }
             TypeError::UnknownMethodOnUnresolvedArray {
@@ -490,12 +649,11 @@ impl fmt::Display for TypeError {
                 method,
                 candidates,
             } => {
+                let candidates = format_candidates(candidates);
                 write!(
                     f,
                     "type `{}` has no method `{}`; the array element type is unknown, so Hern cannot choose a specialized method; available candidates: {}; add an element type annotation such as `[int]` or `[float]`",
-                    receiver,
-                    method,
-                    candidates.join(", ")
+                    receiver, method, candidates
                 )
             }
             TypeError::InvalidTraitImplTarget(target) => write!(
@@ -540,6 +698,9 @@ impl fmt::Display for TypeError {
                 "inherent method `{}` for `{}` must have a first receiver parameter",
                 method, target
             ),
+            TypeError::DerivedImplFailure { trait_name, error } => {
+                write!(f, "derived `{}` impl failed: {}", trait_name, error)
+            }
             TypeError::RefutableParamPattern => write!(
                 f,
                 "refutable pattern in function parameter: only variable, wildcard, record, and \
@@ -551,5 +712,64 @@ impl fmt::Display for TypeError {
                  rest-list patterns are allowed here; use match instead"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FuncParam, FuncReturn};
+
+    #[test]
+    fn display_occurs_check_uses_stable_type_var_name() {
+        assert_eq!(
+            TypeError::OccursCheck(0).to_string(),
+            "infinite type: type variable `'a` occurs in its own definition"
+        );
+    }
+
+    #[test]
+    fn display_not_a_function_with_type_var_uses_stable_name() {
+        assert_eq!(
+            TypeError::NotAFunction(Ty::Func(
+                vec![FuncParam::value(Ty::Var(7))],
+                FuncReturn::value(Ty::Var(7)),
+            ))
+            .to_string(),
+            "expected a function, got `fn('a) -> 'a`"
+        );
+    }
+
+    #[test]
+    fn display_expected_mutable_place_formats_structured_reason() {
+        assert_eq!(
+            TypeError::ExpectedMutablePlace {
+                subject: MutablePlaceSubject::Argument(2),
+                reason: MutablePlaceErrorReason::NotMutable("value".to_string()),
+            }
+            .to_string(),
+            "argument 2 must be a mutable place, but `value` is not mutable"
+        );
+        assert_eq!(
+            TypeError::ExpectedMutablePlace {
+                subject: MutablePlaceSubject::ReturnValue,
+                reason: MutablePlaceErrorReason::NotFresh,
+            }
+            .to_string(),
+            "return value must be a mutable place created by this expression"
+        );
+    }
+
+    #[test]
+    fn display_empty_method_candidate_list_is_guarded() {
+        assert_eq!(
+            TypeError::UnknownMethodWithCandidates {
+                receiver: "int".to_string(),
+                method: "missing".to_string(),
+                candidates: vec![],
+            }
+            .to_string(),
+            "type `int` has no method `missing`; available candidates: none"
+        );
     }
 }

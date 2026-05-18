@@ -734,7 +734,13 @@ impl IndexBuilder {
                         });
                 }
             }
-            ExprKind::AssociatedAccess { .. } => {}
+            ExprKind::AssociatedAccess {
+                member,
+                member_span,
+                ..
+            } => {
+                self.reference(member, *member_span);
+            }
             ExprKind::Index { receiver, key, .. } => {
                 self.index_expr(receiver);
                 self.index_expr(key);

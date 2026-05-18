@@ -22,7 +22,6 @@ pub(crate) enum EntryKind {
 pub(crate) struct App {
     pub(crate) input: String,
     pub(crate) cursor: usize,
-    pub(crate) enhanced_keys: bool,
     pub(crate) type_hint: Option<String>,
     pub(crate) completions: Vec<BindingInfo>,
     hints_dirty: bool,
@@ -47,11 +46,10 @@ pub(crate) enum EventAction {
 }
 
 impl App {
-    pub(crate) fn new(path: Option<&Path>, enhanced_keys: bool) -> Result<Self> {
+    pub(crate) fn new(path: Option<&Path>) -> Result<Self> {
         Ok(Self {
             input: String::new(),
             cursor: 0,
-            enhanced_keys,
             type_hint: None,
             completions: Vec::new(),
             hints_dirty: true,
@@ -472,11 +470,20 @@ fn completion_score(binding: &BindingInfo, prefix: &str) -> Option<(u8, usize)> 
     }
 }
 
-pub(crate) fn startup_entries(path: Option<&Path>) -> Vec<Entry> {
+pub(crate) fn startup_entries(
+    path: Option<&Path>,
+    keyboard_enhancement_error: Option<&str>,
+) -> Vec<Entry> {
     let mut entries = vec![Entry {
         kind: EntryKind::Info,
-        text: "Hern REPL. Enter evaluates, Shift+Enter inserts a newline, Up/Down browse history, Ctrl-D exits.".to_string(),
+        text: "Hern REPL. Enter evaluates, Ctrl-J inserts a newline, Up/Down browse history, Ctrl-D exits.".to_string(),
     }];
+    if let Some(error) = keyboard_enhancement_error {
+        entries.push(Entry {
+            kind: EntryKind::Info,
+            text: format!("Enhanced keyboard reporting unavailable: {error}"),
+        });
+    }
     if let Some(path) = path {
         entries.push(Entry {
             kind: EntryKind::Info,
@@ -492,7 +499,7 @@ mod tests {
 
     #[test]
     fn insert_newline_preserves_cursor_position() {
-        let mut app = App::new(None, false).expect("app should initialize");
+        let mut app = App::new(None).expect("app should initialize");
         app.insert_char('a');
         app.insert_char('c');
         app.cursor = 1;
@@ -504,7 +511,7 @@ mod tests {
 
     #[test]
     fn history_navigation_restores_draft_after_newest_entry() {
-        let mut app = App::new(None, false).expect("app should initialize");
+        let mut app = App::new(None).expect("app should initialize");
         app.history.push("let x = 1".to_string());
         app.history.push("x + 1".to_string());
         app.input = "dra".to_string();
@@ -523,7 +530,7 @@ mod tests {
 
     #[test]
     fn shift_enter_with_extra_modifiers_inserts_newline() {
-        let mut app = App::new(None, false).expect("app should initialize");
+        let mut app = App::new(None).expect("app should initialize");
         app.insert_char('a');
 
         let action = handle_key(
@@ -569,7 +576,7 @@ mod tests {
 
     #[test]
     fn editing_keeps_multibyte_input_on_char_boundaries() {
-        let mut app = App::new(None, false).expect("app should initialize");
+        let mut app = App::new(None).expect("app should initialize");
         app.insert_char('é');
         app.insert_char('x');
 
@@ -585,7 +592,7 @@ mod tests {
 
     #[test]
     fn delete_removes_one_multibyte_char() {
-        let mut app = App::new(None, false).expect("app should initialize");
+        let mut app = App::new(None).expect("app should initialize");
         app.insert_char('é');
         app.insert_char('x');
         app.cursor = 0;

@@ -65,7 +65,7 @@ impl Infer {
         expected_param: Option<&FuncParam>,
     ) -> Result<(Ty, Option<ArgWrapper>), SpannedTypeError> {
         let inferred = if let Some(expected_param) = expected_param
-            && matches!(arg.kind, ExprKind::Lambda { .. })
+            && is_lambda_or_grouped_lambda(arg)
         {
             self.infer_expr_expected(env, arg, expected_param.ty.clone())?
         } else {
@@ -93,7 +93,7 @@ impl Infer {
             };
             attach_dict_args(
                 env,
-                &self.impls.known_dicts,
+                &self.impls.active_dicts,
                 &self.impls.known_schemes,
                 &mut wrapper.dict_args,
                 &mut wrapper.pending_dict_args,
@@ -117,15 +117,18 @@ impl Infer {
         arg_wrappers: &mut Vec<Option<ArgWrapper>>,
         scheme: &Scheme,
         leading_arg_tys: Vec<Ty>,
+        leading_arg_span: Option<SourceSpan>,
         param_offset: usize,
         dict_args: &mut Vec<DictRef>,
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<AppliedSchemeCall, SpannedTypeError> {
         let instantiated = self.instantiate_scheme(scheme);
-        let expected_params = match &instantiated.ty {
-            Ty::Func(params, _) => params.clone(),
-            _ => Vec::new(),
+        let fresh_return = func_return_capability(&instantiated.ty) == ReturnCapability::FreshPlace;
+        let callable_params = match &instantiated.ty {
+            Ty::Func(params, _) => Some(params.clone()),
+            _ => None,
         };
+        let expected_params = callable_params.as_deref().unwrap_or(&[]);
         let mut arg_tys = leading_arg_tys;
         for (idx, leading_ty) in arg_tys.iter().enumerate() {
             if let Some(expected_param) = expected_params.get(idx) {
@@ -133,16 +136,19 @@ impl Infer {
                     &mut self.subst,
                     leading_ty.clone(),
                     expected_param.ty.clone(),
-                )?;
+                )
+                .map_err(|err| span_leading_arg_error(err, leading_arg_span))?;
             }
         }
         arg_tys.extend(self.infer_checked_args_with_expected(
             env,
             args,
             arg_wrappers,
-            &expected_params,
+            expected_params,
             param_offset,
         )?);
+        let arity_span = args.first().map(|arg| arg.span).or(leading_arg_span);
+        ensure_callable_arity(callable_params.as_deref(), arg_tys.len(), arity_span)?;
         let ret_ty = Ty::Var(self.fresh_var());
         let expected_params = expected_func_params(&instantiated.ty, arg_tys.clone());
         let expected_ret = expected_func_return(&instantiated.ty, ret_ty.clone());
@@ -153,7 +159,7 @@ impl Infer {
         )?;
         attach_dict_args(
             env,
-            &self.impls.known_dicts,
+            &self.impls.active_dicts,
             &self.impls.known_schemes,
             dict_args,
             pending_dict_args,
@@ -165,6 +171,7 @@ impl Infer {
         Ok(AppliedSchemeCall {
             ret_ty: self.subst.apply(&ret_ty),
             arg_tys,
+            fresh_return,
         })
     }
 
@@ -177,6 +184,7 @@ impl Infer {
         callable_ty: Ty,
         constraints: Vec<TraitConstraint>,
         leading_arg_tys: Vec<Ty>,
+        leading_arg_span: Option<SourceSpan>,
         param_capabilities: Vec<ParamCapability>,
         param_offset: usize,
         dict_error_span: SourceSpan,
@@ -184,28 +192,34 @@ impl Infer {
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<AppliedCall, SpannedTypeError> {
         let fresh_return = func_return_capability(&callable_ty) == ReturnCapability::FreshPlace;
-        let expected_params = match &callable_ty {
-            Ty::Func(params, _) => params.clone(),
-            _ => Vec::new(),
+        let callable_params = match &callable_ty {
+            Ty::Func(params, _) => Some(params.clone()),
+            _ => None,
         };
+        let known_params = callable_params.as_deref().unwrap_or(&[]);
         let mut arg_tys = leading_arg_tys;
         for (idx, leading_ty) in arg_tys.iter().enumerate() {
-            if let Some(expected_param) = expected_params.get(idx) {
+            if let Some(expected_param) = known_params.get(idx) {
                 unify(
                     &mut self.subst,
                     leading_ty.clone(),
                     expected_param.ty.clone(),
-                )?;
+                )
+                .map_err(|err| span_leading_arg_error(err, leading_arg_span))?;
             }
         }
         arg_tys.extend(self.infer_checked_args_with_expected(
             env,
             args,
             arg_wrappers,
-            &expected_params,
+            known_params,
             param_offset,
         )?);
-        if expected_params.is_empty() {
+        let arity_span = args.first().map(|arg| arg.span).or(leading_arg_span);
+        ensure_callable_arity(callable_params.as_deref(), arg_tys.len(), arity_span)?;
+        // Unknown callable shapes cannot supply per-parameter capabilities above,
+        // so use the metadata gathered while inferring the callee expression.
+        if callable_params.is_none() {
             self.check_mutable_place_args_from(env, args, &param_capabilities, param_offset)?;
         }
         let ret_ty = Ty::Var(self.fresh_var());
@@ -216,7 +230,7 @@ impl Infer {
         unify(&mut self.subst, callable_ty, call_ty.clone())?;
         attach_dict_args(
             env,
-            &self.impls.known_dicts,
+            &self.impls.active_dicts,
             &self.impls.known_schemes,
             dict_args,
             pending_dict_args,
@@ -241,6 +255,11 @@ impl Infer {
         pending_dict_args: &mut Vec<PendingDictArg>,
     ) -> Result<Ty, SpannedTypeError> {
         let instantiated = self.instantiate_scheme(scheme);
+        let callable_params = match &instantiated.ty {
+            Ty::Func(params, _) => Some(params.as_slice()),
+            _ => None,
+        };
+        ensure_callable_arity(callable_params, arg_tys.len(), None)?;
         let ret_ty = Ty::Var(self.fresh_var());
         let expected_params = expected_func_params(&instantiated.ty, arg_tys);
         let expected_ret = expected_func_return(&instantiated.ty, ret_ty.clone());
@@ -251,7 +270,7 @@ impl Infer {
         )?;
         attach_dict_args(
             env,
-            &self.impls.known_dicts,
+            &self.impls.active_dicts,
             &self.impls.known_schemes,
             dict_args,
             pending_dict_args,
@@ -261,6 +280,41 @@ impl Infer {
         )
         .map_err(TypeError::unspanned)?;
         Ok(self.subst.apply(&ret_ty))
+    }
+}
+
+fn is_lambda_or_grouped_lambda(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Lambda { .. } => true,
+        ExprKind::Grouped(inner) => is_lambda_or_grouped_lambda(inner),
+        _ => false,
+    }
+}
+
+fn ensure_callable_arity(
+    expected_params: Option<&[FuncParam]>,
+    got: usize,
+    span: Option<SourceSpan>,
+) -> Result<(), SpannedTypeError> {
+    if let Some(expected_params) = expected_params
+        && expected_params.len() != got
+    {
+        let err = TypeError::ArityMismatch {
+            expected: expected_params.len(),
+            got,
+        };
+        return Err(match span {
+            Some(span) => err.at(span),
+            None => err.into(),
+        });
+    }
+    Ok(())
+}
+
+fn span_leading_arg_error(err: TypeError, span: Option<SourceSpan>) -> SpannedTypeError {
+    match span {
+        Some(span) => err.at(span),
+        None => err.into(),
     }
 }
 

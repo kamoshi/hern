@@ -30,12 +30,21 @@ pub(super) struct FinalizedTypeMaps {
     pub(super) fresh_place_exprs: HashSet<NodeId>,
 }
 
+#[derive(Debug)]
 pub(super) struct FailedStatementMetadata {
+    // Recovery keeps callee/callable metadata from failed statements so editor
+    // diagnostics and code actions can still explain the failing call. Binding
+    // and definition metadata is dropped because the failed statement's names
+    // are removed from the surviving environment.
     pub(super) symbol_types: HashMap<NodeId, Ty>,
     pub(super) callable_capabilities: HashMap<NodeId, CallableCapabilities>,
 }
 
+#[derive(Debug)]
 pub(super) struct TypeMetadataSnapshot {
+    // Statement recovery snapshots keys only. Inference metadata is expected to
+    // be insert-only for a given AST node/span during one statement attempt; if
+    // a future path overwrites existing keys, this must become value snapshots.
     expr_type_keys: Vec<NodeId>,
     symbol_type_keys: Vec<NodeId>,
     binding_type_keys: Vec<SourceSpan>,
@@ -57,23 +66,27 @@ impl TypeMetadata {
     }
 
     pub(super) fn record_expr_type(&mut self, node_id: NodeId, ty: Ty) {
-        if node_id != NO_NODE_ID {
+        if is_real_node_id(node_id) {
             self.expr_types.insert(node_id, ty);
         }
     }
 
     pub(super) fn record_symbol_type(&mut self, node_id: NodeId, ty: Ty) {
-        if node_id != NO_NODE_ID {
+        if is_real_node_id(node_id) {
             self.symbol_types.insert(node_id, ty);
         }
     }
 
     pub(super) fn record_binding_type(&mut self, span: SourceSpan, ty: Ty) {
-        self.binding_types.insert(span, ty);
+        if is_source_span(span) {
+            self.binding_types.insert(span, ty);
+        }
     }
 
     pub(super) fn record_definition_scheme(&mut self, span: SourceSpan, scheme: Scheme) {
-        self.definition_schemes.insert(span, scheme);
+        if is_source_span(span) {
+            self.definition_schemes.insert(span, scheme);
+        }
     }
 
     pub(super) fn record_binding_capability(
@@ -81,7 +94,9 @@ impl TypeMetadata {
         span: SourceSpan,
         capability: BindingCapabilities,
     ) {
-        self.binding_capabilities.insert(span, capability);
+        if is_source_span(span) {
+            self.binding_capabilities.insert(span, capability);
+        }
     }
 
     pub(super) fn record_callable_capabilities(
@@ -89,7 +104,7 @@ impl TypeMetadata {
         node_id: NodeId,
         param_capabilities: Vec<ParamCapability>,
     ) {
-        if node_id != NO_NODE_ID {
+        if is_real_node_id(node_id) {
             self.callable_capabilities
                 .insert(node_id, CallableCapabilities { param_capabilities });
         }
@@ -107,7 +122,7 @@ impl TypeMetadata {
     }
 
     pub(super) fn mark_fresh_place(&mut self, node_id: NodeId) {
-        if node_id != NO_NODE_ID {
+        if is_real_node_id(node_id) {
             self.fresh_place_exprs.insert(node_id);
         }
     }
@@ -127,7 +142,10 @@ impl TypeMetadata {
             self.expr_types.len()
                 + self.symbol_types.len()
                 + self.binding_types.len()
-                + self.definition_schemes.len(),
+                + self.definition_schemes.len()
+                + self.binding_capabilities.len()
+                + self.callable_capabilities.len()
+                + self.fresh_place_exprs.len(),
         );
         FinalizedTypeMaps {
             expr_types: self
@@ -210,6 +228,14 @@ impl TypeMetadata {
         );
         retain_set_keys(&mut self.fresh_place_exprs, snapshot.fresh_place_expr_keys);
     }
+}
+
+fn is_real_node_id(node_id: NodeId) -> bool {
+    node_id != NO_NODE_ID
+}
+
+fn is_source_span(span: SourceSpan) -> bool {
+    !span.is_synthetic()
 }
 
 fn retain_map_keys<K, V>(map: &mut HashMap<K, V>, snapshot_keys: Vec<K>)

@@ -64,20 +64,13 @@ impl Infer {
                             })
                     })
                     .collect::<Result<_, _>>()?;
+                let ret_ty = self.ast_to_ty_with_vars_inner(&ret.ty, param_vars, alias_stack)?;
                 Ty::Func(
                     param_tys,
                     if ret.mut_place {
-                        FuncReturn::fresh_place(self.ast_to_ty_with_vars_inner(
-                            &ret.ty,
-                            param_vars,
-                            alias_stack,
-                        )?)
+                        FuncReturn::fresh_place(ret_ty)
                     } else {
-                        value_func_return(self.ast_to_ty_with_vars_inner(
-                            &ret.ty,
-                            param_vars,
-                            alias_stack,
-                        )?)
+                        value_func_return(ret_ty)
                     },
                 )
             }
@@ -97,6 +90,16 @@ impl Infer {
                         substituted = subst_hkt_param(&substituted, param, arg);
                     }
                     return self.expand_type_alias(name, &substituted, param_vars, alias_stack);
+                }
+                if let Type::Ident(name) = &**con
+                    && let Some(expected) = self.types.constructor_arities.get(name).copied()
+                    && expected != args.len()
+                {
+                    return Err(TypeError::TypeConstructorArityMismatch {
+                        name: name.clone(),
+                        expected,
+                        got: args.len(),
+                    });
                 }
                 let con_ty = self.ast_to_ty_with_vars_inner(con, param_vars, alias_stack)?;
                 let arg_tys = args
@@ -119,6 +122,13 @@ impl Infer {
                     })
                     .collect::<Result<_, _>>()?;
                 field_tys.sort_by(|(a, _), (b, _)| a.cmp(b));
+                if let Some((name, _)) = field_tys
+                    .windows(2)
+                    .find(|pair| pair[0].0 == pair[1].0)
+                    .map(|pair| pair[0].clone())
+                {
+                    return Err(TypeError::DuplicateRecordField(name));
+                }
                 let tail = if *is_open { self.fresh_ty() } else { Ty::Unit };
                 Ty::Record(Row {
                     fields: field_tys,
@@ -137,8 +147,13 @@ impl Infer {
         param_vars: &mut HashMap<String, TyVar>,
         alias_stack: &mut Vec<String>,
     ) -> Result<Ty, TypeError> {
-        if alias_stack.iter().any(|alias| alias == name) {
-            return Err(TypeError::RecursiveTypeAlias(name.to_string()));
+        if let Some(start) = alias_stack.iter().position(|alias| alias == name) {
+            let mut cycle = alias_stack[start..].to_vec();
+            cycle.push(name.to_string());
+            return Err(TypeError::RecursiveTypeAlias {
+                name: name.to_string(),
+                cycle,
+            });
         }
 
         alias_stack.push(name.to_string());
