@@ -1,0 +1,5 @@
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  Ok(syntax_children("not syntax"))
+}
+
+bad!(ignored)

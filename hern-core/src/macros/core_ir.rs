@@ -77,11 +77,6 @@ pub(super) enum CoreExprKind {
         receiver: Box<CoreExpr>,
         key: Box<CoreExpr>,
     },
-    Binary {
-        lhs: Box<CoreExpr>,
-        op: CoreBinaryOp,
-        rhs: Box<CoreExpr>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +94,7 @@ pub(super) enum CoreStmtKind {
 #[derive(Debug, Clone)]
 pub(super) enum CoreCallee {
     Ident(String),
+    Intrinsic(CoreIntrinsic),
     Expr(Box<CoreExpr>),
     Method {
         receiver: Box<CoreExpr>,
@@ -114,7 +110,9 @@ pub(super) enum CoreAssignTarget {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum CoreBinaryOp {
+pub(super) enum CoreIntrinsic {
+    Not,
+    Neg,
     Eq,
     NotEq,
     And,
@@ -227,12 +225,19 @@ fn lower_expr(expr: &Expr) -> Result<CoreExpr, MacroRuntimeError> {
             receiver: Box::new(lower_expr(receiver)?),
             key: Box::new(lower_expr(key)?),
         },
-        ExprKind::Binary { lhs, op, rhs, .. } => CoreExprKind::Binary {
-            lhs: Box::new(lower_expr(lhs)?),
-            op: lower_binary_op(op).ok_or_else(|| {
+        ExprKind::Not(inner) => CoreExprKind::Call {
+            callee: CoreCallee::Intrinsic(CoreIntrinsic::Not),
+            args: vec![lower_expr(inner)?],
+        },
+        ExprKind::Neg { operand, .. } => CoreExprKind::Call {
+            callee: CoreCallee::Intrinsic(CoreIntrinsic::Neg),
+            args: vec![lower_expr(operand)?],
+        },
+        ExprKind::Binary { lhs, op, rhs, .. } => CoreExprKind::Call {
+            callee: CoreCallee::Intrinsic(lower_binary_intrinsic(op).ok_or_else(|| {
                 MacroRuntimeError::new(expr.span, "unsupported macro-phase binary operator")
-            })?,
-            rhs: Box::new(lower_expr(rhs)?),
+            })?),
+            args: vec![lower_expr(lhs)?, lower_expr(rhs)?],
         },
         _ => {
             return Err(MacroRuntimeError::new(
@@ -310,18 +315,18 @@ fn lower_assign_target(target: &Expr) -> CoreAssignTarget {
     }
 }
 
-fn lower_binary_op(op: &BinOp) -> Option<CoreBinaryOp> {
+fn lower_binary_intrinsic(op: &BinOp) -> Option<CoreIntrinsic> {
     match op {
-        BinOp::Custom(op) if op == "==" => Some(CoreBinaryOp::Eq),
-        BinOp::Custom(op) if op == "!=" => Some(CoreBinaryOp::NotEq),
-        BinOp::Custom(op) if op == "&&" => Some(CoreBinaryOp::And),
-        BinOp::Custom(op) if op == "||" => Some(CoreBinaryOp::Or),
-        BinOp::Custom(op) if op == "+" => Some(CoreBinaryOp::Add),
-        BinOp::Custom(op) if op == "-" => Some(CoreBinaryOp::Sub),
-        BinOp::Custom(op) if op == "<" => Some(CoreBinaryOp::Lt),
-        BinOp::Custom(op) if op == "<=" => Some(CoreBinaryOp::Le),
-        BinOp::Custom(op) if op == ">" => Some(CoreBinaryOp::Gt),
-        BinOp::Custom(op) if op == ">=" => Some(CoreBinaryOp::Ge),
+        BinOp::Custom(op) if op == "==" => Some(CoreIntrinsic::Eq),
+        BinOp::Custom(op) if op == "!=" => Some(CoreIntrinsic::NotEq),
+        BinOp::Custom(op) if op == "&&" => Some(CoreIntrinsic::And),
+        BinOp::Custom(op) if op == "||" => Some(CoreIntrinsic::Or),
+        BinOp::Custom(op) if op == "+" => Some(CoreIntrinsic::Add),
+        BinOp::Custom(op) if op == "-" => Some(CoreIntrinsic::Sub),
+        BinOp::Custom(op) if op == "<" => Some(CoreIntrinsic::Lt),
+        BinOp::Custom(op) if op == "<=" => Some(CoreIntrinsic::Le),
+        BinOp::Custom(op) if op == ">" => Some(CoreIntrinsic::Gt),
+        BinOp::Custom(op) if op == ">=" => Some(CoreIntrinsic::Ge),
         _ => None,
     }
 }
@@ -357,6 +362,8 @@ mod tests {
 macro demo(input: Syntax) -> MacroResult(Syntax) {
   let xs = [1, 2];
   let pair = (xs[0], #{ name: "hern" });
+  let flag = !(1 == 2);
+  let neg = -1;
   let count = 0;
   loop {
     break count;

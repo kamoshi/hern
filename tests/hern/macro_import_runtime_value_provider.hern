@@ -1,0 +1,8 @@
+let dep = import "macro_import_runtime_value_dep";
+
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  let value = dep.value();
+  Ok(input)
+}
+
+#{}

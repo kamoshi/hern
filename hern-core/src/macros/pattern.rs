@@ -6,7 +6,7 @@ use crate::syntax::{
 use std::collections::HashMap;
 
 use super::diagnostics::{MacroRuntimeError, pattern_span};
-use super::source::{sequence_syntax, syntax_nodes_source, syntax_shape_eq, syntax_token_eq};
+use super::source::{sequence_syntax, syntax_shape_eq, syntax_token_eq};
 use super::value::{MacroEnv, MacroValue};
 
 pub(super) fn match_macro_pattern(
@@ -16,8 +16,110 @@ pub(super) fn match_macro_pattern(
 ) -> Result<bool, MacroRuntimeError> {
     match pattern {
         Pattern::Wildcard => Ok(true),
+        Pattern::StringLit(expected) => {
+            Ok(matches!(value, MacroValue::String(actual) if actual == expected))
+        }
+        Pattern::NumberLit(crate::lex::NumberLiteral::Int(expected)) => {
+            Ok(matches!(value, MacroValue::Int(actual) if actual == expected))
+        }
+        Pattern::NumberLit(crate::lex::NumberLiteral::Float(expected)) => {
+            Ok(matches!(value, MacroValue::Float(actual) if actual == expected))
+        }
+        Pattern::BoolLit(expected) => {
+            Ok(matches!(value, MacroValue::Bool(actual) if actual == expected))
+        }
         Pattern::Variable(name, _) => {
             env.insert(name.clone(), value.clone());
+            Ok(true)
+        }
+        Pattern::Constructor { name, binding } => {
+            match_constructor_pattern(name, binding.as_deref(), value, env)
+        }
+        Pattern::Tuple(items) => {
+            let MacroValue::Tuple(values) = value else {
+                return Ok(false);
+            };
+            if items.len() != values.len() {
+                return Ok(false);
+            }
+            let mut scoped = env.clone();
+            for (pattern, value) in items.iter().zip(values) {
+                if !match_macro_pattern(pattern, value, &mut scoped)? {
+                    return Ok(false);
+                }
+            }
+            *env = scoped;
+            Ok(true)
+        }
+        Pattern::List { elements, rest } => {
+            let values = match value {
+                MacroValue::Array(values) => values,
+                MacroValue::SyntaxArray(values) => {
+                    if elements.len() > values.len() {
+                        return Ok(false);
+                    }
+                    let mut scoped = env.clone();
+                    for (pattern, syntax) in elements.iter().zip(values) {
+                        if !match_macro_pattern(
+                            pattern,
+                            &MacroValue::Syntax(syntax.clone()),
+                            &mut scoped,
+                        )? {
+                            return Ok(false);
+                        }
+                    }
+                    match rest {
+                        None if elements.len() != values.len() => return Ok(false),
+                        Some(Some((name, _))) => {
+                            scoped.insert(
+                                name.clone(),
+                                MacroValue::SyntaxArray(values[elements.len()..].to_vec()),
+                            );
+                        }
+                        Some(None) | None => {}
+                    }
+                    *env = scoped;
+                    return Ok(true);
+                }
+                _ => return Ok(false),
+            };
+            if elements.len() > values.len() {
+                return Ok(false);
+            }
+            let mut scoped = env.clone();
+            for (pattern, value) in elements.iter().zip(values) {
+                if !match_macro_pattern(pattern, value, &mut scoped)? {
+                    return Ok(false);
+                }
+            }
+            match rest {
+                None if elements.len() != values.len() => return Ok(false),
+                Some(Some((name, _))) => {
+                    scoped.insert(
+                        name.clone(),
+                        MacroValue::Array(values[elements.len()..].to_vec()),
+                    );
+                }
+                Some(None) | None => {}
+            }
+            *env = scoped;
+            Ok(true)
+        }
+        Pattern::Record { fields, rest } => {
+            let MacroValue::Record(values) = value else {
+                return Ok(false);
+            };
+            if rest.is_none() && fields.len() != values.len() {
+                return Ok(false);
+            }
+            let mut scoped = env.clone();
+            for (field, binding, _) in fields {
+                let Some((_, value)) = values.iter().find(|(name, _)| name == field) else {
+                    return Ok(false);
+                };
+                scoped.insert(binding.clone(), value.clone());
+            }
+            *env = scoped;
             Ok(true)
         }
         Pattern::SyntaxQuote(pattern) => {
@@ -34,10 +136,49 @@ pub(super) fn match_macro_pattern(
                 Ok(false)
             }
         }
-        _ => Err(MacroRuntimeError::new(
+        Pattern::IntRange { .. } => Err(MacroRuntimeError::new(
             pattern_span(pattern),
-            "unsupported match pattern in macro body",
+            "unsupported range pattern in macro body",
         )),
+    }
+}
+
+fn match_constructor_pattern(
+    name: &str,
+    binding: Option<&Pattern>,
+    value: &MacroValue,
+    env: &mut MacroEnv,
+) -> Result<bool, MacroRuntimeError> {
+    let payload = match (name, value) {
+        ("Some", MacroValue::OptionSome(value)) => Some(value.as_ref()),
+        ("None", MacroValue::OptionNone) => None,
+        ("Ok", MacroValue::ResultOk(value)) => Some(value.as_ref()),
+        ("Err", MacroValue::ResultErr(message)) => {
+            return match binding {
+                Some(pattern) => {
+                    match_macro_pattern(pattern, &MacroValue::String(message.clone()), env)
+                }
+                None => Ok(false),
+            };
+        }
+        ("MacroError", MacroValue::Error(message)) => {
+            return match binding {
+                Some(pattern) => {
+                    match_macro_pattern(pattern, &MacroValue::String(message.clone()), env)
+                }
+                None => Ok(false),
+            };
+        }
+        (expected, MacroValue::Variant(actual, payload)) if expected == actual => {
+            payload.as_deref()
+        }
+        _ => return Ok(false),
+    };
+
+    match (binding, payload) {
+        (Some(pattern), Some(value)) => match_macro_pattern(pattern, value, env),
+        (None, None) => Ok(true),
+        _ => Ok(false),
     }
 }
 
@@ -73,6 +214,7 @@ fn match_syntax_pattern(
         SyntaxPattern::Tree {
             delimiter,
             children,
+            ..
         } => {
             let SyntaxKind::Tree {
                 delimiter: actual,
@@ -231,7 +373,154 @@ fn syntax_matches_category(category: SyntaxCategory, nodes: &[Syntax]) -> bool {
             if nodes.is_empty() {
                 return false;
             }
-            category_accepts_source(category, &syntax_nodes_source(nodes)).unwrap_or(false)
+            category_accepts_source(category, &crate::syntax::syntax_nodes_to_source(nodes))
+                .unwrap_or(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{ExprKind, SourceSpan};
+    use crate::lex::Lexer;
+    use crate::parse::Parser;
+    use crate::syntax::{ScopeSet, SyntaxTemplate};
+
+    fn quote_children(source: &str) -> Vec<Syntax> {
+        let quoted = format!("'{{{source}}}");
+        let tokens = Lexer::new(&quoted)
+            .tokenize()
+            .expect("quoted source should lex");
+        let expr = Parser::new(&tokens)
+            .parse_expr_fragment()
+            .expect("quoted source should parse");
+        let ExprKind::SyntaxQuote(SyntaxTemplate::Tree { children, .. }) = expr.kind else {
+            panic!("quoted source should parse as a syntax quote tree");
+        };
+        children
+            .into_iter()
+            .map(template_to_source_syntax)
+            .collect()
+    }
+
+    fn template_to_source_syntax(template: SyntaxTemplate) -> Syntax {
+        match template {
+            SyntaxTemplate::Token { token, span } => Syntax {
+                kind: SyntaxKind::Token(token),
+                span,
+                origin: crate::syntax::SyntaxOrigin::Source(span),
+                scopes: ScopeSet::source(),
+            },
+            SyntaxTemplate::Tree {
+                delimiter,
+                children,
+                span,
+            } => Syntax {
+                kind: SyntaxKind::Tree {
+                    delimiter,
+                    children: children
+                        .into_iter()
+                        .map(template_to_source_syntax)
+                        .collect(),
+                },
+                span,
+                origin: crate::syntax::SyntaxOrigin::Source(span),
+                scopes: ScopeSet::source(),
+            },
+            SyntaxTemplate::Splice { .. } => {
+                panic!("golden category corpus should not contain template splices")
+            }
+        }
+    }
+
+    #[test]
+    fn macro_pattern_categories_match_static_parser_golden_corpus() {
+        let cases = [
+            (SyntaxCategory::Expr, "x.y", true),
+            (SyntaxCategory::Expr, "matrix[0][1]", true),
+            (SyntaxCategory::Expr, "#{ x: 1 }", true),
+            (SyntaxCategory::Expr, "+", false),
+            (SyntaxCategory::Type, "[int]", true),
+            (SyntaxCategory::Type, "#{ x: int }", true),
+            (SyntaxCategory::Type, "x + y", false),
+            (SyntaxCategory::Pat, "Some((x, y))", true),
+            (SyntaxCategory::Pat, "#{ x, ..rest }", true),
+            (SyntaxCategory::Pat, "[..rest]", true),
+            (SyntaxCategory::Pat, "x +", false),
+            (SyntaxCategory::Ident, "name", true),
+            (SyntaxCategory::Ident, "name.field", false),
+            (SyntaxCategory::Literal, "42", true),
+            (SyntaxCategory::Literal, "name", false),
+            (SyntaxCategory::Operator, "+", true),
+            (SyntaxCategory::Operator, "name", false),
+            (SyntaxCategory::Punct, ",", true),
+            (SyntaxCategory::Punct, "+", false),
+            (SyntaxCategory::Token, "name", true),
+            (SyntaxCategory::Token, "()", false),
+            (SyntaxCategory::Tree, "()", true),
+            (SyntaxCategory::Tree, "name", false),
+            (SyntaxCategory::Block, "{}", true),
+            (SyntaxCategory::Block, "()", false),
+            (SyntaxCategory::Tokens, "", true),
+            (SyntaxCategory::Tokens, "x + y", true),
+        ];
+
+        for (category, source, expected) in cases {
+            let nodes = quote_children(source);
+            assert_eq!(
+                syntax_matches_category(category, &nodes),
+                expected,
+                "macro pattern category {} disagreed for `{source}`",
+                category.as_str()
+            );
+            if matches!(
+                category,
+                SyntaxCategory::Expr | SyntaxCategory::Type | SyntaxCategory::Pat
+            ) {
+                assert_eq!(
+                    category_accepts_source(category, source).unwrap_or(false),
+                    expected,
+                    "static parser category {} disagreed for `{source}`",
+                    category.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_nodes_only_match_tokens_category() {
+        let empty: [Syntax; 0] = [];
+        assert!(syntax_matches_category(SyntaxCategory::Tokens, &empty));
+        for category in [
+            SyntaxCategory::Expr,
+            SyntaxCategory::Type,
+            SyntaxCategory::Pat,
+            SyntaxCategory::Ident,
+            SyntaxCategory::Literal,
+            SyntaxCategory::Operator,
+            SyntaxCategory::Punct,
+            SyntaxCategory::Token,
+            SyntaxCategory::Tree,
+            SyntaxCategory::Block,
+        ] {
+            assert!(
+                !syntax_matches_category(category, &empty),
+                "empty node list should not match {}",
+                category.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn generated_synthetic_span_is_not_required_for_category_matching() {
+        let node = Syntax {
+            kind: SyntaxKind::Token(SyntaxToken::Ident("x".to_string())),
+            span: SourceSpan::synthetic(),
+            origin: crate::syntax::SyntaxOrigin::Generated,
+            scopes: ScopeSet::generated(),
+        };
+
+        assert!(syntax_matches_category(SyntaxCategory::Ident, &[node]));
     }
 }

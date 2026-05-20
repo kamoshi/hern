@@ -16,6 +16,7 @@ pub(super) enum MacroValue {
     Array(Vec<MacroValue>),
     Tuple(Vec<MacroValue>),
     Record(Vec<(String, MacroValue)>),
+    Variant(String, Option<Box<MacroValue>>),
     OptionSome(Box<MacroValue>),
     OptionNone,
     Error(String),
@@ -72,6 +73,19 @@ pub(super) fn macro_value_eq(lhs: &MacroValue, rhs: &MacroValue) -> Option<bool>
             }
             Some(equal)
         }
+        (
+            MacroValue::Variant(lhs_name, lhs_payload),
+            MacroValue::Variant(rhs_name, rhs_payload),
+        ) => {
+            if lhs_name != rhs_name {
+                return Some(false);
+            }
+            match (lhs_payload, rhs_payload) {
+                (Some(lhs), Some(rhs)) => macro_value_eq(lhs, rhs),
+                (None, None) => Some(true),
+                _ => Some(false),
+            }
+        }
         (MacroValue::OptionNone, MacroValue::OptionNone) => Some(true),
         (MacroValue::OptionSome(lhs), MacroValue::OptionSome(rhs)) => macro_value_eq(lhs, rhs),
         (MacroValue::Closure(_, _), _) | (_, MacroValue::Closure(_, _)) => None,
@@ -117,6 +131,10 @@ pub(super) fn macro_value_to_string(value: &MacroValue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        MacroValue::Variant(name, Some(value)) => {
+            format!("{name}({})", macro_value_to_string(value))
+        }
+        MacroValue::Variant(name, None) => name.clone(),
         MacroValue::OptionSome(value) => format!("Some({})", macro_value_to_string(value)),
         MacroValue::OptionNone => "None".to_string(),
         MacroValue::Error(message) => format!("MacroError({message})"),

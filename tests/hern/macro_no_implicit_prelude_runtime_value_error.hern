@@ -1,0 +1,8 @@
+#![no_implicit_prelude]
+
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  print("macro phase cannot use runtime prelude IO");
+  Ok(input)
+}
+
+bad!(1)

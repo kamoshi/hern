@@ -63,6 +63,7 @@ fn lower_type_derives(type_def: &mut TypeDef) -> Vec<Stmt> {
                 DeriveTrait::Eq => Stmt::Impl(derive_eq(&input)),
                 DeriveTrait::Ord => Stmt::Impl(derive_ord(&input)),
                 DeriveTrait::ToString => Stmt::Impl(derive_to_string(&input)),
+                DeriveTrait::Custom(_) => continue,
             });
         }
     }

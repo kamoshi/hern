@@ -1,0 +1,8 @@
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  for item in [input] {
+    let _same = item;
+  }
+  Ok(input)
+}
+
+bad!(1);

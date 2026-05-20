@@ -1218,6 +1218,32 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn hover_returns_signature_for_macro_definition_and_call() {
+        let project = TestProject::new("macro-name-hover");
+        let source = concat!(
+            "macro id(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  Ok(input)\n",
+            "}\n",
+            "id!(1)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let definition = hover(&state, uri.clone(), Position::new(0, 6))
+            .expect("macro definition hover should resolve");
+        let call =
+            hover(&state, uri, Position::new(3, 0)).expect("macro call hover should resolve");
+
+        assert_eq!(
+            hover_text(definition),
+            "macro id(input: Syntax) -> MacroResult(Syntax)"
+        );
+        assert_eq!(
+            hover_text(call),
+            "macro id(input: Syntax) -> MacroResult(Syntax)"
+        );
+    }
+
+    #[test]
     fn hover_returns_type_for_syntax_capture_inside_macro_body() {
         let project = TestProject::new("macro-capture-hover");
         let source = concat!(
@@ -1232,6 +1258,25 @@ pub(super) mod tests {
         let (state, uri) = project.open("main.hern", source);
 
         let info = hover(&state, uri, Position::new(2, 8)).expect("hover should resolve");
+
+        assert_eq!(hover_text(info), "Syntax");
+    }
+
+    #[test]
+    fn hover_returns_type_for_syntax_splice_inside_macro_body() {
+        let project = TestProject::new("macro-splice-hover");
+        let (source, position) = source_with_cursor(concat!(
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  match input {\n",
+            "    '{$lhs:expr + $rhs:expr} -> Ok('{ $l<|>hs }),\n",
+            "    _ -> Err(MacroError(\"bad\")),\n",
+            "  }\n",
+            "}\n",
+            "rewrite!(1 + 2)\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let info = hover(&state, uri, position).expect("hover should resolve");
 
         assert_eq!(hover_text(info), "Syntax");
     }
@@ -1264,6 +1309,41 @@ pub(super) mod tests {
                 .iter()
                 .any(|message| message.contains("expected `bool`, got `int`")),
             "runtime diagnostic missing from {messages:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_show_macro_expansion_related_information() {
+        let project = TestProject::new("macro-expansion-related-info");
+        let source = concat!(
+            "macro bad(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  Ok('{ if true { 1 } else { false } })\n",
+            "}\n",
+            "bad!(())\n",
+        );
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let diagnostic = diagnostics[&uri]
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("while expanding `bad!` here"))
+            .unwrap_or_else(|| panic!("macro expansion diagnostic missing from {diagnostics:?}"));
+        let related = diagnostic
+            .related_information
+            .as_ref()
+            .expect("macro expansion diagnostic should include related information");
+
+        assert!(
+            related
+                .iter()
+                .any(|info| info.message == "while expanding `bad!` here"),
+            "call-site related information missing from {related:?}"
+        );
+        assert!(
+            related
+                .iter()
+                .any(|info| info.message == "macro `bad` is defined here"),
+            "definition related information missing from {related:?}"
         );
     }
 
@@ -1537,6 +1617,45 @@ pub(super) mod tests {
 
         assert_eq!(location.uri, dep_uri);
         assert_eq!(location.range.start, Position::new(0, 3));
+    }
+
+    #[test]
+    fn definition_resolves_macro_call_to_macro_definition() {
+        let project = TestProject::new("definition-macro-call");
+        let source = concat!(
+            "macro id(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  Ok(input)\n",
+            "}\n",
+            "id!(1)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let location = definition(&state, uri.clone(), Position::new(3, 0))
+            .expect("macro definition should resolve");
+
+        assert_eq!(location.uri, uri);
+        assert_eq!(location.range.start, Position::new(0, 6));
+    }
+
+    #[test]
+    fn definition_resolves_syntax_splice_to_capture() {
+        let project = TestProject::new("definition-syntax-splice");
+        let (source, position) = source_with_cursor(concat!(
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  match input {\n",
+            "    '{$lhs:expr + $rhs:expr} -> Ok('{ $l<|>hs }),\n",
+            "    _ -> Err(MacroError(\"bad\")),\n",
+            "  }\n",
+            "}\n",
+            "rewrite!(1 + 2)\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let location =
+            definition(&state, uri.clone(), position).expect("capture definition should resolve");
+
+        assert_eq!(location.uri, uri);
+        assert_eq!(location.range.start, Position::new(2, 7));
     }
 
     #[test]
@@ -2072,6 +2191,121 @@ pub(super) mod tests {
         assert!(file_edits.iter().all(|e| e.new_text == "compute"));
         assert_eq!(file_edits[0].range.start.line, 0); // declaration
         assert_eq!(file_edits[1].range.start.line, 1); // call
+    }
+
+    #[test]
+    fn rename_macro_edits_declaration_and_call() {
+        let project = TestProject::new("rename-macro");
+        let source = concat!(
+            "macro id(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  Ok(input)\n",
+            "}\n",
+            "id!(1)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let edit = rename(
+            &state,
+            uri.clone(),
+            Position::new(3, 0),
+            "identity".to_string(),
+        )
+        .expect("rename should succeed")
+        .expect("rename should return edits");
+
+        let edits = edit.changes.expect("changes should be present");
+        let file_edits = edits.get(&uri).expect("edits for file should be present");
+        assert_eq!(file_edits.len(), 2);
+        assert!(file_edits.iter().all(|edit| edit.new_text == "identity"));
+        assert_eq!(file_edits[0].range.start.line, 0);
+        assert_eq!(file_edits[1].range.start.line, 3);
+    }
+
+    #[test]
+    fn rename_syntax_capture_edits_template_splice() {
+        let project = TestProject::new("rename-syntax-capture");
+        let (source, position) = source_with_cursor(concat!(
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  match input {\n",
+            "    '{$lhs:expr + $rhs:expr} -> Ok('{ $l<|>hs }),\n",
+            "    _ -> Err(MacroError(\"bad\")),\n",
+            "  }\n",
+            "}\n",
+            "rewrite!(1 + 2)\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let edit = rename(&state, uri.clone(), position, "left".to_string())
+            .expect("rename should succeed")
+            .expect("rename should return edits");
+
+        let edits = edit.changes.expect("changes should be present");
+        let file_edits = edits.get(&uri).expect("edits for file should be present");
+        assert_eq!(file_edits.len(), 2);
+        assert!(file_edits.iter().all(|edit| edit.new_text == "left"));
+        assert_eq!(file_edits[0].range.start, Position::new(2, 7));
+        assert_eq!(file_edits[1].range.start.line, 2);
+    }
+
+    #[test]
+    fn completion_includes_macro_names() {
+        let project = TestProject::new("completion-macro");
+        let source = concat!(
+            "macro id(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  Ok(input)\n",
+            "}\n",
+            "\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let items = completion(&state, uri, Position::new(3, 0));
+        let names: Vec<_> = items.iter().map(completion_insert_name).collect();
+
+        assert!(names.contains(&"id"), "macro name missing from {names:?}");
+    }
+
+    #[test]
+    fn completion_suggests_syntax_capture_names_inside_templates() {
+        let project = TestProject::new("completion-syntax-captures");
+        let (source, position) = source_with_cursor(concat!(
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  match input {\n",
+            "    '{$lhs:expr + $rhs:expr} -> Ok('{ $l<|> }),\n",
+            "    _ -> Err(MacroError(\"bad\")),\n",
+            "  }\n",
+            "}\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let items = completion(&state, uri, position);
+        let names: Vec<_> = items.iter().map(completion_insert_name).collect();
+
+        assert!(names.contains(&"lhs"), "lhs missing from {names:?}");
+        assert!(names.contains(&"rhs"), "rhs missing from {names:?}");
+        assert!(
+            items
+                .iter()
+                .all(|item| item.detail.as_deref() == Some("Syntax")),
+            "syntax capture details should be precise: {items:?}"
+        );
+    }
+
+    #[test]
+    fn completion_includes_macro_phase_helpers_inside_macro_body() {
+        let project = TestProject::new("completion-macro-phase-helpers");
+        let (source, position) = source_with_cursor(concat!(
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  syntax_<|>\n",
+            "}\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let items = completion(&state, uri, position);
+
+        assert!(
+            items.iter().any(|item| item.label == "syntax_children"),
+            "macro phase helper missing from {items:?}"
+        );
     }
 
     #[test]
@@ -2658,6 +2892,46 @@ pub(super) mod tests {
             names.contains(&"helper"),
             "helper should appear even when overlay has a syntax error; got {:?}",
             names
+        );
+    }
+
+    #[test]
+    fn completion_recovery_inside_partial_macro_body_returns_macro_helpers() {
+        let project = TestProject::new("completion-partial-macro-body");
+        let (source, position) = source_with_cursor(concat!(
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  syntax_<|>\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let items = completion(&state, uri, position);
+        let names: Vec<_> = items.iter().map(completion_insert_name).collect();
+
+        assert!(
+            names.contains(&"syntax_children"),
+            "macro helpers should appear in partial macro bodies: {names:?}"
+        );
+    }
+
+    #[test]
+    fn completion_recovery_with_incomplete_quote_pattern_keeps_file_symbols() {
+        let project = TestProject::new("completion-incomplete-quote-pattern");
+        let (source, position) = source_with_cursor(concat!(
+            "fn helper() { 1 }\n",
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  match input {\n",
+            "    '{$lhs:<|>\n",
+            "  }\n",
+            "}\n",
+        ));
+        let (state, uri) = project.open("main.hern", &source);
+
+        let items = completion(&state, uri, position);
+        let names: Vec<_> = items.iter().map(completion_insert_name).collect();
+
+        assert!(
+            names.contains(&"helper"),
+            "top-level symbols should survive incomplete quote patterns: {names:?}"
         );
     }
 

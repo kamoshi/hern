@@ -22,6 +22,7 @@ pub struct SourceLocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefinitionKind {
     Function,
+    Macro,
     ImplMethod,
     Let,
     Parameter,
@@ -82,6 +83,8 @@ pub enum CompletionCandidateKind {
     Parameter,
     /// A top-level `fn` or `op` definition.
     Function,
+    /// A top-level expression macro definition.
+    Macro,
     /// A top-level `let x = import "..."` binding.
     ImportBinding,
     /// A top-level `let` or `extern` that is not an import.
@@ -206,6 +209,7 @@ impl SourceIndex {
             let included = matches!(
                 def.kind,
                 DefinitionKind::Function
+                    | DefinitionKind::Macro
                     | DefinitionKind::Let
                     | DefinitionKind::Parameter
                     | DefinitionKind::Extern
@@ -234,6 +238,7 @@ impl SourceIndex {
                 let is_top_level = def.visibility_end == TOP_LEVEL_SCOPE_END;
                 let kind = match def.kind {
                     DefinitionKind::Function => CompletionCandidateKind::Function,
+                    DefinitionKind::Macro => CompletionCandidateKind::Macro,
                     DefinitionKind::Parameter => CompletionCandidateKind::Parameter,
                     DefinitionKind::Let if def.import_module.is_some() => {
                         CompletionCandidateKind::ImportBinding
@@ -293,6 +298,7 @@ pub fn index_program(program: &Program) -> SourceIndex {
     for stmt in &program.stmts {
         builder.index_top_level_stmt(stmt);
     }
+    builder.index_macro_expansion_references(program);
 
     builder.index
 }
@@ -394,6 +400,12 @@ impl IndexBuilder {
         });
     }
 
+    fn index_macro_expansion_references(&mut self, program: &Program) {
+        for expansion in &program.macro_expansions {
+            self.reference(&expansion.macro_name, expansion.name_span);
+        }
+    }
+
     fn define_top_level(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let { pat, value, .. } => {
@@ -444,7 +456,7 @@ impl IndexBuilder {
                 self.define(name, *name_span, DefinitionKind::Extern);
             }
             Stmt::Macro(def) => {
-                self.define(&def.name, def.name_span, DefinitionKind::Function);
+                self.define(&def.name, def.name_span, DefinitionKind::Macro);
             }
             Stmt::TestBlock { .. } => {}
             Stmt::RecBlock { stmts, .. } => {

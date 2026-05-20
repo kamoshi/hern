@@ -2,7 +2,9 @@ use super::uri::{path_to_uri, source_span_to_range};
 use hern_core::analysis::{
     CompilerDiagnostic, DiagnosticSeverity as CoreDiagnosticSeverity, DiagnosticSource,
 };
-use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Uri};
+use lsp_types::{
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, Position, Range, Uri,
+};
 use std::collections::HashMap;
 
 pub(crate) type DiagnosticsByUri = HashMap<Uri, Vec<Diagnostic>>;
@@ -26,9 +28,9 @@ pub(super) fn diagnostics_from_compiler_diagnostics(
     for diagnostic in diagnostics {
         let uri = diagnostic_source_uri(&diagnostic).unwrap_or_else(|| entry_uri.clone());
         by_uri
-            .entry(uri)
+            .entry(uri.clone())
             .or_default()
-            .push(compiler_diagnostic_to_lsp(diagnostic));
+            .push(compiler_diagnostic_to_lsp(diagnostic, &uri));
     }
     by_uri
 }
@@ -55,11 +57,12 @@ fn diagnostic_severity_key(severity: DiagnosticSeverity) -> u8 {
     }
 }
 
-fn compiler_diagnostic_to_lsp(diagnostic: CompilerDiagnostic) -> Diagnostic {
+fn compiler_diagnostic_to_lsp(diagnostic: CompilerDiagnostic, primary_uri: &Uri) -> Diagnostic {
     let range = diagnostic
         .span
         .map(source_span_to_range)
         .unwrap_or_else(|| Range::new(Position::new(0, 0), Position::new(0, 1)));
+    let related_information = diagnostic_related_information(&diagnostic, primary_uri);
     Diagnostic {
         range,
         severity: Some(match diagnostic.severity {
@@ -67,12 +70,45 @@ fn compiler_diagnostic_to_lsp(diagnostic: CompilerDiagnostic) -> Diagnostic {
         }),
         message: diagnostic.message,
         source: Some("hern".to_string()),
+        related_information,
         ..Default::default()
     }
 }
 
+fn diagnostic_related_information(
+    diagnostic: &CompilerDiagnostic,
+    primary_uri: &Uri,
+) -> Option<Vec<DiagnosticRelatedInformation>> {
+    let related = diagnostic
+        .related
+        .iter()
+        .filter_map(|related| {
+            let uri = related
+                .source
+                .as_ref()
+                .and_then(diagnostic_source_uri_ref)
+                .unwrap_or_else(|| primary_uri.clone());
+            Some(DiagnosticRelatedInformation {
+                location: Location {
+                    uri,
+                    range: source_span_to_range(related.span),
+                },
+                message: related.message.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!related.is_empty()).then_some(related)
+}
+
 fn diagnostic_source_uri(diagnostic: &CompilerDiagnostic) -> Option<Uri> {
     let DiagnosticSource::Path(path) = diagnostic.source.as_ref()? else {
+        return None;
+    };
+    path_to_uri(path)
+}
+
+fn diagnostic_source_uri_ref(source: &DiagnosticSource) -> Option<Uri> {
+    let DiagnosticSource::Path(path) = source else {
         return None;
     };
     path_to_uri(path)

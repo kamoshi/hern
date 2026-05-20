@@ -3,5 +3,6 @@
 pub mod bundle;
 #[allow(dead_code)]
 pub(crate) mod lua;
+pub(crate) mod lua_syntax_runtime;
 
 pub use bundle::{gen_lua_bundle, gen_lua_iife_bundle, gen_lua_iife_test_bundle};

@@ -1,9 +1,10 @@
-use hern_core::ast::{Expr, ExprKind, Program, SourceSpan, Stmt};
+use hern_core::ast::{Expr, ExprKind, Pattern, Program, SourceSpan, Stmt};
 use hern_core::lex::{Lexer, Token};
 use hern_core::module::GraphInference;
 #[cfg(test)]
 use hern_core::module::ModuleInferenceMetadata;
 use hern_core::source_index::{DefinitionKind, SourceIndex, index_program};
+use hern_core::syntax::{SyntaxPattern, SyntaxTemplate};
 use hern_core::types::Ty;
 use lsp_types::Range;
 use lsp_types::{
@@ -283,7 +284,94 @@ fn apply_semantic_overrides(
         );
     }
     for stmt in &program.stmts {
+        push_macro_keyword_tokens(raw, &mut pos_to_idx, lines, stmt);
+        push_syntax_quote_tokens_stmt(raw, &mut pos_to_idx, lines, stmt);
         push_associated_access_tokens(raw, &mut pos_to_idx, lines, stmt);
+    }
+}
+
+fn push_macro_keyword_tokens(
+    raw: &mut Vec<RawToken>,
+    pos_to_idx: &mut HashMap<(u32, u32, u32), usize>,
+    lines: &[&str],
+    stmt: &Stmt,
+) {
+    match stmt {
+        Stmt::Macro(def) => push_semantic_span(
+            raw,
+            pos_to_idx,
+            lines,
+            SourceSpan {
+                start_line: def.span.start_line,
+                start_col: def.span.start_col,
+                end_line: def.span.start_line,
+                end_col: def.span.start_col + "macro".len(),
+            },
+            TY_KEYWORD,
+            0,
+        ),
+        Stmt::TestBlock { stmts, .. } | Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                push_macro_keyword_tokens(raw, pos_to_idx, lines, stmt);
+            }
+        }
+        Stmt::Let { .. }
+        | Stmt::Fn { .. }
+        | Stmt::Op { .. }
+        | Stmt::Trait(_)
+        | Stmt::Impl(_)
+        | Stmt::InherentImpl(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. }
+        | Stmt::Expr(_) => {}
+    }
+}
+
+fn push_syntax_quote_tokens_stmt(
+    raw: &mut Vec<RawToken>,
+    pos_to_idx: &mut HashMap<(u32, u32, u32), usize>,
+    lines: &[&str],
+    stmt: &Stmt,
+) {
+    match stmt {
+        Stmt::Let { pat, value, .. } => {
+            push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, pat);
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, value);
+        }
+        Stmt::Expr(value) => push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, value),
+        Stmt::Fn { params, body, .. } | Stmt::Op { params, body, .. } => {
+            for param in params {
+                push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, &param.pat);
+            }
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, body);
+        }
+        Stmt::Macro(def) => push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, &def.body),
+        Stmt::Impl(impl_def) => {
+            if impl_def.generated_by.is_some() {
+                return;
+            }
+            for method in &impl_def.methods {
+                for param in &method.params {
+                    push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, &param.pat);
+                }
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, &method.body);
+            }
+        }
+        Stmt::InherentImpl(impl_def) => {
+            for method in &impl_def.methods {
+                for param in &method.params {
+                    push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, &param.pat);
+                }
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, &method.body);
+            }
+        }
+        Stmt::TestBlock { stmts, .. } | Stmt::RecBlock { stmts, .. } => {
+            for stmt in stmts {
+                push_syntax_quote_tokens_stmt(raw, pos_to_idx, lines, stmt);
+            }
+        }
+        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
     }
 }
 
@@ -444,9 +532,212 @@ fn push_associated_access_tokens_expr(
     }
 }
 
+fn push_syntax_quote_tokens_expr(
+    raw: &mut Vec<RawToken>,
+    pos_to_idx: &mut HashMap<(u32, u32, u32), usize>,
+    lines: &[&str],
+    expr: &Expr,
+) {
+    match &expr.kind {
+        ExprKind::SyntaxQuote(template) => {
+            push_syntax_template_tokens(raw, pos_to_idx, lines, template);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, callee);
+            for arg in args {
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, arg);
+            }
+        }
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
+        | ExprKind::Loop(inner)
+        | ExprKind::Break(Some(inner))
+        | ExprKind::Return(Some(inner))
+        | ExprKind::FieldAccess { expr: inner, .. } => {
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, inner)
+        }
+        ExprKind::Neg { operand, .. } => {
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, operand)
+        }
+        ExprKind::Assign { target, value } => {
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, target);
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, value);
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, lhs);
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, rhs);
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, start);
+            }
+            if let Some(end) = end {
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, end);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, cond);
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, then_branch);
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, else_branch);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, scrutinee);
+            for (pattern, body) in arms {
+                push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, pattern);
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, body);
+            }
+        }
+        ExprKind::Block { stmts, final_expr } => {
+            for stmt in stmts {
+                push_syntax_quote_tokens_stmt(raw, pos_to_idx, lines, stmt);
+            }
+            if let Some(expr) = final_expr {
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, expr);
+            }
+        }
+        ExprKind::Tuple(items) => {
+            for item in items {
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, item);
+            }
+        }
+        ExprKind::Array(entries) => {
+            for entry in entries {
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, entry.expr());
+            }
+        }
+        ExprKind::Record(entries) => {
+            for entry in entries {
+                push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, entry.expr());
+            }
+        }
+        ExprKind::Lambda { params, body, .. } => {
+            for param in params {
+                push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, &param.pat);
+            }
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, body);
+        }
+        ExprKind::For {
+            pat,
+            iterable,
+            body,
+            ..
+        } => {
+            push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, pat);
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, iterable);
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, body);
+        }
+        ExprKind::Index { receiver, key, .. } => {
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, receiver);
+            push_syntax_quote_tokens_expr(raw, pos_to_idx, lines, key);
+        }
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::AssociatedAccess { .. }
+        | ExprKind::MacroCall { .. }
+        | ExprKind::Ident(_)
+        | ExprKind::Import(_)
+        | ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None)
+        | ExprKind::Unit => {}
+    }
+}
+
+fn push_syntax_quote_tokens_pattern(
+    raw: &mut Vec<RawToken>,
+    pos_to_idx: &mut HashMap<(u32, u32, u32), usize>,
+    lines: &[&str],
+    pattern: &Pattern,
+) {
+    match pattern {
+        Pattern::SyntaxQuote(pattern) => {
+            push_syntax_pattern_tokens(raw, pos_to_idx, lines, pattern)
+        }
+        Pattern::Constructor {
+            binding: Some(binding),
+            ..
+        } => push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, binding),
+        Pattern::Record { rest, .. } => {
+            if let Some(Some((_, span))) = rest {
+                push_semantic_span(raw, pos_to_idx, lines, *span, TY_PARAMETER, MOD_DECLARATION);
+            }
+        }
+        Pattern::List { elements, rest } => {
+            for element in elements {
+                push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, element);
+            }
+            if let Some(Some((_, span))) = rest {
+                push_semantic_span(raw, pos_to_idx, lines, *span, TY_PARAMETER, MOD_DECLARATION);
+            }
+        }
+        Pattern::Tuple(items) => {
+            for item in items {
+                push_syntax_quote_tokens_pattern(raw, pos_to_idx, lines, item);
+            }
+        }
+        Pattern::Wildcard
+        | Pattern::Variable(_, _)
+        | Pattern::Constructor { binding: None, .. }
+        | Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. } => {}
+    }
+}
+
+fn push_syntax_pattern_tokens(
+    raw: &mut Vec<RawToken>,
+    pos_to_idx: &mut HashMap<(u32, u32, u32), usize>,
+    lines: &[&str],
+    pattern: &SyntaxPattern,
+) {
+    match pattern {
+        SyntaxPattern::Capture(capture) => {
+            push_semantic_span(
+                raw,
+                pos_to_idx,
+                lines,
+                capture.span,
+                TY_PARAMETER,
+                MOD_DECLARATION,
+            );
+        }
+        SyntaxPattern::Tree { children, .. } => {
+            for child in children {
+                push_syntax_pattern_tokens(raw, pos_to_idx, lines, child);
+            }
+        }
+        SyntaxPattern::Token(_) => {}
+    }
+}
+
+fn push_syntax_template_tokens(
+    raw: &mut Vec<RawToken>,
+    pos_to_idx: &mut HashMap<(u32, u32, u32), usize>,
+    lines: &[&str],
+    template: &SyntaxTemplate,
+) {
+    match template {
+        SyntaxTemplate::Splice { span, .. } => {
+            push_semantic_span(raw, pos_to_idx, lines, *span, TY_PARAMETER, 0);
+        }
+        SyntaxTemplate::Tree { children, .. } => {
+            for child in children {
+                push_syntax_template_tokens(raw, pos_to_idx, lines, child);
+            }
+        }
+        SyntaxTemplate::Token { .. } => {}
+    }
+}
+
 fn semantic_type_for_definition(kind: DefinitionKind, ty: Option<&Ty>) -> u32 {
     match kind {
-        DefinitionKind::Function | DefinitionKind::Extern => TY_FUNCTION,
+        DefinitionKind::Function | DefinitionKind::Macro | DefinitionKind::Extern => TY_FUNCTION,
         DefinitionKind::ImplMethod | DefinitionKind::TraitMethod => TY_METHOD,
         DefinitionKind::Let if ty.is_some_and(is_function_type) => TY_FUNCTION,
         DefinitionKind::Let => TY_VARIABLE,
@@ -662,6 +953,22 @@ mod tests {
             .collect()
     }
 
+    fn text_position(source: &str, needle: &str, occurrence: usize) -> (u32, u32, u32) {
+        let byte = source
+            .match_indices(needle)
+            .nth(occurrence)
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {needle:?}"));
+        let line = source[..byte].bytes().filter(|byte| *byte == b'\n').count();
+        let line_start = source[..byte].rfind('\n').map_or(0, |idx| idx + 1);
+        let line_end = source[byte..]
+            .find('\n')
+            .map_or(source.len(), |idx| byte + idx);
+        let col = byte_to_utf16_col(&source[line_start..line_end], byte - line_start);
+        let len = needle.chars().map(|ch| ch.len_utf16() as u32).sum();
+        (line as u32, col, len)
+    }
+
     #[test]
     fn lexer_tokens_include_keywords_numbers_strings_and_comments() {
         let tokens = token_tuples(semantic_tokens_for_source(
@@ -765,6 +1072,45 @@ mod tests {
         );
         assert!(tokens.iter().any(|token| {
             token.0 == 0 && token.1 == 17 && token.2 == 3 && token.3 == TY_METHOD
+        }));
+    }
+
+    #[test]
+    fn semantic_tokens_classify_macro_keyword_and_quote_captures() {
+        let source = concat!(
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  match input {\n",
+            "    '{$lhs:expr + $rhs:expr} -> Ok('{ $lhs }),\n",
+            "    _ -> Err(MacroError(\"bad\")),\n",
+            "  }\n",
+            "}\n",
+        );
+        let program = parse_source(source).expect("source should parse");
+        let tokens = token_tuples(semantic_tokens_for_source(source, Some(&program), None));
+
+        let macro_kw = text_position(source, "macro", 0);
+        let lhs_capture = text_position(source, "lhs", 0);
+        let lhs_splice = text_position(source, "lhs", 1);
+
+        assert!(tokens.iter().any(|token| {
+            token.0 == macro_kw.0
+                && token.1 == macro_kw.1
+                && token.2 == macro_kw.2
+                && token.3 == TY_KEYWORD
+        }));
+        assert!(tokens.iter().any(|token| {
+            token.0 == lhs_capture.0
+                && token.1 == lhs_capture.1
+                && token.2 == lhs_capture.2
+                && token.3 == TY_PARAMETER
+                && token.4 == MOD_DECLARATION
+        }));
+        assert!(tokens.iter().any(|token| {
+            token.0 == lhs_splice.0
+                && token.1 == lhs_splice.1
+                && token.2 == lhs_splice.2
+                && token.3 == TY_PARAMETER
+                && token.4 == 0
         }));
     }
 

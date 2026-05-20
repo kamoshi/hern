@@ -1,0 +1,3 @@
+let macros = import "macro_import_runtime_value_provider";
+
+print(to_string(bad!(1)));

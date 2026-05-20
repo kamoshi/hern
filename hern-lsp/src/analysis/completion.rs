@@ -121,6 +121,12 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
     let definition_schemes = inference.definition_schemes_for_module(module_name);
     let replacement_range = completion_replacement_range(state, &uri, lsp_position);
 
+    if let Some(items) = syntax_capture_completion(state, &uri, &index, position, lsp_position) {
+        return items;
+    }
+
+    let in_macro_body = macro_body_contains(program, position);
+
     if let Some(items) = member_completion(
         state,
         &uri,
@@ -162,6 +168,7 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
             );
             let kind = Some(match candidate.kind {
                 CompletionCandidateKind::Function => CompletionItemKind::FUNCTION,
+                CompletionCandidateKind::Macro => CompletionItemKind::FUNCTION,
                 CompletionCandidateKind::ImportBinding => CompletionItemKind::MODULE,
                 _ => CompletionItemKind::VARIABLE,
             });
@@ -199,7 +206,146 @@ fn completion_inner(state: &ServerState, uri: Uri, position: Position) -> Vec<Co
         items.sort_by(|a, b| a.label.cmp(&b.label));
     }
 
+    if in_macro_body {
+        add_macro_phase_completion_items(&mut items, replacement_range);
+    }
+
     items
+}
+
+const MACRO_PHASE_COMPLETIONS: &[&str] = &[
+    "MacroError",
+    "Err",
+    "Ok",
+    "syntax_children",
+    "syntax_debug",
+    "syntax_delimiter",
+    "syntax_eq_shape",
+    "syntax_find",
+    "syntax_fresh_ident",
+    "syntax_ident",
+    "syntax_ident_at_use_site",
+    "syntax_is_ident",
+    "syntax_join",
+    "syntax_kind",
+    "syntax_literal",
+    "syntax_map_children",
+    "syntax_operator",
+    "syntax_origin",
+    "syntax_punct",
+    "syntax_replace",
+    "syntax_same_binding",
+    "syntax_sequence",
+    "syntax_span",
+    "syntax_token",
+    "syntax_token_text",
+    "syntax_tree",
+];
+
+fn add_macro_phase_completion_items(
+    items: &mut Vec<CompletionItem>,
+    replacement_range: Option<Range>,
+) {
+    let existing = items
+        .iter()
+        .map(|item| item.label.clone())
+        .collect::<std::collections::HashSet<_>>();
+    items.extend(
+        MACRO_PHASE_COMPLETIONS
+            .iter()
+            .filter(|name| !existing.contains(**name))
+            .map(|name| {
+                completion_item(
+                    (*name).to_string(),
+                    Some(CompletionItemKind::FUNCTION),
+                    Some("macro phase".to_string()),
+                    replacement_range,
+                )
+            }),
+    );
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+}
+
+fn macro_body_contains(program: &Program, position: SourcePosition) -> bool {
+    program.stmts.iter().any(
+        |stmt| matches!(stmt, Stmt::Macro(def) if contains_span_position(def.body.span, position)),
+    )
+}
+
+fn contains_span_position(span: SourceSpan, position: SourcePosition) -> bool {
+    let start = (span.start_line, span.start_col);
+    let end = (span.end_line, span.end_col);
+    let pos = (position.line, position.col);
+    pos >= start && pos < end
+}
+
+fn syntax_capture_completion(
+    state: &ServerState,
+    uri: &Uri,
+    index: &SourceIndex,
+    position: SourcePosition,
+    lsp_position: Position,
+) -> Option<Vec<CompletionItem>> {
+    let replacement_range = syntax_capture_completion_range(state, uri, lsp_position)?;
+    let source = state.documents.get(uri)?;
+    let mut items = index
+        .definitions
+        .iter()
+        .filter(|definition| {
+            definition.kind == DefinitionKind::Let
+                && syntax_capture_definition_span(source, definition.location.span)
+                && visible_definition_named(index, &definition.name, position)
+                    .is_some_and(|visible| visible.location.span == definition.location.span)
+        })
+        .map(|definition| {
+            completion_item(
+                definition.name.clone(),
+                Some(CompletionItemKind::VARIABLE),
+                Some("Syntax".to_string()),
+                Some(replacement_range),
+            )
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items.dedup_by(|a, b| a.label == b.label);
+    Some(items)
+}
+
+fn syntax_capture_definition_span(source: &str, span: SourceSpan) -> bool {
+    let Some(line) = source.lines().nth(span.start_line.saturating_sub(1)) else {
+        return false;
+    };
+    let start_byte = utf16_col_to_byte(line, span.start_col.saturating_sub(1) as u32);
+    start_byte > 0 && line.as_bytes().get(start_byte - 1) == Some(&b'$')
+}
+
+fn syntax_capture_completion_range(
+    state: &ServerState,
+    uri: &Uri,
+    position: Position,
+) -> Option<Range> {
+    let line = state
+        .documents
+        .get(uri)?
+        .lines()
+        .nth(position.line as usize)?;
+    let cursor_byte = utf16_col_to_byte(line, position.character).min(line.len());
+    let prefix = &line[..cursor_byte];
+    let name_start = prefix
+        .rfind(|c: char| !is_completion_identifier_char(c))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let dollar_byte = if name_start > 0 && line.as_bytes().get(name_start - 1) == Some(&b'$') {
+        name_start - 1
+    } else if cursor_byte > 0 && line.as_bytes().get(cursor_byte - 1) == Some(&b'$') {
+        cursor_byte - 1
+    } else {
+        return None;
+    };
+    Some(Range::new(
+        Position::new(position.line, byte_to_utf16_col(line, dollar_byte + 1)),
+        position,
+    ))
 }
 
 fn import_path_completion(
@@ -1364,6 +1510,7 @@ fn visible_definition_named<'a>(
         if !matches!(
             definition.kind,
             DefinitionKind::Function
+                | DefinitionKind::Macro
                 | DefinitionKind::Let
                 | DefinitionKind::Parameter
                 | DefinitionKind::Extern

@@ -15,7 +15,7 @@ pub(super) fn expand_template(
             kind: SyntaxKind::Token(token.clone()),
             span: *span,
             origin: SyntaxOrigin::Generated,
-            scopes: ScopeSet::source(),
+            scopes: ScopeSet::macro_introduction(state.macro_call_span()),
         }),
         SyntaxTemplate::Tree {
             delimiter,
@@ -44,10 +44,7 @@ pub(super) fn expand_template(
                                     format!("splice `{name}` expects Syntax"),
                                 ));
                             };
-                            match &syntax.kind {
-                                SyntaxKind::Sequence(items) => out.extend(items.clone()),
-                                _ => out.push(syntax.clone()),
-                            }
+                            out.push(syntax.clone());
                         }
                     }
                     other => out.push(expand_template(other, env, state)?),
@@ -60,7 +57,7 @@ pub(super) fn expand_template(
                 },
                 span: *span,
                 origin: SyntaxOrigin::Generated,
-                scopes: ScopeSet::source(),
+                scopes: ScopeSet::macro_introduction(state.macro_call_span()),
             })
         }
         SyntaxTemplate::Splice { name, span, .. } => match env.get(name) {

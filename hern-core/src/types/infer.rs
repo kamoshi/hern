@@ -442,9 +442,11 @@ impl Infer {
         seed_env: Option<&TypeEnv>,
     ) -> Result<InferenceResult, SpannedTypeError> {
         self.reset_program_state();
+        macro_phase::register_macro_phase_type_surface(&mut self.types);
         self.types.variant_env = build_variant_env_from_stmts(seed_stmts, &program.stmts);
 
         let mut env = seed_env.cloned().unwrap_or_else(TypeEnv::new);
+        macro_phase::insert_syntax_builtin_schemes(&mut env);
         self.validate_type_trait_name_collisions(seed_stmts, &program.stmts)?;
         if let Some(err) = self
             .validate_duplicate_test_function_names(&program.stmts)
@@ -532,9 +534,11 @@ impl Infer {
         seed_env: Option<&TypeEnv>,
     ) -> (ModuleInference, Vec<SpannedTypeError>) {
         self.reset_program_state();
+        macro_phase::register_macro_phase_type_surface(&mut self.types);
         self.types.variant_env = build_variant_env_from_stmts(seed_stmts, &program.stmts);
 
         let mut env = seed_env.cloned().unwrap_or_else(TypeEnv::new);
+        macro_phase::insert_syntax_builtin_schemes(&mut env);
         if let Err(err) = self.validate_type_trait_name_collisions(seed_stmts, &program.stmts) {
             return (ModuleInference::default(), vec![err]);
         }

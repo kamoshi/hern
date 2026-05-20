@@ -108,6 +108,37 @@ pub fn byte_to_source_position(source: &str, byte: usize) -> Option<SourcePositi
 pub struct Program {
     pub stmts: Vec<Stmt>,
     pub inner_attrs: Vec<String>,
+    pub macro_expansions: Vec<MacroExpansionInfo>,
+}
+
+impl Program {
+    pub fn new(stmts: Vec<Stmt>, inner_attrs: Vec<String>) -> Self {
+        Self {
+            stmts,
+            inner_attrs,
+            macro_expansions: Vec::new(),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
+
+    pub fn macro_expansion_for_span(&self, span: SourceSpan) -> Option<&MacroExpansionInfo> {
+        self.macro_expansions
+            .iter()
+            .rev()
+            .find(|expansion| expansion.call_span == span)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MacroExpansionInfo {
+    pub macro_name: String,
+    pub call_span: SourceSpan,
+    pub name_span: SourceSpan,
+    pub definition_span: SourceSpan,
+    pub generated_source_excerpt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,22 +154,28 @@ impl Attribute {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeriveTrait {
     Default,
     Eq,
     Ord,
     ToString,
+    Custom(String),
 }
 
 impl DeriveTrait {
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             DeriveTrait::Default => "Default",
             DeriveTrait::Eq => "Eq",
             DeriveTrait::Ord => "Ord",
             DeriveTrait::ToString => "ToString",
+            DeriveTrait::Custom(name) => name,
         }
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        !matches!(self, DeriveTrait::Custom(_))
     }
 }
 

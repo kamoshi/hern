@@ -1,0 +1,16 @@
+macro derive_Label(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{ type $name:ident = $variant:ident } ->
+      Ok(syntax_sequence(syntax_children('{
+        impl ToString for $name {
+          fn to_string(self) { "labelled" }
+        }
+      }))),
+    _ -> Err(MacroError("derive_Label expects a simple sum type")),
+  }
+}
+
+#[derive(Label)]
+type Labelled = Labelled
+
+print(to_string(Labelled));

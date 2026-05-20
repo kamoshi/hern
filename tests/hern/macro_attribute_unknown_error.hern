@@ -1,0 +1,2 @@
+#[missing_attr]
+fn f() { 1 }

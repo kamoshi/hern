@@ -1827,6 +1827,40 @@ if true {1} else {2}
 [.. rest]
 {answer * 41}
 {answer + 41 * answer + 41}
+tree:brace
+delimiter brace
+false
+generated
+{made + 7}
+generated
+true
+left , right
+{done + 7}
+done
+{done + 8}
+a , b , c
+tree:brace {done + 7}
+false
+false
+false
+"""
+
+[tests.syntax_quote_category_corpus]
+path = "tests/hern/syntax_quote_category_corpus.hern"
+expect = "typecheck"
+output = """
+expr
+type
+pat
+ident
+literal
+operator
+punct
+token
+tree
+block
+3
+reject expr
 """
 
 [tests.syntax_quote_unbound_splice_error]
@@ -1930,7 +1964,7 @@ true
 [tests.derive_unknown_error]
 path = "tests/hern/derive_unknown_error.hern"
 expect = "error"
-error_contains = "Cannot derive `Clone`: supported derives are Default, Eq, Ord, ToString"
+error_contains = "unknown derive macro `Clone`; define macro `derive_Clone`"
 
 [tests.derive_on_function_error]
 path = "tests/hern/derive_on_function_error.hern"
@@ -2027,6 +2061,49 @@ output = """
 1
 """
 
+[tests.macro_assert_example]
+path = "tests/hern/macro_assert_example.hern"
+expect = "typecheck"
+output = """
+ok
+"""
+
+[tests.macro_dbg_example]
+path = "tests/hern/macro_dbg_example.hern"
+expect = "typecheck"
+output = """
+3
+13
+"""
+
+[tests.macro_scoped_example]
+path = "tests/hern/macro_scoped_example.hern"
+expect = "typecheck"
+output = """
+22
+"""
+
+[tests.macro_record_generator_example]
+path = "tests/hern/macro_record_generator_example.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
+[tests.macro_parser_helper_example]
+path = "tests/hern/macro_parser_helper_example.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
+[tests.macro_dsl_rewrite_example]
+path = "tests/hern/macro_dsl_rewrite_example.hern"
+expect = "typecheck"
+output = """
+25
+"""
+
 [tests.macro_baseline]
 path = "tests/hern/macro_baseline.hern"
 expect = "typecheck"
@@ -2073,6 +2150,82 @@ path = "tests/hern/macro_helper_recursion_error.hern"
 expect = "error"
 error_contains = "macro `boom!`: macro comptime call depth limit exceeded"
 
+[tests.macro_generated_import]
+path = "tests/hern/macro_generated_import.hern"
+expect = "typecheck"
+fixtures = ["tests/hern/macro_generated_import_dep.hern"]
+output = """
+9
+"""
+
+[tests.macro_import]
+path = "tests/hern/macro_import.hern"
+expect = "typecheck"
+fixtures = ["tests/hern/macro_import_provider.hern"]
+output = """
+3
+"""
+
+[tests.macro_item_function]
+path = "tests/hern/macro_item_function.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
+[tests.macro_attribute_function]
+path = "tests/hern/macro_attribute_function.hern"
+expect = "typecheck"
+output = """
+42
+"""
+
+[tests.macro_attribute_unknown_error]
+path = "tests/hern/macro_attribute_unknown_error.hern"
+expect = "error"
+error_contains = "unknown attribute macro `missing_attr`"
+
+[tests.macro_derive_label]
+path = "tests/hern/macro_derive_label.hern"
+expect = "typecheck"
+output = """
+labelled
+"""
+
+[tests.macro_reflection]
+path = "tests/hern/macro_reflection.hern"
+expect = "typecheck"
+output = """
+reflection-ok
+"""
+
+[tests.macro_import_conflict]
+path = "tests/hern/macro_import_conflict.hern"
+expect = "error"
+fixtures = [
+  "tests/hern/macro_import_conflict_a.hern",
+  "tests/hern/macro_import_conflict_b.hern",
+]
+error_contains = "macro `conflict` imported from module"
+
+[tests.macro_import_cycle]
+path = "tests/hern/macro_import_cycle.hern"
+expect = "error"
+fixtures = [
+  "tests/hern/macro_import_cycle_a.hern",
+  "tests/hern/macro_import_cycle_b.hern",
+]
+error_contains = "circular import involving"
+
+[tests.macro_import_runtime_value_error]
+path = "tests/hern/macro_import_runtime_value_error.hern"
+expect = "error"
+fixtures = [
+  "tests/hern/macro_import_runtime_value_provider.hern",
+  "tests/hern/macro_import_runtime_value_dep.hern",
+]
+error_contains = "unknown macro-phase binding `dep`"
+
 [tests.macro_structured_helpers]
 path = "tests/hern/macro_structured_helpers.hern"
 expect = "typecheck"
@@ -2098,15 +2251,100 @@ output = """
 41
 """
 
+[tests.macro_operator_calls]
+path = "tests/hern/macro_operator_calls.hern"
+expect = "typecheck"
+output = """
+1
+"""
+
+[tests.macro_precedence_splices]
+path = "tests/hern/macro_precedence_splices.hern"
+expect = "typecheck"
+output = """
+21
+false
+8
+20
+"""
+
+[tests.macro_syntax_helpers]
+path = "tests/hern/macro_syntax_helpers.hern"
+expect = "typecheck"
+output = """
+1
+0
+3
+6
+7
+1
+"""
+
+[tests.macro_hygiene]
+path = "tests/hern/macro_hygiene.hern"
+expect = "typecheck"
+output = """
+1
+1
+1
+1
+1
+"""
+
 [tests.macro_lambda_arity_error]
 path = "tests/hern/macro_lambda_arity_error.hern"
 expect = "error"
 error_contains = "wrong number of macro-phase function arguments: expected 0, got 1"
 
+[tests.macro_non_exhaustive_match_error]
+path = "tests/hern/macro_non_exhaustive_match_error.hern"
+expect = "error"
+error_contains = "macro `only_ident!`: non-exhaustive macro match"
+
+[tests.macro_wrong_host_arg_error]
+path = "tests/hern/macro_wrong_host_arg_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: syntax_children expects Syntax"
+
+[tests.macro_parse_back_error]
+path = "tests/hern/macro_parse_back_error.hern"
+expect = "error"
+error_contains = "macro `bad` expansion did not produce an expression"
+
+[tests.macro_non_syntax_ok_error]
+path = "tests/hern/macro_non_syntax_ok_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: macro returned Ok with a non-Syntax value"
+
 [tests.macro_loop_limit_error]
 path = "tests/hern/macro_loop_limit_error.hern"
 expect = "error"
 error_contains = "macro `boom!`: macro comptime step limit exceeded"
+
+[tests.macro_range_error]
+path = "tests/hern/macro_range_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: unsupported expression in macro body"
+
+[tests.macro_for_error]
+path = "tests/hern/macro_for_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: unsupported expression in macro body"
+
+[tests.macro_return_error]
+path = "tests/hern/macro_return_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: unsupported expression in macro body"
+
+[tests.macro_continue_error]
+path = "tests/hern/macro_continue_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: unsupported expression in macro body"
+
+[tests.macro_import_expression_error]
+path = "tests/hern/macro_import_expression_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: unsupported expression in macro body"
 
 [tests.macro_record_spread_error]
 path = "tests/hern/macro_record_spread_error.hern"
@@ -2127,6 +2365,27 @@ error_contains = "type mismatch in type argument 1: expected `Syntax`, got `int`
 path = "tests/hern/macro_runtime_value_error.hern"
 expect = "error"
 error_contains = "unbound variable: `runtime_value`"
+
+[tests.macro_global_mutation_error]
+path = "tests/hern/macro_global_mutation_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: unknown macro-phase binding `counter`"
+
+[tests.macro_extern_call_error]
+path = "tests/hern/macro_extern_call_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: unsupported macro-phase call `hidden`"
+
+[tests.macro_no_implicit_prelude]
+path = "tests/hern/macro_no_implicit_prelude.hern"
+expect = "typecheck"
+output = """
+"""
+
+[tests.macro_no_implicit_prelude_runtime_value_error]
+path = "tests/hern/macro_no_implicit_prelude_runtime_value_error.hern"
+expect = "error"
+error_contains = "macro `bad!`: unsupported macro-phase call `print`"
 
 [tests.macro_wrong_param_type_error]
 path = "tests/hern/macro_wrong_param_type_error.hern"

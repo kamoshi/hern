@@ -1,0 +1,12 @@
+macro rename(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{ fn $name:ident() $body:block } ->
+      Ok(syntax_sequence(syntax_children('{ fn wrapped() $body }))),
+    _ -> Err(MacroError("rename expects a function")),
+  }
+}
+
+#[rename]
+fn original() { 42 }
+
+print(to_string(wrapped()));

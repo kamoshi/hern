@@ -1,0 +1,13 @@
+macro scoped(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$body:block} -> Ok('{ { $body } }),
+    _ -> Err(MacroError("scoped! expects a block")),
+  }
+}
+
+let value = scoped!({
+  let x = 20;
+  x + 2
+});
+
+print(to_string(value));

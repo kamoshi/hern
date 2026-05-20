@@ -1,0 +1,7 @@
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  loop {
+    continue;
+  }
+}
+
+bad!(1);

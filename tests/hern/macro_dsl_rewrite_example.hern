@@ -1,0 +1,8 @@
+macro squares(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$lhs:expr plus_square $rhs:expr} -> Ok('{ ($lhs * $lhs) + ($rhs * $rhs) }),
+    _ -> Err(MacroError("squares! expects `<expr> plus_square <expr>`")),
+  }
+}
+
+print(to_string(squares!(3 plus_square 4)));

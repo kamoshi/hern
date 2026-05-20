@@ -1,0 +1,7 @@
+extern hidden: fn() -> Syntax = "(function() return nil end)";
+
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  Ok(hidden())
+}
+
+bad!(1);

@@ -1,0 +1,40 @@
+macro reflect(input: Syntax) -> MacroResult(Syntax) {
+  let variants = macro_variants_of(input);
+  let items = macro_module_items(input);
+  let methods = macro_trait_methods_of('{ trait Named 'a { fn name(x: 'a) -> string } });
+  let fields = macro_fields_of('{#{ left: int, right: string }});
+  let resolved = macro_resolve_ident(syntax_children('{Answer})[0]).unwrap_or("none");
+  let ty = macro_type_of('{int}).unwrap_or("none");
+
+  if variants[0] == "Labelled" {
+    if items[0] == "Labelled" {
+      if methods[0] == "name" {
+        if fields[0] == "left" {
+          if fields[1] == "right" {
+            if resolved == "Answer" {
+              if ty == "int" {
+                Ok('{ print("reflection-ok") })
+              } else {
+                Err(MacroError("type reflection failed"))
+              }
+            } else {
+              Err(MacroError("identifier reflection failed"))
+            }
+          } else {
+            Err(MacroError("field reflection failed"))
+          }
+        } else {
+          Err(MacroError("field reflection failed"))
+        }
+      } else {
+        Err(MacroError("trait reflection failed"))
+      }
+    } else {
+      Err(MacroError("module reflection failed"))
+    }
+  } else {
+    Err(MacroError("variant reflection failed"))
+  }
+}
+
+reflect!({ type Labelled = Labelled });

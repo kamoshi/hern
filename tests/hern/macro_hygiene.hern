@@ -1,0 +1,67 @@
+macro copied_identifier_keeps_scope(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$name:ident} -> {
+      let rebuilt = syntax_children('{ $name })[0];
+      if syntax_same_binding(name, rebuilt) {
+        Ok('{ 1 })
+      } else {
+        Ok('{ 0 })
+      }
+    },
+    _ -> Ok('{ 0 }),
+  }
+}
+
+macro literal_identifier_is_introduced(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$name:ident} -> {
+      let introduced = syntax_children('{ name })[0];
+      if syntax_same_binding(name, introduced) {
+        Ok('{ 0 })
+      } else {
+        Ok('{ 1 })
+      }
+    },
+    _ -> Ok('{ 0 }),
+  }
+}
+
+macro repeated_literal_in_one_expansion_shares_intro_scope(input: Syntax) -> MacroResult(Syntax) {
+  let first = syntax_children('{ helper })[0];
+  let second = syntax_children('{ helper })[0];
+  if syntax_same_binding(first, second) {
+    Ok('{ 1 })
+  } else {
+    Ok('{ 0 })
+  }
+}
+
+macro use_site_identifier_matches_call_site(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$name:ident} -> {
+      let deliberate = syntax_ident_at_use_site("name");
+      if syntax_same_binding(name, deliberate) {
+        Ok('{ 1 })
+      } else {
+        Ok('{ 0 })
+      }
+    },
+    _ -> Ok('{ 0 }),
+  }
+}
+
+macro introduced_identifier_differs_from_use_site(input: Syntax) -> MacroResult(Syntax) {
+  let introduced = syntax_children('{ helper })[0];
+  let deliberate = syntax_ident_at_use_site("helper");
+  if syntax_same_binding(introduced, deliberate) {
+    Ok('{ 0 })
+  } else {
+    Ok('{ 1 })
+  }
+}
+
+print(to_string(copied_identifier_keeps_scope!(user_name)));
+print(to_string(literal_identifier_is_introduced!(name)));
+print(to_string(repeated_literal_in_one_expansion_shares_intro_scope!(ignored)));
+print(to_string(use_site_identifier_matches_call_site!(name)));
+print(to_string(introduced_identifier_differs_from_use_site!(ignored)));

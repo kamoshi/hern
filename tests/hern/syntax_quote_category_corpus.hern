@@ -1,0 +1,59 @@
+match '{x.y} {
+  '{$x:expr} -> print("expr"),
+  _ -> print("miss expr"),
+};
+
+match '{#{ field: int }} {
+  '{$x:type} -> print("type"),
+  _ -> print("miss type"),
+};
+
+match '{[..rest]} {
+  '{$x:pat} -> print("pat"),
+  _ -> print("miss pat"),
+};
+
+match '{name} {
+  '{$x:ident} -> print("ident"),
+  _ -> print("miss ident"),
+};
+
+match '{42} {
+  '{$x:literal} -> print("literal"),
+  _ -> print("miss literal"),
+};
+
+match '{+} {
+  '{$x:operator} -> print("operator"),
+  _ -> print("miss operator"),
+};
+
+match '{,} {
+  '{$x:punct} -> print("punct"),
+  _ -> print("miss punct"),
+};
+
+match '{name} {
+  '{$x:token} -> print("token"),
+  _ -> print("miss token"),
+};
+
+match '{()} {
+  '{$x:tree} -> print("tree"),
+  _ -> print("miss tree"),
+};
+
+match '{{}} {
+  '{$x:block} -> print("block"),
+  _ -> print("miss block"),
+};
+
+match '{a + b} {
+  '{$xs:tokens...} -> print(to_string(xs.len())),
+  _ -> print("miss tokens"),
+};
+
+match '{+} {
+  '{$x:expr} -> print("bad expr"),
+  _ -> print("reject expr"),
+};

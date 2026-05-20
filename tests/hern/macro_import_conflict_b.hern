@@ -1,0 +1,5 @@
+macro conflict(input: Syntax) -> MacroResult(Syntax) {
+  Ok('{ 2 })
+}
+
+#{}

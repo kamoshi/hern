@@ -90,24 +90,120 @@ pub enum SyntaxPattern {
     Tree {
         delimiter: SyntaxDelimiter,
         children: Vec<SyntaxPattern>,
+        span: SourceSpan,
     },
     Capture(SyntaxCapture),
 }
 
+impl SyntaxPattern {
+    pub fn span(&self) -> SourceSpan {
+        match self {
+            SyntaxPattern::Tree { span, .. } => *span,
+            SyntaxPattern::Capture(capture) => capture.span,
+            SyntaxPattern::Token(_) => SourceSpan::synthetic(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Scope {
+    Source,
+    MacroIntroduction(u32),
+    UseSite(u32),
+    Generated(u32),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScopeSet {
-    stable_id: u32,
+    scopes: Vec<Scope>,
 }
 
 impl ScopeSet {
     pub fn source() -> Self {
-        Self { stable_id: 0 }
+        Self {
+            scopes: vec![Scope::Source],
+        }
     }
 
-    fn as_runtime_lua(&self) -> &'static str {
-        // TODO(hygiene): project the full scope set into a stable runtime id.
-        "0"
+    pub fn generated() -> Self {
+        Self {
+            scopes: vec![Scope::Generated(1)],
+        }
     }
+
+    pub fn fresh_generated(id: u32) -> Self {
+        Self {
+            scopes: vec![Scope::Generated(id.max(2))],
+        }
+    }
+
+    pub fn macro_introduction(span: SourceSpan) -> Self {
+        Self {
+            scopes: vec![Scope::MacroIntroduction(scope_id_from_span(span, 10_000))],
+        }
+    }
+
+    pub fn use_site(span: SourceSpan) -> Self {
+        Self {
+            scopes: vec![Scope::UseSite(scope_id_from_span(span, 20_000))],
+        }
+    }
+
+    pub fn with_macro_introduction(&self, span: SourceSpan) -> Self {
+        self.with_scope(Scope::MacroIntroduction(scope_id_from_span(span, 10_000)))
+    }
+
+    pub fn with_use_site(&self, span: SourceSpan) -> Self {
+        self.with_scope(Scope::UseSite(scope_id_from_span(span, 20_000)))
+    }
+
+    pub fn with_scope(&self, scope: Scope) -> Self {
+        let mut scopes = self.scopes.clone();
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+            scopes.sort_unstable();
+        }
+        Self { scopes }
+    }
+
+    fn runtime_id(&self) -> u32 {
+        let mut hash = 2_166_136_261u32;
+        for scope in &self.scopes {
+            let (tag, id) = match *scope {
+                Scope::Source => (0, 0),
+                Scope::MacroIntroduction(id) => (1, id),
+                Scope::UseSite(id) => (2, id),
+                Scope::Generated(id) => (3, id),
+            };
+            hash ^= tag;
+            hash = hash.wrapping_mul(16_777_619);
+            hash ^= id;
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        if self.scopes == [Scope::Source] {
+            0
+        } else {
+            hash.max(1)
+        }
+    }
+
+    fn as_runtime_lua(&self) -> String {
+        self.runtime_id().to_string()
+    }
+}
+
+fn scope_id_from_span(span: SourceSpan, salt: u32) -> u32 {
+    let mut hash = 2_166_136_261u32 ^ salt;
+    for part in [
+        span.start_line as u32,
+        span.start_col as u32,
+        span.end_line as u32,
+        span.end_col as u32,
+    ] {
+        hash ^= part;
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash.max(1)
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +328,7 @@ pub fn syntax_pattern_to_lua(pattern: &SyntaxPattern) -> String {
         SyntaxPattern::Tree {
             delimiter,
             children,
+            ..
         } => format!(
             "{{ kind = \"tree\", delimiter = {}, children = {} }}",
             lua_string(delimiter_name(*delimiter)),
@@ -279,6 +376,46 @@ pub fn collect_syntax_template_splices(
             }
         }
         SyntaxTemplate::Token { .. } => {}
+    }
+}
+
+pub fn syntax_nodes_to_source(nodes: &[Syntax]) -> String {
+    nodes
+        .iter()
+        .map(syntax_to_source)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn syntax_to_source(syntax: &Syntax) -> String {
+    match &syntax.kind {
+        SyntaxKind::Token(token) => syntax_token_to_source(token),
+        SyntaxKind::Tree {
+            delimiter,
+            children,
+        } => {
+            let (open, close) = delimiter_pair(*delimiter);
+            format!("{open}{}{close}", syntax_nodes_to_source(children))
+        }
+        SyntaxKind::Sequence(children) => syntax_nodes_to_source(children),
+    }
+}
+
+pub fn syntax_token_to_source(token: &SyntaxToken) -> String {
+    match token {
+        SyntaxToken::Ident(text)
+        | SyntaxToken::Keyword(text)
+        | SyntaxToken::Literal(text)
+        | SyntaxToken::Operator(text)
+        | SyntaxToken::Punct(text) => text.clone(),
+    }
+}
+
+fn delimiter_pair(delimiter: SyntaxDelimiter) -> (&'static str, &'static str) {
+    match delimiter {
+        SyntaxDelimiter::Paren => ("(", ")"),
+        SyntaxDelimiter::Brace => ("{", "}"),
+        SyntaxDelimiter::Bracket => ("[", "]"),
     }
 }
 
@@ -348,7 +485,7 @@ fn syntax_token_to_lua(token: &SyntaxToken, syntax: &Syntax) -> String {
     match token {
         SyntaxToken::Ident(name) => variant(
             "Ident",
-            tuple(&[lua_string(name), syntax.scopes.as_runtime_lua().to_string()]),
+            tuple(&[lua_string(name), syntax.scopes.as_runtime_lua()]),
         ),
         SyntaxToken::Keyword(text) => variant("Keyword", lua_string(text)),
         SyntaxToken::Literal(text) => variant("Literal", lua_string(text)),
@@ -379,8 +516,103 @@ fn syntax_token_pattern_to_lua(token: &SyntaxToken) -> String {
     }
 }
 
-fn meta_to_lua(_syntax: &Syntax) -> String {
-    "{}".to_string()
+fn meta_to_lua(syntax: &Syntax) -> String {
+    format!(
+        "{{ span = {}, origin = {} }}",
+        span_to_lua(syntax.span),
+        origin_to_lua(&syntax.origin)
+    )
+}
+
+fn span_to_lua(span: SourceSpan) -> String {
+    tuple(&[
+        span.start_line.to_string(),
+        span.start_col.to_string(),
+        span.end_line.to_string(),
+        span.end_col.to_string(),
+    ])
+}
+
+fn origin_to_lua(origin: &SyntaxOrigin) -> String {
+    match origin {
+        SyntaxOrigin::Source(_) => lua_string("source"),
+        SyntaxOrigin::Generated => lua_string("generated"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span() -> SourceSpan {
+        SourceSpan::synthetic()
+    }
+
+    #[test]
+    fn syntax_to_source_renders_nested_trees_and_sequences() {
+        let syntax = Syntax {
+            kind: SyntaxKind::Sequence(vec![
+                Syntax::token(SyntaxToken::Ident("foo".to_string()), span()),
+                Syntax::tree(
+                    SyntaxDelimiter::Paren,
+                    vec![
+                        Syntax::token(SyntaxToken::Literal("1".to_string()), span()),
+                        Syntax::token(SyntaxToken::Punct(",".to_string()), span()),
+                        Syntax::token(SyntaxToken::Ident("x".to_string()), span()),
+                    ],
+                    span(),
+                ),
+            ]),
+            span: span(),
+            origin: SyntaxOrigin::Generated,
+            scopes: ScopeSet::generated(),
+        };
+
+        assert_eq!(syntax_to_source(&syntax), "foo (1 , x)");
+    }
+
+    #[test]
+    fn syntax_collectors_walk_nested_patterns_and_templates() {
+        let pattern = SyntaxPattern::Tree {
+            delimiter: SyntaxDelimiter::Brace,
+            span: span(),
+            children: vec![SyntaxPattern::Tree {
+                delimiter: SyntaxDelimiter::Paren,
+                span: span(),
+                children: vec![SyntaxPattern::Capture(SyntaxCapture {
+                    name: "lhs".to_string(),
+                    category: SyntaxCategory::Expr,
+                    repeat: false,
+                    span: span(),
+                })],
+            }],
+        };
+        let template = SyntaxTemplate::Tree {
+            delimiter: SyntaxDelimiter::Brace,
+            span: span(),
+            children: vec![SyntaxTemplate::Tree {
+                delimiter: SyntaxDelimiter::Paren,
+                span: span(),
+                children: vec![SyntaxTemplate::Splice {
+                    name: "lhs".to_string(),
+                    repeat: true,
+                    span: span(),
+                }],
+            }],
+        };
+
+        let mut captures = Vec::new();
+        collect_syntax_pattern_captures(&pattern, &mut captures);
+        let mut splices = Vec::new();
+        collect_syntax_template_splices(&template, &mut splices);
+
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].name, "lhs");
+        assert_eq!(captures[0].category, SyntaxCategory::Expr);
+        assert_eq!(splices.len(), 1);
+        assert_eq!(splices[0].name, "lhs");
+        assert!(splices[0].repeat);
+    }
 }
 
 fn variant(name: &str, payload: String) -> String {

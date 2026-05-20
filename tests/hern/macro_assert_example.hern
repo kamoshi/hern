@@ -1,0 +1,9 @@
+macro assert(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$condition:expr, $message:expr} -> Ok('{ assert($condition, $message) }),
+    _ -> Err(MacroError("assert! expects a condition and message")),
+  }
+}
+
+assert!(1 + 1 == 2, "math still works");
+print("ok");

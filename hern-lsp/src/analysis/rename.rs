@@ -25,7 +25,10 @@ fn is_valid_identifier(name: &str) -> bool {
 }
 
 fn renameable_definition_kind(kind: DefinitionKind) -> bool {
-    matches!(kind, DefinitionKind::Function | DefinitionKind::Let)
+    matches!(
+        kind,
+        DefinitionKind::Function | DefinitionKind::Macro | DefinitionKind::Let
+    )
 }
 
 struct RenameTarget {

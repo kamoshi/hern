@@ -1,0 +1,5 @@
+fn value() -> int {
+  1
+}
+
+#{ value: value }

@@ -1,0 +1,15 @@
+macro make_point_fn(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$x:expr, $y:expr} -> Ok(syntax_sequence(syntax_children('{
+      fn point() {
+        #{ x: $x, y: $y }
+      }
+    }))),
+    _ -> Err(MacroError("make_point_fn! expects two expressions")),
+  }
+}
+
+make_point_fn!(20, 22);
+
+let p = point();
+print(to_string(p.x + p.y));

@@ -810,7 +810,7 @@ impl<'tokens> Parser<'tokens> {
             ptr += consumed;
         }
 
-        Ok(Program { stmts, inner_attrs })
+        Ok(Program::new(stmts, inner_attrs))
     }
 
     pub fn parse_program_recovering(&self) -> (Program, Vec<ParseError>) {
@@ -843,7 +843,7 @@ impl<'tokens> Parser<'tokens> {
             diagnostics.append(&mut self.inner_diagnostics.borrow_mut());
         }
 
-        (Program { stmts, inner_attrs }, diagnostics)
+        (Program::new(stmts, inner_attrs), diagnostics)
     }
 
     fn parse_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
@@ -895,33 +895,45 @@ impl<'tokens> Parser<'tokens> {
                     self.parse_type_def_stmt_with_attrs(&tokens[attrs_consumed..], attrs)?;
                 return Ok((attrs_consumed + consumed, stmt));
             }
-            if let Some(attr) = attrs.iter().find(|attr| !attr.is("test")) {
-                let message = if attr.is("derive") {
-                    "Attribute `derive` is only allowed on type declarations".to_string()
-                } else {
-                    format!("Unknown attribute `{}`", attr.name)
-                };
-                return Err(ParseError::new(message, attr_error_span(attr)));
-            }
-            if let Some(attr) = attrs.iter().find(|attr| !attr.args.is_empty()) {
-                return Err(ParseError::new(
-                    format!("Attribute `{}` does not accept arguments", attr.name),
-                    attr_error_span(attr),
-                ));
-            }
-            if !in_test_block {
-                return Err(ParseError::new(
-                    "Attribute `test` can only be used inside a `test` block",
-                    attr_error_span(&attrs[0]),
-                ));
-            }
             if tok.token != Token::Fn {
+                if let Some(attr) = attrs.iter().find(|attr| !attr.is("test")) {
+                    let message = if attr.is("derive") {
+                        "Attribute `derive` is only allowed on type declarations".to_string()
+                    } else {
+                        format!("Unknown attribute `{}`", attr.name)
+                    };
+                    return Err(ParseError::new(message, attr_error_span(attr)));
+                }
                 return Err(ParseError::new(
                     format!(
                         "Attribute `{}` can only be used on functions",
                         attrs[0].name
                     ),
                     attr_error_span(&attrs[0]),
+                ));
+            }
+            if in_test_block {
+                if let Some(attr) = attrs.iter().find(|attr| !attr.is("test")) {
+                    return Err(ParseError::new(
+                        format!("Unknown attribute `{}`", attr.name),
+                        attr_error_span(attr),
+                    ));
+                }
+                if let Some(attr) = attrs.iter().find(|attr| !attr.args.is_empty()) {
+                    return Err(ParseError::new(
+                        format!("Attribute `{}` does not accept arguments", attr.name),
+                        attr_error_span(attr),
+                    ));
+                }
+            } else if let Some(attr) = attrs.iter().find(|attr| attr.is("test")) {
+                return Err(ParseError::new(
+                    "Attribute `test` can only be used inside a `test` block",
+                    attr_error_span(attr),
+                ));
+            } else if let Some(attr) = attrs.iter().find(|attr| attr.is("derive")) {
+                return Err(ParseError::new(
+                    "Attribute `derive` is only allowed on type declarations",
+                    attr_error_span(attr),
                 ));
             }
             let (consumed, stmt) =
@@ -1725,15 +1737,7 @@ impl<'tokens> Parser<'tokens> {
                     "Eq" => DeriveTrait::Eq,
                     "Ord" => DeriveTrait::Ord,
                     "ToString" => DeriveTrait::ToString,
-                    _ => {
-                        return Err(ParseError::new(
-                            format!(
-                                "Cannot derive `{}`: supported derives are Default, Eq, Ord, ToString",
-                                arg
-                            ),
-                            attr_error_span(attr),
-                        ));
-                    }
+                    _ => DeriveTrait::Custom(arg.clone()),
                 };
                 if seen.contains(&derive_trait) {
                     return Err(ParseError::new(
@@ -1741,7 +1745,7 @@ impl<'tokens> Parser<'tokens> {
                         attr_error_span(attr),
                     ));
                 }
-                seen.push(derive_trait);
+                seen.push(derive_trait.clone());
                 traits.push(derive_trait);
             }
             derives.push(DeriveAttr {
@@ -2427,11 +2431,13 @@ impl<'tokens> Parser<'tokens> {
                 return Err(ParseError::new("unterminated syntax pattern", open.span));
             };
             if tok.token == close_token {
+                let span = SourceSpan::from_bounds(open.span, tok.span);
                 return Ok((
                     ptr - start + 1,
                     SyntaxPattern::Tree {
                         delimiter,
                         children,
+                        span,
                     },
                 ));
             }

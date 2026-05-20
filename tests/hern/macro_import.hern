@@ -1,0 +1,3 @@
+let macros = import "macro_import_provider";
+
+print(to_string(imported_swap!(1, 2)));

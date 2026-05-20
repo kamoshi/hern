@@ -1,0 +1,3 @@
+let a = import "macro_import_cycle_a";
+
+print(to_string(cycle_a!(1)));

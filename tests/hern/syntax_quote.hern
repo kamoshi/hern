@@ -119,3 +119,51 @@ match '{answer + 41} {
   '{$items:token...} -> print(to_string('{ $items... * $items... })),
   _ -> print("missed repeated reconstruction"),
 };
+
+print(syntax_kind(syntax));
+
+match syntax_delimiter(syntax) {
+  Some(Brace) -> print("delimiter brace"),
+  _ -> print("delimiter miss"),
+};
+
+match syntax_span(syntax) {
+  (line, _, _, _) -> print(to_string(line > 0)),
+};
+
+print(syntax_origin(syntax));
+
+let constructed = syntax_tree(Brace, [
+  syntax_ident("made"),
+  syntax_operator("+"),
+  syntax_literal("7"),
+]);
+print(to_string(constructed));
+print(syntax_origin(constructed));
+print(to_string(syntax_eq_shape(syntax_token(Operator("+")), syntax_operator("+"))));
+print(to_string(syntax_sequence([
+  syntax_ident("left"),
+  syntax_punct(","),
+  syntax_ident("right"),
+])));
+
+let mapped = syntax_map_children(constructed, fn(child) {
+  syntax_replace(child, syntax_ident("made"), syntax_ident("done"))
+});
+print(to_string(mapped));
+
+match syntax_find(mapped, fn(node) { syntax_is_ident(node, "done") }) {
+  Some(found) -> print(syntax_token_text(found).unwrap_or("missing")),
+  None -> print("missing"),
+};
+
+print(to_string(syntax_replace(mapped, syntax_literal("7"), syntax_literal("8"))));
+print(to_string(syntax_join([
+  syntax_ident("a"),
+  syntax_ident("b"),
+  syntax_ident("c"),
+], syntax_punct(","))));
+print(syntax_debug(mapped));
+print(to_string(syntax_eq_shape(syntax_ident("tmp"), syntax_fresh_ident("tmp"))));
+print(to_string(syntax_same_binding(syntax_ident("tmp"), syntax_fresh_ident("tmp"))));
+print(to_string(syntax_same_binding(syntax_fresh_ident("tmp"), syntax_fresh_ident("tmp"))));

@@ -562,7 +562,16 @@ fn symbol_hover(
         return imported_member_hover_text(graph, inference, reference, import_alias);
     }
 
-    let definition = index.definition_at(position)?;
+    let definition = if let Some(definition) = index.definition_at(position) {
+        definition
+    } else {
+        let definition = index.definition_for_reference_at(position)?;
+        if definition.kind != DefinitionKind::Macro && !syntax_template_splice_at(program, position)
+        {
+            return None;
+        }
+        definition
+    };
     definition_hover_text(
         definition,
         inference.env_for_module(module_name),
@@ -573,6 +582,21 @@ fn symbol_hover(
         inference.variant_env_for_module(module_name),
         program,
     )
+}
+
+fn syntax_template_splice_at(program: &Program, position: SourcePosition) -> bool {
+    let mut found = false;
+    walk_program_exprs(program, &mut |expr| {
+        if found || !contains(expr.span, position) {
+            return;
+        }
+        if let ExprKind::SyntaxQuote(template) = &expr.kind {
+            let mut splices = Vec::new();
+            hern_core::syntax::collect_syntax_template_splices(template, &mut splices);
+            found = splices.iter().any(|splice| contains(splice.span, position));
+        }
+    });
+    found
 }
 
 // ── Trait access hover ────────────────────────────────────────────────────────
@@ -1021,6 +1045,16 @@ fn type_declaration_hover_text(program: &Program, definition: &Definition) -> Op
                 .iter()
                 .find(|method| method.name_span == definition.location.span)
                 .map(inherent_method_signature),
+            _ => None,
+        }),
+        DefinitionKind::Macro => program.stmts.iter().find_map(|stmt| match stmt {
+            Stmt::Macro(def) if def.name_span == definition.location.span => Some(format!(
+                "macro {}({}: {}) -> {}",
+                def.name,
+                def.param_name,
+                ast_type_to_string(&def.param_ty),
+                ast_type_to_string(&def.ret_ty)
+            )),
             _ => None,
         }),
         _ => None,

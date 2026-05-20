@@ -1,0 +1,13 @@
+macro dbg(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$value:expr} -> Ok('{ {
+      let value = $value;
+      print(to_string(value));
+      value
+    } }),
+    _ -> Err(MacroError("dbg! expects one expression")),
+  }
+}
+
+let value = 10;
+print(to_string(dbg!(value - 7) + value));

@@ -1,0 +1,7 @@
+macro only_ident(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$name:ident} -> Ok(input),
+  }
+}
+
+only_ident!(1 + 2)

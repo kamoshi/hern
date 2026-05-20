@@ -1,0 +1,8 @@
+let mut counter = 0;
+
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  counter = 1;
+  Ok(input)
+}
+
+bad!(1);

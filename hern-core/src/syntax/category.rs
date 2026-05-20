@@ -2,7 +2,7 @@ use crate::lex::error::{LexErrorKind, ParseError};
 use crate::lex::{Lexer, Spanned, Token};
 use crate::parse::Parser;
 
-use super::{SyntaxCategory, SyntaxDelimiter, SyntaxKind, SyntaxToken};
+use super::SyntaxCategory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CategoryMatchMode {
@@ -147,46 +147,6 @@ pub fn category_accepts_tokens(
             )
         )),
         SyntaxCategory::Tree | SyntaxCategory::Block | SyntaxCategory::Tokens => Ok(false),
-    }
-}
-
-pub fn syntax_nodes_to_source(nodes: &[super::Syntax]) -> String {
-    nodes
-        .iter()
-        .map(syntax_to_source)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn syntax_to_source(syntax: &super::Syntax) -> String {
-    match &syntax.kind {
-        SyntaxKind::Token(token) => syntax_token_to_source(token),
-        SyntaxKind::Tree {
-            delimiter,
-            children,
-        } => {
-            let (open, close) = delimiter_pair(*delimiter);
-            format!("{open}{}{close}", syntax_nodes_to_source(children))
-        }
-        SyntaxKind::Sequence(children) => syntax_nodes_to_source(children),
-    }
-}
-
-fn syntax_token_to_source(token: &SyntaxToken) -> String {
-    match token {
-        SyntaxToken::Ident(text)
-        | SyntaxToken::Keyword(text)
-        | SyntaxToken::Literal(text)
-        | SyntaxToken::Operator(text)
-        | SyntaxToken::Punct(text) => text.clone(),
-    }
-}
-
-fn delimiter_pair(delimiter: SyntaxDelimiter) -> (&'static str, &'static str) {
-    match delimiter {
-        SyntaxDelimiter::Paren => ("(", ")"),
-        SyntaxDelimiter::Brace => ("{", "}"),
-        SyntaxDelimiter::Bracket => ("[", "]"),
     }
 }
 

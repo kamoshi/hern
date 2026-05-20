@@ -1,0 +1,4 @@
+let a = import "macro_import_conflict_a";
+let b = import "macro_import_conflict_b";
+
+print(to_string(conflict!(ignored)));

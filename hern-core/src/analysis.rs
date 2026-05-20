@@ -54,6 +54,14 @@ pub struct CompilerDiagnostic {
     pub span: Option<SourceSpan>,
     pub severity: DiagnosticSeverity,
     pub message: String,
+    pub related: Vec<CompilerDiagnosticRelated>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompilerDiagnosticRelated {
+    pub source: Option<DiagnosticSource>,
+    pub span: SourceSpan,
+    pub message: String,
 }
 
 impl CompilerDiagnostic {
@@ -63,6 +71,7 @@ impl CompilerDiagnostic {
             span,
             severity: DiagnosticSeverity::Error,
             message: message.into(),
+            related: Vec::new(),
         }
     }
 
@@ -76,6 +85,7 @@ impl CompilerDiagnostic {
             span,
             severity: DiagnosticSeverity::Error,
             message: message.into(),
+            related: Vec::new(),
         }
     }
 
@@ -95,6 +105,15 @@ impl CompilerDiagnostic {
         if self.span.is_none() {
             self.span = Some(span);
         }
+        self
+    }
+
+    pub fn with_related(mut self, span: SourceSpan, message: impl Into<String>) -> Self {
+        self.related.push(CompilerDiagnosticRelated {
+            source: None,
+            span,
+            message: message.into(),
+        });
         self
     }
 }

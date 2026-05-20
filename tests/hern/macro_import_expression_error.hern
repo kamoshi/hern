@@ -1,0 +1,6 @@
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  let dep = import "macro_import_provider";
+  Ok(input)
+}
+
+bad!(1);

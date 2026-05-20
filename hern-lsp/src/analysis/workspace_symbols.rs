@@ -140,7 +140,7 @@ fn is_workspace_symbol_kind(kind: DefinitionKind) -> bool {
 
 fn symbol_kind(kind: DefinitionKind) -> SymbolKind {
     match kind {
-        DefinitionKind::Function => SymbolKind::FUNCTION,
+        DefinitionKind::Function | DefinitionKind::Macro => SymbolKind::FUNCTION,
         DefinitionKind::ImplMethod | DefinitionKind::TraitMethod => SymbolKind::METHOD,
         DefinitionKind::Let => SymbolKind::VARIABLE,
         DefinitionKind::Parameter => SymbolKind::VARIABLE,

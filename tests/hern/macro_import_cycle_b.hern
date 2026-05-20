@@ -1,0 +1,7 @@
+let a = import "macro_import_cycle_a";
+
+macro cycle_b(input: Syntax) -> MacroResult(Syntax) {
+  Ok(input)
+}
+
+#{}

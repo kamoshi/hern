@@ -4,6 +4,7 @@ use crate::lex::error::{LexError, LexErrorKind, ParseError};
 use crate::lex::{Lexer, Spanned};
 use crate::parse::Parser;
 use crate::reassoc::{ReassocError, build_fixity_table, reassoc_program};
+use crate::types::error::SpannedTypeError;
 use crate::types::infer::{Infer, InferenceResult, ModuleInference, TypeEnv};
 
 /// Tokenizes `source` into a token stream.
@@ -131,7 +132,7 @@ pub fn infer_program_with_seed(
     let mut infer = Infer::new();
     infer
         .infer_program_with_seed_and_types(program, seed_stmts, seed_env)
-        .map_err(|err| CompilerDiagnostic::error(err.span, err.to_string()))
+        .map_err(|err| type_error_diagnostic(program, &err))
 }
 
 /// Runs type inference on `program`, collecting independent top-level diagnostics.
@@ -158,10 +159,47 @@ pub fn infer_program_collecting_with_seed(
             inference,
             diagnostics
                 .into_iter()
-                .map(|err| CompilerDiagnostic::error(err.span, err.to_string()))
+                .map(|err| type_error_diagnostic(program, &err))
                 .collect(),
         )
     }
+}
+
+pub(crate) fn type_error_diagnostic(
+    program: &Program,
+    err: &SpannedTypeError,
+) -> CompilerDiagnostic {
+    let mut diagnostic = CompilerDiagnostic::error(err.span, type_error_message(program, err));
+    if let Some(span) = err.span
+        && let Some(expansion) = program.macro_expansion_for_span(span)
+    {
+        diagnostic = diagnostic
+            .with_related(
+                expansion.call_span,
+                format!("while expanding `{}!` here", expansion.macro_name),
+            )
+            .with_related(
+                expansion.definition_span,
+                format!("macro `{}` is defined here", expansion.macro_name),
+            );
+    }
+    diagnostic
+}
+
+pub(crate) fn type_error_message(program: &Program, err: &SpannedTypeError) -> String {
+    let mut message = err.to_string();
+    if let Some(span) = err.span
+        && let Some(expansion) = program.macro_expansion_for_span(span)
+    {
+        message.push_str(&format!(
+            "\nwhile expanding `{}!` here\nmacro definition starts at {}:{}\ngenerated source:\n{}",
+            expansion.macro_name,
+            expansion.definition_span.start_line,
+            expansion.definition_span.start_col,
+            expansion.generated_source_excerpt
+        ));
+    }
+    message
 }
 
 fn lex_diagnostic(err: LexError) -> CompilerDiagnostic {
@@ -327,11 +365,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_source_rejects_unknown_derives() {
-        let err = parse_source("#[derive(Clone)]\ntype Box('a) = Box('a)\n")
-            .expect_err("unknown derive should fail");
-
-        assert!(err.message.contains("Cannot derive `Clone`"));
+    fn parse_source_accepts_custom_derives_for_macro_expansion() {
+        let program = parse_source("#[derive(Clone)]\ntype Box('a) = Box('a)\n")
+            .expect("custom derives should parse so macro expansion can resolve them");
+        let Stmt::Type(type_def) = &program.stmts[0] else {
+            panic!("expected type definition");
+        };
+        assert_eq!(type_def.derives[0].traits[0].name(), "Clone");
     }
 
     #[test]

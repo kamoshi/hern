@@ -1,0 +1,6 @@
+macro import_dep(input: Syntax) -> MacroResult(Syntax) {
+  Ok('{ import "macro_generated_import_dep" })
+}
+
+let dep = import_dep!(ignored);
+print(to_string(dep.value()));

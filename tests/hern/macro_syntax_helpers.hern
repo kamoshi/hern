@@ -1,0 +1,77 @@
+macro helper_check(input: Syntax) -> MacroResult(Syntax) {
+  let children = syntax_children(input);
+  if children.len() != 3 {
+    Err(MacroError("expected binary expression"))
+  } else {
+    let lhs = children[0];
+    let op = children[1];
+    let rhs = children[2];
+    let quoted_lhs = syntax_children('{foo})[0];
+    let quoted_op = syntax_children('{+})[0];
+    let quoted_rhs = syntax_children('{bar})[0];
+    match (syntax_kind(input), syntax_delimiter(input), syntax_origin(input), syntax_span(input)) {
+      ("tree:paren", Some(Paren), "source", (line, _, _, _)) -> {
+        if (line > 0)
+          && syntax_is_ident(lhs, "foo")
+          && syntax_same_binding(lhs, lhs)
+          && syntax_eq_shape(op, quoted_op)
+          && syntax_is_ident(rhs, "bar") {
+          Ok('{ 1 })
+        } else {
+          Ok('{ 0 })
+        }
+      },
+      _ -> Ok('{ 0 }),
+    }
+  }
+}
+
+macro constructed_expr(input: Syntax) -> MacroResult(Syntax) {
+  let one = syntax_literal("1");
+  let plus = syntax_token(Operator("+"));
+  let two = syntax_literal("2");
+  Ok(syntax_sequence([one, plus, two]))
+}
+
+macro helper_ops(input: Syntax) -> MacroResult(Syntax) {
+  let mapped = syntax_map_children(input, fn(child) {
+    syntax_replace(child, syntax_literal("1"), syntax_literal("4"))
+  });
+  let debug = syntax_debug(mapped);
+  match syntax_find(mapped, fn(node) {
+    syntax_token_text(node).unwrap_or("") == "4"
+  }) {
+    Some(_) -> {
+      if debug == "tree:paren (4 + 2)" {
+        Ok(mapped)
+      } else {
+        Err(MacroError(debug))
+      }
+    },
+    None -> Err(MacroError("replacement not found")),
+  }
+}
+
+macro joined_expr(input: Syntax) -> MacroResult(Syntax) {
+  Ok(syntax_join([
+    syntax_literal("3"),
+    syntax_literal("4"),
+  ], syntax_operator("+")))
+}
+
+macro fresh_check(input: Syntax) -> MacroResult(Syntax) {
+  let first = syntax_fresh_ident("tmp");
+  let second = syntax_fresh_ident("tmp");
+  if syntax_same_binding(first, second) {
+    Ok('{ 0 })
+  } else {
+    Ok('{ 1 })
+  }
+}
+
+print(to_string(helper_check!(foo + bar)));
+print(to_string(helper_check!(bar + foo)));
+print(to_string(constructed_expr!(ignored)));
+print(to_string(helper_ops!(1 + 2)));
+print(to_string(joined_expr!(ignored)));
+print(to_string(fresh_check!(ignored)));

@@ -1,0 +1,7 @@
+macro make_answer(input: Syntax) -> MacroResult(Syntax) {
+  Ok(syntax_sequence(syntax_children('{ fn answer() { 42 } })))
+}
+
+make_answer!(());
+
+print(to_string(answer()));

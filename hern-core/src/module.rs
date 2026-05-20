@@ -3,9 +3,10 @@ use crate::ast::{
     Expr, ExprKind, NodeId, Param, Pattern, Program, SourceSpan, Stmt, TraitDef, walk_program_exprs,
 };
 use crate::derive::expand_derives;
-use crate::macros::expand_macros;
+use crate::macros::{collect_exported_macro_names, expand_macros, expand_macros_with_imports};
 use crate::pipeline::{
     AnalysisOutput, parse_source, parse_source_recovering, reassociate_with_program,
+    type_error_diagnostic,
 };
 use crate::types::infer::{Infer, TypeEnv, VariantEnv};
 use crate::types::{
@@ -26,6 +27,7 @@ const HERN_IMPORT_PREFIX: &str = "hern:";
 pub struct ModuleGraph {
     pub prelude: Program,
     pub modules: HashMap<String, Program>,
+    macro_exports: HashMap<String, Vec<String>>,
     pub paths: HashMap<String, PathBuf>,
     pub order: Vec<String>,
     pub no_prelude_modules: HashSet<String>,
@@ -141,6 +143,7 @@ impl ModuleGraph {
         Self {
             prelude,
             modules: HashMap::new(),
+            macro_exports: HashMap::new(),
             paths: HashMap::new(),
             order: Vec::new(),
             no_prelude_modules: HashSet::new(),
@@ -277,12 +280,15 @@ impl ModuleGraph {
             let content = self.read_source(&path)?;
             let mut program = parse_source(&content)
                 .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
-            expand_macros(&mut program)
-                .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
             let base_dir = path
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf();
+            resolve_imports_in_program(&mut program, &base_dir, self)
+                .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
+            let macro_imports = imported_macro_programs(&program, self);
+            expand_macros_with_imports(&mut program, macro_imports)
+                .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
             resolve_imports_in_program(&mut program, &base_dir, self)
                 .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
             expand_derives(&mut program);
@@ -291,14 +297,9 @@ impl ModuleGraph {
                 .iter()
                 .any(|a| a == "no_implicit_prelude")
             {
-                reassociate_with_program(
-                    &mut program,
-                    &Program {
-                        stmts: vec![],
-                        inner_attrs: vec![],
-                    },
-                )
-                .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
+                reassociate_with_program(&mut program, &Program::empty()).map_err(|err| {
+                    err.with_source_if_absent(DiagnosticSource::Path(path.clone()))
+                })?;
             } else {
                 reassociate_with_program(&mut program, &self.prelude).map_err(|err| {
                     err.with_source_if_absent(DiagnosticSource::Path(path.clone()))
@@ -309,16 +310,7 @@ impl ModuleGraph {
         self.loading.remove(&path);
 
         let program = loaded?;
-        if program
-            .inner_attrs
-            .iter()
-            .any(|a| a == "no_implicit_prelude")
-        {
-            self.no_prelude_modules.insert(name.clone());
-        }
-        self.paths.insert(name.clone(), path);
-        self.modules.insert(name.clone(), program);
-        self.order.push(name.clone());
+        self.insert_loaded_module(name.clone(), path, program);
         Ok(name)
     }
 
@@ -360,7 +352,14 @@ impl ModuleGraph {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf();
             let mut diagnostics = parsed.diagnostics;
-            if let Err(err) = expand_macros(&mut parsed.program) {
+            diagnostics.extend(resolve_imports_in_program_recovering(
+                &mut parsed.program,
+                &base_dir,
+                self,
+                DiagnosticSource::Path(path.clone()),
+            ));
+            let macro_imports = imported_macro_programs(&parsed.program, self);
+            if let Err(err) = expand_macros_with_imports(&mut parsed.program, macro_imports) {
                 diagnostics.push(err.with_source_if_absent(source.clone()));
             }
             diagnostics.extend(resolve_imports_in_program_recovering(
@@ -376,13 +375,7 @@ impl ModuleGraph {
                 .iter()
                 .any(|a| a == "no_implicit_prelude")
             {
-                if let Err(err) = reassociate_with_program(
-                    &mut parsed.program,
-                    &Program {
-                        stmts: vec![],
-                        inner_attrs: vec![],
-                    },
-                ) {
+                if let Err(err) = reassociate_with_program(&mut parsed.program, &Program::empty()) {
                     diagnostics
                         .push(err.with_source_if_absent(DiagnosticSource::Path(path.clone())));
                 }
@@ -401,6 +394,12 @@ impl ModuleGraph {
             Ok(loaded) => loaded,
             Err(diagnostic) => return (name, vec![diagnostic]),
         };
+        self.insert_loaded_module(name.clone(), path, program);
+        (name, diagnostics)
+    }
+
+    fn insert_loaded_module(&mut self, name: String, path: PathBuf, program: Program) {
+        let macro_exports = collect_exported_macro_names(&program);
         if program
             .inner_attrs
             .iter()
@@ -409,9 +408,9 @@ impl ModuleGraph {
             self.no_prelude_modules.insert(name.clone());
         }
         self.paths.insert(name.clone(), path);
+        self.macro_exports.insert(name.clone(), macro_exports);
         self.modules.insert(name.clone(), program);
-        self.order.push(name.clone());
-        (name, diagnostics)
+        self.order.push(name);
     }
 
     fn read_source(&self, path: &Path) -> Result<String, CompilerDiagnostic> {
@@ -797,10 +796,15 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
         );
 
         if has_errors {
+            let path = graph
+                .paths
+                .get(&name)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| name.to_string());
             diagnostics.extend(
                 module_errors
                     .into_iter()
-                    .map(|err| module_type_diagnostic(graph, &name, source.clone(), err)),
+                    .map(|err| module_type_diagnostic(&path, program, source.clone(), err)),
             );
             unavailable_modules.insert(name);
         }
@@ -814,17 +818,14 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
 }
 
 fn module_type_diagnostic(
-    graph: &ModuleGraph,
-    name: &str,
+    path: &str,
+    program: &Program,
     source: DiagnosticSource,
     err: crate::types::error::SpannedTypeError,
 ) -> CompilerDiagnostic {
-    let path = graph
-        .paths
-        .get(name)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| name.to_string());
-    CompilerDiagnostic::error_in(source, err.span, format!("type error in {}: {}", path, err))
+    let mut diagnostic = type_error_diagnostic(program, &err).with_source(source);
+    diagnostic.message = format!("type error in {}: {}", path, diagnostic.message);
+    diagnostic
 }
 
 fn export_schemes_from_program(program: &Program, env: &TypeEnv) -> HashMap<String, Scheme> {
@@ -882,6 +883,23 @@ fn collect_imports_with_spans(program: &Program) -> Vec<ImportRef> {
     });
     imports.dedup_by(|a, b| a.module == b.module);
     imports
+}
+
+fn imported_macro_programs<'a>(
+    program: &Program,
+    graph: &'a ModuleGraph,
+) -> Vec<(&'a str, &'a Program)> {
+    collect_imports_with_spans(program)
+        .into_iter()
+        .filter_map(|import| {
+            let (module_name, module) = graph.modules.get_key_value(&import.module)?;
+            let has_macro_exports = graph.macro_exports.get(module_name).map_or_else(
+                || !collect_exported_macro_names(module).is_empty(),
+                |names| !names.is_empty(),
+            );
+            has_macro_exports.then_some((module_name.as_str(), module))
+        })
+        .collect()
 }
 
 impl ModuleEnv {
@@ -1176,6 +1194,9 @@ fn resolve_imports_in_expr(
 ) -> Result<(), CompilerDiagnostic> {
     match &mut expr.kind {
         ExprKind::Import(spec) => {
+            if graph.modules.contains_key(spec) {
+                return Ok(());
+            }
             let path = graph.resolve_import_path(base_dir, spec)?;
             *spec = graph.load_module(&path)?;
             Ok(())
@@ -1287,6 +1308,9 @@ fn resolve_imports_in_expr_recovering(
 ) {
     match &mut expr.kind {
         ExprKind::Import(spec) => {
+            if graph.modules.contains_key(spec) {
+                return;
+            }
             let path = match graph.resolve_import_path(base_dir, spec) {
                 Ok(path) => path,
                 Err(err) => {
@@ -1921,6 +1945,80 @@ mod tests {
         assert!(
             !dep_path.exists(),
             "test must exercise non-existing imported overlays"
+        );
+    }
+
+    #[test]
+    fn macro_generated_import_is_resolved_after_expansion() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "hern-macro-generated-import-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&test_dir).expect("temp test directory should be created");
+
+        let dep_path = test_dir.join("dep.hern");
+        let entry_path = test_dir.join("main.hern");
+        fs::write(&dep_path, "fn value() { 9 }\n#{ value: value }\n")
+            .expect("dep module should be written");
+        fs::write(
+            &entry_path,
+            "macro import_dep(input: Syntax) -> MacroResult(Syntax) {\n  Ok('{ import \"dep\" })\n}\nlet dep = import_dep!(ignored);\ndep.value()\n",
+        )
+        .expect("entry module should be written");
+
+        let (graph, _entry_name) =
+            ModuleGraph::load_entry(&entry_path).expect("module graph should load");
+        assert!(
+            graph.module_name_for_path(&dep_path).is_some(),
+            "post-expansion import pass should load the macro-generated import"
+        );
+    }
+
+    #[test]
+    fn module_graph_caches_loaded_macro_exports() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "hern-macro-export-cache-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&test_dir).expect("temp test directory should be created");
+
+        let dep_path = test_dir.join("dep.hern");
+        let entry_path = test_dir.join("main.hern");
+        fs::write(
+            &dep_path,
+            "macro literal(input: Syntax) -> MacroResult(Syntax) {\n  Ok('{ 41 })\n}\n#{}\n",
+        )
+        .expect("dep module should be written");
+        fs::write(
+            &entry_path,
+            "let dep = import \"dep\";\nliteral!(ignored)\n",
+        )
+        .expect("entry module should be written");
+
+        let (graph, entry_name) =
+            ModuleGraph::load_entry(&entry_path).expect("module graph should load");
+        let dep_name = graph
+            .module_name_for_path(&dep_path)
+            .expect("imported module should be loaded");
+
+        assert_eq!(
+            graph.macro_exports.get(dep_name),
+            Some(&vec!["literal".to_string()])
+        );
+        assert!(
+            graph.module(&entry_name).is_some_and(|program| program
+                .stmts
+                .iter()
+                .all(|stmt| !matches!(stmt, Stmt::Macro(_)))),
+            "entry macro call should expand through cached imported macro exports"
         );
     }
 

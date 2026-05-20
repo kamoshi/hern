@@ -1,0 +1,8 @@
+#![no_implicit_prelude]
+
+macro id_syntax(input: Syntax) -> MacroResult(Syntax) {
+  let kind = syntax_kind(input);
+  Ok(input)
+}
+
+id_syntax!(1)

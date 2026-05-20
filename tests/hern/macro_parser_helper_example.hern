@@ -1,0 +1,15 @@
+fn parse_int(text) {
+  match text {
+    "forty-one" -> 41,
+    _ -> 0,
+  }
+}
+
+macro parse_with(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$parser:expr, $text:expr} -> Ok('{ $parser($text) }),
+    _ -> Err(MacroError("parse_with! expects a parser expression and input expression")),
+  }
+}
+
+print(to_string(parse_with!(parse_int, "forty-one") + 1));

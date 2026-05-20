@@ -1,0 +1,40 @@
+macro multiply(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$lhs:expr, $rhs:expr} -> Ok('{ $lhs * $rhs }),
+    _ -> Err(MacroError("multiply expects two expressions")),
+  }
+}
+
+macro negate(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$cond:expr} -> Ok('{ !$cond }),
+    _ -> Err(MacroError("negate expects an expression")),
+  }
+}
+
+macro call_twice(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$f:expr, $arg:expr} -> Ok('{ $f($arg) + $f($arg) }),
+    _ -> Err(MacroError("call_twice expects a function and argument")),
+  }
+}
+
+macro select(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$receiver:expr, $index:expr} -> Ok('{ $receiver[$index].value }),
+    _ -> Err(MacroError("select expects receiver and index")),
+  }
+}
+
+fn add_one(x: int) -> int {
+  x + 1
+}
+
+let a = 1;
+let b = 2;
+let c = 3;
+let d = 4;
+print(to_string(multiply!(a + b, c + d)));
+print(to_string(negate!(a + b == c)));
+print(to_string(call_twice!(add_one, a + b)));
+print(to_string(select!([#{ value: 10 }, #{ value: 20 }], a)));

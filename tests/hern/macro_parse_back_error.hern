@@ -1,0 +1,5 @@
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  Ok('{ if })
+}
+
+bad!(ignored)

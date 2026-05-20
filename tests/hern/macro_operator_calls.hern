@@ -1,0 +1,11 @@
+macro ops(input: Syntax) -> MacroResult(Syntax) {
+  let arithmetic = 1 + 2 - 3;
+  let comparisons = (arithmetic == 0) && !(2 < 1) && (-1 < 0);
+  if comparisons {
+    Ok(input)
+  } else {
+    Err(MacroError("bad operators"))
+  }
+}
+
+print(to_string(ops!(1)));

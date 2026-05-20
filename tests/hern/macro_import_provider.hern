@@ -1,0 +1,12 @@
+fn add_reversed(lhs: Syntax, rhs: Syntax) -> Syntax {
+  '{ $rhs + $lhs }
+}
+
+macro imported_swap(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$lhs:expr, $rhs:expr} -> Ok(add_reversed(lhs, rhs)),
+    _ -> Err(MacroError("imported_swap expects two expressions")),
+  }
+}
+
+#{}

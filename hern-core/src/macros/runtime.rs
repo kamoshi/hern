@@ -51,7 +51,7 @@ impl MacroRuntime {
         call_span: SourceSpan,
     ) -> Result<Syntax, MacroRuntimeError> {
         let body = lower_macro_body_to_core(&def.body)?;
-        let mut state = MacroRuntimeState::new(self.limits);
+        let mut state = MacroRuntimeState::new(self.limits, call_span);
         let syntax = eval_macro_result(
             &body.expr,
             &def.param_name,
@@ -77,13 +77,17 @@ impl MacroRuntime {
 pub(super) struct MacroRuntimeState {
     remaining_steps: usize,
     remaining_call_depth: usize,
+    macro_call_span: SourceSpan,
+    next_fresh_scope: u32,
 }
 
 impl MacroRuntimeState {
-    fn new(limits: MacroRuntimeLimits) -> Self {
+    fn new(limits: MacroRuntimeLimits, macro_call_span: SourceSpan) -> Self {
         Self {
             remaining_steps: limits.eval_steps,
             remaining_call_depth: limits.call_depth,
+            macro_call_span,
+            next_fresh_scope: 100_000,
         }
     }
 
@@ -111,5 +115,15 @@ impl MacroRuntimeState {
 
     pub(super) fn exit_call(&mut self) {
         self.remaining_call_depth += 1;
+    }
+
+    pub(super) fn macro_call_span(&self) -> SourceSpan {
+        self.macro_call_span
+    }
+
+    pub(super) fn fresh_scope_id(&mut self) -> u32 {
+        let id = self.next_fresh_scope;
+        self.next_fresh_scope = self.next_fresh_scope.saturating_add(1);
+        id
     }
 }
