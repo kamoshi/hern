@@ -15,6 +15,7 @@ mod impls;
 mod indexing;
 mod iteration;
 mod lexical;
+mod macro_phase;
 mod metadata;
 mod operators;
 mod pattern_infer;
@@ -51,7 +52,7 @@ use crate::lex::NumberLiteral;
 use crate::types::{
     BindingCapabilities, CallableCapabilities, EnvInfo, FuncParam, FuncReturn,
     InherentMethodScheme, ParamCapability, ROOT_LEVEL, ReturnCapability, Row, Scheme, Subst,
-    TraitConstraint, Ty, TyVar, TypeLevel, display_ty_with_var_names,
+    SyntaxCaptureInfo, TraitConstraint, Ty, TyVar, TypeLevel, display_ty_with_var_names,
     env::build_variant_env_from_stmts,
     error::{
         MutablePlaceErrorReason, MutablePlaceSubject, SpannedTypeError, TypeError,
@@ -111,6 +112,7 @@ pub struct InferenceResult {
     pub expr_types: HashMap<NodeId, Ty>,
     pub symbol_types: HashMap<NodeId, Ty>,
     pub binding_types: HashMap<SourceSpan, Ty>,
+    pub syntax_captures: HashMap<SourceSpan, SyntaxCaptureInfo>,
     pub definition_schemes: HashMap<SourceSpan, Scheme>,
     pub binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     pub callable_capabilities: HashMap<NodeId, CallableCapabilities>,
@@ -137,6 +139,7 @@ impl Default for InferenceResult {
             expr_types: HashMap::new(),
             symbol_types: HashMap::new(),
             binding_types: HashMap::new(),
+            syntax_captures: HashMap::new(),
             definition_schemes: HashMap::new(),
             binding_capabilities: HashMap::new(),
             callable_capabilities: HashMap::new(),
@@ -494,6 +497,7 @@ impl Infer {
             expr_types: maps.expr_types,
             symbol_types: maps.symbol_types,
             binding_types: maps.binding_types,
+            syntax_captures: maps.syntax_captures,
             definition_schemes: maps.definition_schemes,
             binding_capabilities: maps.binding_capabilities,
             callable_capabilities: maps.callable_capabilities,
@@ -593,6 +597,7 @@ impl Infer {
                 expr_types: maps.expr_types,
                 symbol_types: maps.symbol_types,
                 binding_types: maps.binding_types,
+                syntax_captures: maps.syntax_captures,
                 definition_schemes: maps.definition_schemes,
                 binding_capabilities: maps.binding_capabilities,
                 callable_capabilities: maps.callable_capabilities,
@@ -898,6 +903,7 @@ impl Infer {
                     dict_params,
                     type_bounds,
                     true,
+                    true,
                 )?;
                 Ok(Ty::Unit)
             }
@@ -921,7 +927,12 @@ impl Infer {
                     dict_params,
                     type_bounds,
                     false,
+                    false,
                 )?;
+                Ok(Ty::Unit)
+            }
+            Stmt::Macro(def) => {
+                self.infer_macro_defs(env, std::slice::from_mut(def))?;
                 Ok(Ty::Unit)
             }
             Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => Ok(Ty::Unit),

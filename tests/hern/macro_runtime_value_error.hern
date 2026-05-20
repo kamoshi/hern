@@ -1,0 +1,5 @@
+let runtime_value = 1;
+
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  Ok(runtime_value)
+}

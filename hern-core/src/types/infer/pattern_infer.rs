@@ -6,6 +6,15 @@
 
 use super::*;
 
+pub(super) fn syntax_capture_ty(repeat: bool) -> Ty {
+    let syntax = Ty::Con("Syntax".to_string());
+    if repeat {
+        Ty::App(Box::new(Ty::Con("Array".to_string())), vec![syntax])
+    } else {
+        syntax
+    }
+}
+
 impl Infer {
     pub(super) fn check_pattern(
         &mut self,
@@ -34,6 +43,28 @@ impl Infer {
             }
             Pattern::BoolLit(_) => {
                 unify(&mut self.subst, scrutinee_ty, Ty::Con("bool".to_string()))
+            }
+            Pattern::SyntaxQuote(pattern) => {
+                unify(&mut self.subst, scrutinee_ty, Ty::Con("Syntax".to_string()))?;
+                let mut captures = Vec::new();
+                crate::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+                for capture in captures {
+                    let capture_info = SyntaxCaptureInfo {
+                        name: capture.name.clone(),
+                        category: capture.category,
+                        repeat: capture.repeat,
+                        span: capture.span,
+                    };
+                    self.metadata
+                        .record_binding_type(capture.span, syntax_capture_ty(capture.repeat));
+                    self.metadata.record_syntax_capture(capture_info.clone());
+                    env.insert(
+                        capture.name,
+                        binding_info(Scheme::mono(syntax_capture_ty(capture.repeat)))
+                            .with_syntax_capture(capture_info),
+                    );
+                }
+                Ok(())
             }
             Pattern::Variable(name, span) => {
                 self.metadata

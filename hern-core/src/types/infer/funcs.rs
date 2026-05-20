@@ -40,6 +40,7 @@ impl Infer {
         dict_params: &mut Vec<String>,
         type_bounds: &[TypeBound],
         add_self_binding: bool,
+        macro_phase_available: bool,
     ) -> Result<(), SpannedTypeError> {
         let ambient = self.current_level;
         let (fn_ty, fn_constraints) = self.with_child_level(|this| {
@@ -117,7 +118,11 @@ impl Infer {
 
         env.insert(
             name.to_string(),
-            EnvInfo::immutable(finalized.scheme.clone()),
+            if macro_phase_available {
+                EnvInfo::immutable(finalized.scheme.clone()).with_macro_phase_available()
+            } else {
+                EnvInfo::immutable(finalized.scheme.clone())
+            },
         );
         self.metadata
             .record_definition_scheme(name_span, finalized.scheme);

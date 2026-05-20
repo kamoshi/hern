@@ -116,7 +116,11 @@ fn collect_code_actions_for_stmt(stmt: &Stmt, ctx: &mut CodeActionCtx<'_>) {
             }
         }
         Stmt::Expr(expr) => collect_code_actions_for_expr(expr, ctx),
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
+        Stmt::Macro(_)
+        | Stmt::Trait(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. } => {}
     }
 }
 
@@ -204,6 +208,8 @@ fn collect_code_actions_for_expr(expr: &Expr, ctx: &mut CodeActionCtx<'_>) {
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Break(None)

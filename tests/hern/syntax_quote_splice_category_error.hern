@@ -1,0 +1,4 @@
+match '{a + b} {
+  '{$lhs:expr + $rhs:expr} -> print(to_string('{ type $lhs })),
+  _ -> print("missed"),
+};

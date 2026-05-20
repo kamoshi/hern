@@ -321,7 +321,7 @@ pub(super) mod tests {
     #[test]
     fn diagnostics_for_interpolation_lex_error_point_inside_hole() {
         let project = TestProject::new("interpolation-lex-diagnostic");
-        let source = "print($\"value ${`}\")\n";
+        let source = "print($\"value ${é}\")\n";
         let (mut state, uri) = project.open("main.hern", source);
 
         let diagnostics = diagnostics_for_document(&mut state, &uri);
@@ -332,7 +332,7 @@ pub(super) mod tests {
 
         assert_eq!(
             diagnostic.message,
-            "Invalid interpolation expression: unexpected character ```"
+            "Invalid interpolation expression: unexpected character `é`"
         );
         assert_eq!(diagnostic.range.start, Position::new(0, 16));
         assert_eq!(diagnostic.range.end, Position::new(0, 17));
@@ -341,7 +341,7 @@ pub(super) mod tests {
     #[test]
     fn diagnostics_for_nested_interpolation_rebase_transitively() {
         let project = TestProject::new("interpolation-nested-diagnostic");
-        let source = "print($\"outer ${$\"inner ${`}\"}\")\n";
+        let source = "print($\"outer ${$\"inner ${é}\"}\")\n";
         let (mut state, uri) = project.open("main.hern", source);
 
         let diagnostics = diagnostics_for_document(&mut state, &uri);
@@ -352,7 +352,7 @@ pub(super) mod tests {
 
         assert_eq!(
             diagnostic.message,
-            "Invalid interpolation expression: unexpected character ```"
+            "Invalid interpolation expression: unexpected character `é`"
         );
         assert_eq!(diagnostic.range.start, Position::new(0, 26));
         assert_eq!(diagnostic.range.end, Position::new(0, 27));
@@ -1183,6 +1183,88 @@ pub(super) mod tests {
         let info = hover(&state, uri, Position::new(0, 4)).expect("hover should resolve");
 
         assert_eq!(hover_text(info), "int");
+    }
+
+    #[test]
+    fn hover_returns_type_inside_macro_body() {
+        let project = TestProject::new("macro-body-hover");
+        let source = concat!(
+            "macro id(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  Ok(input)\n",
+            "}\n",
+            "id!(1)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(1, 5)).expect("hover should resolve");
+
+        assert_eq!(hover_text(info), "Syntax");
+    }
+
+    #[test]
+    fn hover_returns_type_for_macro_parameter() {
+        let project = TestProject::new("macro-param-hover");
+        let source = concat!(
+            "macro id(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  Ok(input)\n",
+            "}\n",
+            "id!(1)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(0, 10)).expect("hover should resolve");
+
+        assert_eq!(hover_text(info), "Syntax");
+    }
+
+    #[test]
+    fn hover_returns_type_for_syntax_capture_inside_macro_body() {
+        let project = TestProject::new("macro-capture-hover");
+        let source = concat!(
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  match input {\n",
+            "    '{$lhs:expr + $rhs:expr} -> Ok('{ $lhs }),\n",
+            "    _ -> Err(MacroError(\"bad\")),\n",
+            "  }\n",
+            "}\n",
+            "rewrite!(1 + 2)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let info = hover(&state, uri, Position::new(2, 8)).expect("hover should resolve");
+
+        assert_eq!(hover_text(info), "Syntax");
+    }
+
+    #[test]
+    fn diagnostics_keep_macro_body_error_with_unrelated_runtime_error() {
+        let project = TestProject::new("macro-diagnostic-recovery");
+        let source = concat!(
+            "macro bad(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  Ok(1)\n",
+            "}\n",
+            "let runtime: bool = 2;\n",
+        );
+        let (mut state, uri) = project.open("main.hern", source);
+
+        let diagnostics = diagnostics_for_document(&mut state, &uri);
+        let messages: Vec<_> = diagnostics[&uri]
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("expected `Syntax`, got `int`")),
+            "macro-body diagnostic missing from {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("expected `bool`, got `int`")),
+            "runtime diagnostic missing from {messages:?}"
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub(super) fn is_irrefutable_param(pat: &Pattern, variant_env: &VariantEnv) -> b
         Pattern::StringLit(_)
         | Pattern::NumberLit(_)
         | Pattern::BoolLit(_)
+        | Pattern::SyntaxQuote(_)
         | Pattern::IntRange { .. } => false,
     }
 }
@@ -39,6 +40,7 @@ pub(super) fn is_irrefutable_let(pat: &Pattern, variant_env: &VariantEnv) -> boo
         Pattern::StringLit(_)
         | Pattern::NumberLit(_)
         | Pattern::BoolLit(_)
+        | Pattern::SyntaxQuote(_)
         | Pattern::IntRange { .. } => false,
     }
 }
@@ -103,6 +105,13 @@ pub(super) fn insert_pattern_bindings(scope: &mut HashSet<String>, pat: &Pattern
         Pattern::Tuple(elems) => {
             for elem in elems {
                 insert_pattern_bindings(scope, elem);
+            }
+        }
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            crate::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+            for capture in captures {
+                scope.insert(capture.name);
             }
         }
         Pattern::Wildcard
@@ -407,6 +416,7 @@ fn pattern_covers(pattern: &Pattern, witness: &Pattern) -> bool {
             matches!(witness, Pattern::NumberLit(other) if number_literals_equal(value, other))
         }
         Pattern::BoolLit(value) => matches!(witness, Pattern::BoolLit(other) if value == other),
+        Pattern::SyntaxQuote(_) => false,
         Pattern::IntRange {
             start,
             end,
@@ -599,6 +609,7 @@ fn pattern_for_message(pattern: &Pattern) -> String {
             }
             format!("[{}]", parts.join(", "))
         }
+        Pattern::SyntaxQuote(_) => "`'(...)`".to_string(),
     }
 }
 

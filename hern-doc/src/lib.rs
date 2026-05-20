@@ -609,7 +609,7 @@ fn collect_stmt_hovers(
             Stmt::Expr(expr) => {
                 collect_expr_stmt_hovers(source, expr, definition_schemes, binding_types, hovers)
             }
-            Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
+            Stmt::Macro(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
         }
     }
 }
@@ -681,6 +681,19 @@ fn collect_pattern_hovers(
                 collect_pattern_binding_hover(
                     source,
                     *span,
+                    definition_schemes,
+                    binding_types,
+                    hovers,
+                );
+            }
+        }
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            hern_core::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+            for capture in captures {
+                collect_pattern_binding_hover(
+                    source,
+                    capture.span,
                     definition_schemes,
                     binding_types,
                     hovers,
@@ -830,6 +843,8 @@ fn collect_expr_stmt_hovers(
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit
@@ -882,7 +897,11 @@ fn collect_associated_access_stmt_hovers(
                 collect_associated_access_stmt_hovers(source, stmt, symbol_types, hovers);
             }
         }
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
+        Stmt::Macro(_)
+        | Stmt::Trait(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. } => {}
     }
 }
 
@@ -987,6 +1006,8 @@ fn collect_associated_access_expr_hovers(
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit

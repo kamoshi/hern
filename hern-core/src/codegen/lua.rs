@@ -1,4 +1,8 @@
 use crate::ast::*;
+use crate::syntax::{
+    SyntaxCapture, SyntaxDelimiter, SyntaxTemplate, SyntaxToken, collect_syntax_pattern_captures,
+    syntax_pattern_to_lua,
+};
 use crate::types::{
     trait_impl_arg_keys_from_ast, trait_impl_dict_name_for_indexes, trait_impl_dict_name_from_keys,
     type_syntax::exact_impl_target_key_from_ast,
@@ -10,6 +14,372 @@ use std::collections::HashMap;
 
 // Must stay in sync with the prelude's `impl Iterable for Array` dictionary name.
 const ARRAY_ITER_METHOD: &str = "__Iterable__Array.iter";
+
+const SYNTAX_MATCH_HELPERS: &str = r##"
+local function __syntax_copy_captures(captures)
+  local out = {}
+  for k, v in pairs(captures) do out[k] = v end
+  return out
+end
+
+local function __syntax_slice(nodes, first, last)
+  local out = {}
+  for i = first, last do out[#out + 1] = nodes[i] end
+  return out
+end
+
+local function __syntax_sequence_value(nodes)
+  if #nodes == 1 then return nodes[1] end
+  return { _tag = "Sequence", _0 = { nodes, {} } }
+end
+
+local function __syntax_template_append(out, value)
+  if value._tag == "Sequence" then
+    for i = 1, #value._0[1] do out[#out + 1] = value._0[1][i] end
+  else
+    out[#out + 1] = value
+  end
+end
+
+local function __syntax_template_append_many(out, values)
+  for i = 1, #values do __syntax_template_append(out, values[i]) end
+end
+
+local function __syntax_template_tree(delimiter, children)
+  local out = {}
+  for i = 1, #children do
+    local child = children[i]
+    if child.kind == "node" then
+      out[#out + 1] = child.value
+    elseif child.kind == "splice" then
+      __syntax_template_append(out, child.value)
+    elseif child.kind == "many" then
+      __syntax_template_append_many(out, child.value)
+    end
+  end
+  return { _tag = "Tree", _0 = { delimiter, out, {} } }
+end
+
+local function __syntax_equal(lhs, rhs)
+  if lhs == rhs then return true end
+  if type(lhs) ~= "table" or type(rhs) ~= "table" then return false end
+  if lhs._tag == nil and rhs._tag == nil then
+    if #lhs ~= #rhs then return false end
+    for i = 1, #lhs do if not __syntax_equal(lhs[i], rhs[i]) then return false end end
+    return true
+  end
+  if lhs._tag ~= rhs._tag then return false end
+  if lhs._tag == "Token" then
+    local lt, rt = lhs._0[1], rhs._0[1]
+    if lt._tag ~= rt._tag then return false end
+    if lt._tag == "Ident" then return lt._0[1] == rt._0[1] and lt._0[2] == rt._0[2] end
+    return lt._0 == rt._0
+  elseif lhs._tag == "Tree" then
+    if lhs._0[1]._tag ~= rhs._0[1]._tag then return false end
+    local lc, rc = lhs._0[2], rhs._0[2]
+    if #lc ~= #rc then return false end
+    for i = 1, #lc do if not __syntax_equal(lc[i], rc[i]) then return false end end
+    return true
+  elseif lhs._tag == "Sequence" then
+    local lc, rc = lhs._0[1], rhs._0[1]
+    if #lc ~= #rc then return false end
+    for i = 1, #lc do if not __syntax_equal(lc[i], rc[i]) then return false end end
+    return true
+  end
+  return false
+end
+
+local function __syntax_token_category(node, tag)
+  return node and node._tag == "Token" and node._0[1]._tag == tag
+end
+
+local function __syntax_token_tag(node)
+  if not node or node._tag ~= "Token" then return nil end
+  return node._0[1]._tag
+end
+
+local function __syntax_token_text(node)
+  if not node or node._tag ~= "Token" then return nil end
+  local token = node._0[1]
+  if token._tag == "Ident" then return token._0[1] end
+  return token._0
+end
+
+local function __syntax_is_operator(node, text)
+  return __syntax_token_tag(node) == "Operator" and (text == nil or __syntax_token_text(node) == text)
+end
+
+local function __syntax_is_punct(node, text)
+  return __syntax_token_tag(node) == "Punct" and (text == nil or __syntax_token_text(node) == text)
+end
+
+local function __syntax_is_name(node, text)
+  local tag = __syntax_token_tag(node)
+  return (tag == "Ident" or tag == "Keyword") and (text == nil or __syntax_token_text(node) == text)
+end
+
+local __syntax_parse_expr
+local __syntax_parse_type
+local __syntax_parse_pat
+
+local function __syntax_parse_comma_list(nodes, parser, allow_empty)
+  if #nodes == 0 then return allow_empty end
+  local index = 1
+  while index <= #nodes do
+    local next_index = parser(nodes, index)
+    if not next_index then return false end
+    index = next_index
+    if index > #nodes then return true end
+    if not __syntax_is_punct(nodes[index], ",") then return false end
+    index = index + 1
+    if index > #nodes then return false end
+  end
+  return true
+end
+
+local function __syntax_parse_expr_primary(nodes, index)
+  local node = nodes[index]
+  if not node then return nil end
+  local tag = __syntax_token_tag(node)
+  if tag == "Ident" or tag == "Literal" then return index + 1 end
+  if __syntax_is_name(node, "if") then
+    local cond_end = __syntax_parse_expr(nodes, index + 1)
+    if not cond_end then return nil end
+    local then_branch = nodes[cond_end]
+    if not then_branch or then_branch._tag ~= "Tree" or then_branch._0[1]._tag ~= "Brace" then return nil end
+    local next_index = cond_end + 1
+    if __syntax_is_name(nodes[next_index], "else") then
+      local else_end = __syntax_parse_expr(nodes, next_index + 1)
+      if not else_end then return nil end
+      return else_end
+    end
+    return next_index
+  end
+  if __syntax_is_name(node, "fn") then
+    local params = nodes[index + 1]
+    local body = nodes[index + 2]
+    if not params or params._tag ~= "Tree" or params._0[1]._tag ~= "Paren" then return nil end
+    if not body or body._tag ~= "Tree" or body._0[1]._tag ~= "Brace" then return nil end
+    return index + 3
+  end
+  if __syntax_is_punct(node, "#") then
+    local record = nodes[index + 1]
+    if record and record._tag == "Tree" and record._0[1]._tag == "Brace" then return index + 2 end
+    return nil
+  end
+  if __syntax_is_operator(node, "-") or __syntax_is_operator(node, "!") then
+    return __syntax_parse_expr_primary(nodes, index + 1)
+  end
+  if node._tag == "Tree" then
+    local delimiter, children = node._0[1]._tag, node._0[2]
+    if delimiter == "Paren" then
+      return __syntax_parse_comma_list(children, __syntax_parse_expr, false) and index + 1 or nil
+    elseif delimiter == "Bracket" then
+      return __syntax_parse_comma_list(children, __syntax_parse_expr, true) and index + 1 or nil
+    elseif delimiter == "Brace" then
+      return index + 1
+    end
+  end
+  return nil
+end
+
+__syntax_parse_expr = function(nodes, index)
+  local next_index = __syntax_parse_expr_primary(nodes, index)
+  if not next_index then return nil end
+  while next_index <= #nodes do
+    local node = nodes[next_index]
+    if node and node._tag == "Tree" and node._0[1]._tag == "Paren" then
+      if not __syntax_parse_comma_list(node._0[2], __syntax_parse_expr, true) then return nil end
+      next_index = next_index + 1
+    elseif node and node._tag == "Tree" and node._0[1]._tag == "Bracket" then
+      local key_end = __syntax_parse_expr(node._0[2], 1)
+      if not key_end or key_end <= #node._0[2] then return nil end
+      next_index = next_index + 1
+    elseif __syntax_is_punct(node, ".") then
+      if not __syntax_is_name(nodes[next_index + 1]) then return nil end
+      next_index = next_index + 2
+    elseif __syntax_is_punct(node, "::") then
+      if not __syntax_is_name(nodes[next_index + 1]) then return nil end
+      next_index = next_index + 2
+    elseif __syntax_is_operator(node) then
+      next_index = __syntax_parse_expr_primary(nodes, next_index + 1)
+      if not next_index then return nil end
+    else
+      break
+    end
+  end
+  return next_index
+end
+
+__syntax_parse_type = function(nodes, index)
+  local node = nodes[index]
+  if __syntax_is_punct(node, "#") then
+    local record = nodes[index + 1]
+    if record and record._tag == "Tree" and record._0[1]._tag == "Brace" then return index + 2 end
+    return nil
+  end
+  if node and node._tag == "Tree" and node._0[1]._tag == "Bracket" then
+    return __syntax_parse_comma_list(node._0[2], __syntax_parse_type, false) and index + 1 or nil
+  end
+  if __syntax_is_name(node, "fn") then
+    local params = nodes[index + 1]
+    if not params or params._tag ~= "Tree" or params._0[1]._tag ~= "Paren" then return nil end
+    if not __syntax_parse_comma_list(params._0[2], __syntax_parse_type, true) then return nil end
+    if not __syntax_is_operator(nodes[index + 2], "->") then return nil end
+    local ret = __syntax_parse_type(nodes, index + 3)
+    return ret
+  end
+  if not (__syntax_is_name(node) or (__syntax_token_tag(node) == "Operator" and __syntax_token_text(node) == "->")) then
+    return nil
+  end
+  local next_index = index + 1
+  if next_index <= #nodes and nodes[next_index]._tag == "Tree" and nodes[next_index]._0[1]._tag == "Paren" then
+    if not __syntax_parse_comma_list(nodes[next_index]._0[2], __syntax_parse_type, true) then return nil end
+    next_index = next_index + 1
+  end
+  return next_index
+end
+
+__syntax_parse_pat = function(nodes, index)
+  local node = nodes[index]
+  if not node then return nil end
+  local tag = __syntax_token_tag(node)
+  if tag == "Literal" then return index + 1 end
+  if __syntax_is_punct(node, "#") then
+    local record = nodes[index + 1]
+    if record and record._tag == "Tree" and record._0[1]._tag == "Brace" then return index + 2 end
+    return nil
+  end
+  if tag == "Ident" then
+    local next_index = index + 1
+    if next_index <= #nodes and nodes[next_index]._tag == "Tree" and nodes[next_index]._0[1]._tag == "Paren" then
+      if not __syntax_parse_comma_list(nodes[next_index]._0[2], __syntax_parse_pat, false) then return nil end
+      next_index = next_index + 1
+    end
+    return next_index
+  end
+  if node._tag == "Tree" then
+    local delimiter, children = node._0[1]._tag, node._0[2]
+    if delimiter == "Bracket" and #children >= 1 and __syntax_is_operator(children[1], "..") then
+      return (#children == 1 or (#children == 2 and __syntax_token_tag(children[2]) == "Ident")) and index + 1 or nil
+    elseif delimiter == "Paren" or delimiter == "Bracket" then
+      return __syntax_parse_comma_list(children, __syntax_parse_pat, true) and index + 1 or nil
+    elseif delimiter == "Brace" then
+      return index + 1
+    end
+  end
+  return nil
+end
+
+local function __syntax_matches_parser_category(category, nodes, first, last)
+  local slice = __syntax_slice(nodes, first, last)
+  local parser = category == "expr" and __syntax_parse_expr
+    or category == "type" and __syntax_parse_type
+    or category == "pat" and __syntax_parse_pat
+    or nil
+  if parser == nil then return false end
+  local next_index = parser(slice, 1)
+  return next_index ~= nil and next_index > #slice
+end
+
+local function __syntax_match_category(category, nodes, first, last)
+  local count = last - first + 1
+  if category == "tokens" then return count >= 0 end
+  if count <= 0 then return false end
+  if category == "expr" or category == "type" or category == "pat" then
+    return __syntax_matches_parser_category(category, nodes, first, last)
+  end
+  if count ~= 1 then return false end
+  local node = nodes[first]
+  if category == "ident" then return __syntax_token_category(node, "Ident") end
+  if category == "literal" then return __syntax_token_category(node, "Literal") end
+  if category == "operator" then return __syntax_token_category(node, "Operator") end
+  if category == "punct" then return __syntax_token_category(node, "Punct") end
+  if category == "token" then return node and node._tag == "Token" end
+  if category == "tree" then return node and node._tag == "Tree" end
+  if category == "block" then return node and node._tag == "Tree" and node._0[1]._tag == "Brace" end
+  return false
+end
+
+local function __syntax_match_repeated_category(category, nodes, first, last)
+  if last < first then return true end
+  for i = first, last do
+    if not __syntax_match_category(category, nodes, i, i) then return false end
+  end
+  return true
+end
+
+local function __syntax_capture_value(pattern, nodes, first, last)
+  local slice = __syntax_slice(nodes, first, last)
+  if pattern.repeat_capture then return slice end
+  return __syntax_sequence_value(slice)
+end
+
+local function __syntax_match_token_pattern(pattern, node)
+  if not node or node._tag ~= "Token" then return false end
+  local actual, expected = node._0[1], pattern.token
+  if actual._tag ~= expected._tag then return false end
+  if actual._tag == "Ident" then return actual._0[1] == expected._0 end
+  return actual._0 == expected._0
+end
+
+local __syntax_match_node
+local __syntax_match_sequence
+
+__syntax_match_node = function(pattern, node, captures)
+  if pattern.kind == "token" then
+    return __syntax_match_token_pattern(pattern, node) and captures or nil
+  elseif pattern.kind == "tree" then
+    if not node or node._tag ~= "Tree" or node._0[1]._tag ~= pattern.delimiter then return nil end
+    return __syntax_match_sequence(pattern.children, node._0[2], 1, 1, captures)
+  elseif pattern.kind == "capture" then
+    if not __syntax_match_category(pattern.category, { node }, 1, 1) then return nil end
+    local next_captures = __syntax_copy_captures(captures)
+    local value = pattern.repeat_capture and { node } or node
+    if next_captures[pattern.name] ~= nil and not __syntax_equal(next_captures[pattern.name], value) then return nil end
+    next_captures[pattern.name] = value
+    return next_captures
+  end
+  return nil
+end
+
+__syntax_match_sequence = function(patterns, nodes, pattern_index, node_index, captures)
+  if pattern_index > #patterns then
+    if node_index > #nodes then return captures else return nil end
+  end
+  local pattern = patterns[pattern_index]
+  if pattern.kind == "capture" then
+    local min_count = pattern.repeat_capture and 0 or 1
+    for count = min_count, (#nodes - node_index + 1) do
+      local last = node_index + count - 1
+      local category_matches
+      if pattern.repeat_capture then
+        category_matches = __syntax_match_repeated_category(pattern.category, nodes, node_index, last)
+      else
+        category_matches = __syntax_match_category(pattern.category, nodes, node_index, last)
+      end
+      if category_matches then
+        local value = __syntax_capture_value(pattern, nodes, node_index, last)
+        local next_captures = __syntax_copy_captures(captures)
+        if next_captures[pattern.name] == nil or __syntax_equal(next_captures[pattern.name], value) then
+          next_captures[pattern.name] = value
+          local result = __syntax_match_sequence(patterns, nodes, pattern_index + 1, last + 1, next_captures)
+          if result ~= nil then return result end
+        end
+      end
+    end
+    return nil
+  else
+    local next_captures = __syntax_match_node(pattern, nodes[node_index], captures)
+    if next_captures == nil then return nil end
+    return __syntax_match_sequence(patterns, nodes, pattern_index + 1, node_index + 1, next_captures)
+  end
+end
+
+local function __syntax_match(pattern, node)
+  return __syntax_match_node(pattern, node, {})
+end
+"##;
 
 // ── Tail-position descriptor ──────────────────────────────────────────────────
 
@@ -235,6 +605,9 @@ impl LuaCodegen {
     fn gen_program_stmts(&mut self, stmts: &[Stmt]) -> String {
         self.begin_test_collection();
         let mut out = String::from("-- Hern generated Lua\n");
+        if stmts_use_syntax_runtime(stmts) {
+            out.push_str(SYNTAX_MATCH_HELPERS);
+        }
         for stmt in stmts {
             if self.test_emit_mode == TestEmitMode::Include && matches!(stmt, Stmt::Expr(_)) {
                 continue;
@@ -251,6 +624,9 @@ impl LuaCodegen {
     fn gen_module_stmts(&mut self, stmts: &[Stmt], dict_names: Vec<String>) -> String {
         self.begin_test_collection();
         let mut out = String::from("-- Hern generated Lua module\n");
+        if stmts_use_syntax_runtime(stmts) {
+            out.push_str(SYNTAX_MATCH_HELPERS);
+        }
         let (body_stmts, final_expr) = split_module_body(stmts);
         for stmt in body_stmts {
             out.push_str(&self.gen_stmt(stmt));
@@ -461,7 +837,7 @@ impl LuaCodegen {
                 }
             }
             Stmt::RecBlock { stmts, .. } => self.gen_rec_block(stmts),
-            Stmt::Trait(_) | Stmt::TypeAlias { .. } => String::new(),
+            Stmt::Macro(_) | Stmt::Trait(_) | Stmt::TypeAlias { .. } => String::new(),
         }
     }
 
@@ -718,6 +1094,11 @@ impl LuaCodegen {
             ExprKind::Number(n) => Some(n.as_lua_source()),
             ExprKind::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
             ExprKind::Unit => Some("{}".to_string()),
+            ExprKind::SyntaxQuote(template) => {
+                Some(syntax_template_to_lua_with_names(template, &|name| {
+                    subst.get(name).cloned().unwrap_or_else(|| mangle_op(name))
+                }))
+            }
             ExprKind::StringLit(s) => Some(lua_string(s)),
             ExprKind::Not(e) => {
                 let v = self.gen_expr_with_subst(e, subst, pre)?;
@@ -893,6 +1274,7 @@ impl LuaCodegen {
                 .map(|expr| self.gen_expr_with_subst(expr, subst, pre))
                 .unwrap_or_else(|| Some("{}".to_string())),
             ExprKind::Import(_) => None,
+            ExprKind::MacroCall { .. } => None,
             ExprKind::Block { .. }
             | ExprKind::If { .. }
             | ExprKind::Match { .. }
@@ -915,6 +1297,12 @@ impl LuaCodegen {
             ExprKind::Number(n) => n.as_lua_source(),
             ExprKind::Bool(b) => if *b { "1" } else { "0" }.to_string(),
             ExprKind::Unit => "{}".to_string(),
+            ExprKind::SyntaxQuote(template) => {
+                syntax_template_to_lua_with_names(template, &|name| mangle_op(name))
+            }
+            ExprKind::MacroCall { name, .. } => {
+                panic!("unexpanded macro call `{name}!` reached Lua codegen")
+            }
             ExprKind::Ident(name) => self
                 .gen_current_function_value(name)
                 .unwrap_or_else(|| mangle_op(name)),
@@ -1793,6 +2181,18 @@ impl LuaCodegen {
             | Pattern::NumberLit(_)
             | Pattern::BoolLit(_)
             | Pattern::IntRange { .. } => String::new(),
+            Pattern::SyntaxQuote(pattern) => {
+                let captures_tmp = self.fresh_tmp();
+                let mut out = format!(
+                    "{}local {} = __syntax_match({}, {})\n",
+                    self.ind(),
+                    captures_tmp,
+                    syntax_pattern_to_lua(pattern),
+                    var
+                );
+                out.push_str(&self.gen_syntax_pattern_bindings(pattern, &captures_tmp));
+                out
+            }
             Pattern::Variable(name, _) => {
                 format!("{}local {} = {}\n", self.ind(), mangle_op(name), var)
             }
@@ -1891,41 +2291,67 @@ impl LuaCodegen {
         tail: Tail<'_>,
         scrutinee_var: &str,
     ) -> String {
-        let mut out = String::new();
-        let mut first = true;
-        let mut closed = false;
+        self.gen_match_arms_from(arms, 0, tail, scrutinee_var)
+    }
 
-        for (pat, body) in arms {
-            match self.gen_pattern_cond_for(pat, scrutinee_var) {
-                Some(cond) => {
-                    let kw = if first { "if" } else { "elseif" };
-                    first = false;
-                    out.push_str(&format!("{}{} {} then\n", self.ind(), kw, cond));
+    fn gen_match_arms_from(
+        &mut self,
+        arms: &[(Pattern, Expr)],
+        index: usize,
+        tail: Tail<'_>,
+        scrutinee_var: &str,
+    ) -> String {
+        let Some((pat, body)) = arms.get(index) else {
+            return String::new();
+        };
+
+        let mut out = String::new();
+
+        if let Pattern::SyntaxQuote(pattern) = pat {
+            let captures_tmp = self.fresh_tmp();
+            out.push_str(&format!(
+                "{}local {} = __syntax_match({}, {})\n",
+                self.ind(),
+                captures_tmp,
+                syntax_pattern_to_lua(pattern),
+                scrutinee_var
+            ));
+            out.push_str(&format!("{}if {} ~= nil then\n", self.ind(), captures_tmp));
+            self.indent += 2;
+            out.push_str(&self.gen_syntax_pattern_bindings(pattern, &captures_tmp));
+            out.push_str(&self.gen_tail(body, tail));
+            self.indent -= 2;
+            if index + 1 < arms.len() {
+                out.push_str(&format!("{}else\n", self.ind()));
+                self.indent += 2;
+                out.push_str(&self.gen_match_arms_from(arms, index + 1, tail, scrutinee_var));
+                self.indent -= 2;
+            }
+            out.push_str(&format!("{}end\n", self.ind()));
+            return out;
+        }
+
+        match self.gen_pattern_cond_for(pat, scrutinee_var) {
+            Some(cond) => {
+                out.push_str(&format!("{}if {} then\n", self.ind(), cond));
+                self.indent += 2;
+                out.push_str(&self.gen_for_pattern_bindings(pat, scrutinee_var));
+                out.push_str(&self.gen_tail(body, tail));
+                self.indent -= 2;
+                if index + 1 < arms.len() {
+                    out.push_str(&format!("{}else\n", self.ind()));
                     self.indent += 2;
-                    out.push_str(&self.gen_for_pattern_bindings(pat, scrutinee_var));
-                    out.push_str(&self.gen_tail(body, tail));
+                    out.push_str(&self.gen_match_arms_from(arms, index + 1, tail, scrutinee_var));
                     self.indent -= 2;
                 }
-                None => {
-                    if !first {
-                        out.push_str(&format!("{}else\n", self.ind()));
-                        self.indent += 2;
-                    }
-                    out.push_str(&self.gen_for_pattern_bindings(pat, scrutinee_var));
-                    out.push_str(&self.gen_tail(body, tail));
-                    if !first {
-                        self.indent -= 2;
-                        out.push_str(&format!("{}end\n", self.ind()));
-                        closed = true;
-                    }
-                    break;
-                }
+                out.push_str(&format!("{}end\n", self.ind()));
+            }
+            None => {
+                out.push_str(&self.gen_for_pattern_bindings(pat, scrutinee_var));
+                out.push_str(&self.gen_tail(body, tail));
             }
         }
 
-        if !first && !closed {
-            out.push_str(&format!("{}end\n", self.ind()));
-        }
         out
     }
 
@@ -1937,6 +2363,11 @@ impl LuaCodegen {
             Pattern::StringLit(s) => Some(format!("{} == {}", var, lua_string(s))),
             Pattern::NumberLit(n) => Some(format!("{} == {}", var, n.as_lua_source())),
             Pattern::BoolLit(value) => Some(format!("{} == {}", var, if *value { 1 } else { 0 })),
+            Pattern::SyntaxQuote(pattern) => Some(format!(
+                "__syntax_match({}, {}) ~= nil",
+                syntax_pattern_to_lua(pattern),
+                var
+            )),
             Pattern::IntRange {
                 start,
                 end,
@@ -1994,6 +2425,29 @@ impl LuaCodegen {
                 }
             }
         }
+    }
+
+    fn gen_syntax_pattern_bindings(
+        &self,
+        pattern: &crate::syntax::SyntaxPattern,
+        captures_var: &str,
+    ) -> String {
+        let mut captures = Vec::new();
+        collect_syntax_pattern_captures(pattern, &mut captures);
+        let mut seen = std::collections::HashSet::new();
+        let mut out = String::new();
+        for SyntaxCapture { name, .. } in captures {
+            if seen.insert(name.clone()) {
+                out.push_str(&format!(
+                    "{}local {} = {}[{}]\n",
+                    self.ind(),
+                    mangle_op(&name),
+                    captures_var,
+                    lua_string(&name)
+                ));
+            }
+        }
+        out
     }
 
     // ── Type definitions / trait impls ────────────────────────────────────────
@@ -2243,6 +2697,8 @@ fn expr_flow(expr: &Expr, include_bc: bool) -> Flow {
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit => Flow::FallsThrough,
@@ -2393,6 +2849,142 @@ fn split_module_body(stmts: &[Stmt]) -> (&[Stmt], Option<&Expr>) {
     }
 }
 
+fn stmts_use_syntax_runtime(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_uses_syntax_runtime)
+}
+
+fn stmt_uses_syntax_runtime(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Let { pat, value, .. } => {
+            pattern_uses_syntax_runtime(pat) || expr_uses_syntax_runtime(value)
+        }
+        Stmt::Fn { params, body, .. } | Stmt::Op { params, body, .. } => {
+            params.iter().any(param_uses_syntax_runtime) || expr_uses_syntax_runtime(body)
+        }
+        Stmt::Impl(id) => id.methods.iter().any(|method| {
+            method.params.iter().any(param_uses_syntax_runtime)
+                || expr_uses_syntax_runtime(&method.body)
+        }),
+        Stmt::InherentImpl(id) => id.methods.iter().any(|method| {
+            method.params.iter().any(param_uses_syntax_runtime)
+                || expr_uses_syntax_runtime(&method.body)
+        }),
+        Stmt::TestBlock { stmts, .. } | Stmt::RecBlock { stmts, .. } => {
+            stmts_use_syntax_runtime(stmts)
+        }
+        Stmt::Expr(expr) => expr_uses_syntax_runtime(expr),
+        Stmt::Macro(_)
+        | Stmt::Trait(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. } => false,
+    }
+}
+
+fn param_uses_syntax_runtime(param: &Param) -> bool {
+    pattern_uses_syntax_runtime(&param.pat)
+}
+
+fn expr_uses_syntax_runtime(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::SyntaxQuote(_) => true,
+        ExprKind::Grouped(inner)
+        | ExprKind::Not(inner)
+        | ExprKind::Loop(inner)
+        | ExprKind::Break(Some(inner))
+        | ExprKind::Return(Some(inner))
+        | ExprKind::FieldAccess { expr: inner, .. } => expr_uses_syntax_runtime(inner),
+        ExprKind::Neg { operand, .. } => expr_uses_syntax_runtime(operand),
+        ExprKind::Assign { target, value } => {
+            expr_uses_syntax_runtime(target) || expr_uses_syntax_runtime(value)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            expr_uses_syntax_runtime(lhs) || expr_uses_syntax_runtime(rhs)
+        }
+        ExprKind::Range { start, end, .. } => {
+            start.as_deref().is_some_and(expr_uses_syntax_runtime)
+                || end.as_deref().is_some_and(expr_uses_syntax_runtime)
+        }
+        ExprKind::Call { callee, args, .. } => {
+            expr_uses_syntax_runtime(callee) || args.iter().any(expr_uses_syntax_runtime)
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_uses_syntax_runtime(cond)
+                || expr_uses_syntax_runtime(then_branch)
+                || expr_uses_syntax_runtime(else_branch)
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            expr_uses_syntax_runtime(scrutinee)
+                || arms.iter().any(|(pat, body)| {
+                    pattern_uses_syntax_runtime(pat) || expr_uses_syntax_runtime(body)
+                })
+        }
+        ExprKind::Block { stmts, final_expr } => {
+            stmts_use_syntax_runtime(stmts)
+                || final_expr.as_deref().is_some_and(expr_uses_syntax_runtime)
+        }
+        ExprKind::Tuple(items) => items.iter().any(expr_uses_syntax_runtime),
+        ExprKind::Array(entries) => entries
+            .iter()
+            .any(|entry| expr_uses_syntax_runtime(entry.expr())),
+        ExprKind::Record(entries) => entries
+            .iter()
+            .any(|entry| expr_uses_syntax_runtime(entry.expr())),
+        ExprKind::Index { receiver, key, .. } => {
+            expr_uses_syntax_runtime(receiver) || expr_uses_syntax_runtime(key)
+        }
+        ExprKind::Lambda { params, body, .. } => {
+            params.iter().any(param_uses_syntax_runtime) || expr_uses_syntax_runtime(body)
+        }
+        ExprKind::For {
+            pat,
+            iterable,
+            body,
+            ..
+        } => {
+            pattern_uses_syntax_runtime(pat)
+                || expr_uses_syntax_runtime(iterable)
+                || expr_uses_syntax_runtime(body)
+        }
+        ExprKind::Number(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_)
+        | ExprKind::MacroCall { .. }
+        | ExprKind::AssociatedAccess { .. }
+        | ExprKind::Import(_)
+        | ExprKind::Break(None)
+        | ExprKind::Continue
+        | ExprKind::Return(None)
+        | ExprKind::Unit => false,
+    }
+}
+
+fn pattern_uses_syntax_runtime(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::SyntaxQuote(_) => true,
+        Pattern::Constructor {
+            binding: Some(binding),
+            ..
+        } => pattern_uses_syntax_runtime(binding),
+        Pattern::List { elements, .. } | Pattern::Tuple(elements) => {
+            elements.iter().any(pattern_uses_syntax_runtime)
+        }
+        Pattern::Wildcard
+        | Pattern::StringLit(_)
+        | Pattern::NumberLit(_)
+        | Pattern::BoolLit(_)
+        | Pattern::IntRange { .. }
+        | Pattern::Variable(_, _)
+        | Pattern::Constructor { binding: None, .. }
+        | Pattern::Record { .. } => false,
+    }
+}
+
 fn impl_dict_names(program: &Program) -> Vec<String> {
     impl_dict_names_from_stmts(&program.stmts)
 }
@@ -2421,6 +3013,13 @@ fn collect_pattern_names(pat: &Pattern, names: &mut Vec<String>) {
         | Pattern::BoolLit(_)
         | Pattern::IntRange { .. }
         | Pattern::Constructor { binding: None, .. } => {}
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            collect_syntax_pattern_captures(pattern, &mut captures);
+            for capture in captures {
+                names.push(mangle_op(&capture.name));
+            }
+        }
         Pattern::Constructor {
             binding: Some(binding),
             ..
@@ -2476,6 +3075,7 @@ fn prelude_value_names(stmts: &[Stmt]) -> Vec<String> {
                 ..
             }
             | Stmt::Expr(_)
+            | Stmt::Macro(_)
             | Stmt::Trait(_)
             | Stmt::Impl(_)
             | Stmt::InherentImpl(_)
@@ -2517,6 +3117,128 @@ fn bundle_module_var(name: &str) -> String {
     format!("__mod_{}", name)
 }
 
+fn syntax_template_to_lua_with_names(
+    template: &SyntaxTemplate,
+    name_to_lua: &dyn Fn(&str) -> String,
+) -> String {
+    syntax_template_to_lua_in_scope(
+        template,
+        name_to_lua,
+        introduced_scope_id(template_span(template)),
+    )
+}
+
+fn syntax_template_to_lua_in_scope(
+    template: &SyntaxTemplate,
+    name_to_lua: &dyn Fn(&str) -> String,
+    introduced_scope: u32,
+) -> String {
+    match template {
+        SyntaxTemplate::Token { token, .. } => {
+            syntax_node_to_lua(syntax_token_to_lua(token, introduced_scope))
+        }
+        SyntaxTemplate::Tree {
+            delimiter,
+            children,
+            ..
+        } => {
+            let children = children
+                .iter()
+                .map(|child| syntax_template_child_to_lua(child, name_to_lua, introduced_scope))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "__syntax_template_tree({}, {{ {} }})",
+                syntax_delimiter_to_lua(*delimiter),
+                children
+            )
+        }
+        SyntaxTemplate::Splice { name, repeat, .. } => {
+            let kind = if *repeat { "many" } else { "splice" };
+            format!(
+                "{{ kind = {}, value = {} }}",
+                lua_string(kind),
+                name_to_lua(name)
+            )
+        }
+    }
+}
+
+fn syntax_template_child_to_lua(
+    template: &SyntaxTemplate,
+    name_to_lua: &dyn Fn(&str) -> String,
+    introduced_scope: u32,
+) -> String {
+    match template {
+        SyntaxTemplate::Splice { .. } => {
+            syntax_template_to_lua_in_scope(template, name_to_lua, introduced_scope)
+        }
+        _ => format!(
+            "{{ kind = \"node\", value = {} }}",
+            syntax_template_to_lua_in_scope(template, name_to_lua, introduced_scope)
+        ),
+    }
+}
+
+fn syntax_node_to_lua(token: String) -> String {
+    format!("{{ _tag = \"Token\", _0 = {{ {}, {{}} }} }}", token)
+}
+
+fn syntax_token_to_lua(token: &SyntaxToken, introduced_scope: u32) -> String {
+    match token {
+        SyntaxToken::Ident(name) => {
+            format!(
+                "{{ _tag = \"Ident\", _0 = {{ {}, {} }} }}",
+                lua_string(name),
+                introduced_scope
+            )
+        }
+        SyntaxToken::Keyword(text) => syntax_payload_variant("Keyword", text),
+        SyntaxToken::Literal(text) => syntax_payload_variant("Literal", text),
+        SyntaxToken::Operator(text) => syntax_payload_variant("Operator", text),
+        SyntaxToken::Punct(text) => syntax_payload_variant("Punct", text),
+    }
+}
+
+fn template_span(template: &SyntaxTemplate) -> SourceSpan {
+    match template {
+        SyntaxTemplate::Token { span, .. }
+        | SyntaxTemplate::Tree { span, .. }
+        | SyntaxTemplate::Splice { span, .. } => *span,
+    }
+}
+
+fn introduced_scope_id(span: SourceSpan) -> u32 {
+    let mut hash = 2_166_136_261u32;
+    for part in [
+        span.start_line as u32,
+        span.start_col as u32,
+        span.end_line as u32,
+        span.end_col as u32,
+    ] {
+        hash ^= part;
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash.max(1)
+}
+
+fn syntax_payload_variant(tag: &str, value: &str) -> String {
+    format!(
+        "{{ _tag = {}, _0 = {} }}",
+        lua_string(tag),
+        lua_string(value)
+    )
+}
+
+fn syntax_delimiter_to_lua(delimiter: SyntaxDelimiter) -> String {
+    let tag = match delimiter {
+        SyntaxDelimiter::Paren => "Paren",
+        SyntaxDelimiter::Brace => "Brace",
+        SyntaxDelimiter::Bracket => "Bracket",
+    };
+    format!("{{ _tag = {} }}", lua_string(tag))
+}
+
 fn lua_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -2554,6 +3276,7 @@ fn lua_field_receiver(expr: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::parse_source;
     use crate::workspace::{WorkspaceInputs, analyze_workspace};
     use std::collections::HashMap;
 
@@ -2615,6 +3338,13 @@ let hof_result = apply_twice(local_double, 1.0);
             lua_string("quote\" slash\\\n\r\t\u{7f}"),
             "\"quote\\\" slash\\\\\\n\\r\\t\\127\""
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpanded macro call `missing!` reached Lua codegen")]
+    fn unexpanded_macro_call_cannot_reach_codegen_silently() {
+        let program = parse_source("missing!(1);\n").expect("source should parse");
+        LuaCodegen::new().gen_program(&program);
     }
 
     #[test]

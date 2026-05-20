@@ -128,7 +128,11 @@ fn associated_definition_span_in_stmt(
         Stmt::RecBlock { stmts, .. } => stmts
             .iter()
             .find_map(|stmt| associated_definition_span_in_stmt(program, stmt, position)),
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
+        Stmt::Macro(_)
+        | Stmt::Trait(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. } => None,
     }
 }
 
@@ -233,6 +237,8 @@ fn associated_definition_span_in_expr(
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Break(None)

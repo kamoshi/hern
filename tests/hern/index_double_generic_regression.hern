@@ -1,0 +1,42 @@
+type Vector = Vector([float])
+type Matrix = Matrix([[float]])
+
+fn matrix(rows: [[float]]) -> Matrix {
+  Matrix(rows)
+}
+
+impl Vector {
+  fn values(self) -> [float] {
+    match self {
+      Vector(values) -> values,
+    }
+  }
+
+  fn get(self, index: int) -> float {
+    self.values()[index]
+  }
+}
+
+impl Matrix {
+  fn values(self) -> [[float]] {
+    match self {
+      Matrix(rows) -> rows,
+    }
+  }
+
+  fn get(self, row: int, col: int) -> float {
+    self.values()[row][col]
+  }
+}
+
+impl Index for Matrix, (int, int) -> float {
+  fn index(self: Matrix, key: (int, int)) -> float {
+    let (row, col) = key;
+    self.get(row, col)
+  }
+}
+
+let m = matrix([[1.0, 2.0], [3.0, 4.0]]);
+
+print(m.get(1, 0));
+print(m[(0, 1)]);

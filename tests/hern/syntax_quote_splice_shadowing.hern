@@ -1,0 +1,7 @@
+match '{a} {
+  '{$x:ident} -> {
+    let x: Syntax = '{b};
+    print(to_string('{ type $x }));
+  },
+  _ -> print("missed"),
+};

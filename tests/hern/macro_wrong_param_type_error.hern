@@ -1,0 +1,3 @@
+macro bad(input: int) -> MacroResult(Syntax) {
+  Ok(input)
+}

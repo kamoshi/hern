@@ -9,6 +9,7 @@ pub fn is_value(expr: &Expr) -> bool {
         | ExprKind::Lambda { .. }
         | ExprKind::Import(_)
         | ExprKind::AssociatedAccess { .. }
+        | ExprKind::SyntaxQuote(_)
         | ExprKind::Unit => true,
         ExprKind::Grouped(expr) => is_value(expr),
         ExprKind::Tuple(exprs) => exprs.iter().all(is_value),
@@ -38,6 +39,7 @@ fn is_fresh_mutable_component(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
+        | ExprKind::SyntaxQuote(_)
         | ExprKind::Bool(_)
         | ExprKind::Lambda { .. }
         | ExprKind::Unit => true,

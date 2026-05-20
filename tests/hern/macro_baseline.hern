@@ -1,0 +1,20 @@
+let quoted = '{foo(1, x + y)};
+
+print(to_string(quoted));
+
+match quoted {
+  '{foo($value:literal, $lhs:expr + $rhs:expr)} -> {
+    print(to_string(value));
+    print(to_string('{ $rhs + $lhs }));
+  },
+  _ -> print("missed quote pattern"),
+};
+
+macro add_swapped(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$lhs:expr + $rhs:expr} -> Ok('{ $rhs + $lhs }),
+    _ -> Err(MacroError("add_swapped expects a binary addition")),
+  }
+}
+
+print(to_string(add_swapped!(1 + 2)));

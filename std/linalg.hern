@@ -10,7 +10,7 @@ fn matrix(rows: [[float]]) -> Matrix {
 }
 
 fn zeros(n: int) -> Vector {
-  let mut values = [];
+  let mut values: [float] = [];
   for _ in range(1, n) {
     values.push(0.0);
   };
@@ -18,9 +18,9 @@ fn zeros(n: int) -> Vector {
 }
 
 fn identity(n: int) -> Matrix {
-  let mut rows = [];
+  let mut rows: [[float]] = [];
   for row in range(1, n) {
-    let mut values = [];
+    let mut values: [float] = [];
     for col in range(1, n) {
       if row == col {
         values.push(1.0);
@@ -80,7 +80,7 @@ impl Vector {
       self
     } else {
       let scale = 1.0 / len;
-      let mut values = [];
+      let mut values: [float] = [];
       for item in self.values() {
         values.push(item * scale);
       };
@@ -138,7 +138,7 @@ impl Matrix {
     if index < 0 || index >= self.cols() {
       panic("matrix column index out of bounds")
     };
-    let mut values = [];
+    let mut values: [float] = [];
     for row in range(0, self.rows() - 1) {
       values.push(self.get(row, index));
     };
@@ -146,10 +146,10 @@ impl Matrix {
   }
 
   fn transpose(self) -> Matrix {
-    let mut rows = [];
+    let mut rows: [[float]] = [];
     if self.rows() > 0 {
       for col in range(0, self.cols() - 1) {
-        let mut values = [];
+        let mut values: [float] = [];
         for row in range(0, self.rows() - 1) {
           values.push(self.get(row, col));
         };
@@ -179,7 +179,7 @@ impl Add for Vector, Vector -> Vector {
       panic("vector add dimension mismatch")
     };
 
-    let mut values = [];
+    let mut values: [float] = [];
     for i in range(0, lhs.len() - 1) {
       values.push(lhs.get(i) + rhs.get(i));
     };
@@ -193,7 +193,7 @@ impl Sub for Vector, Vector -> Vector {
       panic("vector subtract dimension mismatch")
     };
 
-    let mut values = [];
+    let mut values: [float] = [];
     for i in range(0, lhs.len() - 1) {
       values.push(lhs.get(i) - rhs.get(i));
     };
@@ -203,7 +203,7 @@ impl Sub for Vector, Vector -> Vector {
 
 impl Mul for Vector, float -> Vector {
   fn *(lhs: Vector, rhs: float) -> Vector {
-    let mut values = [];
+    let mut values: [float] = [];
     for item in lhs.values() {
       values.push(item * rhs);
     };
@@ -225,9 +225,9 @@ impl Add for Matrix, Matrix -> Matrix {
       panic("matrix add dimension mismatch")
     };
 
-    let mut rows = [];
+    let mut rows: [[float]] = [];
     for row in range(0, lhs.rows() - 1) {
-      let mut values = [];
+      let mut values: [float] = [];
       for col in range(0, lhs.cols() - 1) {
         values.push(lhs.get(row, col) + rhs.get(row, col));
       };
@@ -245,9 +245,9 @@ impl Sub for Matrix, Matrix -> Matrix {
       panic("matrix subtract dimension mismatch")
     };
 
-    let mut rows = [];
+    let mut rows: [[float]] = [];
     for row in range(0, lhs.rows() - 1) {
-      let mut values = [];
+      let mut values: [float] = [];
       for col in range(0, lhs.cols() - 1) {
         values.push(lhs.get(row, col) - rhs.get(row, col));
       };
@@ -260,9 +260,9 @@ impl Sub for Matrix, Matrix -> Matrix {
 impl Mul for Matrix, float -> Matrix {
   fn *(lhs: Matrix, rhs: float) -> Matrix {
     lhs.validate();
-    let mut rows = [];
+    let mut rows: [[float]] = [];
     for row in lhs.values() {
-      let mut values = [];
+      let mut values: [float] = [];
       for item in row {
         values.push(item * rhs);
       };
@@ -285,7 +285,7 @@ impl Mul for Matrix, Vector -> Vector {
       panic("matrix-vector dimension mismatch")
     };
 
-    let mut values = [];
+    let mut values: [float] = [];
     for row in range(0, lhs.rows() - 1) {
       values.push(lhs.row(row).dot(rhs));
     };
@@ -301,9 +301,9 @@ impl Mul for Matrix, Matrix -> Matrix {
       panic("matrix-matrix dimension mismatch")
     };
 
-    let mut rows = [];
+    let mut rows: [[float]] = [];
     for row in range(0, lhs.rows() - 1) {
-      let mut values = [];
+      let mut values: [float] = [];
       for col in range(0, rhs.cols() - 1) {
         values.push(lhs.row(row).dot(rhs.col(col)));
       };

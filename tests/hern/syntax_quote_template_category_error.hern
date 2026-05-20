@@ -1,0 +1,3 @@
+let syntax = '{x};
+
+print(to_string('{ $syntax:expr }));

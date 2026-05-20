@@ -1,0 +1,8 @@
+macro add_swapped(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$lhs:expr + $rhs:expr} -> Ok('{ $rhs + $lhs }),
+    _ -> Err(MacroError("add_swapped expects a binary addition")),
+  }
+}
+
+add_swapped!(1);

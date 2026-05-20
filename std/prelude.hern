@@ -71,6 +71,9 @@ impl Option('a) {
 #[derive(Eq, ToString)]
 type Result('a, 'e) = Ok('a) | Err('e)
 
+type MacroError = MacroError(string)
+type alias MacroResult('a) = Result('a, MacroError)
+
 impl Result('a, 'e) {
   fn is_ok(self) -> bool {
     match self {
@@ -121,6 +124,24 @@ type Ordering = LT | EQ | GT
 type Map('k, 'v) = *
 
 type Heap('a) = *
+
+type Hygiene = *
+
+type SyntaxMeta = *
+
+type SyntaxDelimiter = Paren | Brace | Bracket
+
+type SyntaxToken =
+  Ident((string, Hygiene))
+  | Keyword(string)
+  | Literal(string)
+  | Operator(string)
+  | Punct(string)
+
+type Syntax =
+  Token((SyntaxToken, SyntaxMeta))
+  | Tree((SyntaxDelimiter, [Syntax], SyntaxMeta))
+  | Sequence(([Syntax], SyntaxMeta))
 
 // --- Primitive operators ---
 
@@ -458,6 +479,79 @@ impl ToString for string {
 
 impl Default for string {
   fn default() { "" }
+}
+
+fn syntax_token_to_string(token: SyntaxToken) -> string {
+  match token {
+    Ident((name, _)) -> name,
+    Keyword(text) -> text,
+    Literal(text) -> text,
+    Operator(text) -> text,
+    Punct(text) -> text,
+  }
+}
+
+impl ToString for Syntax {
+  fn to_string(self) {
+    match self {
+      Token((token, _)) -> syntax_token_to_string(token),
+      Tree((delimiter, children, _)) -> {
+        let mut body = "";
+        let mut first = true;
+        for child in children {
+          if first {
+            first = false;
+          } else {
+            body = body <> " ";
+          };
+          body = body <> ToString::to_string(child);
+        };
+        match delimiter {
+          Paren -> "(" <> body <> ")",
+          Brace -> "{" <> body <> "}",
+          Bracket -> "[" <> body <> "]",
+        }
+      },
+      Sequence((children, _)) -> {
+        let mut body = "";
+        let mut first = true;
+        for child in children {
+          if first {
+            first = false;
+          } else {
+            body = body <> " ";
+          };
+          body = body <> ToString::to_string(child);
+        };
+        body
+      },
+    }
+  }
+}
+
+fn syntax_children(syntax: Syntax) -> [Syntax] {
+  match syntax {
+    Tree((_, children, _)) -> children,
+    Sequence((children, _)) -> children,
+    Token(_) -> {
+      let children: [Syntax] = [];
+      children
+    },
+  }
+}
+
+fn syntax_token_text(syntax: Syntax) -> Option(string) {
+  match syntax {
+    Token((token, _)) -> Some(syntax_token_to_string(token)),
+    _ -> None,
+  }
+}
+
+fn syntax_is_ident(syntax: Syntax, name: string) -> bool {
+  match syntax {
+    Token((Ident((actual, _)), _)) -> actual == name,
+    _ -> false,
+  }
 }
 
 // --- Globals ---

@@ -1,0 +1,3 @@
+macro bad(input: Syntax) -> Syntax {
+  input
+}

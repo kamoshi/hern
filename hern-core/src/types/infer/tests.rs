@@ -127,6 +127,150 @@ fn collecting_inference_reports_all_duplicate_test_names() {
 }
 
 #[test]
+fn macro_phase_inference_records_metadata_after_unrelated_error() {
+    let mut program = parse_source(
+        "type Syntax = Dummy
+         type Result('a, 'e) = Ok('a) | Err('e)
+         type MacroError = MacroError(string)
+         type alias MacroResult('a) = Result('a, MacroError)
+         macro rewrite(input: Syntax) -> MacroResult(Syntax) {
+           match input {
+             '{$lhs:expr + $rhs:expr} -> Ok('{ $lhs }),
+             _ -> Err(MacroError(\"bad\")),
+           }
+         }
+         let unrelated: bool = 1;
+        ",
+    )
+    .expect("source should parse");
+    reassociate_standalone(&mut program).expect("source should reassociate");
+
+    let input_span = match program
+        .stmts
+        .iter()
+        .find(|stmt| matches!(stmt, Stmt::Macro(_)))
+    {
+        Some(Stmt::Macro(def)) => def.param_span,
+        _ => panic!("expected macro definition"),
+    };
+
+    let mut infer = Infer::new();
+    let (inference, diagnostics) = infer.infer_program_collecting(&mut program, &[], None);
+
+    assert_eq!(diagnostics.len(), 1);
+    assert!(matches!(
+        diagnostics[0].error.as_ref(),
+        TypeError::Mismatch {
+            expected: Ty::Con(name),
+            got: Ty::Int,
+        } if name == "bool"
+    ));
+    assert_eq!(
+        inference.binding_types.get(&input_span),
+        Some(&Ty::Con("Syntax".to_string()))
+    );
+    assert!(
+        inference
+            .syntax_captures
+            .values()
+            .any(|capture| capture.name == "lhs" && !capture.repeat),
+        "macro syntax capture metadata should survive unrelated errors: {:?}",
+        inference.syntax_captures
+    );
+}
+
+#[test]
+fn macro_phase_rejects_runtime_only_top_level_values() {
+    let mut program = parse_source(
+        "type Syntax = Dummy
+         type Result('a, 'e) = Ok('a) | Err('e)
+         type MacroError = MacroError(string)
+         type alias MacroResult('a) = Result('a, MacroError)
+         let runtime_value = 1;
+         macro bad(input: Syntax) -> MacroResult(Syntax) {
+           Ok(runtime_value)
+         }
+        ",
+    )
+    .expect("source should parse");
+    reassociate_standalone(&mut program).expect("source should reassociate");
+
+    let (_, diagnostics) = Infer::new().infer_program_collecting(&mut program, &[], None);
+
+    assert_eq!(diagnostics.len(), 1);
+    assert!(matches!(
+        diagnostics[0].error.as_ref(),
+        TypeError::UnboundVariable(name) if name == "runtime_value"
+    ));
+}
+
+#[test]
+fn macro_phase_allows_prior_function_helpers() {
+    let mut program = parse_source(
+        "type Syntax = Dummy
+         type Result('a, 'e) = Ok('a) | Err('e)
+         type MacroError = MacroError(string)
+         type alias MacroResult('a) = Result('a, MacroError)
+         fn id_syntax(input: Syntax) -> Syntax { input }
+         macro ok(input: Syntax) -> MacroResult(Syntax) {
+           Ok(id_syntax(input))
+         }
+        ",
+    )
+    .expect("source should parse");
+    reassociate_standalone(&mut program).expect("source should reassociate");
+
+    let (_, diagnostics) = Infer::new().infer_program_collecting(&mut program, &[], None);
+
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn macro_signature_errors_are_type_errors() {
+    let mut program = parse_source(
+        "type Syntax = Dummy
+         type Result('a, 'e) = Ok('a) | Err('e)
+         type MacroError = MacroError(string)
+         type alias MacroResult('a) = Result('a, MacroError)
+         macro wrong_param(input: int) -> MacroResult(Syntax) {
+           Ok(input)
+         }
+         macro wrong_return(input: Syntax) -> Syntax {
+           input
+         }
+         macro wrong_body(input: Syntax) -> MacroResult(Syntax) Ok(input)
+        ",
+    )
+    .expect("source should parse");
+    reassociate_standalone(&mut program).expect("source should reassociate");
+
+    let (_, diagnostics) = Infer::new().infer_program_collecting(&mut program, &[], None);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.to_string())
+        .collect();
+
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("input parameter must have type `Syntax`")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("return type must be `MacroResult(Syntax)`")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("body must be a block expression")),
+        "{messages:?}"
+    );
+}
+
+#[test]
 fn collecting_inference_keeps_duplicate_test_names_when_prepass_fails() {
     let mut program = parse_source(
         "type alias Bad('a, 'a) = 'a

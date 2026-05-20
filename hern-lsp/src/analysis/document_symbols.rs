@@ -93,7 +93,7 @@ fn symbols_for_stmt(stmt: &Stmt) -> Vec<DocumentSymbol> {
             *span,
             Some(stmts.iter().flat_map(symbols_for_stmt).collect()),
         )],
-        Stmt::Expr(_) => Vec::new(),
+        Stmt::Macro(_) | Stmt::Expr(_) => Vec::new(),
     }
 }
 
@@ -249,6 +249,19 @@ fn collect_pattern_bindings(
         Pattern::Tuple(elements) => {
             for element in elements {
                 collect_pattern_bindings(element, declaration_span, bindings);
+            }
+        }
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            hern_core::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+            for capture in captures {
+                bindings.push(symbol(
+                    capture.name,
+                    SymbolKind::VARIABLE,
+                    declaration_span,
+                    capture.span,
+                    None,
+                ));
             }
         }
         Pattern::Wildcard

@@ -185,6 +185,7 @@ fn reassoc_diagnostic(err: ReassocError) -> CompilerDiagnostic {
 mod tests {
     use super::*;
     use crate::ast::{DeriveTrait, ExprKind};
+    use crate::syntax::{SyntaxDelimiter, SyntaxTemplate, SyntaxToken};
 
     #[test]
     fn parse_source_reports_lex_span() {
@@ -221,6 +222,43 @@ mod tests {
         };
 
         assert!(matches!(value.kind, ExprKind::Grouped(_)));
+    }
+
+    #[test]
+    fn parse_source_preserves_syntax_quote_tree() {
+        let program =
+            parse_source("let syntax = '{foo(1, x + y)};\n").expect("source should parse");
+        let Stmt::Let { value, .. } = &program.stmts[0] else {
+            panic!("expected let statement");
+        };
+        let ExprKind::SyntaxQuote(syntax) = &value.kind else {
+            panic!("expected syntax quote expression");
+        };
+        let SyntaxTemplate::Tree {
+            delimiter,
+            children,
+            ..
+        } = syntax
+        else {
+            panic!("expected quoted brace tree");
+        };
+
+        assert_eq!(*delimiter, SyntaxDelimiter::Brace);
+        assert_eq!(children.len(), 2);
+        assert!(matches!(
+            children[0],
+            SyntaxTemplate::Token {
+                token: SyntaxToken::Ident(ref name),
+                ..
+            } if name == "foo"
+        ));
+        assert!(matches!(
+            children[1],
+            SyntaxTemplate::Tree {
+                delimiter: SyntaxDelimiter::Paren,
+                ..
+            }
+        ));
     }
 
     #[test]

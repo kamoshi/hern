@@ -69,6 +69,7 @@ pub enum Token {
     LBracket, // [
     RBracket, // ]
     Hash,     // #
+    Quote,    // ' before a quote delimiter
 
     InnerAttr(String), // #![name]
 
@@ -136,6 +137,7 @@ impl fmt::Display for Token {
             Token::LBracket => write!(f, "`[`"),
             Token::RBracket => write!(f, "`]`"),
             Token::Hash => write!(f, "`#`"),
+            Token::Quote => write!(f, "`'`"),
             Token::InnerAttr(attr) => write!(f, "inner attribute `#![{}]`", attr),
             Token::Eof => write!(f, "end of file"),
         }
@@ -362,6 +364,10 @@ impl<'src> Lexer<'src> {
             b',' => {
                 self.advance();
                 Token::Comma
+            }
+            b'\'' if matches!(self.peek2(), Some(b'(' | b'{' | b'[')) => {
+                self.advance();
+                Token::Quote
             }
             b'"' => self.lex_string(line, col)?,
             b'$' if self.peek2() == Some(b'"') => self.lex_interpolated_string(line, col)?,

@@ -335,7 +335,7 @@ fn callable_keyword_hover_in_stmt(
                 callable_keyword_hover_in_stmt(stmt, context, best);
             }
         }
-        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
+        Stmt::Macro(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
     }
 }
 
@@ -434,6 +434,8 @@ fn callable_keyword_hover_in_expr(
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit
@@ -1219,6 +1221,7 @@ fn pattern_to_string(pat: &Pattern) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Pattern::SyntaxQuote(_) => "`'(...)`".to_string(),
     }
 }
 
@@ -1600,6 +1603,21 @@ fn extract_binding_type(
             }
             None
         }
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            hern_core::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+            captures
+                .into_iter()
+                .find(|capture| capture.name == target_name && capture.span == target_span)
+                .map(|capture| {
+                    let syntax = Ty::Con("Syntax".to_string());
+                    if capture.repeat {
+                        Ty::App(Box::new(Ty::Con("Array".to_string())), vec![syntax])
+                    } else {
+                        syntax
+                    }
+                })
+        }
         // Wildcards have no bindings; any other pattern is unreachable here after
         // the irrefutability check in the type inferencer.
         _ => None,
@@ -1867,6 +1885,8 @@ fn param_type_in_expr_stmts(
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit => None,
@@ -1891,6 +1911,13 @@ fn pattern_has_binding_at(pat: &Pattern, name: &str, span: SourceSpan) -> bool {
                 || matches!(rest, Some(Some((n, s))) if n == name && *s == span)
         }
         Pattern::Tuple(elems) => elems.iter().any(|e| pattern_has_binding_at(e, name, span)),
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            hern_core::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+            captures
+                .iter()
+                .any(|capture| capture.name == name && capture.span == span)
+        }
         _ => false,
     }
 }
@@ -1912,6 +1939,11 @@ fn pattern_has_span_at(pat: &Pattern, span: SourceSpan) -> bool {
                 || matches!(rest, Some(Some((_, s))) if *s == span)
         }
         Pattern::Tuple(elems) => elems.iter().any(|e| pattern_has_span_at(e, span)),
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            hern_core::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+            captures.iter().any(|capture| capture.span == span)
+        }
         _ => false,
     }
 }
@@ -1989,7 +2021,11 @@ fn local_pattern_binding_type_in_stmt(
         Stmt::RecBlock { stmts, .. } => stmts.iter().find_map(|stmt| {
             local_pattern_binding_type_in_stmt(stmt, name, binding_span, expr_types, variant_env)
         }),
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
+        Stmt::Macro(_)
+        | Stmt::Trait(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. } => None,
     }
 }
 
@@ -2201,6 +2237,8 @@ fn local_pattern_binding_type_in_expr(
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit => None,
@@ -2263,7 +2301,11 @@ fn declaration_value_type_in_stmt<'a>(
         Stmt::RecBlock { stmts, .. } => stmts
             .iter()
             .find_map(|stmt| declaration_value_type_in_stmt(stmt, span, expr_types)),
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => None,
+        Stmt::Macro(_)
+        | Stmt::Trait(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. } => None,
         Stmt::Let { value, .. } => declaration_value_type_in_expr(value, span, expr_types),
         Stmt::Fn { body, .. } | Stmt::Op { body, .. } => {
             declaration_value_type_in_expr(body, span, expr_types)
@@ -2354,6 +2396,8 @@ fn declaration_value_type_in_expr<'a>(
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit => None,

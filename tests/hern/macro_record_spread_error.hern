@@ -1,0 +1,11 @@
+fn with_spread(input: Syntax) -> #{ original: Syntax } {
+  let base = #{ original: input };
+  #{ ..base }
+}
+
+macro boom(input: Syntax) -> MacroResult(Syntax) {
+  let info = with_spread(input);
+  Ok(info.original)
+}
+
+boom!(1);

@@ -1,0 +1,121 @@
+let syntax = '{foo(1, x + y)};
+
+print(to_string(syntax));
+
+match syntax {
+  Tree((Brace, children, _)) -> print(to_string(children.len())),
+  _ -> print("not a brace tree"),
+};
+
+print(to_string(syntax_children(syntax).len()));
+
+match syntax {
+  Tree((Brace, [
+    Token((Ident(("foo", _)), _)),
+    Tree((Paren, [
+      Token((Literal("1"), _)),
+      Token((Punct(","), _)),
+      Token((Ident(("x", _)), _)),
+      Token((Operator("+"), _)),
+      Token((Ident(("y", _)), _)),
+    ], _)),
+  ], _)) -> print("matched tree"),
+  _ -> print("missed tree"),
+};
+
+match syntax_children(syntax) {
+  [first, ..] -> {
+    print(syntax_token_text(first).unwrap_or("not token"));
+    print(to_string(syntax_is_ident(first, "foo")));
+  },
+  _ -> print("missing first child"),
+};
+
+match '{answer + 41} {
+  '{answer + 41} -> print("matched quote pattern"),
+  _ -> print("missed direct quote"),
+};
+
+match '{answer + 41} {
+  '{$lhs:expr + $rhs:expr} -> {
+    print(to_string(lhs));
+    print(to_string(rhs));
+  },
+  _ -> print("missed expr captures"),
+};
+
+match ('{nested + 1}, 0) {
+  ('{$lhs:expr + $rhs:literal}, _) -> {
+    print(to_string(lhs));
+    print(to_string(rhs));
+  },
+  _ -> print("missed nested quote pattern"),
+};
+
+match '{answer + 41} {
+  '{$name:ident + $value:literal} -> {
+    print(to_string(name));
+    print(to_string(value));
+  },
+  _ -> print("missed typed captures"),
+};
+
+match '{answer + 41} {
+  '{$items:token...} -> print(to_string(items.len())),
+  _ -> print("missed repeated capture"),
+};
+
+match '{a b + a b} {
+  '{$items:token... + $items:token...} -> print(to_string(items.len())),
+  _ -> print("repeat capture mismatch"),
+};
+
+match '{+} {
+  '{$not_expr:expr} -> print("matched invalid expr"),
+  _ -> print("operator is not expr"),
+};
+
+match '{value.field} {
+  '{$field_access:expr} -> print(to_string(field_access)),
+  _ -> print("field access is not expr"),
+};
+
+match '{matrix[0][1]} {
+  '{$indexed:expr} -> print(to_string(indexed)),
+  _ -> print("index chain is not expr"),
+};
+
+match '{if true { 1 } else { 2 }} {
+  '{$branch:expr} -> print(to_string(branch)),
+  _ -> print("if is not expr"),
+};
+
+match '{#{ x: 1 }} {
+  '{$record:expr} -> print(to_string(record)),
+  _ -> print("record is not expr"),
+};
+
+match '{#{ x: int }} {
+  '{$record_ty:type} -> print(to_string(record_ty)),
+  _ -> print("record type is not type"),
+};
+
+match '{#{ x, ..rest }} {
+  '{$record_pat:pat} -> print(to_string(record_pat)),
+  _ -> print("record pattern is not pat"),
+};
+
+match '{[..rest]} {
+  '{$list_pat:pat} -> print(to_string(list_pat)),
+  _ -> print("rest list pattern is not pat"),
+};
+
+match '{answer + 41} {
+  '{$lhs:expr + $rhs:expr} -> print(to_string('{ $lhs * $rhs })),
+  _ -> print("missed reconstructed quote"),
+};
+
+match '{answer + 41} {
+  '{$items:token...} -> print(to_string('{ $items... * $items... })),
+  _ -> print("missed repeated reconstruction"),
+};

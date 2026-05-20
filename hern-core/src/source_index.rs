@@ -443,6 +443,9 @@ impl IndexBuilder {
             } => {
                 self.define(name, *name_span, DefinitionKind::Extern);
             }
+            Stmt::Macro(def) => {
+                self.define(&def.name, def.name_span, DefinitionKind::Function);
+            }
             Stmt::TestBlock { .. } => {}
             Stmt::RecBlock { stmts, .. } => {
                 for stmt in stmts {
@@ -483,6 +486,7 @@ impl IndexBuilder {
             Stmt::TestBlock { span, stmts } | Stmt::RecBlock { span, stmts } => {
                 self.index_scoped_top_level_stmts(*span, stmts);
             }
+            Stmt::Macro(def) => self.index_macro_body(def),
             Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
         }
     }
@@ -532,6 +536,7 @@ impl IndexBuilder {
             Stmt::TestBlock { span, stmts } | Stmt::RecBlock { span, stmts } => {
                 self.index_scoped_top_level_stmts(*span, stmts);
             }
+            Stmt::Macro(def) => self.index_macro_body(def),
             Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
         }
     }
@@ -564,6 +569,27 @@ impl IndexBuilder {
             self.define_param_pattern_bindings(&param.pat, body_start);
         }
         self.index_expr(body);
+        self.pop_scope();
+    }
+
+    fn index_macro_body(&mut self, def: &crate::ast::MacroDef) {
+        let scope_end = SourcePosition {
+            line: def.body.span.end_line,
+            col: def.body.span.end_col,
+        };
+        let body_start = SourcePosition {
+            line: def.body.span.start_line,
+            col: def.body.span.start_col,
+        };
+        self.push_scope_with_end(scope_end);
+        self.define_core(
+            &def.param_name,
+            def.param_span,
+            DefinitionKind::Parameter,
+            None,
+            body_start,
+        );
+        self.index_expr(&def.body);
         self.pop_scope();
     }
 
@@ -777,6 +803,16 @@ impl IndexBuilder {
                 self.index_expr(body);
                 self.pop_scope();
             }
+            ExprKind::SyntaxQuote(template) => {
+                let mut splices = Vec::new();
+                crate::syntax::collect_syntax_template_splices(template, &mut splices);
+                for splice in splices {
+                    self.reference(&splice.name, splice.span);
+                }
+            }
+            ExprKind::MacroCall {
+                name, name_span, ..
+            } => self.reference(name, *name_span),
             ExprKind::Break(None)
             | ExprKind::Return(None)
             | ExprKind::Continue
@@ -826,6 +862,13 @@ impl IndexBuilder {
             Pattern::Tuple(elems) => {
                 for elem in elems {
                     self.define_pattern_bindings(elem);
+                }
+            }
+            Pattern::SyntaxQuote(pattern) => {
+                let mut captures = Vec::new();
+                crate::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+                for capture in captures {
+                    self.define(&capture.name, capture.span, DefinitionKind::Let);
                 }
             }
         }
@@ -884,6 +927,18 @@ impl IndexBuilder {
             Pattern::Tuple(elems) => {
                 for elem in elems {
                     self.define_let_pattern_top_level(elem, module_name.clone());
+                }
+            }
+            Pattern::SyntaxQuote(pattern) => {
+                let mut captures = Vec::new();
+                crate::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+                for capture in captures {
+                    self.define_with_import(
+                        &capture.name,
+                        capture.span,
+                        DefinitionKind::Let,
+                        module_name.clone(),
+                    );
                 }
             }
         }
@@ -950,6 +1005,19 @@ impl IndexBuilder {
             Pattern::Tuple(elems) => {
                 for elem in elems {
                     self.define_let_pattern_local(elem, module_name.clone(), visible_from);
+                }
+            }
+            Pattern::SyntaxQuote(pattern) => {
+                let mut captures = Vec::new();
+                crate::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+                for capture in captures {
+                    self.define_core(
+                        &capture.name,
+                        capture.span,
+                        DefinitionKind::Let,
+                        module_name.clone(),
+                        visible_from,
+                    );
                 }
             }
         }

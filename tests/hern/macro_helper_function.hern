@@ -1,0 +1,23 @@
+fn first_token_text(input: Syntax) -> string {
+  let children = syntax_children(input);
+  if children.is_empty() {
+    ""
+  } else {
+    syntax_token_text(children[0]).unwrap_or("")
+  }
+}
+
+fn starts_with(input: Syntax, expected: string) -> bool {
+  first_token_text(input) == expected
+}
+
+macro first_if_foo(input: Syntax) -> MacroResult(Syntax) {
+  if starts_with(input, "foo") {
+    Ok('{ 1 })
+  } else {
+    Ok('{ 0 })
+  }
+}
+
+print(to_string(first_if_foo!(foo + bar)));
+print(to_string(first_if_foo!(bar + foo)));

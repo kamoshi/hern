@@ -1,6 +1,10 @@
 use crate::ast::*;
 use crate::lex::error::{LexErrorKind, ParseError, Span};
 use crate::lex::{InterpolatedStringPart, Lexer, NumberLiteral, Spanned, Token};
+use crate::syntax::{
+    Syntax, SyntaxCapture, SyntaxCategory, SyntaxDelimiter, SyntaxKind, SyntaxPattern,
+    SyntaxTemplate, token_to_syntax,
+};
 use std::cell::{Cell, RefCell};
 
 type FnParamsBody = (usize, Vec<Param>, Option<TypeReturn>, Vec<TypeBound>, Expr);
@@ -18,6 +22,10 @@ fn is_test_token(token: &Token) -> bool {
 
 fn is_and_token(token: &Token) -> bool {
     matches!(token, Token::Ident(name) if name == "and")
+}
+
+fn is_macro_token(token: &Token) -> bool {
+    matches!(token, Token::Ident(name) if name == "macro")
 }
 
 fn attr_error_span(attr: &Attribute) -> Span {
@@ -46,6 +54,7 @@ fn starts_statement_or_item(token: &Token) -> bool {
             | Token::Match
             | Token::Loop
     ) || is_test_token(token)
+        || is_macro_token(token)
 }
 
 fn negate_number_literal(number: &NumberLiteral) -> NumberLiteral {
@@ -191,6 +200,31 @@ fn can_end_range(tokens: &[Spanned], ptr: usize) -> bool {
                 | Token::RBrace
         )
     )
+}
+
+fn quote_delimiter(token: &Token) -> Option<(SyntaxDelimiter, Token)> {
+    match token {
+        Token::LParen => Some((SyntaxDelimiter::Paren, Token::RParen)),
+        Token::LBrace => Some((SyntaxDelimiter::Brace, Token::RBrace)),
+        Token::LBracket => Some((SyntaxDelimiter::Bracket, Token::RBracket)),
+        _ => None,
+    }
+}
+
+fn is_closing_delimiter(token: &Token) -> bool {
+    matches!(token, Token::RParen | Token::RBrace | Token::RBracket)
+}
+
+fn is_dollar_token(token: &Token) -> bool {
+    matches!(token, Token::Op(op) if op == "$")
+}
+
+fn syntax_capture_category_name(token: &Token) -> Option<&str> {
+    match token {
+        Token::Ident(name) => Some(name),
+        Token::Type => Some("type"),
+        _ => None,
+    }
 }
 
 fn associated_target_from_expr(
@@ -390,6 +424,8 @@ fn check_do_control_flow(expr: &Expr, in_explicit_loop: bool) -> Result<(), Pars
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit
@@ -430,6 +466,44 @@ impl<'tokens> Parser<'tokens> {
             recovering: true,
             inner_diagnostics: RefCell::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn parse_expr_fragment(&self) -> Result<Expr, ParseError> {
+        let (consumed, expr) = self.parse_expr(self.tokens, 0)?;
+        self.expect_fragment_end(consumed, "expression")?;
+        Ok(expr)
+    }
+
+    pub(crate) fn parse_type_fragment(&self) -> Result<Type, ParseError> {
+        let (consumed, ty) = self.parse_type(self.tokens)?;
+        self.expect_fragment_end(consumed, "type")?;
+        Ok(ty)
+    }
+
+    pub(crate) fn parse_pattern_fragment(&self) -> Result<Pattern, ParseError> {
+        let (consumed, pattern) = self.parse_for_pattern(self.tokens)?;
+        self.expect_fragment_end(consumed, "pattern")?;
+        Ok(pattern)
+    }
+
+    fn expect_fragment_end(&self, consumed: usize, fragment_name: &str) -> Result<(), ParseError> {
+        if self.tokens.get(consumed).map(|tok| &tok.token) == Some(&Token::Eof) {
+            return Ok(());
+        }
+        let span = self
+            .tokens
+            .get(consumed)
+            .or_else(|| self.tokens.last())
+            .map(|tok| tok.span)
+            .unwrap_or(Span {
+                line: 0,
+                col: 0,
+                len: 0,
+            });
+        Err(ParseError::new(
+            format!("unexpected token after syntax {fragment_name}"),
+            span,
+        ))
     }
 
     fn next_node_id(&self) -> NodeId {
@@ -868,6 +942,7 @@ impl<'tokens> Parser<'tokens> {
         match &tok.token {
             Token::Let => self.parse_let_stmt(tokens),
             Token::Fn => self.parse_fn_group_stmt(tokens),
+            _ if is_macro_token(&tok.token) => self.parse_macro_stmt(tokens),
             _ if is_test_token(&tok.token)
                 && tokens.get(1).map(|tok| &tok.token) == Some(&Token::LBrace) =>
             {
@@ -888,6 +963,68 @@ impl<'tokens> Parser<'tokens> {
                 Ok((total_consumed, Stmt::Expr(expr)))
             }
         }
+    }
+
+    fn parse_macro_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
+        let mut ptr = 0;
+        if !tokens
+            .get(ptr)
+            .is_some_and(|tok| is_macro_token(&tok.token))
+        {
+            return Err(ParseError::new(
+                "Expected `macro`",
+                tokens.get(ptr).map(|t| t.span).unwrap_or(Span {
+                    line: 0,
+                    col: 0,
+                    len: 0,
+                }),
+            ));
+        }
+        ptr += 1;
+
+        let (consumed_name, name, name_span) = self.expect_ident_with_span(&tokens[ptr..])?;
+        ptr += consumed_name;
+        ptr += self.expect(&tokens[ptr..], Token::LParen)?;
+        if tokens.get(ptr).map(|tok| &tok.token) == Some(&Token::RParen) {
+            return Err(ParseError::new(
+                "invalid macro signature: macro must declare exactly one input parameter of type `Syntax`",
+                tokens
+                    .get(ptr)
+                    .map(|tok| tok.span)
+                    .unwrap_or(tokens[0].span),
+            ));
+        }
+        let (consumed_param, param_name, param_span) =
+            self.expect_ident_with_span(&tokens[ptr..])?;
+        ptr += consumed_param;
+        ptr += self.expect(&tokens[ptr..], Token::Colon)?;
+        let param_ty_start = ptr;
+        let (consumed_param_ty, param_ty) = self.parse_type(&tokens[ptr..])?;
+        ptr += consumed_param_ty;
+        let param_ty_span = consumed_span(&tokens[param_ty_start..], consumed_param_ty);
+        ptr += self.expect(&tokens[ptr..], Token::RParen)?;
+        ptr += self.expect(&tokens[ptr..], Token::Arrow)?;
+        let ret_ty_start = ptr;
+        let (consumed_ret, ret_ty) = self.parse_type(&tokens[ptr..])?;
+        ptr += consumed_ret;
+        let ret_ty_span = consumed_span(&tokens[ret_ty_start..], consumed_ret);
+        let (consumed_body, body) = self.parse_expr(&tokens[ptr..], 0)?;
+        ptr += consumed_body;
+        Ok((
+            ptr,
+            Stmt::Macro(MacroDef {
+                span: consumed_span(tokens, ptr),
+                name,
+                name_span,
+                param_name,
+                param_span,
+                param_ty,
+                param_ty_span,
+                ret_ty,
+                ret_ty_span,
+                body,
+            }),
+        ))
     }
 
     fn parse_test_stmt(&self, tokens: &[Spanned]) -> Result<(usize, Stmt), ParseError> {
@@ -2135,6 +2272,7 @@ impl<'tokens> Parser<'tokens> {
             }
             Token::True => Ok((1, Pattern::BoolLit(true))),
             Token::False => Ok((1, Pattern::BoolLit(false))),
+            Token::Quote => self.parse_syntax_pattern(tokens),
             Token::Ident(name) => {
                 let name = name.clone();
                 ptr += 1;
@@ -2245,6 +2383,222 @@ impl<'tokens> Parser<'tokens> {
                 tok.span,
             )),
         }
+    }
+
+    fn parse_syntax_pattern(&self, tokens: &[Spanned]) -> Result<(usize, Pattern), ParseError> {
+        let mut ptr = 0;
+        ptr += self.expect(&tokens[ptr..], Token::Quote)?;
+        let Some(open) = tokens.get(ptr) else {
+            return Err(ParseError::new(
+                "expected quote delimiter after quote",
+                tokens[ptr - 1].span,
+            ));
+        };
+        if quote_delimiter(&open.token).is_none() {
+            return Err(ParseError::new(
+                "expected quote delimiter after quote",
+                open.span,
+            ));
+        }
+        let (consumed, syntax) = self.parse_syntax_pattern_tree(tokens, ptr)?;
+        ptr += consumed;
+        Ok((ptr, Pattern::SyntaxQuote(syntax)))
+    }
+
+    fn parse_syntax_pattern_tree(
+        &self,
+        tokens: &[Spanned],
+        start: usize,
+    ) -> Result<(usize, SyntaxPattern), ParseError> {
+        let open = tokens.get(start).ok_or_else(|| {
+            ParseError::new("unterminated syntax pattern", tokens[start - 1].span)
+        })?;
+        let Some((delimiter, close_token)) = quote_delimiter(&open.token) else {
+            return Err(ParseError::new(
+                "expected quote delimiter after quote",
+                open.span,
+            ));
+        };
+
+        let mut ptr = start + 1;
+        let mut children = Vec::new();
+        loop {
+            let Some(tok) = tokens.get(ptr) else {
+                return Err(ParseError::new("unterminated syntax pattern", open.span));
+            };
+            if tok.token == close_token {
+                return Ok((
+                    ptr - start + 1,
+                    SyntaxPattern::Tree {
+                        delimiter,
+                        children,
+                    },
+                ));
+            }
+            if is_dollar_token(&tok.token) {
+                let (consumed, capture) = self.parse_syntax_pattern_capture(&tokens[ptr..])?;
+                ptr += consumed;
+                children.push(capture);
+                continue;
+            }
+            if quote_delimiter(&tok.token).is_some() {
+                let (consumed, child) = self.parse_syntax_pattern_tree(tokens, ptr)?;
+                ptr += consumed;
+                children.push(child);
+                continue;
+            }
+            if is_closing_delimiter(&tok.token) {
+                return Err(ParseError::new(
+                    "unexpected closing delimiter in syntax pattern",
+                    tok.span,
+                ));
+            }
+            if tok.token == Token::Eof {
+                return Err(ParseError::new("unterminated syntax pattern", open.span));
+            }
+            match token_to_syntax(tok) {
+                Some(child) => {
+                    if let crate::syntax::SyntaxKind::Token(token) = child.kind {
+                        children.push(SyntaxPattern::Token(token));
+                    }
+                }
+                None => {
+                    return Err(ParseError::new(
+                        "unsupported token in syntax pattern",
+                        tok.span,
+                    ));
+                }
+            }
+            ptr += 1;
+        }
+    }
+
+    fn parse_syntax_value_tree(
+        &self,
+        tokens: &[Spanned],
+        start: usize,
+    ) -> Result<(usize, Syntax), ParseError> {
+        let open = tokens
+            .get(start)
+            .ok_or_else(|| ParseError::new("unterminated macro input", tokens[start - 1].span))?;
+        let Some((delimiter, close_token)) = quote_delimiter(&open.token) else {
+            return Err(ParseError::new("expected macro input delimiter", open.span));
+        };
+
+        let mut ptr = start + 1;
+        let mut children = Vec::new();
+        loop {
+            let Some(tok) = tokens.get(ptr) else {
+                return Err(ParseError::new("unterminated macro input", open.span));
+            };
+            if tok.token == close_token {
+                let span = SourceSpan::from_bounds(open.span, tok.span);
+                return Ok((
+                    ptr - start + 1,
+                    Syntax {
+                        kind: SyntaxKind::Tree {
+                            delimiter,
+                            children,
+                        },
+                        span,
+                        origin: crate::syntax::SyntaxOrigin::Source(span),
+                        scopes: crate::syntax::ScopeSet::source(),
+                    },
+                ));
+            }
+            if quote_delimiter(&tok.token).is_some() {
+                let (consumed, child) = self.parse_syntax_value_tree(tokens, ptr)?;
+                ptr += consumed;
+                children.push(child);
+                continue;
+            }
+            if is_closing_delimiter(&tok.token) {
+                return Err(ParseError::new(
+                    "unexpected closing delimiter in macro input",
+                    tok.span,
+                ));
+            }
+            if tok.token == Token::Eof {
+                return Err(ParseError::new("unterminated macro input", open.span));
+            }
+            match token_to_syntax(tok) {
+                Some(child) => children.push(child),
+                None => {
+                    return Err(ParseError::new(
+                        "unsupported token in macro input",
+                        tok.span,
+                    ));
+                }
+            }
+            ptr += 1;
+        }
+    }
+
+    fn parse_syntax_pattern_capture(
+        &self,
+        tokens: &[Spanned],
+    ) -> Result<(usize, SyntaxPattern), ParseError> {
+        let dollar = tokens.first().expect("caller checked capture start");
+        let mut ptr = 1;
+        let Some(name_tok) = tokens.get(ptr) else {
+            return Err(ParseError::new(
+                "expected capture name after `$` in syntax pattern",
+                dollar.span,
+            ));
+        };
+        let Token::Ident(name) = &name_tok.token else {
+            return Err(ParseError::new(
+                "expected capture name after `$` in syntax pattern",
+                name_tok.span,
+            ));
+        };
+        let name = name.clone();
+        let name_span = SourceSpan::from_lex_span(name_tok.span);
+        ptr += 1;
+        if tokens.get(ptr).map(|t| &t.token) != Some(&Token::Colon) {
+            return Err(ParseError::new(
+                "syntax pattern captures require a category; write `$name:expr`, `$name:ident`, or another syntax category",
+                name_tok.span,
+            ));
+        }
+        ptr += self.expect(&tokens[ptr..], Token::Colon)?;
+        let Some(category_tok) = tokens.get(ptr) else {
+            return Err(ParseError::new(
+                "expected capture category after `:` in syntax pattern",
+                tokens[ptr - 1].span,
+            ));
+        };
+        let Some(category_name) = syntax_capture_category_name(&category_tok.token) else {
+            return Err(ParseError::new(
+                "expected capture category after `:` in syntax pattern",
+                category_tok.span,
+            ));
+        };
+        let Some(category) = SyntaxCategory::from_name(category_name) else {
+            return Err(ParseError::new(
+                format!("unknown syntax capture category `{category_name}`"),
+                category_tok.span,
+            ));
+        };
+        ptr += 1;
+        let repeat = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::DotDot)
+            && tokens.get(ptr + 1).map(|t| &t.token) == Some(&Token::Dot)
+        {
+            ptr += 2;
+            true
+        } else {
+            false
+        };
+
+        Ok((
+            ptr,
+            SyntaxPattern::Capture(SyntaxCapture {
+                name,
+                category,
+                repeat,
+                span: name_span,
+            }),
+        ))
     }
 
     fn parse_number_pattern(
@@ -2626,6 +2980,11 @@ impl<'tokens> Parser<'tokens> {
                 ptr += consumed;
                 do_expr
             }
+            Token::Quote => {
+                let (consumed, quote) = self.parse_syntax_quote(tokens)?;
+                ptr += consumed;
+                quote
+            }
             _ => {
                 return Err(ParseError::new(
                     format!("Unexpected token in expression: {}", tok.token),
@@ -2636,6 +2995,34 @@ impl<'tokens> Parser<'tokens> {
 
         while let Some(op_tok) = tokens.get(ptr) {
             match &op_tok.token {
+                Token::Bang => {
+                    let (l_bp, _r_bp) = (13, 14);
+                    if l_bp < min_bp {
+                        break;
+                    }
+                    let ExprKind::Ident(name) = &lhs.kind else {
+                        break;
+                    };
+                    if tokens.get(ptr + 1).map(|tok| &tok.token) != Some(&Token::LParen) {
+                        break;
+                    }
+                    let name = name.clone();
+                    let name_span = lhs.span;
+                    let bang_span = SourceSpan::from_lex_span(op_tok.span);
+                    ptr += 1;
+                    let (consumed_input, input) = self.parse_syntax_value_tree(tokens, ptr)?;
+                    ptr += consumed_input;
+                    lhs = self.expr_from_tokens(
+                        tokens,
+                        ptr,
+                        ExprKind::MacroCall {
+                            name,
+                            name_span,
+                            bang_span,
+                            input,
+                        },
+                    );
+                }
                 Token::LParen => {
                     let (l_bp, _r_bp) = (13, 14);
                     if l_bp < min_bp {
@@ -2791,6 +3178,204 @@ impl<'tokens> Parser<'tokens> {
         }
 
         Ok((ptr, lhs))
+    }
+
+    fn parse_syntax_quote(&self, tokens: &[Spanned]) -> Result<(usize, Expr), ParseError> {
+        let mut ptr = 0;
+        ptr += self.expect(&tokens[ptr..], Token::Quote)?;
+        let Some(open) = tokens.get(ptr) else {
+            return Err(ParseError::new(
+                "expected quote delimiter after quote",
+                tokens[ptr - 1].span,
+            ));
+        };
+        if quote_delimiter(&open.token).is_none() {
+            return Err(ParseError::new(
+                "expected quote delimiter after quote",
+                open.span,
+            ));
+        }
+        let (consumed, syntax) = self.parse_syntax_template_tree(tokens, ptr)?;
+        ptr += consumed;
+        Ok((
+            ptr,
+            self.expr_from_tokens(tokens, ptr, ExprKind::SyntaxQuote(syntax)),
+        ))
+    }
+
+    fn parse_syntax_template_tree(
+        &self,
+        tokens: &[Spanned],
+        start: usize,
+    ) -> Result<(usize, SyntaxTemplate), ParseError> {
+        let open = tokens
+            .get(start)
+            .ok_or_else(|| ParseError::new("unterminated syntax quote", tokens[start - 1].span))?;
+        let Some((delimiter, close_token)) = quote_delimiter(&open.token) else {
+            return Err(ParseError::new(
+                "expected quote delimiter after quote",
+                open.span,
+            ));
+        };
+
+        let mut ptr = start + 1;
+        let mut children = Vec::new();
+        loop {
+            let Some(tok) = tokens.get(ptr) else {
+                return Err(ParseError::new("unterminated syntax quote", open.span));
+            };
+            if tok.token == close_token {
+                let span = SourceSpan::from_bounds(open.span, tok.span);
+                return Ok((
+                    ptr - start + 1,
+                    SyntaxTemplate::Tree {
+                        delimiter,
+                        children,
+                        span,
+                    },
+                ));
+            }
+            if is_dollar_token(&tok.token) {
+                let (consumed, splice) = self.parse_syntax_template_splice(&tokens[ptr..])?;
+                ptr += consumed;
+                children.push(splice);
+                continue;
+            }
+            if let Token::Op(op) = &tok.token
+                && let Some(prefix) = op.strip_suffix('$')
+                && tokens
+                    .get(ptr + 1)
+                    .is_some_and(|next| matches!(next.token, Token::Ident(_)))
+            {
+                if !prefix.is_empty() {
+                    children.push(SyntaxTemplate::Token {
+                        token: crate::syntax::SyntaxToken::Operator(prefix.to_string()),
+                        span: SourceSpan::from_lex_span(tok.span),
+                    });
+                }
+                let splice =
+                    self.parse_syntax_template_splice_after_marker(tok, &tokens[ptr + 1..])?;
+                ptr += splice.0 + 1;
+                children.push(splice.1);
+                continue;
+            }
+            if quote_delimiter(&tok.token).is_some() {
+                let (consumed, child) = self.parse_syntax_template_tree(tokens, ptr)?;
+                ptr += consumed;
+                children.push(child);
+                continue;
+            }
+            if is_closing_delimiter(&tok.token) {
+                return Err(ParseError::new(
+                    "unexpected closing delimiter in syntax quote",
+                    tok.span,
+                ));
+            }
+            if tok.token == Token::Eof {
+                return Err(ParseError::new("unterminated syntax quote", open.span));
+            }
+            match token_to_syntax(tok) {
+                Some(child) => children.push(SyntaxTemplate::from_syntax(child)),
+                None => {
+                    return Err(ParseError::new(
+                        "unsupported token in syntax quote",
+                        tok.span,
+                    ));
+                }
+            }
+            ptr += 1;
+        }
+    }
+
+    fn parse_syntax_template_splice(
+        &self,
+        tokens: &[Spanned],
+    ) -> Result<(usize, SyntaxTemplate), ParseError> {
+        let dollar = tokens.first().expect("caller checked splice start");
+        let mut ptr = 1;
+        let Some(name_tok) = tokens.get(ptr) else {
+            return Err(ParseError::new(
+                "expected splice name after `$` in syntax quote",
+                dollar.span,
+            ));
+        };
+        let Token::Ident(name) = &name_tok.token else {
+            return Err(ParseError::new(
+                "expected splice name after `$` in syntax quote",
+                name_tok.span,
+            ));
+        };
+        let name = name.clone();
+        let name_span = SourceSpan::from_lex_span(name_tok.span);
+        ptr += 1;
+        if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Colon) {
+            return Err(ParseError::new(
+                "syntax quote splices do not take categories; write `$name` in templates and `$name:category` in patterns",
+                tokens[ptr].span,
+            ));
+        }
+        let repeat = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::DotDot)
+            && tokens.get(ptr + 1).map(|t| &t.token) == Some(&Token::Dot)
+        {
+            ptr += 2;
+            true
+        } else {
+            false
+        };
+
+        Ok((
+            ptr,
+            SyntaxTemplate::Splice {
+                name,
+                repeat,
+                span: name_span,
+            },
+        ))
+    }
+
+    fn parse_syntax_template_splice_after_marker(
+        &self,
+        marker: &Spanned,
+        tokens: &[Spanned],
+    ) -> Result<(usize, SyntaxTemplate), ParseError> {
+        let Some(name_tok) = tokens.first() else {
+            return Err(ParseError::new(
+                "expected splice name after `$` in syntax quote",
+                marker.span,
+            ));
+        };
+        let Token::Ident(name) = &name_tok.token else {
+            return Err(ParseError::new(
+                "expected splice name after `$` in syntax quote",
+                name_tok.span,
+            ));
+        };
+        let name = name.clone();
+        let name_span = SourceSpan::from_lex_span(name_tok.span);
+        let mut ptr = 1;
+        if tokens.get(ptr).map(|t| &t.token) == Some(&Token::Colon) {
+            return Err(ParseError::new(
+                "syntax quote splices do not take categories; write `$name` in templates and `$name:category` in patterns",
+                tokens[ptr].span,
+            ));
+        }
+        let repeat = if tokens.get(ptr).map(|t| &t.token) == Some(&Token::DotDot)
+            && tokens.get(ptr + 1).map(|t| &t.token) == Some(&Token::Dot)
+        {
+            ptr += 2;
+            true
+        } else {
+            false
+        };
+
+        Ok((
+            ptr,
+            SyntaxTemplate::Splice {
+                name,
+                repeat,
+                span: name_span,
+            },
+        ))
     }
 
     fn parse_if(&self, tokens: &[Spanned]) -> Result<(usize, Expr), ParseError> {

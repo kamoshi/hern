@@ -1,0 +1,4 @@
+match '{x} {
+  '{$x} -> print("bad"),
+  _ -> print("ok"),
+};

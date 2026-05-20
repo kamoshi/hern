@@ -70,7 +70,11 @@ fn reassoc_stmt(
                 reassoc_stmt(stmt, table, next_node_id)?;
             }
         }
-        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
+        Stmt::Macro(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Trait(_)
+        | Stmt::Extern { .. } => {}
     }
     Ok(())
 }
@@ -191,6 +195,8 @@ fn reassoc_expr_with_ids(
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit
@@ -247,7 +253,11 @@ fn max_stmt_node_id(stmt: &Stmt) -> NodeId {
         Stmt::TestBlock { stmts, .. } | Stmt::RecBlock { stmts, .. } => {
             stmts.iter().map(max_stmt_node_id).max().unwrap_or(0)
         }
-        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => 0,
+        Stmt::Macro(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Trait(_)
+        | Stmt::Extern { .. } => 0,
     }
 }
 
@@ -309,6 +319,8 @@ fn max_expr_node_id(expr: &Expr) -> NodeId {
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit

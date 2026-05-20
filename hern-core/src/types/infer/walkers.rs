@@ -68,7 +68,7 @@ pub(super) fn expr_always_exits(expr: &Expr, include_bc: bool) -> bool {
         }
         ExprKind::Loop(body) => expr_always_exits(body, false),
         ExprKind::For { iterable, .. } => expr_always_exits(iterable, include_bc),
-        ExprKind::Import(_) => false,
+        ExprKind::Import(_) | ExprKind::SyntaxQuote(_) | ExprKind::MacroCall { .. } => false,
         _ => false,
     }
 }
@@ -255,6 +255,8 @@ pub(super) fn attach_owned_dicts_to_recursive_self_calls_inner(
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Unit
         | ExprKind::Import(_)
@@ -286,6 +288,7 @@ pub(super) fn attach_owned_dicts_to_recursive_self_calls_in_stmt(
         }
         Stmt::Fn { .. }
         | Stmt::Op { .. }
+        | Stmt::Macro(_)
         | Stmt::Trait(_)
         | Stmt::Impl(_)
         | Stmt::InherentImpl(_)
@@ -353,6 +356,7 @@ pub(super) fn stmt_binds_name(stmt: &Stmt, name: &str) -> bool {
         Stmt::Extern { name: bound, .. } => bound == name,
         Stmt::TestBlock { .. }
         | Stmt::RecBlock { .. }
+        | Stmt::Macro(_)
         | Stmt::Trait(_)
         | Stmt::Impl(_)
         | Stmt::InherentImpl(_)
@@ -385,6 +389,11 @@ pub(super) fn pattern_binds_name(pat: &Pattern, name: &str) -> bool {
                     .as_ref()
                     .and_then(|rest| rest.as_ref())
                     .is_some_and(|(bound, _)| bound == name)
+        }
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            crate::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+            captures.iter().any(|capture| capture.name == name)
         }
         Pattern::Wildcard
         | Pattern::StringLit(_)

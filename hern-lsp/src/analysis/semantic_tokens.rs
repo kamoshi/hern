@@ -208,6 +208,7 @@ fn lexical_token_type(token: &Token) -> Option<u32> {
         | Token::DotDotEq
         | Token::DotDot
         | Token::Dot
+        | Token::Quote
         | Token::ColonColon => TY_OPERATOR,
         Token::InnerAttr(_) => TY_KEYWORD,
         Token::Eof
@@ -324,7 +325,11 @@ fn push_associated_access_tokens(
         }
         // Associated access is an expression form today; declaration-only
         // statements have no expression bodies to traverse.
-        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
+        Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Macro(_)
+        | Stmt::Trait(_)
+        | Stmt::Extern { .. } => {}
     }
 }
 
@@ -428,6 +433,8 @@ fn push_associated_access_tokens_expr(
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Break(None)

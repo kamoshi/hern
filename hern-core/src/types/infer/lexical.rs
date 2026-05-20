@@ -120,6 +120,8 @@ fn collect_expr(expr: &Expr, indexes: &HashMap<&str, usize>, targets: &mut HashS
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Unit
         | ExprKind::Import(_)
@@ -140,6 +142,7 @@ fn collect_stmt(stmt: &Stmt, indexes: &HashMap<&str, usize>, targets: &mut HashS
         }
         Stmt::Fn { .. }
         | Stmt::Op { .. }
+        | Stmt::Macro(_)
         | Stmt::Trait(_)
         | Stmt::Impl(_)
         | Stmt::InherentImpl(_)
@@ -193,6 +196,7 @@ fn remove_stmt_value_bindings(indexes: &mut HashMap<&str, usize>, stmt: &Stmt) {
         }
         Stmt::TestBlock { .. }
         | Stmt::RecBlock { .. }
+        | Stmt::Macro(_)
         | Stmt::Trait(_)
         | Stmt::Impl(_)
         | Stmt::InherentImpl(_)
@@ -230,6 +234,13 @@ fn remove_pattern_value_bindings(indexes: &mut HashMap<&str, usize>, pat: &Patte
             }
             if let Some(Some((name, _))) = rest {
                 indexes.remove(name.as_str());
+            }
+        }
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            crate::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+            for capture in captures {
+                indexes.remove(capture.name.as_str());
             }
         }
         Pattern::Wildcard

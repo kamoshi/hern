@@ -1,0 +1,1 @@
+macro bad(input: Syntax) -> MacroResult(Syntax) Ok(input)

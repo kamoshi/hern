@@ -1,0 +1,21 @@
+fn head_info(input: Syntax) -> #{ ok: bool, text: string, pair: (string, bool) } {
+  let children = syntax_children(input);
+  if children.is_empty() {
+    #{ ok: false, text: "", pair: ("", false) }
+  } else {
+    let text = syntax_token_text(children[0]).unwrap_or("");
+    #{ ok: true, text: text, pair: (text, true) }
+  }
+}
+
+macro starts_with_foo(input: Syntax) -> MacroResult(Syntax) {
+  let info = head_info(input);
+  if info.ok && (info.text == "foo") && (info.pair == ("foo", true)) {
+    Ok('{ 1 })
+  } else {
+    Ok('{ 0 })
+  }
+}
+
+print(to_string(starts_with_foo!(foo + bar)));
+print(to_string(starts_with_foo!(bar + foo)));

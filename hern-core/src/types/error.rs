@@ -180,6 +180,15 @@ pub enum TypeError {
     /// A refutable pattern was used in a `let` binding.
     /// Only irrefutable patterns are allowed here; use `match` for refutable ones.
     RefutableLetPattern,
+    InvalidSyntaxSplice {
+        name: String,
+        captured_as: String,
+        expected: String,
+    },
+    InvalidMacroSignature {
+        message: String,
+    },
+    UnexpandedMacroCall(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -711,6 +720,24 @@ impl fmt::Display for TypeError {
                 "refutable pattern in let binding: only variable, wildcard, record, tuple, and \
                  rest-list patterns are allowed here; use match instead"
             ),
+            TypeError::InvalidSyntaxSplice {
+                name,
+                captured_as,
+                expected,
+            } => write!(
+                f,
+                "syntax splice `${}` was captured as {} and cannot be used as {}",
+                name, captured_as, expected
+            ),
+            TypeError::InvalidMacroSignature { message } => {
+                write!(f, "invalid macro signature: {message}")
+            }
+            TypeError::UnexpandedMacroCall(name) => {
+                write!(
+                    f,
+                    "macro call `{name}!` was not expanded before typechecking"
+                )
+            }
         }
     }
 }

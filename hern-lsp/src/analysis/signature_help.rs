@@ -123,7 +123,11 @@ fn find_call_in_stmt<'a>(
             }
         }
         Stmt::Expr(expr) => find_call_in_expr(expr, position, best),
-        Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
+        Stmt::Macro(_)
+        | Stmt::Trait(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Extern { .. } => {}
     }
 }
 
@@ -229,6 +233,8 @@ fn find_call_in_expr<'a>(
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Break(None)

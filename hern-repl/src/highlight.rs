@@ -101,6 +101,7 @@ fn token_style(token: &Token) -> Style {
         | Token::DotDotEq
         | Token::DotDot
         | Token::Dot
+        | Token::Quote
         | Token::Hash => Style::default().fg(Color::DarkGray),
         Token::Comma
         | Token::LParen

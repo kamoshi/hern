@@ -14,6 +14,7 @@ pub(super) struct TypeMetadata {
     expr_types: HashMap<NodeId, Ty>,
     symbol_types: HashMap<NodeId, Ty>,
     binding_types: HashMap<SourceSpan, Ty>,
+    syntax_captures: HashMap<SourceSpan, SyntaxCaptureInfo>,
     definition_schemes: HashMap<SourceSpan, Scheme>,
     binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     callable_capabilities: HashMap<NodeId, CallableCapabilities>,
@@ -24,6 +25,7 @@ pub(super) struct FinalizedTypeMaps {
     pub(super) expr_types: HashMap<NodeId, Ty>,
     pub(super) symbol_types: HashMap<NodeId, Ty>,
     pub(super) binding_types: HashMap<SourceSpan, Ty>,
+    pub(super) syntax_captures: HashMap<SourceSpan, SyntaxCaptureInfo>,
     pub(super) definition_schemes: HashMap<SourceSpan, Scheme>,
     pub(super) binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     pub(super) callable_capabilities: HashMap<NodeId, CallableCapabilities>,
@@ -48,6 +50,7 @@ pub(super) struct TypeMetadataSnapshot {
     expr_type_keys: Vec<NodeId>,
     symbol_type_keys: Vec<NodeId>,
     binding_type_keys: Vec<SourceSpan>,
+    syntax_capture_keys: Vec<SourceSpan>,
     definition_scheme_keys: Vec<SourceSpan>,
     binding_capability_keys: Vec<SourceSpan>,
     callable_capability_keys: Vec<NodeId>,
@@ -59,6 +62,7 @@ impl TypeMetadata {
         self.expr_types.clear();
         self.symbol_types.clear();
         self.binding_types.clear();
+        self.syntax_captures.clear();
         self.definition_schemes.clear();
         self.binding_capabilities.clear();
         self.callable_capabilities.clear();
@@ -80,6 +84,12 @@ impl TypeMetadata {
     pub(super) fn record_binding_type(&mut self, span: SourceSpan, ty: Ty) {
         if is_source_span(span) {
             self.binding_types.insert(span, ty);
+        }
+    }
+
+    pub(super) fn record_syntax_capture(&mut self, capture: SyntaxCaptureInfo) {
+        if is_source_span(capture.span) {
+            self.syntax_captures.insert(capture.span, capture);
         }
     }
 
@@ -142,6 +152,7 @@ impl TypeMetadata {
             self.expr_types.len()
                 + self.symbol_types.len()
                 + self.binding_types.len()
+                + self.syntax_captures.len()
                 + self.definition_schemes.len()
                 + self.binding_capabilities.len()
                 + self.callable_capabilities.len()
@@ -163,6 +174,7 @@ impl TypeMetadata {
                 .iter()
                 .map(|(span, ty)| (*span, subst.apply(ty)))
                 .collect(),
+            syntax_captures: self.syntax_captures.clone(),
             definition_schemes: self
                 .definition_schemes
                 .iter()
@@ -179,6 +191,7 @@ impl TypeMetadata {
             expr_type_keys: self.expr_types.keys().copied().collect(),
             symbol_type_keys: self.symbol_types.keys().copied().collect(),
             binding_type_keys: self.binding_types.keys().copied().collect(),
+            syntax_capture_keys: self.syntax_captures.keys().copied().collect(),
             definition_scheme_keys: self.definition_schemes.keys().copied().collect(),
             binding_capability_keys: self.binding_capabilities.keys().copied().collect(),
             callable_capability_keys: self.callable_capabilities.keys().copied().collect(),
@@ -214,6 +227,7 @@ impl TypeMetadata {
         retain_map_keys(&mut self.expr_types, snapshot.expr_type_keys);
         retain_map_keys(&mut self.symbol_types, snapshot.symbol_type_keys);
         retain_map_keys(&mut self.binding_types, snapshot.binding_type_keys);
+        retain_map_keys(&mut self.syntax_captures, snapshot.syntax_capture_keys);
         retain_map_keys(
             &mut self.definition_schemes,
             snapshot.definition_scheme_keys,

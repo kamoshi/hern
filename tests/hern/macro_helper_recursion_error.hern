@@ -1,0 +1,9 @@
+fn forever(input: Syntax) -> Syntax {
+  forever(input)
+}
+
+macro boom(input: Syntax) -> MacroResult(Syntax) {
+  Ok(forever(input))
+}
+
+boom!(1);

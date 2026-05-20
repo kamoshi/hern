@@ -1,0 +1,8 @@
+macro unless(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$cond:expr, $body:block} -> Ok('{ if $cond { () } else { $body } }),
+    _ -> Err(MacroError("unless expects a condition and block")),
+  }
+}
+
+unless!(true);

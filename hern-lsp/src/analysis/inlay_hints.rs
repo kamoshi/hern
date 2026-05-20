@@ -126,6 +126,9 @@ fn collect_stmt_hints(
                 collect_stmt_hints(stmt, range, binding_types, definition_schemes, hints);
             }
         }
+        Stmt::Macro(def) => {
+            collect_expr_hints(&def.body, range, binding_types, definition_schemes, hints);
+        }
         Stmt::Trait(_) | Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Extern { .. } => {}
     }
 }
@@ -259,6 +262,21 @@ fn collect_pattern_type_hints_with_type(
             }
             collect_rest_pattern_type_hint(rest, range, binding_types, hints);
         }
+        Pattern::SyntaxQuote(pattern) => {
+            let mut captures = Vec::new();
+            hern_core::syntax::collect_syntax_pattern_captures(pattern, &mut captures);
+            for capture in captures {
+                if ranges_intersect(source_span_to_range(capture.span), range)
+                    && let Some(ty) = binding_types.get(&capture.span)
+                {
+                    push_type_hint(
+                        source_span_to_range(capture.span).end,
+                        ty_to_display_string(ty),
+                        hints,
+                    );
+                }
+            }
+        }
         Pattern::Variable(_, _)
         | Pattern::Wildcard
         | Pattern::StringLit(_)
@@ -369,7 +387,8 @@ fn collect_expr_hints(
         }
         ExprKind::Match { scrutinee, arms } => {
             collect_expr_hints(scrutinee, range, binding_types, definition_schemes, hints);
-            for (_, body) in arms {
+            for (pattern, body) in arms {
+                collect_pattern_type_hints(pattern, range, binding_types, hints);
                 collect_expr_hints(body, range, binding_types, definition_schemes, hints);
             }
         }
@@ -412,6 +431,8 @@ fn collect_expr_hints(
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Break(None)
@@ -584,6 +605,36 @@ mod tests {
             hints
                 .iter()
                 .all(|hint| hint.position != Position::new(0, 25))
+        );
+    }
+
+    #[test]
+    fn inlay_hints_show_syntax_capture_type_inside_macro_body() {
+        let project = TestProject::new("inlay-macro-capture");
+        let source = concat!(
+            "macro rewrite(input: Syntax) -> MacroResult(Syntax) {\n",
+            "  match input {\n",
+            "    '{$lhs:expr + $rhs:expr} -> Ok('{ $lhs }),\n",
+            "    _ -> Err(MacroError(\"bad\")),\n",
+            "  }\n",
+            "}\n",
+            "rewrite!(1 + 2)\n",
+        );
+        let (state, uri) = project.open("main.hern", source);
+
+        let hints = inlay_hints(
+            &state,
+            uri,
+            Range::new(Position::new(0, 0), Position::new(7, 0)),
+        )
+        .expect("inlay hints should be available");
+
+        assert!(
+            hints.iter().any(|hint| {
+                hint.position == Position::new(2, 10)
+                    && matches!(&hint.label, InlayHintLabel::String(text) if text == ": Syntax")
+            }),
+            "missing syntax capture hint in {hints:?}"
         );
     }
 }

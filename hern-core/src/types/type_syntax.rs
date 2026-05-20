@@ -315,6 +315,8 @@ fn substitute_self_in_expr_types(expr: &mut Expr, target: &Type) {
         ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit
@@ -458,6 +460,7 @@ fn substitute_self_in_stmt_types(stmt: &mut Stmt, target: &Type) {
         | Stmt::InherentImpl(_)
         | Stmt::Type(_)
         | Stmt::TypeAlias { .. }
+        | Stmt::Macro(_)
         | Stmt::Extern { .. } => {}
     }
 }

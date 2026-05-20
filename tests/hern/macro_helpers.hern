@@ -1,0 +1,17 @@
+macro first_if_foo(input: Syntax) -> MacroResult(Syntax) {
+  let children = syntax_children(input);
+  if children.len() == 0 {
+    Err(MacroError("expected non-empty syntax"))
+  } else {
+    let first = children[0];
+    let text = syntax_token_text(first).unwrap_or("");
+    if (text == "foo") && syntax_is_ident(first, "foo") {
+      Ok('{ 1 })
+    } else {
+      Ok('{ 0 })
+    }
+  }
+}
+
+print(to_string(first_if_foo!(foo + bar)));
+print(to_string(first_if_foo!(bar + foo)));

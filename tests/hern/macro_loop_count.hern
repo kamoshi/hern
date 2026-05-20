@@ -1,0 +1,25 @@
+fn token_count(input: Syntax) -> int {
+  let children = syntax_children(input);
+  let mut i = 0;
+  let mut count = 0;
+  loop {
+    if i == children.len() {
+      break count;
+    } else {
+      count = count + 1;
+      i = i + 1;
+    }
+  }
+}
+
+macro count_tokens(input: Syntax) -> MacroResult(Syntax) {
+  let count = token_count(input);
+  if count == 3 {
+    Ok('{ 1 })
+  } else {
+    Ok('{ 0 })
+  }
+}
+
+print(to_string(count_tokens!(a + b)));
+print(to_string(count_tokens!(a + b + c)));

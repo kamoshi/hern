@@ -199,6 +199,9 @@ fn find_hover_in_stmt(
                 find_hover_in_stmt(stmt, expr_types, symbol_types, pos, best);
             }
         }
+        Stmt::Macro(def) => {
+            find_hover_in_expr(&def.body, expr_types, symbol_types, pos, best);
+        }
         Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
     }
 }
@@ -399,6 +402,8 @@ fn find_hover_in_expr(
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Import(_)
         | ExprKind::Unit => {}
@@ -421,7 +426,9 @@ fn hover_target_span(expr: &Expr, pos: SourcePosition) -> Option<SourceSpan> {
         | ExprKind::Range { .. }
         | ExprKind::Tuple(_)
         | ExprKind::Array(_)
-        | ExprKind::Record(_) => Some(expr.span).filter(|span| contains(*span, pos)),
+        | ExprKind::Record(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. } => Some(expr.span).filter(|span| contains(*span, pos)),
         ExprKind::FieldAccess { field_span, .. } => {
             Some(*field_span).filter(|span| contains(*span, pos))
         }
@@ -545,6 +552,8 @@ mod tests {
                 ExprKind::Number(_)
                 | ExprKind::StringLit(_)
                 | ExprKind::Bool(_)
+                | ExprKind::SyntaxQuote(_)
+                | ExprKind::MacroCall { .. }
                 | ExprKind::Ident(_)
                 | ExprKind::Import(_)
                 | ExprKind::Unit
@@ -572,9 +581,11 @@ mod tests {
                 Stmt::RecBlock { stmts, .. } => stmts
                     .iter()
                     .find_map(|stmt| find_in_stmt(stmt, method_name)),
-                Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {
-                    None
-                }
+                Stmt::Macro(_)
+                | Stmt::Type(_)
+                | Stmt::TypeAlias { .. }
+                | Stmt::Trait(_)
+                | Stmt::Extern { .. } => None,
             }
         }
 

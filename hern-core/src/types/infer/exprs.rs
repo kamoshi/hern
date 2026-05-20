@@ -150,6 +150,14 @@ impl Infer {
                 crate::lex::NumberLiteral::Float(_) => Ok(Ty::Float),
             },
             ExprKind::StringLit(_) => Ok(Ty::Con("string".to_string())),
+            ExprKind::SyntaxQuote(template) => {
+                self.check_syntax_template_splices(env, template)?;
+                crate::syntax::check_template_splice_categories(template, env)?;
+                Ok(Ty::Con("Syntax".to_string()))
+            }
+            ExprKind::MacroCall { name, .. } => {
+                Err(TypeError::UnexpandedMacroCall(name.clone()).into())
+            }
             ExprKind::Bool(_) => Ok(Ty::Con("bool".to_string())),
             ExprKind::Not(operand) => {
                 let op_ty = self.infer_expr(env, operand)?;
@@ -541,6 +549,34 @@ impl Infer {
             self.metadata.record_expr_type(expr.id, ty.clone());
         }
         result.map_err(|err: SpannedTypeError| err.with_span_if_absent(expr.span))
+    }
+
+    fn check_syntax_template_splices(
+        &mut self,
+        env: &TypeEnv,
+        template: &crate::syntax::SyntaxTemplate,
+    ) -> Result<(), SpannedTypeError> {
+        match template {
+            crate::syntax::SyntaxTemplate::Token { .. } => Ok(()),
+            crate::syntax::SyntaxTemplate::Tree { children, .. } => {
+                for child in children {
+                    self.check_syntax_template_splices(env, child)?;
+                }
+                Ok(())
+            }
+            crate::syntax::SyntaxTemplate::Splice { name, repeat, span } => {
+                let info = env
+                    .get(name)
+                    .ok_or_else(|| TypeError::UnboundVariable(name.clone()).at(*span))?;
+                let ty = self.instantiate(&info.scheme);
+                unify(
+                    &mut self.subst,
+                    ty,
+                    super::pattern_infer::syntax_capture_ty(*repeat),
+                )
+                .map_err(|err| err.at(*span))
+            }
+        }
     }
 }
 

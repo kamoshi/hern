@@ -77,7 +77,7 @@ pub(super) fn stmt_bound_names(stmt: &Stmt) -> CollectedNames {
                 names.extend(stmt_bound_names(stmt));
             }
         }
-        Stmt::TestBlock { .. } | Stmt::InherentImpl(_) | Stmt::Expr(_) => {}
+        Stmt::Macro(_) | Stmt::TestBlock { .. } | Stmt::InherentImpl(_) | Stmt::Expr(_) => {}
     }
     names
 }
@@ -224,6 +224,11 @@ fn collect_stmt_referenced_names(
             collect_type_referenced_names(ty, refs, &stmt_type_scope);
         }
         Stmt::Extern { ty, .. } => collect_type_referenced_names(ty, refs, type_scope),
+        Stmt::Macro(def) => {
+            let mut macro_scope = value_scope.clone();
+            macro_scope.insert(def.param_name.clone());
+            collect_expr_referenced_names(&def.body, refs, &macro_scope, type_scope);
+        }
         Stmt::Expr(expr) => collect_expr_referenced_names(expr, refs, value_scope, type_scope),
         Stmt::TestBlock { stmts, .. } => {
             let mut block_value_scope = value_scope.clone();
@@ -261,10 +266,20 @@ fn collect_expr_referenced_names(
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
         | ExprKind::Import(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Unit
         | ExprKind::Break(None)
         | ExprKind::Continue
         | ExprKind::Return(None) => {}
+        ExprKind::SyntaxQuote(template) => {
+            let mut splices = Vec::new();
+            crate::syntax::collect_syntax_template_splices(template, &mut splices);
+            for splice in splices {
+                if !value_scope.contains(&splice.name) {
+                    refs.values.insert(splice.name);
+                }
+            }
+        }
         ExprKind::Ident(name) => {
             if !value_scope.contains(name) {
                 refs.values.insert(name.clone());
@@ -413,6 +428,7 @@ fn collect_pattern_referenced_names(pat: &Pattern, refs: &mut CollectedNames) {
         | Pattern::StringLit(_)
         | Pattern::NumberLit(_)
         | Pattern::BoolLit(_)
+        | Pattern::SyntaxQuote(_)
         | Pattern::IntRange { .. }
         | Pattern::Variable(_, _)
         | Pattern::Record { .. } => {}

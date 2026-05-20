@@ -6,7 +6,7 @@
 
 use crate::ast::*;
 use crate::types::{
-    Scheme, Subst, TraitConstraint, Ty, TypeEnv,
+    FuncParam, FuncReturn, Row, Scheme, Subst, TraitConstraint, Ty, TyVar, TypeEnv,
     error::TypeError,
     free_type_vars, perf,
     type_syntax::{
@@ -331,7 +331,8 @@ pub(super) fn resolve_concrete_from_args_unifying(
             return None;
         };
         let mut trial = subst.clone();
-        if !unify_scheme_method_actuals(&scheme.ty, args, &mut trial) {
+        let scheme_ty = instantiate_scheme_ty_for_dispatch(&scheme, &mut trial);
+        if !unify_scheme_method_actuals(&scheme_ty, args, &mut trial) {
             return None;
         }
         let resolved_args = args.iter().map(|arg| trial.apply(arg)).collect::<Vec<_>>();
@@ -386,7 +387,8 @@ fn resolve_concrete_from_impl_schemes_unifying(
     let mut matches = Vec::new();
     for (dict_name, scheme) in candidates {
         let mut trial = subst.clone();
-        if !unify_scheme_method_actuals(&scheme.ty, args, &mut trial) {
+        let scheme_ty = instantiate_scheme_ty_for_dispatch(scheme, &mut trial);
+        if !unify_scheme_method_actuals(&scheme_ty, args, &mut trial) {
             continue;
         }
         let resolved_args = args.iter().map(|arg| trial.apply(arg)).collect::<Vec<_>>();
@@ -432,6 +434,74 @@ fn resolve_concrete_from_impl_schemes_unifying(
                 .map(|(dict_name, _, _)| dict_name)
                 .collect(),
         }),
+    }
+}
+
+fn instantiate_scheme_ty_for_dispatch(scheme: &Scheme, subst: &mut Subst) -> Ty {
+    let mut vars = HashMap::new();
+    for &var in &scheme.vars {
+        vars.insert(var, Ty::Var(subst.fresh_tyvar()));
+    }
+    apply_scheme_inst(&scheme.ty, &vars)
+}
+
+fn apply_scheme_inst(ty: &Ty, vars: &HashMap<TyVar, Ty>) -> Ty {
+    match ty {
+        Ty::Var(var) => vars.get(var).cloned().unwrap_or(Ty::Var(*var)),
+        Ty::Qualified(constraints, inner) => Ty::Qualified(
+            constraints
+                .iter()
+                .filter_map(|constraint| match vars.get(&constraint.var) {
+                    Some(Ty::Var(var)) => Some(TraitConstraint {
+                        var: *var,
+                        trait_name: constraint.trait_name.clone(),
+                        args: constraint
+                            .args
+                            .iter()
+                            .map(|arg| apply_scheme_inst(arg, vars))
+                            .collect(),
+                        determinant_indexes: constraint.determinant_indexes.clone(),
+                    }),
+                    Some(_) => None,
+                    None => Some(constraint.clone()),
+                })
+                .collect(),
+            Box::new(apply_scheme_inst(inner, vars)),
+        ),
+        Ty::Func(params, ret) => Ty::Func(
+            params
+                .iter()
+                .map(|param| FuncParam {
+                    ty: apply_scheme_inst(&param.ty, vars),
+                    capability: param.capability,
+                })
+                .collect(),
+            FuncReturn {
+                ty: Box::new(apply_scheme_inst(&ret.ty, vars)),
+                capability: ret.capability,
+            },
+        ),
+        Ty::Tuple(items) => Ty::Tuple(
+            items
+                .iter()
+                .map(|item| apply_scheme_inst(item, vars))
+                .collect(),
+        ),
+        Ty::App(con, args) => Ty::App(
+            Box::new(apply_scheme_inst(con, vars)),
+            args.iter()
+                .map(|arg| apply_scheme_inst(arg, vars))
+                .collect(),
+        ),
+        Ty::Record(row) => Ty::Record(Row {
+            fields: row
+                .fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), apply_scheme_inst(ty, vars)))
+                .collect(),
+            tail: Box::new(apply_scheme_inst(&row.tail, vars)),
+        }),
+        other => other.clone(),
     }
 }
 

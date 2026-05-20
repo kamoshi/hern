@@ -320,7 +320,7 @@ error_contains = "must be a mutable place"
 [tests.mut_return_alias_rejected]
 path = "tests/hern/mut_return_alias_rejected.hern"
 expect = "error"
-error_contains = "return value must be a fresh mutable place"
+error_contains = "return value must be a mutable place created by this expression"
 
 [tests.mut_param_higher_order_erasure]
 path = "tests/hern/mut_param_higher_order_erasure.hern"
@@ -693,7 +693,7 @@ output = """
 [tests.inherent_applied_array_missing]
 path = "tests/hern/inherent_applied_array_missing.hern"
 expect = "error"
-error_contains = "available candidates: [float].sum, [int].sum"
+error_contains = "available candidates: `[float].sum`, `[int].sum`"
 
 [tests.empty_array_specialized_method_error]
 path = "tests/hern/empty_array_specialized_method_error.hern"
@@ -1615,6 +1615,14 @@ output = """
 20
 """
 
+[tests.index_double_generic_regression]
+path = "tests/hern/index_double_generic_regression.hern"
+expect = "typecheck"
+output = """
+3
+2
+"""
+
 [tests.index_lambda_string]
 path = "tests/hern/index_lambda_string.hern"
 expect = "typecheck"
@@ -1788,6 +1796,71 @@ output = """
 5
 """
 
+[tests.syntax_quote]
+path = "tests/hern/syntax_quote.hern"
+expect = "typecheck"
+# Record/list cases pin the parser-backed category precision used by `$x:expr`,
+# `$x:type`, and `$x:pat` in syntax quote patterns.
+output = """
+{foo (1 , x + y)}
+2
+2
+matched tree
+foo
+true
+matched quote pattern
+answer
+41
+nested
+1
+answer
+41
+3
+2
+operator is not expr
+value . field
+matrix [0] [1]
+if true {1} else {2}
+# {x : 1}
+# {x : int}
+# {x , .. rest}
+[.. rest]
+{answer * 41}
+{answer + 41 * answer + 41}
+"""
+
+[tests.syntax_quote_unbound_splice_error]
+path = "tests/hern/syntax_quote_unbound_splice_error.hern"
+expect = "error"
+error_contains = "unbound variable: `missing`"
+
+[tests.syntax_quote_repeat_splice_type_error]
+path = "tests/hern/syntax_quote_repeat_splice_type_error.hern"
+expect = "error"
+error_contains = "type mismatch: expected `[Syntax]`, got `Syntax`"
+
+[tests.syntax_quote_template_category_error]
+path = "tests/hern/syntax_quote_template_category_error.hern"
+expect = "error"
+error_contains = "syntax quote splices do not take categories"
+
+[tests.syntax_quote_pattern_category_error]
+path = "tests/hern/syntax_quote_pattern_category_error.hern"
+expect = "error"
+error_contains = "syntax pattern captures require a category"
+
+[tests.syntax_quote_splice_category_error]
+path = "tests/hern/syntax_quote_splice_category_error.hern"
+expect = "error"
+error_contains = "syntax splice `$lhs` was captured as expr and cannot be used as a type"
+
+[tests.syntax_quote_splice_shadowing]
+path = "tests/hern/syntax_quote_splice_shadowing.hern"
+expect = "typecheck"
+output = """
+{type {b}}
+"""
+
 [tests.and_fn_duplicate_name_error]
 path = "tests/hern/and_fn_duplicate_name_error.hern"
 expect = "error"
@@ -1946,3 +2019,131 @@ error_contains = "test function `repeats` is defined multiple times"
 path = "tests/hern/duplicate_test_name_and_fn_error.hern"
 expect = "error"
 error_contains = "test function `dup` is defined multiple times"
+
+[tests.macro_unless]
+path = "tests/hern/macro_unless.hern"
+expect = "typecheck"
+output = """
+1
+"""
+
+[tests.macro_baseline]
+path = "tests/hern/macro_baseline.hern"
+expect = "typecheck"
+output = """
+{foo (1 , x + y)}
+1
+{y + x}
+3
+"""
+
+[tests.macro_baseline_body_type_error]
+path = "tests/hern/macro_baseline_body_type_error.hern"
+expect = "error"
+error_contains = "type mismatch in type argument 1: expected `Syntax`, got `int`"
+
+[tests.macro_baseline_expansion_error]
+path = "tests/hern/macro_baseline_expansion_error.hern"
+expect = "error"
+error_contains = "macro `add_swapped!`: add_swapped expects a binary addition"
+
+[tests.macro_error]
+path = "tests/hern/macro_error.hern"
+expect = "error"
+error_contains = "macro `unless!`: unless expects a condition and block"
+
+[tests.macro_helpers]
+path = "tests/hern/macro_helpers.hern"
+expect = "typecheck"
+output = """
+1
+0
+"""
+
+[tests.macro_helper_function]
+path = "tests/hern/macro_helper_function.hern"
+expect = "typecheck"
+output = """
+1
+0
+"""
+
+[tests.macro_helper_recursion_error]
+path = "tests/hern/macro_helper_recursion_error.hern"
+expect = "error"
+error_contains = "macro `boom!`: macro comptime call depth limit exceeded"
+
+[tests.macro_structured_helpers]
+path = "tests/hern/macro_structured_helpers.hern"
+expect = "typecheck"
+output = """
+1
+0
+"""
+
+[tests.macro_loop_count]
+path = "tests/hern/macro_loop_count.hern"
+expect = "typecheck"
+output = """
+1
+0
+"""
+
+[tests.macro_lambda]
+path = "tests/hern/macro_lambda.hern"
+expect = "typecheck"
+output = """
+3
+7
+41
+"""
+
+[tests.macro_lambda_arity_error]
+path = "tests/hern/macro_lambda_arity_error.hern"
+expect = "error"
+error_contains = "wrong number of macro-phase function arguments: expected 0, got 1"
+
+[tests.macro_loop_limit_error]
+path = "tests/hern/macro_loop_limit_error.hern"
+expect = "error"
+error_contains = "macro `boom!`: macro comptime step limit exceeded"
+
+[tests.macro_record_spread_error]
+path = "tests/hern/macro_record_spread_error.hern"
+expect = "error"
+error_contains = "macro `boom!`: cannot use `with_spread` as a macro-phase helper: unsupported record spread in macro body"
+
+[tests.macro_unknown_error]
+path = "tests/hern/macro_unknown_error.hern"
+expect = "error"
+error_contains = "unknown macro `missing_macro!`"
+
+[tests.macro_body_type_error]
+path = "tests/hern/macro_body_type_error.hern"
+expect = "error"
+error_contains = "type mismatch in type argument 1: expected `Syntax`, got `int`"
+
+[tests.macro_runtime_value_error]
+path = "tests/hern/macro_runtime_value_error.hern"
+expect = "error"
+error_contains = "unbound variable: `runtime_value`"
+
+[tests.macro_wrong_param_type_error]
+path = "tests/hern/macro_wrong_param_type_error.hern"
+expect = "error"
+error_contains = "invalid macro signature: input parameter must have type `Syntax`, got `int`"
+
+[tests.macro_wrong_return_type_error]
+path = "tests/hern/macro_wrong_return_type_error.hern"
+expect = "error"
+error_contains = "invalid macro signature: return type must be `MacroResult(Syntax)`"
+
+[tests.macro_non_block_body_error]
+path = "tests/hern/macro_non_block_body_error.hern"
+expect = "error"
+error_contains = "invalid macro signature: body must be a block expression"
+
+[tests.macro_missing_param_error]
+path = "tests/hern/macro_missing_param_error.hern"
+expect = "error"
+error_contains = "invalid macro signature: macro must declare exactly one input parameter of type `Syntax`"

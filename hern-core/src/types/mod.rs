@@ -19,6 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
 
+use crate::ast::SourceSpan;
+use crate::syntax::SyntaxCategory;
 use error::TypeMismatchContext;
 
 pub type TyVar = u32;
@@ -482,6 +484,8 @@ pub struct EnvInfo {
     pub scheme: Scheme,
     pub binding_mutable: bool,
     pub place_mutable: bool,
+    pub syntax_capture: Option<SyntaxCaptureInfo>,
+    pub macro_phase_available: bool,
 }
 
 impl EnvInfo {
@@ -490,6 +494,8 @@ impl EnvInfo {
             scheme,
             binding_mutable: false,
             place_mutable: false,
+            syntax_capture: None,
+            macro_phase_available: false,
         }
     }
 
@@ -498,6 +504,8 @@ impl EnvInfo {
             scheme,
             binding_mutable: true,
             place_mutable: false,
+            syntax_capture: None,
+            macro_phase_available: false,
         }
     }
 
@@ -506,11 +514,23 @@ impl EnvInfo {
             scheme,
             binding_mutable: true,
             place_mutable: true,
+            syntax_capture: None,
+            macro_phase_available: false,
         }
+    }
+
+    pub fn with_macro_phase_available(mut self) -> Self {
+        self.macro_phase_available = true;
+        self
     }
 
     pub fn with_place_mutable(mut self, place_mutable: bool) -> Self {
         self.place_mutable = place_mutable;
+        self
+    }
+
+    pub fn with_syntax_capture(mut self, syntax_capture: SyntaxCaptureInfo) -> Self {
+        self.syntax_capture = Some(syntax_capture);
         self
     }
 
@@ -521,6 +541,14 @@ impl EnvInfo {
     pub fn is_place_mutable(&self) -> bool {
         self.place_mutable
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxCaptureInfo {
+    pub name: String,
+    pub category: SyntaxCategory,
+    pub repeat: bool,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone)]

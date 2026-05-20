@@ -1,0 +1,27 @@
+macro direct(input: Syntax) -> MacroResult(Syntax) {
+  Ok((fn(x: Syntax) { x })(input))
+}
+
+macro captured(input: Syntax) -> MacroResult(Syntax) {
+  let fallback = '{ 7 };
+  let choose = fn(use_input: bool) {
+    if use_input {
+      input
+    } else {
+      fallback
+    }
+  };
+  Ok(choose(false))
+}
+
+fn apply_syntax(f: fn(Syntax) -> Syntax, input: Syntax) -> Syntax {
+  f(input)
+}
+
+macro helper(input: Syntax) -> MacroResult(Syntax) {
+  Ok(apply_syntax(fn(x: Syntax) { x }, input))
+}
+
+print(to_string(direct!(1 + 2)));
+print(to_string(captured!(ignored)));
+print(to_string(helper!(41)));

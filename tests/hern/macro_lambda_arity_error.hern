@@ -1,0 +1,6 @@
+macro bad(input: Syntax) -> MacroResult(Syntax) {
+  let f = fn() { input };
+  Ok(f(input))
+}
+
+bad!(1);

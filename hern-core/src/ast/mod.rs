@@ -154,6 +154,11 @@ pub enum GeneratedBy {
         trait_name: String,
         source_span: SourceSpan,
     },
+    Macro {
+        macro_name: String,
+        call_span: SourceSpan,
+        definition_span: SourceSpan,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -195,6 +200,7 @@ pub enum Stmt {
         dict_params: Vec<String>,
         type_bounds: Vec<TypeBound>,
     },
+    Macro(MacroDef),
     Trait(TraitDef),
     Impl(ImplDef),
     InherentImpl(InherentImplDef),
@@ -224,6 +230,20 @@ pub enum Stmt {
     Expr(Expr),
 }
 
+#[derive(Debug, Clone)]
+pub struct MacroDef {
+    pub span: SourceSpan,
+    pub name: String,
+    pub name_span: SourceSpan,
+    pub param_name: String,
+    pub param_span: SourceSpan,
+    pub param_ty: Type,
+    pub param_ty_span: SourceSpan,
+    pub ret_ty: Type,
+    pub ret_ty_span: SourceSpan,
+    pub body: Expr,
+}
+
 impl Stmt {
     pub fn span(&self) -> SourceSpan {
         match self {
@@ -232,6 +252,7 @@ impl Stmt {
             | Stmt::Op { span, .. }
             | Stmt::TypeAlias { span, .. }
             | Stmt::Extern { span, .. } => *span,
+            Stmt::Macro(def) => def.span,
             Stmt::Trait(td) => td.span,
             Stmt::Impl(id) => id.span,
             Stmt::InherentImpl(id) => id.span,
@@ -263,6 +284,7 @@ pub fn walk_stmt_exprs(stmt: &Stmt, visit: &mut impl FnMut(&Expr)) {
     match stmt {
         Stmt::Let { value, .. } | Stmt::Expr(value) => walk_expr(value, visit),
         Stmt::Fn { body, .. } | Stmt::Op { body, .. } => walk_expr(body, visit),
+        Stmt::Macro(def) => walk_expr(&def.body, visit),
         Stmt::Impl(id) => {
             for method in &id.methods {
                 walk_expr(&method.body, visit);
@@ -370,10 +392,12 @@ pub fn walk_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         ExprKind::Break(None)
         | ExprKind::Return(None)
         | ExprKind::Continue
+        | ExprKind::SyntaxQuote(_)
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
         | ExprKind::Ident(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::AssociatedAccess { .. }
         | ExprKind::Import(_)
         | ExprKind::Unit => {}
@@ -681,6 +705,8 @@ pub enum Pattern {
     },
     /// `(a, b, c)` — positional tuple destructuring, mirroring `Ty::Tuple`.
     Tuple(Vec<Pattern>),
+    /// A quoted syntax tree pattern, e.g. `` `(x + $rhs:expr) ``.
+    SyntaxQuote(crate::syntax::SyntaxPattern),
 }
 
 // ── Spread entries ───────────────────────────────────────────────────────────
@@ -837,6 +863,12 @@ pub enum ExprKind {
         member_span: SourceSpan,
         resolution: Option<AssociatedAccessResolution>,
     },
+    MacroCall {
+        name: String,
+        name_span: SourceSpan,
+        bang_span: SourceSpan,
+        input: crate::syntax::Syntax,
+    },
     Import(String),
     Lambda {
         params: Vec<Param>,
@@ -844,6 +876,7 @@ pub enum ExprKind {
         body: Box<Expr>,
         dict_params: Vec<String>,
     },
+    SyntaxQuote(crate::syntax::SyntaxTemplate),
     For {
         pat: Pattern,
         iterable: Box<Expr>,

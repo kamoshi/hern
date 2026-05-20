@@ -1,0 +1,12 @@
+macro unless(input: Syntax) -> MacroResult(Syntax) {
+  match input {
+    '{$cond:expr, $body:block} -> Ok('{ if $cond { () } else { $body } }),
+    _ -> Err(MacroError("unless expects a condition and block")),
+  }
+}
+
+let mut n = 0;
+unless!(n == 3, {
+  n = n + 1;
+});
+print(to_string(n));

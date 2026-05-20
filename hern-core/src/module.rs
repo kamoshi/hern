@@ -3,12 +3,13 @@ use crate::ast::{
     Expr, ExprKind, NodeId, Param, Pattern, Program, SourceSpan, Stmt, TraitDef, walk_program_exprs,
 };
 use crate::derive::expand_derives;
+use crate::macros::expand_macros;
 use crate::pipeline::{
     AnalysisOutput, parse_source, parse_source_recovering, reassociate_with_program,
 };
 use crate::types::infer::{Infer, TypeEnv, VariantEnv};
 use crate::types::{
-    BindingCapabilities, CallableCapabilities, InherentMethodScheme, Scheme, Ty,
+    BindingCapabilities, CallableCapabilities, InherentMethodScheme, Scheme, SyntaxCaptureInfo, Ty,
     trait_dict_indexes, trait_impl_arg_keys_from_ast, trait_impl_dict_name_for_indexes,
     type_syntax::exact_impl_target_key_from_ast,
 };
@@ -47,6 +48,7 @@ pub struct ModuleInferenceMetadata {
     pub expr_types: HashMap<NodeId, Ty>,
     pub symbol_types: HashMap<NodeId, Ty>,
     pub binding_types: HashMap<SourceSpan, Ty>,
+    pub syntax_captures: HashMap<SourceSpan, SyntaxCaptureInfo>,
     pub definition_schemes: HashMap<SourceSpan, Scheme>,
     pub binding_capabilities: HashMap<SourceSpan, BindingCapabilities>,
     pub callable_capabilities: HashMap<NodeId, CallableCapabilities>,
@@ -275,6 +277,8 @@ impl ModuleGraph {
             let content = self.read_source(&path)?;
             let mut program = parse_source(&content)
                 .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
+            expand_macros(&mut program)
+                .map_err(|err| err.with_source_if_absent(DiagnosticSource::Path(path.clone())))?;
             let base_dir = path
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
@@ -356,6 +360,9 @@ impl ModuleGraph {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf();
             let mut diagnostics = parsed.diagnostics;
+            if let Err(err) = expand_macros(&mut parsed.program) {
+                diagnostics.push(err.with_source_if_absent(source.clone()));
+            }
             diagnostics.extend(resolve_imports_in_program_recovering(
                 &mut parsed.program,
                 &base_dir,
@@ -545,6 +552,14 @@ impl GraphInference {
             .map(|metadata| &metadata.definition_schemes)
     }
 
+    pub fn syntax_captures_for_module(
+        &self,
+        name: &str,
+    ) -> Option<&HashMap<SourceSpan, SyntaxCaptureInfo>> {
+        self.metadata_for_module(name)
+            .map(|metadata| &metadata.syntax_captures)
+    }
+
     pub fn binding_capabilities_for_module(
         &self,
         name: &str,
@@ -590,6 +605,7 @@ pub fn parse_file(path: &Path, prelude: &Program) -> Result<Program, CompilerDia
     })?;
     let mut program =
         parse_source(&content).map_err(|err| err.with_source_if_absent(source.clone()))?;
+    expand_macros(&mut program)?;
     expand_derives(&mut program);
     reassociate_with_program(&mut program, prelude)?;
     Ok(program)
@@ -618,6 +634,11 @@ pub fn parse_file_recovering(
         return Ok(AnalysisOutput::diagnostics(parsed.diagnostics));
     }
 
+    if let Err(err) = expand_macros(&mut parsed.program) {
+        return Ok(AnalysisOutput::diagnostics(vec![
+            err.with_source_if_absent(source),
+        ]));
+    }
     expand_derives(&mut parsed.program);
     if let Err(err) = reassociate_with_program(&mut parsed.program, prelude) {
         return Ok(AnalysisOutput::diagnostics(vec![
@@ -767,6 +788,7 @@ pub fn infer_graph_collecting(graph: &mut ModuleGraph) -> AnalysisOutput<GraphIn
                 expr_types: inference.expr_types,
                 symbol_types: inference.symbol_types,
                 binding_types: inference.binding_types,
+                syntax_captures: inference.syntax_captures,
                 definition_schemes: inference.definition_schemes,
                 binding_capabilities: inference.binding_capabilities,
                 callable_capabilities: inference.callable_capabilities,
@@ -1073,7 +1095,11 @@ fn resolve_imports_in_stmt(
             }
             Ok(())
         }
-        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => Ok(()),
+        Stmt::Macro(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Trait(_)
+        | Stmt::Extern { .. } => Ok(()),
     }
 }
 
@@ -1135,7 +1161,11 @@ fn resolve_imports_in_stmt_recovering(
                 );
             }
         }
-        Stmt::Type(_) | Stmt::TypeAlias { .. } | Stmt::Trait(_) | Stmt::Extern { .. } => {}
+        Stmt::Macro(_)
+        | Stmt::Type(_)
+        | Stmt::TypeAlias { .. }
+        | Stmt::Trait(_)
+        | Stmt::Extern { .. } => {}
     }
 }
 
@@ -1241,6 +1271,8 @@ fn resolve_imports_in_expr(
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Unit => Ok(()),
     }
@@ -1434,6 +1466,8 @@ fn resolve_imports_in_expr_recovering(
         | ExprKind::Number(_)
         | ExprKind::StringLit(_)
         | ExprKind::Bool(_)
+        | ExprKind::SyntaxQuote(_)
+        | ExprKind::MacroCall { .. }
         | ExprKind::Ident(_)
         | ExprKind::Unit => {}
     }
